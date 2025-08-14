@@ -1,0 +1,35 @@
+
+
+// src/main.jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+
+// ✅ CssBaseline from @mui/material
+import { CssBaseline } from '@mui/material';
+// ✅ ThemeProvider from @mui/material/styles
+import { ThemeProvider } from '@mui/material/styles';
+
+import { createBrowserRouter, RouterProvider } from 'react-router-dom';
+import App from './App.jsx';
+import theme from './theme.js';  // our fixed theme.js
+
+const router = createBrowserRouter(
+  [{ path: '/*', element: <App /> }],
+  {
+    future: {
+      v7_startTransition: true,
+      v7_relativeSplatPath: true,
+    },
+  }
+);
+
+ReactDOM
+  .createRoot(document.getElementById('root'))
+  .render(
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <RouterProvider router={router} />
+    </ThemeProvider>
+  );
+
+
