@@ -1,158 +1,4 @@
-await generateRawExcel(filtered, { region, location, rawSearch, from, to, rawAdmitFilter });
-
-
-
-
-
-
-// generateRawExcel(rows, opts)
-const generateRawExcel = async (rows, opts = {}) => {
-  // helper: format time coming from Swipe_Time (handles ISO or "HH:mm[:ss]" fallback)
-  const formatTimeFromSwipe = (swipeIso) => {
-    if (!swipeIso) return '';
-    // try ISO parse first
-    const dt = new Date(swipeIso);
-    if (!isNaN(dt.getTime())) {
-      return formatTimeFromServerISO(swipeIso);
-    }
-    // fallback: parse "HH:mm" or "HH:mm:ss"
-    const parts = ('' + swipeIso).split(':').map(p => parseInt(p || 0, 10));
-    const hh = parts[0] || 0;
-    const mm = parts[1] || 0;
-    const ss = parts[2] || 0;
-    const ampm = hh >= 12 ? 'PM' : 'AM';
-    const hh12 = ((hh + 11) % 12) + 1;
-    return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
-  };
-
-  // determine which columns to include based on filter
-  const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase(); // 'all'|'admit'|'reject'
-
-  // base columns always present
-  const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
-  // conditional columns
-  const admitCol = 'AdmitCode';
-  const rejCol = 'Rejection_Type';
-  // always include these at end
-  const tailCols = ['Direction','Door'];
-
-  // build final headers in requested order
-  let headers = [...baseHeaders];
-  if (admitFilter === 'all') {
-    headers.push(admitCol);
-    headers.push(...tailCols);
-    headers.push(rejCol);
-  } else if (admitFilter === 'admit') {
-    // admitted only -> hide Rejection_Type
-    headers.push(admitCol);
-    headers.push(...tailCols);
-  } else if (admitFilter === 'reject') {
-    // rejected only -> hide AdmitCode
-    headers.push(...tailCols);
-    headers.push(rejCol);
-  } else {
-    // defensive fallback - include both
-    headers.push(admitCol);
-    headers.push(...tailCols);
-    headers.push(rejCol);
-  }
-
-  if (!rows || !rows.length) {
-    // fallback: write an empty workbook with dynamic headers
-    const wbEmpty = XLSX.utils.book_new();
-    const wsEmpty = XLSX.utils.aoa_to_sheet([headers]);
-    XLSX.utils.book_append_sheet(wbEmpty, wsEmpty, 'Raw');
-    const fileNameEmpty = buildRawFileName(opts);
-    XLSX.writeFile(wbEmpty, fileNameEmpty);
-    return;
-  }
-
-  // Build rows for sheet mapping only included headers
-  const rowsForSheet = rows.map(r => {
-    // Build server-wall-clock ISO for the row (LocaleMessageTime preferred)
-    const iso = getServerISO(r); // LocaleMessageTime || DateOnly+Swipe_Time
-    const dateStr = iso ? formatDateFromServerISO(iso) : '';
-    const timeStr = iso ? formatTimeFromServerISO(iso) : '';
-    const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
-
-    // Format DateOnly as DD-MMM-YY (if present), otherwise blank
-    const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
-
-    // Format Swipe_Time as h:mm:ss AM/PM — handle ISO or HH:mm fallback
-    const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
-
-    // Build a full object then pick keys according to headers to control column inclusion order
-    const fullObj = {
-      LocaleMessageTime: localeMsgFormatted,
-      DateOnly: dateOnlyFormatted,
-      Swipe_Time: swipeTimeFormatted,
-      EmployeeID: r.EmployeeID || '',
-      ObjectName1: r.ObjectName1 || '',
-      PersonnelType: r.PersonnelType || '',
-      location: r.location || '',
-      CardNumber: r.CardNumber || '',
-      AdmitCode: r.AdmitCode || r.Messagetype || '',
-      Direction: r.Direction || r.Swipe || '',
-      Door: r.Door || r.ObjectName2 || '',
-      Rejection_Type: r.Rejection_Type || ''
-    };
-
-    // pick only the requested headers
-    const picked = {};
-    headers.forEach(h => {
-      // ensure we always provide a string/empty when key missing
-      picked[h] = (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '';
-    });
-    return picked;
-  });
-
-  // create workbook/sheet with ordered headers
-  const ws = XLSX.utils.json_to_sheet(rowsForSheet, { header: headers });
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Raw');
-
-  // build filename per your examples
-  const filename = buildRawFileName(opts);
-
-  XLSX.writeFile(wb, filename);
-};
-
-
-
-
-
-
-
-
-
-
-
-Good Above is Working fine 
-
-so There is only one Upadte like 
-
-When i select Admited only in Raw Report ../.
-
-LocaleMessageTime	DateOnly	Swipe_Time	EmployeeID	ObjectName1	PersonnelType	location	CardNumber	AdmitCode	Direction	Door	Rejection_Type
-
-Then Dont Display " Rejection_Type " Column 
-
-and Whee I select Rejected Only  then disable AdmitCode column 
-
-
-When i select All(Admitted + Rejected )
-then display 
-
-
-LocaleMessageTime	DateOnly	Swipe_Time	EmployeeID	ObjectName1	PersonnelType	location	CardNumber	AdmitCode	Direction	Door	Rejection_Type
-Both column 
-
-Update this patch carefully...
-
-
-
-
-
+//Swapnil  include Euroc 
 
 // src/pages/ReportsPage.jsx
 import React, { useState } from 'react';
@@ -694,7 +540,9 @@ const generateRejectionExcel = async data => {
   const [rawAdmitFilter, setRawAdmitFilter] = useState('all'); // 'all' | 'admit' | 'reject'
 
 
-// generateRawExcel(rows, opts) - REPLACE your existing function with this
+
+
+// generateRawExcel(rows, opts)
 const generateRawExcel = async (rows, opts = {}) => {
   // helper: format time coming from Swipe_Time (handles ISO or "HH:mm[:ss]" fallback)
   const formatTimeFromSwipe = (swipeIso) => {
@@ -714,10 +562,41 @@ const generateRawExcel = async (rows, opts = {}) => {
     return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
   };
 
+  // determine which columns to include based on filter
+  const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase(); // 'all'|'admit'|'reject'
+
+  // base columns always present
+  const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
+  // conditional columns
+  const admitCol = 'AdmitCode';
+  const rejCol = 'Rejection_Type';
+  // always include these at end
+  const tailCols = ['Direction','Door'];
+
+  // build final headers in requested order
+  let headers = [...baseHeaders];
+  if (admitFilter === 'all') {
+    headers.push(admitCol);
+    headers.push(...tailCols);
+    headers.push(rejCol);
+  } else if (admitFilter === 'admit') {
+    // admitted only -> hide Rejection_Type
+    headers.push(admitCol);
+    headers.push(...tailCols);
+  } else if (admitFilter === 'reject') {
+    // rejected only -> hide AdmitCode
+    headers.push(...tailCols);
+    headers.push(rejCol);
+  } else {
+    // defensive fallback - include both
+    headers.push(admitCol);
+    headers.push(...tailCols);
+    headers.push(rejCol);
+  }
+
   if (!rows || !rows.length) {
-    // fallback: write an empty workbook with headers
+    // fallback: write an empty workbook with dynamic headers
     const wbEmpty = XLSX.utils.book_new();
-    const headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber','AdmitCode','Direction','Door','Rejection_Type'];
     const wsEmpty = XLSX.utils.aoa_to_sheet([headers]);
     XLSX.utils.book_append_sheet(wbEmpty, wsEmpty, 'Raw');
     const fileNameEmpty = buildRawFileName(opts);
@@ -725,9 +604,7 @@ const generateRawExcel = async (rows, opts = {}) => {
     return;
   }
 
-  // exact column order requested
-  const headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber','AdmitCode','Direction','Door','Rejection_Type'];
-
+  // Build rows for sheet mapping only included headers
   const rowsForSheet = rows.map(r => {
     // Build server-wall-clock ISO for the row (LocaleMessageTime preferred)
     const iso = getServerISO(r); // LocaleMessageTime || DateOnly+Swipe_Time
@@ -741,7 +618,8 @@ const generateRawExcel = async (rows, opts = {}) => {
     // Format Swipe_Time as h:mm:ss AM/PM — handle ISO or HH:mm fallback
     const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
 
-    return {
+    // Build a full object then pick keys according to headers to control column inclusion order
+    const fullObj = {
       LocaleMessageTime: localeMsgFormatted,
       DateOnly: dateOnlyFormatted,
       Swipe_Time: swipeTimeFormatted,
@@ -755,6 +633,14 @@ const generateRawExcel = async (rows, opts = {}) => {
       Door: r.Door || r.ObjectName2 || '',
       Rejection_Type: r.Rejection_Type || ''
     };
+
+    // pick only the requested headers
+    const picked = {};
+    headers.forEach(h => {
+      // ensure we always provide a string/empty when key missing
+      picked[h] = (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '';
+    });
+    return picked;
   });
 
   // create workbook/sheet with ordered headers
@@ -767,6 +653,8 @@ const generateRawExcel = async (rows, opts = {}) => {
 
   XLSX.writeFile(wb, filename);
 };
+
+
 
 
 const handleGenerate = async () => {
@@ -848,21 +736,10 @@ const resp = await axios.get('/api/reports/raw', { params });
       }
 
 
+// await generateRawExcel(filtered, { region, location, rawSearch, from, to });
 
+await generateRawExcel(filtered, { region, location, rawSearch, from, to, rawAdmitFilter });
 
-
-
-      // const ws = XLSX.utils.json_to_sheet(filtered);
-      // const wb = XLSX.utils.book_new();
-      // XLSX.utils.book_append_sheet(wb, ws, 'Raw');
-
-      // const fileStart = startDate.toISOString().slice(0, 10);
-      // const fileEnd = endDate.toISOString().slice(0, 10);
-      // const filename = `RawReport_${region}_${fileStart}_to_${fileEnd}.xlsx`;
-      // XLSX.writeFile(wb, filename);
-
-
-await generateRawExcel(filtered, { region, location, rawSearch, from, to });
 
       return;
     }
@@ -1586,6 +1463,5 @@ const disabled = loading
   );
 
 }
-
 
 
