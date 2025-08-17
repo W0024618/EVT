@@ -1,3 +1,335 @@
+# compare_service.py
+import pandas as pd
+from datetime import datetime, date
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+def ingest_live_details_list(details_list):
+    """
+    Persist details_list (array of detail dicts) into LiveSwipe table.
+    Each dict expected to include LocaleMessageTime, EmployeeID, CardNumber, ObjectName1, PartitionName2, Floor, Door, Direction
+    """
+    from db import SessionLocal as _SessionLocal
+    with _SessionLocal() as db:
+        for d in details_list:
+            ts = d.get("LocaleMessageTime")
+            try:
+                ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                ts_parsed = datetime.utcnow()
+            rec = LiveSwipe(
+                timestamp=ts_parsed,
+                employee_id=(d.get("EmployeeID") or "").strip() or None,
+                card_number=(d.get("CardNumber") or "").strip() or None,
+                full_name=d.get("ObjectName1"),
+                partition=d.get("PartitionName2") or d.get("PartitionName1"),
+                floor=d.get("Floor"),
+                door=d.get("Door") or d.get("DoorName"),
+                region=d.get("PartitionName2"),
+                raw=d
+            )
+            db.add(rec)
+        db.commit()
+
+def compute_daily_attendance(target_date: date):
+    """
+    Build AttendanceSummary rows for target_date by reading LiveSwipe rows on that date
+    """
+    with SessionLocal() as db:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = datetime.combine(target_date, datetime.max.time())
+        swipes_q = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end)
+        swipes = swipes_q.all()
+        if not swipes:
+            return []  # nothing to summarize
+
+        # Create dataframe from raw objects
+        rows = []
+        for s in swipes:
+            rows.append({
+                "id": s.id,
+                "timestamp": s.timestamp,
+                "employee_id": s.employee_id,
+                "card_number": s.card_number,
+                "full_name": s.full_name,
+                "partition": s.partition,
+                "floor": s.floor,
+                "door": s.door
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return []
+
+        # determine primary key for grouping (employee_id or card_number)
+        df['key'] = df['employee_id'].fillna(df['card_number'])
+        grouped = df.groupby('key').agg(
+            presence_count=('id', 'count'),
+            first_seen=('timestamp', 'min'),
+            last_seen=('timestamp', 'max'),
+            full_name=('full_name', 'first'),
+            partition=('partition', 'first')
+        ).reset_index()
+
+        # upsert into AttendanceSummary
+        for _, row in grouped.iterrows():
+            rec = AttendanceSummary(
+                employee_id=row['key'],
+                date=target_date,
+                presence_count=int(row['presence_count']),
+                first_seen=row['first_seen'],
+                last_seen=row['last_seen'],
+                derived={"partition": row['partition'], "full_name": row['full_name']}
+            )
+            db.merge(rec)
+        db.commit()
+        return grouped.to_dict(orient='records')
+
+def compare_with_active(target_date: date):
+    """
+    Compare AttendanceSummary (for target_date) with ActiveEmployee table.
+    Returns a dict: { by_location: [...], merged: [...] }
+    This function is robust when either side is empty.
+    """
+    with SessionLocal() as db:
+        # fetch attendance summary rows for date
+        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+        if not att_rows:
+            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen"])
+        else:
+            att_df = pd.DataFrame([{
+                "employee_id": a.employee_id,
+                "presence_count": a.presence_count,
+                "first_seen": a.first_seen,
+                "last_seen": a.last_seen,
+                **(a.derived or {})
+            } for a in att_rows])
+
+        # fetch active employees
+        act_rows = db.query(ActiveEmployee).all()
+        if not act_rows:
+            act_df = pd.DataFrame(columns=["employee_id", "full_name", "location_city", "status"])
+        else:
+            act_df = pd.DataFrame([{
+                "employee_id": e.employee_id,
+                "full_name": e.full_name,
+                "location_city": e.location_city,
+                "status": e.current_status
+            } for e in act_rows])
+
+        # Ensure 'employee_id' column exists on both dataframes before merge
+        if 'employee_id' not in act_df.columns:
+            act_df['employee_id'] = pd.NA
+        if 'employee_id' not in att_df.columns:
+            att_df['employee_id'] = pd.NA
+
+        # Merge - left join active employees with attendance
+        merged = pd.merge(act_df, att_df, on='employee_id', how='left')
+
+        # If presence_count missing -> 0
+        merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
+        merged['present_today'] = merged['presence_count'] > 0
+
+        # Location-wise summary
+        # Use location_city; fill null with 'Unknown'
+        merged['location_city'] = merged['location_city'].fillna('Unknown')
+        loc_group = merged.groupby('location_city', dropna=False).agg(
+            total_n=('employee_id', 'count'),
+            present_n=('present_today', 'sum')
+        ).reset_index()
+        loc_group['percent_present'] = ((loc_group['present_n'] / loc_group['total_n']) * 100).round(2)
+
+        # Prepare JSON-compatible outputs
+        by_location = loc_group.to_dict(orient='records')
+        merged_list = merged.to_dict(orient='records')
+
+        return {"by_location": by_location, "merged": merged_list}
+
+
+
+
+
+
+
+
+
+# create a backup (optional)
+copy .\compare_service.py .\compare_service.py.bak -Force
+
+$code = @'
+# compare_service.py
+import pandas as pd
+from datetime import datetime, date
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+def ingest_live_details_list(details_list):
+    """
+    Persist details_list (array of detail dicts) into LiveSwipe table.
+    Each dict expected to include LocaleMessageTime, EmployeeID, CardNumber, ObjectName1, PartitionName2, Floor, Door, Direction
+    """
+    from db import SessionLocal as _SessionLocal
+    with _SessionLocal() as db:
+        for d in details_list:
+            ts = d.get("LocaleMessageTime")
+            try:
+                ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                ts_parsed = datetime.utcnow()
+            rec = LiveSwipe(
+                timestamp=ts_parsed,
+                employee_id=(d.get("EmployeeID") or "").strip() or None,
+                card_number=(d.get("CardNumber") or "").strip() or None,
+                full_name=d.get("ObjectName1"),
+                partition=d.get("PartitionName2") or d.get("PartitionName1"),
+                floor=d.get("Floor"),
+                door=d.get("Door") or d.get("DoorName"),
+                region=d.get("PartitionName2"),
+                raw=d
+            )
+            db.add(rec)
+        db.commit()
+
+def compute_daily_attendance(target_date: date):
+    """
+    Build AttendanceSummary rows for target_date by reading LiveSwipe rows on that date
+    """
+    with SessionLocal() as db:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = datetime.combine(target_date, datetime.max.time())
+        swipes_q = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end)
+        swipes = swipes_q.all()
+        if not swipes:
+            return []  # nothing to summarize
+
+        # Create dataframe from raw objects
+        rows = []
+        for s in swipes:
+            rows.append({
+                "id": s.id,
+                "timestamp": s.timestamp,
+                "employee_id": s.employee_id,
+                "card_number": s.card_number,
+                "full_name": s.full_name,
+                "partition": s.partition,
+                "floor": s.floor,
+                "door": s.door
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return []
+
+        # determine primary key for grouping (employee_id or card_number)
+        df['key'] = df['employee_id'].fillna(df['card_number'])
+        grouped = df.groupby('key').agg(
+            presence_count=('id', 'count'),
+            first_seen=('timestamp', 'min'),
+            last_seen=('timestamp', 'max'),
+            full_name=('full_name', 'first'),
+            partition=('partition', 'first')
+        ).reset_index()
+
+        # upsert into AttendanceSummary
+        for _, row in grouped.iterrows():
+            rec = AttendanceSummary(
+                employee_id=row['key'],
+                date=target_date,
+                presence_count=int(row['presence_count']),
+                first_seen=row['first_seen'],
+                last_seen=row['last_seen'],
+                derived={"partition": row['partition'], "full_name": row['full_name']}
+            )
+            db.merge(rec)
+        db.commit()
+        return grouped.to_dict(orient='records')
+
+def compare_with_active(target_date: date):
+    """
+    Compare AttendanceSummary (for target_date) with ActiveEmployee table.
+    Returns a dict: { by_location: [...], merged: [...] }
+    This function is robust when either side is empty.
+    """
+    with SessionLocal() as db:
+        # fetch attendance summary rows for date
+        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+        if not att_rows:
+            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen"])
+        else:
+            att_df = pd.DataFrame([{
+                "employee_id": a.employee_id,
+                "presence_count": a.presence_count,
+                "first_seen": a.first_seen,
+                "last_seen": a.last_seen,
+                **(a.derived or {})
+            } for a in att_rows])
+
+        # fetch active employees
+        act_rows = db.query(ActiveEmployee).all()
+        if not act_rows:
+            act_df = pd.DataFrame(columns=["employee_id", "full_name", "location_city", "status"])
+        else:
+            act_df = pd.DataFrame([{
+                "employee_id": e.employee_id,
+                "full_name": e.full_name,
+                "location_city": e.location_city,
+                "status": e.current_status
+            } for e in act_rows])
+
+        # Ensure 'employee_id' column exists on both dataframes before merge
+        if 'employee_id' not in act_df.columns:
+            act_df['employee_id'] = pd.NA
+        if 'employee_id' not in att_df.columns:
+            att_df['employee_id'] = pd.NA
+
+        # Merge - left join active employees with attendance
+        merged = pd.merge(act_df, att_df, on='employee_id', how='left')
+
+        # If presence_count missing -> 0
+        merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
+        merged['present_today'] = merged['presence_count'] > 0
+
+        # Location-wise summary
+        # Use location_city; fill null with 'Unknown'
+        merged['location_city'] = merged['location_city'].fillna('Unknown')
+        loc_group = merged.groupby('location_city', dropna=False).agg(
+            total_n=('employee_id', 'count'),
+            present_n=('present_today', 'sum')
+        ).reset_index()
+        loc_group['percent_present'] = ((loc_group['present_n'] / loc_group['total_n']) * 100).round(2)
+
+        # Prepare JSON-compatible outputs
+        by_location = loc_group.to_dict(orient='records')
+        merged_list = merged.to_dict(orient='records')
+
+        return {"by_location": by_location, "merged": merged_list}
+'@
+
+$code | Out-File -FilePath .\compare_service.py -Encoding utf8 -Force
+
+
+
+
+
+
+
+
+
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+
+
+curl http://localhost:8000/reports/daily/20250817
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> Remove-Item Env:\ATT_DB_URL -ErrorAction SilentlyContinue
 (.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> python create_tables.py
 C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Scripts\python.exe: can't open file 'C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\create_tables.py': [Errno 2] No such file or directory
