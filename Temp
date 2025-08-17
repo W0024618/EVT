@@ -1,1374 +1,1663 @@
-# compare_service.py
-import pandas as pd
-import numpy as np
-from datetime import datetime, date
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
-
-def _to_native(value):
-    """Convert numpy/pandas types and datetimes to plain Python types."""
-    if value is None:
-        return None
-    # pandas NA or numpy nan
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    # numpy numbers
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        # float('nan') already handled above
-        return float(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
-    # pandas Timestamp or datetime
-    try:
-        import datetime as _dt
-        if isinstance(value, _dt.datetime) or hasattr(value, 'isoformat'):
-            try:
-                return value.isoformat()
-            except Exception:
-                return str(value)
-    except Exception:
-        pass
-    return value
-
-def ingest_live_details_list(details_list):
-    """Persist details_list (array of detail dicts) into LiveSwipe table."""
-    from db import SessionLocal as _SessionLocal
-    with _SessionLocal() as db:
-        for d in details_list:
-            ts = d.get("LocaleMessageTime")
-            try:
-                ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else datetime.utcnow()
-            except Exception:
-                ts_parsed = datetime.utcnow()
-            rec = LiveSwipe(
-                timestamp=ts_parsed,
-                employee_id=(d.get("EmployeeID") or "").strip() or None,
-                card_number=(d.get("CardNumber") or "").strip() or None,
-                full_name=d.get("ObjectName1"),
-                partition=d.get("PartitionName2") or d.get("PartitionName1"),
-                floor=d.get("Floor"),
-                door=d.get("Door") or d.get("DoorName"),
-                region=d.get("PartitionName2"),
-                raw=d
-            )
-            db.add(rec)
-        db.commit()
-
-def compute_daily_attendance(target_date: date):
-    """Build AttendanceSummary rows for target_date by reading LiveSwipe rows on that date."""
-    with SessionLocal() as db:
-        start = datetime.combine(target_date, datetime.min.time())
-        end = datetime.combine(target_date, datetime.max.time())
-        swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-        if not swipes:
-            return []
-
-        rows = []
-        for s in swipes:
-            rows.append({
-                "id": s.id,
-                "timestamp": s.timestamp,
-                "employee_id": s.employee_id,
-                "card_number": s.card_number,
-                "full_name": s.full_name,
-                "partition": s.partition,
-                "floor": s.floor,
-                "door": s.door
-            })
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return []
-
-        # Key: prefer employee_id, fallback to card_number
-        df['key'] = df['employee_id'].fillna(df['card_number'])
-        grouped = df.groupby('key').agg(
-            presence_count=('id', 'count'),
-            first_seen=('timestamp', 'min'),
-            last_seen=('timestamp', 'max'),
-            full_name=('full_name', 'first'),
-            partition=('partition', 'first')
-        ).reset_index()
-
-        # Upsert AttendanceSummary
-        for _, row in grouped.iterrows():
-            rec = AttendanceSummary(
-                employee_id=row['key'],
-                date=target_date,
-                presence_count=int(row['presence_count']),
-                first_seen=row['first_seen'],
-                last_seen=row['last_seen'],
-                derived={"partition": row['partition'], "full_name": row['full_name']}
-            )
-            db.merge(rec)
-        db.commit()
-        return grouped.to_dict(orient='records')
-
-def compare_with_active(target_date: date):
-    """
-    Compare AttendanceSummary (for target_date) with ActiveEmployee table.
-    Returns a dict with clean Python types, no NaN values (JSON-safe).
-    """
-    with SessionLocal() as db:
-        # Attendance summary rows for date
-        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
-        if not att_rows:
-            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen"])
-        else:
-            att_df = pd.DataFrame([{
-                "employee_id": a.employee_id,
-                "presence_count": a.presence_count,
-                "first_seen": a.first_seen,
-                "last_seen": a.last_seen,
-                **(a.derived or {})
-            } for a in att_rows])
-
-        # Active employees
-        act_rows = db.query(ActiveEmployee).all()
-        if not act_rows:
-            act_df = pd.DataFrame(columns=["employee_id", "full_name", "location_city", "status"])
-        else:
-            act_df = pd.DataFrame([{
-                "employee_id": e.employee_id,
-                "full_name": e.full_name,
-                "location_city": e.location_city,
-                "status": e.current_status
-            } for e in act_rows])
-
-        # Ensure key column exists
-        if 'employee_id' not in act_df.columns:
-            act_df['employee_id'] = pd.NA
-        if 'employee_id' not in att_df.columns:
-            att_df['employee_id'] = pd.NA
-
-        # Merge left (active employees -> attendance)
-        merged = pd.merge(act_df, att_df, on='employee_id', how='left')
-
-        # Fill presence_count and booleans safely
-        if 'presence_count' in merged.columns:
-            merged['presence_count'] = merged['presence_count'].fillna(0)
-            # convert any floats like 0.0 to int where safe
-            merged['presence_count'] = merged['presence_count'].apply(lambda x: int(x) if (pd.notnull(x) and float(x).is_integer()) else x)
-        else:
-            merged['presence_count'] = 0
-
-        merged['present_today'] = merged['presence_count'].apply(lambda x: bool(x and x != 0))
-
-        # Location summary
-        merged['location_city'] = merged.get('location_city').fillna('Unknown')
-        loc_group = merged.groupby('location_city', dropna=False).agg(
-            total_n=('employee_id', 'count'),
-            present_n=('present_today', 'sum')
-        ).reset_index()
-
-        # percent_present safe (avoid division by zero/NaN)
-        def safe_percent(row):
-            try:
-                if row['total_n'] and row['total_n'] > 0:
-                    return round((row['present_n'] / row['total_n']) * 100, 2)
-            except Exception:
-                pass
-            return 0.0
-        loc_group['percent_present'] = loc_group.apply(safe_percent, axis=1)
-
-        # Convert to JSON-safe native Python types
-        by_location = []
-        for r in loc_group.to_dict(orient='records'):
-            clean = {k: _to_native(v) for k, v in r.items()}
-            # keep location_city key name consistent
-            if 'location_city' not in clean and 'index' in clean:
-                clean['location_city'] = clean.pop('index')
-            by_location.append(clean)
-
-        merged_list = []
-        for r in merged.to_dict(orient='records'):
-            clean = {}
-            for k, v in r.items():
-                clean[k] = _to_native(v)
-            # ensure keys present
-            if 'employee_id' not in clean:
-                clean['employee_id'] = None
-            merged_list.append(clean)
-
-        return {"by_location": by_location, "merged": merged_list}
-
-
-
-
-
-
-
-
-# region_clients.py
-import requests
-from requests.exceptions import RequestException
-
-# Edit endpoints if your hosts/ports differ
-endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
-}
-
-def fetch_all_regions():
-    """Return list of dicts: [{region: name, count: N}, ...]"""
-    results = []
-    for region, url in endpoints.items():
-        try:
-            r = requests.get(url, timeout=6)
-            r.raise_for_status()
-            data = r.json()
-            realtime = data.get("realtime", {}) if isinstance(data, dict) else {}
-            total = 0
-            for site in realtime.values():
-                try:
-                    total += int(site.get("total", 0))
-                except Exception:
-                    pass
-            results.append({"region": region, "count": total})
-        except RequestException as e:
-            # log to console for now
-            print(f"[region_clients] error fetching {region} @ {url}: {e}")
-            results.append({"region": region, "count": None})
-    return results
-
-def fetch_all_details():
-    """
-    Return flattened 'details' list across all regions (tagged with '__region').
-    Returns an empty list if none available.
-    """
-    all_details = []
-    for region, url in endpoints.items():
-        try:
-            r = requests.get(url, timeout=6)
-            r.raise_for_status()
-            data = r.json()
-            details = data.get("details", []) if isinstance(data, dict) else []
-            for d in details:
-                d2 = dict(d)
-                d2["__region"] = region
-                all_details.append(d2)
-        except RequestException as e:
-            print(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
-            continue
-    return all_details
-
-
-
-
-
-
-# app.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import JSONResponse
-import shutil, uuid, json
-from settings import UPLOAD_DIR, OUTPUT_DIR
-from ingest_excel import ingest_employee_excel, ingest_contractor_excel
-from compare_service import ingest_live_details_list, compute_daily_attendance, compare_with_active
-import os
-
-app = FastAPI(title="Attendance Analytics")
-
-@app.post("/upload/active-employees")
-async def upload_active_employees(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.xls', '.xlsx')):
-        raise HTTPException(400, "Please upload an Excel file")
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
-    with open(dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    ingest_employee_excel(dest)
-    return {"status":"ok", "path": str(dest)}
-
-@app.post("/upload/active-contractors")
-async def upload_active_contractors(file: UploadFile = File(...)):
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
-    with open(dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    ingest_contractor_excel(dest)
-    return {"status":"ok", "path": str(dest)}
-
-@app.post("/ingest/live-details")
-async def ingest_live(request: Request):
-    """
-    Accepts:
-      - Raw JSON array in body (preferred)
-      - JSON object with {"details": [...]} in body
-      - multipart/form-data where a form field 'details' contains a JSON string
-    """
-    # 1) Try to parse JSON body first
-    details = None
-    try:
-        body = await request.json()
-        if isinstance(body, dict) and 'details' in body:
-            details = body['details']
-        else:
-            details = body
-    except Exception:
-        # not a JSON body, try form data
-        try:
-            form = await request.form()
-            if 'details' in form:
-                raw = form['details']
-                if isinstance(raw, str):
-                    details = json.loads(raw)
-                else:
-                    # file upload or other; try to read if file-like
-                    try:
-                        details = json.loads((await raw.read()).decode('utf-8'))
-                    except Exception:
-                        details = list(form.getlist('details'))
-            else:
-                # try first field if it looks like JSON string
-                first = None
-                for v in form.values():
-                    first = v
-                    break
-                if isinstance(first, str):
-                    details = json.loads(first)
-                else:
-                    raise HTTPException(status_code=400, detail="No JSON payload found")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
-
-    if not isinstance(details, (list, tuple)):
-        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
-
-    try:
-        ingest_live_details_list(details)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
-
-    return {"status": "ok", "inserted": len(details)}
-
-@app.get("/ingest/fetch-all")
-def fetch_all_and_ingest():
-    """
-    Convenience: call region_clients.fetch_all_details() and ingest them.
-    Uses local import to avoid circular import issues.
-    """
-    try:
-        import region_clients
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
-
-    details = region_clients.fetch_all_details()
-    if not isinstance(details, list):
-        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
-    ingest_live_details_list(details)
-    return {"status":"ok", "inserted": len(details)}
-
-@app.get("/reports/daily/{yyyymmdd}")
-def daily_report(yyyymmdd: str):
-    import datetime
-    try:
-        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
-    compute_daily_attendance(dt)
-    summary = compare_with_active(dt)
-    # summary is JSON-safe (compare_service ensures conversion)
-    return JSONResponse(summary)
-
-
-
-
-
-
-# check_counts.py
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
-
-with SessionLocal() as db:
-    print("Active employees:", db.query(ActiveEmployee).count())
-    print("Active contractors:", db.query(ActiveContractor).count())
-    print("Live swipe rows:", db.query(LiveSwipe).count())
-    print("AttendanceSummary rows:", db.query(AttendanceSummary).count())
-
-
-check_counts.py 
-
-
-
-
-
-
-
-# restart server
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
-
-
-
-
-curl -X POST "http://localhost:8000/ingest/live-details" \
-  -H "Content-Type: application/json" \
-  -d '[{"LocaleMessageTime":"2025-08-17T11:52:29.000Z","ObjectName1":"Test User","Door":"Main Door","EmployeeID":"1001","CardNumber":"C1001","PartitionName2":"Pune","Direction":"InDirection","Floor":"Podium Floor"}]'
-
-
-
-curl http://localhost:8000/ingest/fetch-all
-
-
-curl http://localhost:8000/reports/daily/20250817
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 (.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> uvicorn app:app --reload --host 0.0.0.0 --port 8000
+>>
 INFO:     Will watch for changes in these directories: ['C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [23380] using WatchFiles
-INFO:     Started server process [3520]
+INFO:     Started reloader process [32708] using WatchFiles
+INFO:     Started server process [29928]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     127.0.0.1:62508 - "GET /docs HTTP/1.1" 200 OK
-INFO:     127.0.0.1:62508 - "GET /openapi.json HTTP/1.1" 200 OK
-INFO:     127.0.0.1:62509 - "POST /upload/active-employees HTTP/1.1" 422 Unprocessable Content
-INFO:     127.0.0.1:62511 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
-INFO:     127.0.0.1:62587 - "POST /ingest/live-details HTTP/1.1" 400 Bad Request
-INFO:     127.0.0.1:62588 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
-INFO:     127.0.0.1:62588 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
-INFO:     127.0.0.1:62588 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62633 - "GET /reports/daily/20250816 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62635 - "GET /reports/daily/20250816 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62640 - "GET /reports/daily/20250816 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62641 - "GET /reports/daily/20250816 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62643 - "GET /reports/daily/20250817 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-INFO:     127.0.0.1:62702 - "POST /upload/active-employees HTTP/1.1" 200 OK
-INFO:     127.0.0.1:62703 - "POST /upload/active-employees HTTP/1.1" 200 OK
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:129: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
-  merged['presence_count'] = merged['presence_count'].fillna(0).astype(int)
-INFO:     127.0.0.1:62727 - "GET /reports/daily/20250817 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 114, in daily_report
-    return JSONResponse(summary)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 190, in __init__
-    super().__init__(content, status_code, headers, media_type, background)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 47, in __init__
-    self.body = self.render(content)
-                ~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\responses.py", line 193, in render
-    return json.dumps(
-           ~~~~~~~~~~^
-        content,
-        ^^^^^^^^
-    ...<3 lines>...
-        separators=(",", ":"),
-        ^^^^^^^^^^^^^^^^^^^^^^
-    ).encode("utf-8")
-    ^
-  File "C:\Program Files\Python313\Lib\json\__init__.py", line 238, in dumps
-    **kw).encode(obj)
-          ~~~~~~^^^^^
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 200, in encode
-    chunks = self.iterencode(o, _one_shot=True)
-  File "C:\Program Files\Python313\Lib\json\encoder.py", line 261, in iterencode
-    return _iterencode(o, 0)
-ValueError: Out of range float values are not JSON compliant: nan
-INFO:     127.0.0.1:62751 - "POST /upload/active-contractors HTTP/1.1" 200 OK
-INFO:     127.0.0.1:62752 - "GET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:63361 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63361 - "GET /openapi.json HTTP/1.1" 200 OK
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:153: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
+  merged['presence_count'] = merged['presence_count'].fillna(0)
+INFO:     127.0.0.1:63362 - "GET /reports/daily/20250817 HTTP/1.1" 200 OK
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:153: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
+  merged['presence_count'] = merged['presence_count'].fillna(0)
+INFO:     127.0.0.1:63410 - "GET /reports/daily/20250814 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63439 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:153: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
+  merged['presence_count'] = merged['presence_count'].fillna(0)
+INFO:     127.0.0.1:63500 - "GET /reports/daily/20250813 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63501 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:63501 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:153: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
+  merged['presence_count'] = merged['presence_count'].fillna(0)
+INFO:     127.0.0.1:49407 - "GET /reports/daily/20250811 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49788 - "GET /ingest/fetch-all HTTP/1.1" 500 Internal Server Error
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py:153: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`   
+  merged['presence_count'] = merged['presence_count'].fillna(0)
+INFO:     127.0.0.1:49788 - "GET /reports/daily/20250814 HTTP/1.1" 200 OK
 
 
-
-
-
-
-http://localhost:8000/docs#
-
-
-Attendance Analytics
- 0.1.0 
-OAS 3.1
-/openapi.json
-default
-
-
-POST
-/upload/active-employees
-Upload Active Employees
-
-Parameters
-Cancel
-Reset
-No parameters
-
-Request body
-
-multipart/form-data
-file *
-string($binary)
-Copy of Excel 2025-07-01 15_31 GMT+5_30.xlsx
-Execute
-Clear
-Responses
-Curl
-
-curl -X 'POST' \
-  'http://localhost:8000/upload/active-employees' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: multipart/form-data' \
-  -F 'file=@Copy of Excel 2025-07-01 15_31 GMT+5_30.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-Request URL
-http://localhost:8000/upload/active-employees
-Server response
-Code	Details
-200	
-Response body
-Download
-{
-  "status": "ok",
-  "path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\data\\raw_uploads\\fbc950ab62204d4ba907b308eb8b1f74_Copy of Excel 2025-07-01 15_31 GMT+5_30.xlsx"
-}
-Response headers
- content-length: 195 
- content-type: application/json 
- date: Sun,17 Aug 2025 06:44:28 GMT 
- server: uvicorn 
-Responses
-Code	Description	Links
-200	
-Successful Response
-
-Media type
-
-application/json
-Controls Accept header.
-Example Value
-Schema
-"string"
-No links
-422	
-Validation Error
-
-Media type
-
-application/json
-Example Value
-Schema
-{
-  "detail": [
-    {
-      "loc": [
-        "string",
-        0
-      ],
-      "msg": "string",
-      "type": "string"
-    }
-  ]
-}
-No links
-
-POST
-/upload/active-contractors
-Upload Active Contractors
-
-Parameters
-Cancel
-Reset
-No parameters
-
-Request body
-
-multipart/form-data
-file *
-string($binary)
-Active_Contractors_-_Badge_Issuing_20250810-230009226115.xlsx
-Execute
-Clear
-Responses
-Curl
-
-curl -X 'POST' \
-  'http://localhost:8000/upload/active-contractors' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: multipart/form-data' \
-  -F 'file=@Active_Contractors_-_Badge_Issuing_20250810-230009226115.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-Request URL
-http://localhost:8000/upload/active-contractors
-Server response
-Code	Details
-200	
-Response body
-Download
-{
-  "status": "ok",
-  "path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\data\\raw_uploads\\a1ac355ed7d04d50b888600a5198a58f_Active_Contractors_-_Badge_Issuing_20250810-230009226115.xlsx"
-}
-Response headers
- content-length: 212 
- content-type: application/json 
- date: Sun,17 Aug 2025 06:45:30 GMT 
- server: uvicorn 
-Responses
-Code	Description	Links
-200	
-Successful Response
-
-Media type
-
-application/json
-Controls Accept header.
-Example Value
-Schema
-"string"
-No links
-422	
-Validation Error
-
-Media type
-
-application/json
-Example Value
-Schema
-{
-  "detail": [
-    {
-      "loc": [
-        "string",
-        0
-      ],
-      "msg": "string",
-      "type": "string"
-    }
-  ]
-}
-No links
-
-POST
-/ingest/live-details
-Ingest Live
-
-Accepts:
-
-JSON body: a raw array of detail objects
-multipart/form-data form field 'details' containing JSON string
-form body with a single JSON string
-Parameters
-Cancel
-No parameters
-
-Execute
-Responses
-Code	Description	Links
-200	
-Successful Response
-
-Media type
-
-application/json
-Controls Accept header.
-Example Value
-Schema
-"string"
-No links
-
-GET
-/ingest/fetch-all
-Fetch All And Ingest
-
-Parameters
-Try it out
-No parameters
-
-Responses
-Curl
-
-curl -X 'GET' \
-  'http://localhost:8000/ingest/fetch-all' \
-  -H 'accept: application/json'
-Request URL
 http://localhost:8000/ingest/fetch-all
-Server response
-Code	Details
-500
-Undocumented
-Error: Internal Server Error
 
-Response body
-Download
-{
-  "detail": "region_clients unavailable: cannot import name 'fetch_all_details' from 'region_clients' (C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\region_clients.py)"
-}
-Response headers
- content-length: 195 
- content-type: application/json 
- date: Sun,17 Aug 2025 06:41:11 GMT 
- server: uvicorn 
-Responses
-Code	Description	Links
-200	
-Successful Response
+{"detail":"region_clients unavailable: No module named 'requests'"}
 
-Media type
 
-application/json
-Controls Accept header.
-Example Value
-Schema
-"string"
-No links
+Now lets check 
 
-GET
-/reports/daily/{yyyymmdd}
-Daily Report
+http://localhost:8000/reports/daily/20250814
 
-Parameters
-Cancel
-Name	Description
-yyyymmdd *
-string
-(path)
-20250816
-Execute
-Clear
-Responses
-Curl
-
-curl -X 'GET' \
-  'http://localhost:8000/reports/daily/20250816' \
-  -H 'accept: application/json'
-Request URL
-http://localhost:8000/reports/daily/20250816
-Server response
-Code	Details
-500
-Undocumented
-Error: Internal Server Error
-
-Response body
-Download
-Internal Server Error
-Response headers
- content-length: 21 
- content-type: text/plain; charset=utf-8 
- date: Sun,17 Aug 2025 06:41:55 GMT 
- server: uvicorn 
-Responses
-Code	Description	Links
-200	
-Successful Response
-
-Media type
-
-application/json
-Controls Accept header.
-Example Value
-Schema
-"string"
-No links
-422	
-Validation Error
-
-Media type
-
-application/json
-Example Value
-Schema
-{
-  "detail": [
+  "by_location": [
     {
-      "loc": [
-        "string",
-        0
-      ],
-      "msg": "string",
-      "type": "string"
+      "location_city": "Abdijan",
+      "total_n": 5,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Albuquerque",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Alpharetta",
+      "total_n": 10,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Amsterdam",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Auckland",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Aurora",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Austin",
+      "total_n": 97,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Balcarce",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Baltimore",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Basel",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Bay Point",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Beijing",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Benito Juarez",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Berlin",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Bern",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Biel",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Brisbane",
+      "total_n": 14,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Brussels",
+      "total_n": 37,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Bucharest",
+      "total_n": 10,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Budapest",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Buenos Aires",
+      "total_n": 1260,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Burnsville",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Calcutta",
+      "total_n": 8,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Calgary",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Charlotte",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Cincinnati",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Copenhagen",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Cordoba",
+      "total_n": 12,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Corrientes",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Cuauhtémoc",
+      "total_n": 14,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Cuauhtémoc ",
+      "total_n": 66,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Cumberland",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Den Haag",
+      "total_n": 8,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Denver",
+      "total_n": 854,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Dhaka",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Dublin",
+      "total_n": 56,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "East Los Angeles",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Evansdale",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Frankfurt",
+      "total_n": 28,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Geneve",
+      "total_n": 9,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Grand Prairie",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Grand Rapids",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Hallandale Beach",
+      "total_n": 23,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Hamden",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Henderson",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Houston",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Indianapolis",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Irving",
+      "total_n": 5,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Istanbul",
+      "total_n": 8,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Itaim Bibi",
+      "total_n": 231,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Jakarta",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Johannesburg",
+      "total_n": 17,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Kansas City",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Karachi",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Kuala Lumpur",
+      "total_n": 14,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Kwun Tong",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lafayette",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lake Oswego",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Las Conde",
+      "total_n": 10,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lausanne",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lima",
+      "total_n": 271,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lisbon",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lisle",
+      "total_n": 13,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "London",
+      "total_n": 70,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Los Angeles",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Louisville",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Lugano",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Luzern",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Madrid",
+      "total_n": 147,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Mar de Plata",
+      "total_n": 9,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Mendoza",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Miami",
+      "total_n": 35,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Milan",
+      "total_n": 353,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Milwaukee",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Minato",
+      "total_n": 8,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Mobile",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Montreal",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Montvale",
+      "total_n": 31,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Moscow",
+      "total_n": 16,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Nashville",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Neuquen",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "New York",
+      "total_n": 75,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Newark",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "North Little Rock",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Omaha",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Oslo",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Panama City",
+      "total_n": 147,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Paris",
+      "total_n": 29,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Phoenix",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Pittsburgh",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Plano",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Pleasant Hill",
+      "total_n": 55,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Prague",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Pune",
+      "total_n": 1146,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Puteaux",
+      "total_n": 33,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Quezon City",
+      "total_n": 422,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Ranga Reddy District, Hyderabad",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Renens",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Riyadh",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Rome",
+      "total_n": 52,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Rosario",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Roslindale",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "San Isidro",
+      "total_n": 68,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "San Miguel de Tucuma",
+      "total_n": 5,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "San Salvador of Jujuy",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Santa Ana",
+      "total_n": 1088,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Santiago",
+      "total_n": 53,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Sao Paulo",
+      "total_n": 103,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Schlieren",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Seattle",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Seoul",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Singapore",
+      "total_n": 97,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "South Ogden",
+      "total_n": 5,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "St. Louis",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Stockholm",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Sydney",
+      "total_n": 21,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Taguig City",
+      "total_n": 25,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Tashkent",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Tashkent City",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Thonex",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Toronto",
+      "total_n": 31,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "UK except LON",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Unknown",
+      "total_n": 82,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Vancouver",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Victoria Island",
+      "total_n": 4,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Vienna",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Vienna,Wien",
+      "total_n": 80,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Vilnius",
+      "total_n": 1025,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Waipahu",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Warrenton",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Warsaw",
+      "total_n": 7,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Winnipeg",
+      "total_n": 1,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Winterthur",
+      "total_n": 2,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Zagreb",
+      "total_n": 3,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Zahringerstr",
+      "total_n": 6,
+      "present_n": 0,
+      "percent_present": 0
+    },
+    {
+      "location_city": "Zurich",
+      "total_n": 13,
+      "present_n": 0,
+      "percent_present": 0
     }
-  ]
-}
-No links
+  ],
+  "merged": [
+    {
+      "employee_id": "072072",
+      "full_name": "Galligan, Michelle L",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "072315",
+      "full_name": "Mackintosh, William A",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "072526",
+      "full_name": "Luft, Mathias",
+      "location_city": "Puteaux",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "072690",
+      "full_name": "Ragnone-Biesiada, Charlene",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073134",
+      "full_name": "Lupo, Wendy S",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073376",
+      "full_name": "Sherman, Lisa R",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073479",
+      "full_name": "Morales, John M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073521",
+      "full_name": "Borinshteyn, Dmitriy",
+      "location_city": "Montvale",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073674",
+      "full_name": "Park, Leslie E",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "073993",
+      "full_name": "O'Brien, Neil",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074229",
+      "full_name": "Glaser, Guy Mark",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074258",
+      "full_name": "Gillespie, Brenda M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074260",
+      "full_name": "Stazick, Jeffrey",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074387",
+      "full_name": "Cavalieri, Kammi M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074480",
+      "full_name": "Schloeman, William T",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "074908",
+      "full_name": "Marostica, Daniel J",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075066",
+      "full_name": "Rojas Gomez, Ana Cristina",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075083",
+      "full_name": "Adams, Reggie G",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075085",
+      "full_name": "Thompson CAMS, Alexander L",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075099",
+      "full_name": "Garay, Luis-Alberto Peralta",
+      "location_city": "Pleasant Hill",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075264",
+      "full_name": "Thortvedt, Tiffany R",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075343",
+      "full_name": "Calderon Yong, Alonso",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075446",
+      "full_name": "Ayres, Nicole M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "075621",
+      "full_name": "Latchman, June L",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "076333",
+      "full_name": "Lara, Jose Gerardo",
+      "location_city": "Pleasant Hill",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "076449",
+      "full_name": "Rodriguez, Oralia",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "076937",
+      "full_name": "Roach, Matthew J",
+      "location_city": "New York",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077016",
+      "full_name": "Lee, Ruby W",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077119",
+      "full_name": "Carmichael, Sheila S",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077313",
+      "full_name": "Leyva, Jose Noe",
+      "location_city": "Pleasant Hill",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077554",
+      "full_name": "Sancho Salas, Rafael Eduardo",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077877",
+      "full_name": "Rubino, Gary P",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "077953",
+      "full_name": "Porter, Mark J",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "078336",
+      "full_name": "Coman, Jeffrey A",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "078778",
+      "full_name": "Montoya, Catherine S",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "079000",
+      "full_name": "Lee, Leticia",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "079734",
+      "full_name": "Iglesias, Rosa M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "081107",
+      "full_name": "Hensley, Laurel A",
+      "location_city": "St. Louis",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "081821",
+      "full_name": "Dalmadge, Charles E",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "110022",
+      "full_name": "Cardoza, Hector R.",
+      "location_city": "Austin",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "128766",
+      "full_name": "Gunn, Todd D",
+      "location_city": "Hallandale Beach",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "131247",
+      "full_name": "Chabolla, Martha",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "134153",
+      "full_name": "Young, John P",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "139794",
+      "full_name": "Kirby, Mary I",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "140217",
+      "full_name": "Splatt, Gordon",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "141771",
+      "full_name": "Garay, Luis",
+      "location_city": "Buenos Aires",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "141787",
+      "full_name": "Blanco, Juan Carlos",
+      "location_city": "Hallandale Beach",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "141788",
+      "full_name": "Suarez, Marcelo",
+      "location_city": "Buenos Aires",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "141795",
+      "full_name": "Sorbo, Gabriel",
+      "location_city": "Rome",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "141797",
+      "full_name": "Viner, Mayra Yael",
+      "location_city": "Buenos Aires",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "142954",
+      "full_name": "Johnson, Kelly J",
+      "location_city": "St. Louis",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "142995",
+      "full_name": "Delas Carnevali, Fernando",
+      "location_city": "Montvale",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "143911",
+      "full_name": "Ruleva, Elena",
+      "location_city": "Moscow",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "143912",
+      "full_name": "Pavlovskaya, Evgenija",
+      "location_city": "Moscow",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "143940",
+      "full_name": "Lizina, Galina",
+      "location_city": "Moscow",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "143979",
+      "full_name": "Konwerski, Martin",
+      "location_city": "Vilnius",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "147951",
+      "full_name": "Apodaca, Scott M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "148213",
+      "full_name": "Corby, Suzanne L",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "148788",
+      "full_name": "Benson, Linda K",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "150232",
+      "full_name": "Acuna, Fabio A",
+      "location_city": "Pleasant Hill",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "152137",
+      "full_name": "Sada, Rodrigo",
+      "location_city": "Miami",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "153596",
+      "full_name": "Richardson Box, Mario",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "154046",
+      "full_name": "Nguyen, Tien Le",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "154512",
+      "full_name": "Wharton, Ngoc-Zune T",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "154912",
+      "full_name": "de Vries, Jan P",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "157856",
+      "full_name": "Bellato, Christian L.",
+      "location_city": "Las Conde",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "158397",
+      "full_name": "Glendenning, Heather A",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "158956",
+      "full_name": "Tayler, Joshua M",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "159452",
+      "full_name": "Fiol, Irma Magdalena",
+      "location_city": "Buenos Aires",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "161477",
+      "full_name": "Anderson, Jonathan M",
+      "location_city": "Phoenix",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "162104",
+      "full_name": "Gonzalez-Pierson, Gloria Ines",
+      "location_city": "Pleasant Hill",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "163010",
+      "full_name": "Richards, James A",
+      "location_city": "Denver",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166361",
+      "full_name": "Aguilar Araya, Giovanni",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166368",
+      "full_name": "Golcher Quiros, Pablo",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166377",
+      "full_name": "Porras Carrillo, Anabelle",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166381",
+      "full_name": "Rosales Benavides, Alberto Maikal",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166416",
+      "full_name": "Morales Thompson, Ernesto Jose",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166424",
+      "full_name": "Najera Barquero, Giovanni",
+      "location_city": "Santa Ana",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166711",
+      "full_name": "Lahey-Anzinger, Doris",
+      "location_city": "Vienna,Wien",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
+    },
+    {
+      "employee_id": "166889",
+      "full_name": "Almazan Gonzalez, Miguel",
+      "location_city": "Cuauhtémoc ",
+      "status": null,
+      "presence_count": 0,
+      "first_seen": null,
+      "last_seen": null,
+      "present_today": false
 
-Schemas
-Body_upload_active_contractors_upload_active_contractors_postCollapse allobject
-filestringbinary
-Body_upload_active_employees_upload_active_employees_postCollapse allobject
-filestringbinary
-HTTPValidationErrorCollapse allobject
-detailCollapse allarray<object>
-ItemsCollapse allobject
-locCollapse allarray<(string | integer)>
-ItemsCollapse all(string | integer)
-Any ofCollapse all(string | integer)
-#0string
-#1integer
-msgstring
-typestring
-ValidationErrorCollapse allobject
-locExpand allarray<(string | integer)>
-msgstring
-typestring
 
 
 
-
-
-http://localhost:8000/reports/daily/20250817
-
-Internal Server Error
-
-
-
-ailed to load resource: the server responded with a status of 422 (Unprocessable Content)
-
-ingest/fetch-all:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-ingest/live-details:1 
- Failed to load resource: the server responded with a status of 400 (Bad Request)
-ingest/fetch-all:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-ingest/fetch-all:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-ingest/fetch-all:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-reports/daily/20250816:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-reports/daily/20250816:1 
- Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-﻿
 
