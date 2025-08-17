@@ -1,56 +1,179 @@
-# app.py (replace the ingest endpoint)
-from fastapi import Body
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
+
+
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
+import shutil, uuid, json
+from settings import UPLOAD_DIR, OUTPUT_DIR
+from ingest_excel import ingest_employee_excel, ingest_contractor_excel
+from compare_service import ingest_live_details_list, compute_daily_attendance, compare_with_active
+import os
+
+app = FastAPI(title="Attendance Analytics")
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    ingest_employee_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    ingest_contractor_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+
 
 @app.post("/ingest/live-details")
-async def ingest_live(details: list = Body(...)):
+async def ingest_live(request: Request):
     """
-    Accepts a JSON array in the request body (details = [...]).
+    Accepts:
+      - Raw JSON array in body (preferred)
+      - JSON object with {"details": [...]} in body
+      - multipart/form-data where a form field 'details' contains a JSON string
     """
+    # 1) Try to parse JSON body first
+    details = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        # not a JSON body, try form data
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    # file upload or other; try to read if file-like
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                # try first field if it looks like JSON string
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    try:
+        ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    return {"status": "ok", "inserted": len(details)}
+
+
+
+
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    """
+    Convenience: call region_clients.fetch_all_details() and ingest them.
+    Uses local import to avoid circular import issues.
+    """
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
     if not isinstance(details, list):
-        raise HTTPException(status_code=400, detail="Expected JSON array of detail objects")
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
     ingest_live_details_list(details)
     return {"status":"ok", "inserted": len(details)}
 
 
 
 
-# compare_service.py (inside ingest_live_details_list)
-from dateutil import parser as dateutil_parser
-from datetime import timezone
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+    compute_daily_attendance(dt)
+    summary = compare_with_active(dt)
+    # summary is JSON-safe (compare_service ensures conversion)
+    return JSONResponse(summary)
+
+
+
+
+
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py
+
+# compare_service.py
+import pandas as pd
+import numpy as np
+from datetime import datetime, date
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+def _to_native(value):
+    """Convert numpy/pandas types and datetimes to plain Python types."""
+    if value is None:
+        return None
+    # pandas NA or numpy nan
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    # numpy numbers
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        # float('nan') already handled above
+        return float(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    # pandas Timestamp or datetime
+    try:
+        import datetime as _dt
+        if isinstance(value, _dt.datetime) or hasattr(value, 'isoformat'):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        pass
+    return value
 
 def ingest_live_details_list(details_list):
+    """Persist details_list (array of detail dicts) into LiveSwipe table."""
     from db import SessionLocal as _SessionLocal
     with _SessionLocal() as db:
         for d in details_list:
-            ts = (
-                d.get("LocaleMessageTime")
-                or d.get("Swipe_Time")
-                or d.get("SwipeTime")
-                or d.get("SwipeTimeLocal")
-                or d.get("time")
-            )
-            # parse robustly
+            ts = d.get("LocaleMessageTime")
             try:
-                if ts:
-                    ts_parsed = dateutil_parser.isoparse(ts) if isinstance(ts, str) else None
-                else:
-                    ts_parsed = None
+                ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else datetime.utcnow()
             except Exception:
-                # fallback to generic parse attempt
-                try:
-                    ts_parsed = dateutil_parser.parse(ts)
-                except Exception:
-                    ts_parsed = None
-
-            if ts_parsed is None:
-                ts_parsed = datetime.utcnow().replace(tzinfo=timezone.utc)
-            # normalize to UTC naive (store consistent)
-            if ts_parsed.tzinfo is not None:
-                ts_parsed = ts_parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            else:
-                # assume naive times are already UTC; if they are local-local, you need to adjust
-                ts_parsed = ts_parsed
-
+                ts_parsed = datetime.utcnow()
             rec = LiveSwipe(
                 timestamp=ts_parsed,
                 employee_id=(d.get("EmployeeID") or "").strip() or None,
@@ -65,535 +188,145 @@ def ingest_live_details_list(details_list):
             db.add(rec)
         db.commit()
 
+def compute_daily_attendance(target_date: date):
+    """Build AttendanceSummary rows for target_date by reading LiveSwipe rows on that date."""
+    with SessionLocal() as db:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = datetime.combine(target_date, datetime.max.time())
+        swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+        if not swipes:
+            return []
+
+        rows = []
+        for s in swipes:
+            rows.append({
+                "id": s.id,
+                "timestamp": s.timestamp,
+                "employee_id": s.employee_id,
+                "card_number": s.card_number,
+                "full_name": s.full_name,
+                "partition": s.partition,
+                "floor": s.floor,
+                "door": s.door
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return []
+
+        # Key: prefer employee_id, fallback to card_number
+        df['key'] = df['employee_id'].fillna(df['card_number'])
+        grouped = df.groupby('key').agg(
+            presence_count=('id', 'count'),
+            first_seen=('timestamp', 'min'),
+            last_seen=('timestamp', 'max'),
+            full_name=('full_name', 'first'),
+            partition=('partition', 'first')
+        ).reset_index()
+
+        # Upsert AttendanceSummary
+        for _, row in grouped.iterrows():
+            rec = AttendanceSummary(
+                employee_id=row['key'],
+                date=target_date,
+                presence_count=int(row['presence_count']),
+                first_seen=row['first_seen'],
+                last_seen=row['last_seen'],
+                derived={"partition": row['partition'], "full_name": row['full_name']}
+            )
+            db.merge(rec)
+        db.commit()
+        return grouped.to_dict(orient='records')
+
+def compare_with_active(target_date: date):
+    """
+    Compare AttendanceSummary (for target_date) with ActiveEmployee table.
+    Returns a dict with clean Python types, no NaN values (JSON-safe).
+    """
+    with SessionLocal() as db:
+        # Attendance summary rows for date
+        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+        if not att_rows:
+            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen"])
+        else:
+            att_df = pd.DataFrame([{
+                "employee_id": a.employee_id,
+                "presence_count": a.presence_count,
+                "first_seen": a.first_seen,
+                "last_seen": a.last_seen,
+                **(a.derived or {})
+            } for a in att_rows])
+
+        # Active employees
+        act_rows = db.query(ActiveEmployee).all()
+        if not act_rows:
+            act_df = pd.DataFrame(columns=["employee_id", "full_name", "location_city", "status"])
+        else:
+            act_df = pd.DataFrame([{
+                "employee_id": e.employee_id,
+                "full_name": e.full_name,
+                "location_city": e.location_city,
+                "status": e.current_status
+            } for e in act_rows])
+
+        # Ensure key column exists
+        if 'employee_id' not in act_df.columns:
+            act_df['employee_id'] = pd.NA
+        if 'employee_id' not in att_df.columns:
+            att_df['employee_id'] = pd.NA
+
+        # Merge left (active employees -> attendance)
+        merged = pd.merge(act_df, att_df, on='employee_id', how='left')
+
+        # Fill presence_count and booleans safely
+        if 'presence_count' in merged.columns:
+            merged['presence_count'] = merged['presence_count'].fillna(0)
+            # convert any floats like 0.0 to int where safe
+            merged['presence_count'] = merged['presence_count'].apply(lambda x: int(x) if (pd.notnull(x) and float(x).is_integer()) else x)
+        else:
+            merged['presence_count'] = 0
+
+        merged['present_today'] = merged['presence_count'].apply(lambda x: bool(x and x != 0))
+
+        # Location summary
+        merged['location_city'] = merged.get('location_city').fillna('Unknown')
+        loc_group = merged.groupby('location_city', dropna=False).agg(
+            total_n=('employee_id', 'count'),
+            present_n=('present_today', 'sum')
+        ).reset_index()
+
+        # percent_present safe (avoid division by zero/NaN)
+        def safe_percent(row):
+            try:
+                if row['total_n'] and row['total_n'] > 0:
+                    return round((row['present_n'] / row['total_n']) * 100, 2)
+            except Exception:
+                pass
+            return 0.0
+        loc_group['percent_present'] = loc_group.apply(safe_percent, axis=1)
+
+        # Convert to JSON-safe native Python types
+        by_location = []
+        for r in loc_group.to_dict(orient='records'):
+            clean = {k: _to_native(v) for k, v in r.items()}
+            # keep location_city key name consistent
+            if 'location_city' not in clean and 'index' in clean:
+                clean['location_city'] = clean.pop('index')
+            by_location.append(clean)
+
+        merged_list = []
+        for r in merged.to_dict(orient='records'):
+            clean = {}
+            for k, v in r.items():
+                clean[k] = _to_native(v)
+            # ensure keys present
+            if 'employee_id' not in clean:
+                clean['employee_id'] = None
+            merged_list.append(clean)
+
+        return {"by_location": by_location, "merged": merged_list}
 
 
 
 
 
-(.venv) pip install python-dateutil
 
-
-
-# ensure both DataFrames use stripped strings for employee_id
-if 'employee_id' in act_df.columns:
-    act_df['employee_id'] = act_df['employee_id'].astype(str).str.strip()
-if 'employee_id' in att_df.columns:
-    att_df['employee_id'] = att_df['employee_id'].astype(str).str.strip()
-
-
-
-
-# tools/inspect_swipes.py
-from db import SessionLocal
-from models import LiveSwipe
-from sqlalchemy import func
-
-with SessionLocal() as db:
-    rows = db.query(func.strftime('%Y-%m-%d', LiveSwipe.timestamp).label('date'),
-                    func.count(LiveSwipe.id)).group_by('date').order_by('date').all()
-    for date, cnt in rows:
-        print(date, cnt)
-
-
-
-
-
-
-
-
-sqlite3 attendance.db "PRAGMA integrity_check;"
-
-
-sqlite3 attendance.db .dump > dump.sql
-# If dump succeeds:
-sqlite3 new_attendance.db < dump.sql
-mv attendance.db attendance.db.broken
-mv new_attendance.db attendance.db
-
-
-
-
-
-# Windows PowerShell commands
-Move-Item .\attendance.db .\attendance.db.corrupt
-python tables.py   # creates new empty DB tables
-# then call your endpoints to re-ingest (upload excel or fetch-all)
-
-
-
-
-(.venv) pip install python-dateutil requests
-
-
-
-
-(.venv) uvicorn app:app --reload --host 0.0.0.0 --port 8000
-
-
-
-
-
-
-
-File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 107, in daily_report
-    compute_daily_attendance(dt)
-    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py", line 67, in compute_daily_attendance
-    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2704, in all
-    return self._iter().all()  # type: ignore
-           ~~~~~~~~~~^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2857, in _iter
-    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
-                                                  ~~~~~~~~~~~~~~~~~~~~^
-        statement,
-        ^^^^^^^^^^
-        params,
-        ^^^^^^^
-        execution_options={"_sa_orm_load_options": self.load_options},
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2365, in execute
-    return self._execute_internal(
-           ~~~~~~~~~~~~~~~~~~~~~~^
-        statement,
-        ^^^^^^^^^^
-    ...<4 lines>...
-        _add_event=_add_event,
-        ^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2251, in _execute_internal
-    result: Result[Any] = compile_state_cls.orm_execute_statement(
-                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        self,
-        ^^^^^
-    ...<4 lines>...
-        conn,
-        ^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\context.py", line 306, in orm_execute_statement
-    result = conn.execute(
-        statement, params or {}, execution_options=execution_options
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1419, in execute
-    return meth(
-        self,
-        distilled_parameters,
-        execution_options or NO_OPTIONS,
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 526, in _execute_on_connection
-    return connection._execute_clauseelement(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        self, distilled_params, execution_options
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1641, in _execute_clauseelement
-    ret = self._execute_context(
-        dialect,
-    ...<8 lines>...
-        cache_hit=cache_hit,
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1846, in _execute_context
-    return self._exec_single_context(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~^
-        dialect, context, statement, parameters
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1986, in _exec_single_context
-    self._handle_dbapi_exception(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        e, str_statement, effective_parameters, cursor, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2355, in _handle_dbapi_exception
-    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
-    self.dialect.do_execute(
-    ~~~~~~~~~~~~~~~~~~~~~~~^
-        cursor, str_statement, effective_parameters, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
-    cursor.execute(statement, parameters)
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-sqlalchemy.exc.DatabaseError: (sqlite3.DatabaseError) database disk image is malformed
-[SQL: SELECT live_swipes.id AS live_swipes_id, live_swipes.timestamp AS live_swipes_timestamp, live_swipes.employee_id AS live_swipes_employee_id, live_swipes.card_number AS live_swipes_card_number, live_swipes.full_name AS live_swipes_full_name, live_swipes.partition AS live_swipes_partition, live_swipes.floor AS live_swipes_floor, live_swipes.door AS live_swipes_door, live_swipes.region AS live_swipes_region, live_swipes.raw AS live_swipes_raw
-FROM live_swipes
-WHERE live_swipes.timestamp >= ? AND live_swipes.timestamp <= ?]
-[parameters: ('2025-08-11 00:00:00.000000', '2025-08-11 23:59:59.999999')]
-(Background on this error at: https://sqlalche.me/e/20/4xp6)
-INFO:     127.0.0.1:50994 - "GET /reports/daily/20250811 HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
-    self.dialect.do_execute(
-    ~~~~~~~~~~~~~~~~~~~~~~~^
-        cursor, str_statement, effective_parameters, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
-    cursor.execute(statement, parameters)
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-sqlite3.DatabaseError: database disk image is malformed
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 107, in daily_report
-    compute_daily_attendance(dt)
-    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\compare_service.py", line 67, in compute_daily_attendance
-    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2704, in all
-    return self._iter().all()  # type: ignore
-           ~~~~~~~~~~^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2857, in _iter
-    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
-                                                  ~~~~~~~~~~~~~~~~~~~~^
-        statement,
-        ^^^^^^^^^^
-        params,
-        ^^^^^^^
-        execution_options={"_sa_orm_load_options": self.load_options},
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2365, in execute
-    return self._execute_internal(
-           ~~~~~~~~~~~~~~~~~~~~~~^
-        statement,
-        ^^^^^^^^^^
-    ...<4 lines>...
-        _add_event=_add_event,
-        ^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2251, in _execute_internal
-    result: Result[Any] = compile_state_cls.orm_execute_statement(
-                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        self,
-        ^^^^^
-    ...<4 lines>...
-        conn,
-        ^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\orm\context.py", line 306, in orm_execute_statement
-    result = conn.execute(
-        statement, params or {}, execution_options=execution_options
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1419, in execute
-    return meth(
-        self,
-        distilled_parameters,
-        execution_options or NO_OPTIONS,
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 526, in _execute_on_connection
-    return connection._execute_clauseelement(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        self, distilled_params, execution_options
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1641, in _execute_clauseelement
-    ret = self._execute_context(
-        dialect,
-    ...<8 lines>...
-        cache_hit=cache_hit,
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1846, in _execute_context
-    return self._exec_single_context(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~^
-        dialect, context, statement, parameters
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1986, in _exec_single_context
-    self._handle_dbapi_exception(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        e, str_statement, effective_parameters, cursor, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2355, in _handle_dbapi_exception
-    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
-    self.dialect.do_execute(
-    ~~~~~~~~~~~~~~~~~~~~~~~^
-        cursor, str_statement, effective_parameters, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
-    cursor.execute(statement, parameters)
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-sqlalchemy.exc.DatabaseError: (sqlite3.DatabaseError) database disk image is malformed
-[SQL: SELECT live_swipes.id AS live_swipes_id, live_swipes.timestamp AS live_swipes_timestamp, live_swipes.employee_id AS live_swipes_employee_id, live_swipes.card_number AS live_swipes_card_number, live_swipes.full_name AS live_swipes_full_name, live_swipes.partition AS live_swipes_partition, live_swipes.floor AS live_swipes_floor, live_swipes.door AS live_swipes_door, live_swipes.region AS live_swipes_region, live_swipes.raw AS live_swipes_raw
-FROM live_swipes
-WHERE live_swipes.timestamp >= ? AND live_swipes.timestamp <= ?]
-[parameters: ('2025-08-11 00:00:00.000000', '2025-08-11 23:59:59.999999')]
-(Background on this error at: https://sqlalche.me/e/20/4xp6)
-INFO:     Shutting down
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.
-INFO:     Finished server process [1740]
-INFO:     Stopping reloader process [8352]
-(.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> uvicorn app:app --reload --host 0.0.0.0 --port 8000
-INFO:     Will watch for changes in these directories: ['C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics']
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [10684] using WatchFiles
-Process SpawnProcess-1:
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
-    self.dialect.do_execute(
-    ~~~~~~~~~~~~~~~~~~~~~~~^
-        cursor, str_statement, effective_parameters, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
-    cursor.execute(statement, parameters)
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-sqlite3.DatabaseError: database disk image is malformed
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "C:\Program Files\Python313\Lib\multiprocessing\process.py", line 313, in _bootstrap
-    self.run()
-    ~~~~~~~~^^
-  File "C:\Program Files\Python313\Lib\multiprocessing\process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\_subprocess.py", line 80, in subprocess_started
-    target(sockets=sockets)
-    ~~~~~~^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\server.py", line 67, in run
-    return asyncio.run(self.serve(sockets=sockets))
-           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\server.py", line 71, in serve
-    await self._serve(sockets)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\server.py", line 78, in _serve
-    config.load()
-    ~~~~~~~~~~~^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\config.py", line 436, in load
-    self.loaded_app = import_from_string(self.app)
-                      ~~~~~~~~~~~~~~~~~~^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\importer.py", line 19, in import_from_string
-    module = importlib.import_module(module_str)
-  File "C:\Program Files\Python313\Lib\importlib\__init__.py", line 88, in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
-  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
-  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
-  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
-  File "<frozen importlib._bootstrap_external>", line 1026, in exec_module
-  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 6, in <module>
-    from ingest_excel import ingest_employee_excel, ingest_contractor_excel
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\ingest_excel.py", line 9, in <module>       
-    Base.metadata.create_all(bind=engine)
-    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\schema.py", line 5924, in create_all
-    bind._run_ddl_visitor(
-    ~~~~~~~~~~~~~~~~~~~~~^
-        ddl.SchemaGenerator, self, checkfirst=checkfirst, tables=tables
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 3252, in _run_ddl_visitor
-    conn._run_ddl_visitor(visitorcallable, element, **kwargs)
-    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2459, in _run_ddl_visitor
-    ).traverse_single(element)
-      ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\visitors.py", line 661, in traverse_single
-    return meth(obj, **kw)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\ddl.py", line 963, in visit_metadata
-    [t for t in tables if self._can_create_table(t)]
-                          ~~~~~~~~~~~~~~~~~~~~~~^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\sql\ddl.py", line 928, in _can_create_table
-    return not self.checkfirst or not self.dialect.has_table(
-                                      ~~~~~~~~~~~~~~~~~~~~~~^
-        self.connection, table.name, schema=effective_schema
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "<string>", line 2, in has_table
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\reflection.py", line 89, in cache
-    return fn(self, con, *args, **kw)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\dialects\sqlite\base.py", line 2304, in has_table
-    info = self._get_table_pragma(
-        connection, "table_info", table_name, schema=schema
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\dialects\sqlite\base.py", line 2942, in _get_table_pragma
-    cursor = connection.exec_driver_sql(statement)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1779, in exec_driver_sql
-    ret = self._execute_context(
-        dialect,
-    ...<5 lines>...
-        distilled_parameters,
-    )
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1846, in _execute_context
-    return self._exec_single_context(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~^
-        dialect, context, statement, parameters
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1986, in _exec_single_context
-    self._handle_dbapi_exception(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        e, str_statement, effective_parameters, cursor, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2355, in _handle_dbapi_exception
-    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
-    self.dialect.do_execute(
-    ~~~~~~~~~~~~~~~~~~~~~~~^
-        cursor, str_statement, effective_parameters, context
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 951, in do_execute
-    cursor.execute(statement, parameters)
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-sqlalchemy.exc.DatabaseError: (sqlite3.DatabaseError) database disk image is malformed
-[SQL: PRAGMA main.table_info("active_employees")]
-(Background on this error at: https://sqlalche.me/e/20/4xp6)
