@@ -1,3 +1,484 @@
+# compare_service.py
+import pandas as pd
+import numpy as np
+from datetime import datetime, date, timezone
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+# --- Helpers -----------------------------------------------------------------
+
+def _to_native(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    try:
+        import datetime as _dt
+        if isinstance(value, _dt.datetime):
+            try:
+                if value.tzinfo is not None:
+                    utc = value.astimezone(timezone.utc)
+                    return utc.replace(tzinfo=None).isoformat() + "Z"
+                else:
+                    return value.isoformat()
+            except Exception:
+                return str(value)
+        if hasattr(value, 'isoformat'):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        pass
+    return value
+
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _parse_timestamp_from_value(val):
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        dt = val
+        try:
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            try:
+                return dt.replace(tzinfo=None)
+            except Exception:
+                return None
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        try:
+            v = int(val)
+            if v > 1e12:
+                return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+            else:
+                return datetime.fromtimestamp(v, tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+    if isinstance(val, str):
+        s = val.strip()
+        if s == "":
+            return None
+        try:
+            if s.endswith("Z"):
+                s2 = s.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(s2)
+                if dt.tzinfo is not None:
+                    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            try:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is not None:
+                    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            except Exception:
+                pass
+            if s.isdigit():
+                v = int(s)
+                if v > 1e12:
+                    return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc).replace(tzinfo=None)
+                else:
+                    return datetime.fromtimestamp(v, tz=timezone.utc).replace(tzinfo=None)
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+                        "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    return dt
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return None
+
+def _extract_timestamp_from_detail(detail):
+    keys = [
+        "LocaleMessageDateTime", "LocalMessageDateTime", "LocaleMessageTime", "LocalMessageTime",
+        "LocaleMessageDate", "Timestamp", "timestamp", "Time", "LocaleTime", "LocalTime",
+        "time", "date", "LocaleMessageDateTimeUtc", "LocalMessageDateTimeUtc"
+    ]
+    if not isinstance(detail, dict):
+        return _parse_timestamp_from_value(detail)
+    for k in keys:
+        if k in detail:
+            ts = detail.get(k)
+            parsed = _parse_timestamp_from_value(ts)
+            if parsed is not None:
+                return parsed
+    for v in detail.values():
+        p = _parse_timestamp_from_value(v)
+        if p is not None:
+            return p
+    return None
+
+# --- Main functions ----------------------------------------------------------
+
+def ingest_live_details_list(details_list):
+    """
+    Persist incoming swipe detail dicts into LiveSwipe.
+    Returns dict: {'inserted': N, 'skipped_invalid_timestamp': M}
+    """
+    from db import SessionLocal as _SessionLocal
+    inserted = 0
+    skipped = 0
+    with _SessionLocal() as db:
+        for d in details_list:
+            try:
+                ts_parsed = _extract_timestamp_from_detail(d)
+            except Exception:
+                ts_parsed = None
+            if ts_parsed is None:
+                skipped += 1
+                continue
+
+            emp = _normalize_employee_key(d.get("EmployeeID") or d.get("employee_id") or d.get("employeeId"))
+            card = _normalize_employee_key(d.get("CardNumber") or d.get("card_number") or d.get("Card"))
+            full_name = d.get("ObjectName1") or d.get("FullName") or d.get("full_name")
+            partition = d.get("PartitionName2") or d.get("PartitionName1") or d.get("Partition")
+            floor = d.get("Floor") or d.get("floor")
+            door = d.get("Door") or d.get("DoorName") or d.get("door")
+            region = d.get("PartitionName2") or d.get("Region") or d.get("region")
+
+            rec = LiveSwipe(
+                timestamp=ts_parsed,
+                employee_id=emp,
+                card_number=card,
+                full_name=full_name,
+                partition=partition,
+                floor=floor,
+                door=door,
+                region=region,
+                raw=d
+            )
+            db.add(rec)
+            inserted += 1
+        db.commit()
+    return {"inserted": inserted, "skipped_invalid_timestamp": skipped}
+
+def compute_daily_attendance(target_date: date):
+    """
+    Read LiveSwipe rows for the date, group by key (employee_id || card_number),
+    and upsert AttendanceSummary. We also store card_number in derived for mapping.
+    """
+    with SessionLocal() as db:
+        start = datetime.combine(target_date, datetime.min.time())
+        end = datetime.combine(target_date, datetime.max.time())
+        swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+        if not swipes:
+            return []
+
+        rows = []
+        for s in swipes:
+            rows.append({
+                "id": s.id,
+                "timestamp": s.timestamp,
+                "employee_id": _normalize_employee_key(s.employee_id),
+                "card_number": _normalize_employee_key(s.card_number),
+                "full_name": s.full_name,
+                "partition": s.partition,
+                "floor": s.floor,
+                "door": s.door
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return []
+
+        df['key'] = df['employee_id'].fillna(df['card_number'])
+        df = df[df['key'].notna()]
+        if df.empty:
+            return []
+
+        grouped = df.groupby('key', dropna=False).agg(
+            presence_count=('id', 'count'),
+            first_seen=('timestamp', 'min'),
+            last_seen=('timestamp', 'max'),
+            full_name=('full_name', 'first'),
+            partition=('partition', 'first'),
+            card_number=('card_number', 'first')
+        ).reset_index().rename(columns={'key': 'employee_id'})
+
+        for _, row in grouped.iterrows():
+            try:
+                derived_obj = {
+                    "partition": (row.get('partition') or None),
+                    "full_name": (row.get('full_name') or None),
+                    "card_number": (row.get('card_number') or None)
+                }
+                rec = AttendanceSummary(
+                    employee_id=str(row['employee_id']) if pd.notna(row['employee_id']) else None,
+                    date=target_date,
+                    presence_count=int(row['presence_count']),
+                    first_seen=row['first_seen'],
+                    last_seen=row['last_seen'],
+                    derived=derived_obj
+                )
+                db.merge(rec)
+            except Exception:
+                # skip single failures but continue
+                continue
+        db.commit()
+        return grouped.to_dict(orient='records')
+
+def compare_with_active(target_date: date):
+    """
+    Join AttendanceSummary -> ActiveEmployee. If active-employee list is empty,
+    return attendance-only view. Also try mapping card numbers -> employee_id
+    using ActiveEmployee.raw_row or AttendanceSummary.derived.card_number.
+    """
+    with SessionLocal() as db:
+        # load attendance summary rows for date
+        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+        if not att_rows:
+            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen", "card_number", "partition", "full_name"])
+        else:
+            att_df = pd.DataFrame([{
+                "employee_id": _normalize_employee_key(a.employee_id),
+                "presence_count": a.presence_count,
+                "first_seen": a.first_seen,
+                "last_seen": a.last_seen,
+                "card_number": (a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None),
+                "partition": (a.derived.get('partition') if (a.derived and isinstance(a.derived, dict)) else None),
+                "full_name": (a.derived.get('full_name') if (a.derived and isinstance(a.derived, dict)) else None)
+            } for a in att_rows])
+
+        # load active employees
+        act_rows = db.query(ActiveEmployee).all()
+        if not act_rows:
+            act_df = pd.DataFrame(columns=["employee_id", "full_name", "location_city", "status", "card_number"])
+        else:
+            act_list = []
+            for e in act_rows:
+                # try to extract card number(s) from e.raw_row if present
+                card_from_raw = None
+                try:
+                    rr = e.raw_row or {}
+                    if isinstance(rr, dict):
+                        # common keys
+                        for ck in ("CardNumber", "card_number", "Card", "Card No", "CardNo", "IPassID", "IpassID"):
+                            if ck in rr and rr.get(ck):
+                                card_from_raw = str(rr.get(ck)).strip()
+                                break
+                except Exception:
+                    card_from_raw = None
+                act_list.append({
+                    "employee_id": _normalize_employee_key(e.employee_id),
+                    "full_name": e.full_name,
+                    "location_city": e.location_city,
+                    "status": e.current_status,
+                    "card_number": _normalize_employee_key(card_from_raw)
+                })
+            act_df = pd.DataFrame(act_list)
+
+        # If there are no active employees, return attendance-only view
+        if act_df.empty:
+            if att_df.empty:
+                return {"by_location": [], "merged": []}
+            # ensure partition present
+            if 'partition' not in att_df.columns:
+                att_df['partition'] = 'Unknown'
+            att_df['presence_count'] = att_df['presence_count'].fillna(0)
+            att_df['present_today'] = att_df['presence_count'].apply(lambda x: bool(x and x != 0))
+            loc_group = att_df.groupby('partition', dropna=False).agg(
+                total_n=('employee_id', 'count'),
+                present_n=('present_today', 'sum')
+            ).reset_index().rename(columns={'partition': 'location_city'})
+            def safe_percent(row):
+                try:
+                    if row['total_n'] and row['total_n'] > 0:
+                        return round((row['present_n'] / row['total_n']) * 100, 2)
+                except Exception:
+                    pass
+                return 0.0
+            loc_group['percent_present'] = loc_group.apply(safe_percent, axis=1)
+            by_location = [{k: _to_native(v) for k, v in r.items()} for r in loc_group.to_dict(orient='records')]
+
+            merged_list = []
+            for r in att_df.to_dict(orient='records'):
+                out = {
+                    "employee_id": _to_native(r.get('employee_id')),
+                    "presence_count": _to_native(r.get('presence_count')),
+                    "first_seen": _to_native(r.get('first_seen')),
+                    "last_seen": _to_native(r.get('last_seen')),
+                    "full_name": _to_native(r.get('full_name')),
+                    "location_city": _to_native(r.get('partition')),
+                    "present_today": _to_native(r.get('present_today'))
+                }
+                merged_list.append(out)
+            return {"by_location": by_location, "merged": merged_list}
+
+        # Normalize columns
+        if 'employee_id' not in act_df.columns:
+            act_df['employee_id'] = pd.NA
+        if 'employee_id' not in att_df.columns:
+            att_df['employee_id'] = pd.NA
+
+        act_df['employee_id'] = act_df['employee_id'].astype(object).apply(_normalize_employee_key)
+        att_df['employee_id'] = att_df['employee_id'].astype(object).apply(_normalize_employee_key)
+        if 'card_number' not in act_df.columns:
+            act_df['card_number'] = pd.NA
+        else:
+            act_df['card_number'] = act_df['card_number'].astype(object).apply(_normalize_employee_key)
+        if 'card_number' not in att_df.columns:
+            att_df['card_number'] = pd.NA
+        else:
+            att_df['card_number'] = att_df['card_number'].astype(object).apply(_normalize_employee_key)
+
+        # Build a card_number -> employee_id mapping from active employees
+        card_to_emp = {}
+        for r in act_df.to_dict(orient='records'):
+            c = r.get('card_number')
+            eid = r.get('employee_id')
+            if c and eid:
+                card_to_emp[c] = eid
+
+        # If AttendanceSummary.employee_id looks like a card number, map it to actual employee_id
+        def remap_att_key(x, card_map):
+            if not x:
+                return None
+            x_s = str(x)
+            # if this key exists directly as employee_id in act_df, keep
+            if x_s in set(act_df['employee_id'].dropna().astype(str)):
+                return x_s
+            # if key matches a card in the map, translate
+            if x_s in card_map:
+                return card_map[x_s]
+            # not found, return as-is (so we won't lose the attendance record)
+            return x_s
+
+        # Apply mapping: try to map attendance.employee_id via mapping or via att_df.card_number
+        att_df['mapped_employee_id'] = att_df.apply(
+            lambda r: remap_att_key(r.get('employee_id') or r.get('card_number'), card_to_emp),
+            axis=1
+        )
+
+        # Now merge using mapped_employee_id -> act_df.employee_id
+        # prepare act_df keyed by employee_id
+        # For merging ease, rename act_df.employee_id -> employee_id (already)
+        merged = pd.merge(
+            act_df,
+            att_df.rename(columns={'mapped_employee_id': 'employee_id'}),
+            on='employee_id',
+            how='left',
+            suffixes=('', '_att')
+        )
+
+        # Fill and shape result fields
+        if 'presence_count' in merged.columns:
+            merged['presence_count'] = merged['presence_count'].fillna(0)
+            merged['presence_count'] = merged['presence_count'].apply(lambda x: int(x) if (pd.notnull(x) and float(x).is_integer()) else x)
+        else:
+            merged['presence_count'] = 0
+
+        merged['present_today'] = merged['presence_count'].apply(lambda x: bool(x and x != 0))
+
+        if 'location_city' not in merged.columns:
+            merged['location_city'] = 'Unknown'
+        else:
+            merged['location_city'] = merged['location_city'].fillna('Unknown')
+
+        loc_group = merged.groupby('location_city', dropna=False).agg(
+            total_n=('employee_id', 'count'),
+            present_n=('present_today', 'sum')
+        ).reset_index()
+
+        def safe_percent(row):
+            try:
+                if row['total_n'] and row['total_n'] > 0:
+                    return round((row['present_n'] / row['total_n']) * 100, 2)
+            except Exception:
+                pass
+            return 0.0
+        loc_group['percent_present'] = loc_group.apply(safe_percent, axis=1)
+
+        by_location = [{k: _to_native(v) for k, v in r.items()} for r in loc_group.to_dict(orient='records')]
+
+        merged_list = []
+        for r in merged.to_dict(orient='records'):
+            clean = {}
+            for k, v in r.items():
+                clean[k] = _to_native(v)
+            if 'employee_id' not in clean:
+                clean['employee_id'] = None
+            merged_list.append(clean)
+
+        return {"by_location": by_location, "merged": merged_list}
+
+
+
+
+copy compare_service.py compare_service.py.bak
+
+
+
+# in your venv
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+
+
+python - <<'PY'
+from db import SessionLocal
+from models import LiveSwipe, AttendanceSummary, ActiveEmployee
+import datetime, json
+
+date_str = "20250815"   # change date
+dt = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+start = datetime.datetime.combine(dt, datetime.time.min)
+end = datetime.datetime.combine(dt, datetime.time.max)
+
+with SessionLocal() as db:
+    sw_count = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).count()
+    att_count = db.query(AttendanceSummary).filter(AttendanceSummary.date == dt).count()
+    act_count = db.query(ActiveEmployee).count()
+    print("DATE:", date_str)
+    print("live_swipes on date:", sw_count)
+    print("attendance_summary rows on date:", att_count)
+    print("active_employees total:", act_count)
+    print("\n--- sample live_swipes (latest 10 in date range) ---")
+    rows = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).order_by(LiveSwipe.timestamp.desc()).limit(10).all()
+    for r in rows:
+        print(r.id, r.timestamp, r.employee_id, r.card_number, r.partition)
+    print("\n--- attendance_summary rows ---")
+    rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == dt).limit(20).all()
+    for r in rows:
+        print(r.id, r.employee_id, r.presence_count, r.first_seen, r.last_seen, json.dumps(r.derived or {}))
+    print("\n--- sample active_employees (10) ---")
+    rows = db.query(ActiveEmployee).limit(10).all()
+    for r in rows:
+        print(r.employee_id, r.full_name, r.location_city, r.current_status, json.dumps(r.raw_row or {}))
+PY
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> uvicorn app:app --reload --host 0.0.0.0 --port 8000
 >>
 INFO:     Will watch for changes in these directories: ['C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics']
