@@ -1,3 +1,405 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
+import shutil, uuid, json
+from settings import UPLOAD_DIR, OUTPUT_DIR
+import os
+
+app = FastAPI(title="Attendance Analytics")
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    # lazy import to avoid DB activity at import
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    """
+    Accepts:
+      - Raw JSON array in body (preferred)
+      - JSON object with {"details": [...]} in body
+      - multipart/form-data where a form field 'details' contains a JSON string
+    """
+    details = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        # not JSON, try form
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                # attempt first field
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    # lazy import of compare_service
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    try:
+        res = ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    if isinstance(res, dict):
+        return {"status": "ok", **res}
+    return {"status": "ok", "inserted": len(details)}
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    res = ingest_live_details_list(details)
+    if isinstance(res, dict):
+        return {"status":"ok", **res}
+    return {"status":"ok", "inserted": len(details)}
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+
+    try:
+        from compare_service import compute_daily_attendance, compare_with_active
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    compute_daily_attendance(dt)
+    summary = compare_with_active(dt)
+    return JSONResponse(summary)
+
+
+
+
+
+
+
+# --- database setup: do NOT run create_all at import time ---
+def init_db():
+    """
+    Create DB tables if they do not exist.
+    Call this manually only when you want to initialize/repair the DB:
+      python -c "from ingest_excel import init_db; init_db()"
+    """
+    from db import engine
+    from models import Base
+    Base.metadata.create_all(bind=engine)
+
+
+
+
+
+
+# tools/repair_sqlite.py
+"""
+Attempt to repair a possibly corrupted SQLite DB using Python-only approach.
+Usage:
+  (.venv) python tools\repair_sqlite.py attendance.db
+
+This will:
+ - run PRAGMA integrity_check
+ - if not ok, attempt conn.iterdump() and recreate a new DB from the dump
+ - if iterdump fails, it will exit with instructions to run salvage_raw_json.py
+"""
+import sqlite3
+import sys
+import os
+import shutil
+import traceback
+
+def integrity_check(conn):
+    try:
+        cur = conn.execute("PRAGMA integrity_check;")
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        return str(e)
+
+def do_iterdump_recreate(src_path, new_path):
+    conn = None
+    try:
+        conn = sqlite3.connect(src_path)
+        print("Attempting iterdump()...")
+        dump_lines = []
+        for line in conn.iterdump():
+            dump_lines.append(line)
+        dump_sql = "\n".join(dump_lines)
+        if not dump_sql.strip():
+            raise RuntimeError("iterdump returned no SQL")
+        print("Iterdump produced SQL, creating new DB:", new_path)
+        if os.path.exists(new_path):
+            os.remove(new_path)
+        conn_new = sqlite3.connect(new_path)
+        conn_new.executescript(dump_sql)
+        conn_new.commit()
+        conn_new.close()
+        print("New DB created:", new_path)
+        return True
+    finally:
+        if conn:
+            conn.close()
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python tools/repair_sqlite.py <path-to-db>")
+        sys.exit(1)
+    src = sys.argv[1]
+    if not os.path.exists(src):
+        print("File not found:", src)
+        sys.exit(1)
+    # backup
+    bak = src + ".bak"
+    if not os.path.exists(bak):
+        shutil.copy2(src, bak)
+        print("Backup created:", bak)
+    else:
+        print("Backup already exists:", bak)
+
+    # try integrity_check
+    try:
+        conn = sqlite3.connect(src)
+        res = integrity_check(conn)
+        conn.close()
+        print("PRAGMA integrity_check result:", res)
+        if res == "ok":
+            print("Database appears OK. No repair needed.")
+            sys.exit(0)
+    except Exception as e:
+        print("Error running integrity_check:", e)
+
+    # attempt iterdump and recreate
+    new_db = src + ".recreated"
+    try:
+        ok = do_iterdump_recreate(src, new_db)
+        if ok and os.path.exists(new_db):
+            # replace original (move corrupted aside)
+            corrupt_name = src + ".corrupt"
+            if not os.path.exists(corrupt_name):
+                shutil.move(src, corrupt_name)
+            else:
+                print("Note: .corrupt file already exists:", corrupt_name)
+            shutil.move(new_db, src)
+            print("Replaced corrupted DB with recreated DB. Original moved to:", corrupt_name)
+            sys.exit(0)
+    except Exception:
+        print("iterdump recreate failed. Traceback:")
+        traceback.print_exc()
+
+    print("\nCould not repair automatically using iterdump(). Next step: try tools/salvage_raw_json.py to extract raw JSON blobs from DB file, then re-create DB and re-post those hits.\n")
+    sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+# tools/salvage_raw_json.py
+"""
+Heuristic: scan the sqlite file bytes to extract JSON-like objects (useful if DB is badly corrupted).
+This looks for JSON objects containing the key "EmployeeID" and writes each to a JSONL file.
+Usage:
+  (.venv) python tools\salvage_raw_json.py attendance.db
+Output:
+  salvaged_live_details.jsonl
+"""
+import sys, json, os, re
+
+def extract_json_objects_from_bytes(b, token=b'"EmployeeID"'):
+    results = []
+    i = 0
+    L = len(b)
+    while True:
+        idx = b.find(token, i)
+        if idx == -1:
+            break
+        # find start of object going backwards to '{'
+        start = b.rfind(b'{', 0, idx)
+        if start == -1:
+            i = idx + 1
+            continue
+        # now find matching closing brace forward
+        depth = 0
+        j = start
+        while j < L:
+            ch = b[j]
+            if ch == 123:  # '{'
+                depth += 1
+            elif ch == 125:  # '}'
+                depth -= 1
+            j += 1
+            if depth == 0:
+                chunk = b[start:j]
+                try:
+                    txt = chunk.decode('utf-8', errors='strict')
+                except Exception:
+                    try:
+                        txt = chunk.decode('utf-8', errors='ignore')
+                    except Exception:
+                        txt = None
+                if txt:
+                    # try to find first JSON object inside the chunk
+                    # greedy attempt: find first '{' and last '}' and try loads
+                    try:
+                        obj = json.loads(txt)
+                        results.append(obj)
+                        i = j
+                        break
+                    except Exception:
+                        # attempt to locate a smaller JSON object inside
+                        # try to find substrings that start with { and end with }
+                        # regex attempt (may be slow)
+                        try:
+                            for m in re.finditer(r'\{.*?\}', txt, flags=re.S):
+                                s = m.group(0)
+                                try:
+                                    o = json.loads(s)
+                                    if isinstance(o, dict) and 'EmployeeID' in s:
+                                        results.append(o)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        i = idx + 1
+                        break
+                else:
+                    i = idx + 1
+                    break
+        else:
+            break
+    return results
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python tools/salvage_raw_json.py <db-file>")
+        sys.exit(1)
+    path = sys.argv[1]
+    if not os.path.exists(path):
+        print("File not found:", path); sys.exit(1)
+    out = "salvaged_live_details.jsonl"
+    with open(path, "rb") as f:
+        data = f.read()
+    objs = extract_json_objects_from_bytes(data)
+    print("Found approx", len(objs), "JSON objects. Writing to", out)
+    with open(out, "w", encoding="utf-8") as fo:
+        for o in objs:
+            json.dump(o, fo, ensure_ascii=False)
+            fo.write("\n")
+    print("Done. You can re-post these lines to POST /ingest/live-details (as JSON array or each line).")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+.\.venv\Scripts\Activate.ps1
+
+
+Copy-Item .\attendance.db .\attendance.db.bak -Force
+
+
+python .\tools\repair_sqlite.py .\attendance.db
+
+
+
+python .\tools\salvage_raw_json.py .\attendance.db
+
+
+
+
+Move-Item .\attendance.db .\attendance.db.corrupt -Force
+python -c "from ingest_excel import init_db; init_db(); print('DB created')"
+
+
+
+python .\tools\repost_salvaged.py
+
+
+
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+
+
+
+
+
+
+
+
 Go Very step by step and fix this errors carefully if need suggest me Which file need to update and fix this issue .
 
 File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 3252, in _run_ddl_visitor
