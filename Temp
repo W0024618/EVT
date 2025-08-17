@@ -1,3 +1,250 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
+import shutil, uuid, json
+from settings import UPLOAD_DIR, OUTPUT_DIR, LIVE_API_URL
+from ingest_excel import ingest_employee_excel, ingest_contractor_excel
+from compare_service import ingest_live_details_list, compute_daily_attendance, compare_with_active
+import os
+
+app = FastAPI(title="Attendance Analytics")
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    # ingest synchronously (small files)
+    ingest_employee_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    ingest_contractor_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    """
+    Accepts:
+      - JSON body: a raw array of detail objects
+      - multipart/form-data form field 'details' containing JSON string
+      - form body with a single JSON string
+    """
+    # 1) Try JSON body
+    try:
+        body = await request.json()
+        # if body is a dict and contains 'details' key, use it
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        # 2) Not valid JSON — try form parsing (multipart/form-data)
+        form = await request.form()
+        # try 'details' field
+        if 'details' in form:
+            raw = form['details']
+            if isinstance(raw, str):
+                try:
+                    details = json.loads(raw)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid JSON in form field 'details': {e}")
+            else:
+                # could be UploadFile or list-like
+                try:
+                    # convert to a list if possible
+                    details = list(raw)
+                except Exception:
+                    details = raw
+        else:
+            # fallback: if form contains a single string field that is JSON, parse it
+            first = None
+            for v in form.values():
+                first = v
+                break
+            if first is None:
+                raise HTTPException(status_code=400, detail="No JSON body or 'details' form field found")
+            if isinstance(first, str):
+                try:
+                    details = json.loads(first)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid JSON in form body: {e}")
+            else:
+                # non-string form value (unlikely)
+                details = first
+
+    # validate basic shape
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected an array of detail records (JSON list)")
+
+    # persist
+    try:
+        ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    return {"status": "ok", "inserted": len(details)}
+
+# convenience endpoint: fetch live-summary from configured region endpoints (calls Python region_clients)
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        from region_clients import fetch_all_details  # local import so module can be optional
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+    ingest_live_details_list(details)
+    return {"status":"ok", "inserted": len(details)}
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    compute_daily_attendance(dt)
+    summary = compare_with_active(dt)
+    return JSONResponse(summary)
+
+
+
+
+
+
+
+
+
+# region_clients.py
+import requests
+from requests.exceptions import RequestException
+
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+def fetch_all_regions():
+    """Return list of dicts: [{region: name, count: N}, ...]"""
+    results = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            realtime = data.get("realtime", {})
+            total = sum((v.get("total", 0) for v in realtime.values()))
+            results.append({"region": region, "count": int(total)})
+        except RequestException as e:
+            results.append({"region": region, "count": None})
+    return results
+
+def fetch_all_details():
+    """
+    Return flattened 'details' across regions, tagging each item with '__region'.
+    """
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            details = data.get("details", [])
+            for d in details:
+                d_copy = dict(d)
+                d_copy["__region"] = region
+                all_details.append(d_copy)
+        except RequestException:
+            continue
+    return all_details
+
+
+
+
+
+
+
+# reports.py
+import csv
+from compare_service import compare_with_active
+from datetime import datetime, date
+
+def write_daily_location_csv(target_date: date, out_path: str):
+    summary = compare_with_active(target_date)
+    rows = summary.get("by_location", [])
+    # write to CSV
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["location_city", "total_n", "present_n", "percent_present"])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({
+                "location_city": r.get("location_city"),
+                "total_n": r.get("total_n"),
+                "present_n": r.get("present_n"),
+                "percent_present": r.get("percent_present")
+            })
+    return out_path
+
+
+
+
+
+
+
+# ml/predict.py
+from joblib import load
+import os
+import pandas as pd
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "isojob.joblib")
+
+def score_features(df_features: pd.DataFrame):
+    """
+    Returns anomaly scores if model exists, otherwise returns None.
+    df_features: DataFrame with same columns used during training (e.g. days_present, presence_rate)
+    """
+    if not os.path.exists(MODEL_PATH):
+        return None
+    clf = load(MODEL_PATH)
+    preds = clf.predict(df_features)        # -1 anomaly, 1 normal
+    scores = clf.decision_function(df_features)
+    df = df_features.copy()
+    df["pred"] = preds
+    df["score"] = scores
+    return df
+
+
+
+
+
+
+Set-Content -Path .\region_clients.py -Value @"
+# (paste the content of region_clients.py here)
+"@ -Encoding utf8
+
+
+
+
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+
+
+
+
+
+
+
 Check Below each file line by line and fix the issue carefully..
 
 Let See and Understand and go step by step
