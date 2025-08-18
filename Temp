@@ -1,3 +1,376 @@
+# ccure_client.py
+import requests
+import math
+from requests.exceptions import RequestException
+
+BASE = "http://10.199.22.57:5001"
+DEFAULT_TIMEOUT = 10
+
+# Set auth headers here if CCure requires them:
+HEADERS = {
+    # "Authorization": "Bearer <TOKEN>",
+    "Accept": "application/json"
+}
+
+
+def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
+    url = BASE.rstrip("/") + path
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except RequestException as e:
+        # caller handles None
+        print(f"[ccure_client] request failed {url} params={params} -> {e}")
+        return None
+    except ValueError:
+        print(f"[ccure_client] response JSON decode error for {url}")
+        return None
+
+
+def fetch_all_employees_full():
+    """
+    Try to fetch a full dump from /api/employees.
+    Returns list of dicts or None on failure.
+    """
+    return _safe_get("/api/employees")
+
+
+def fetch_stats_page(detail, page=1, limit=500):
+    """
+    One page of /api/stats?details=detail&page=page&limit=limit
+    Returns page dict or None.
+    """
+    params = {"details": detail, "page": page, "limit": limit}
+    return _safe_get("/api/stats", params=params)
+
+
+def fetch_all_stats(detail, limit=1000):
+    """
+    Iterate pages for /api/stats detail and return combined data list.
+    Returns list or None.
+    """
+    first = fetch_stats_page(detail, page=1, limit=limit)
+    if not first:
+        return None
+    data = first.get("data") or []
+    total = int(first.get("total") or len(data) or 0)
+    if total <= len(data):
+        return data
+    pages = int(math.ceil(total / float(limit)))
+    for p in range(2, pages + 1):
+        page_res = fetch_stats_page(detail, page=p, limit=limit)
+        if not page_res:
+            # stop early on error
+            break
+        data.extend(page_res.get("data") or [])
+    return data
+
+
+def get_global_stats():
+    """
+    Best-effort summary of CCure totals:
+    - Try /api/employees full dump first
+    - else try /api/stats endpoints
+    Returns dict or None
+    """
+    full = fetch_all_employees_full()
+    if isinstance(full, list):
+        total = len(full)
+        active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
+        active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
+        active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
+        terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
+        return {
+            "TotalProfiles": total,
+            "ActiveProfiles": active_profiles,
+            "ActiveEmployees": active_emps,
+            "ActiveContractors": active_contractors,
+            "TerminatedProfiles": terminated
+        }
+
+    # fallback: try stats endpoints individually
+    details = ["ActiveProfiles", "ActiveEmployees", "ActiveContractors",
+               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
+    out = {}
+    for d in details:
+        resp = fetch_stats_page(d, page=1, limit=1)
+        if isinstance(resp, dict) and 'total' in resp:
+            out[d] = resp['total']
+    if out:
+        return {
+            "TotalProfiles": out.get("TotalProfiles"),
+            "ActiveProfiles": out.get("ActiveProfiles"),
+            "ActiveEmployees": out.get("ActiveEmployees"),
+            "ActiveContractors": out.get("ActiveContractors"),
+            "TerminatedProfiles": out.get("TerminatedProfiles"),
+            "TerminatedEmployees": out.get("TerminatedEmployees"),
+            "TerminatedContractors": out.get("TerminatedContractors"),
+        }
+    return None
+
+
+
+
+
+
+# ccure_compare_service.py
+import pandas as pd
+from ccure_client import fetch_all_employees_full, fetch_all_stats, get_global_stats
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+from settings import OUTPUT_DIR
+from pathlib import Path
+import re
+import uuid
+import traceback
+
+OUTPUT_DIR = Path(OUTPUT_DIR)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_empid(e):
+    if e is None:
+        return None
+    s = str(e).strip()
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return None
+    return s
+
+
+def _normalize_card(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss == "":
+        return None
+    digits = re.sub(r'\D+', '', ss)
+    if not digits:
+        return None
+    return digits.lstrip('0') or digits
+
+
+def _load_local_active():
+    """
+    Return (emp_df, cont_df) as pandas DataFrames built from DB tables.
+    """
+    with SessionLocal() as db:
+        emps = db.query(ActiveEmployee).all()
+        conts = db.query(ActiveContractor).all()
+        emp_rows = []
+        for e in emps:
+            emp_rows.append({
+                "employee_id": _normalize_empid(e.employee_id),
+                "full_name": e.full_name,
+                "location_city": e.location_city,
+                "status": e.current_status,
+                "raw_row": e.raw_row
+            })
+        cont_rows = []
+        for c in conts:
+            cont_rows.append({
+                "worker_system_id": _normalize_empid(c.worker_system_id),
+                "ipass_id": _normalize_empid(c.ipass_id),
+                "full_name": c.full_name,
+                "location": c.location,
+                "status": c.status,
+                "raw_row": c.raw_row
+            })
+    emp_df = pd.DataFrame(emp_rows)
+    cont_df = pd.DataFrame(cont_rows)
+    return emp_df, cont_df
+
+
+def _ccure_fetch_all(mode="full", stats_detail="ActiveProfiles"):
+    """
+    mode: 'full' tries /api/employees then fallback
+          'stats' uses /api/stats?details=stats_detail
+    returns list-of-dicts or empty list
+    """
+    if mode == "stats":
+        lst = fetch_all_stats(stats_detail, limit=1000)
+        return lst or []
+    # mode full
+    lst = fetch_all_employees_full()
+    if lst is not None:
+        return lst
+    # fallback to stats
+    lst = fetch_all_stats(stats_detail, limit=1000)
+    return lst or []
+
+
+def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
+    """
+    Compare CCure -> local active sheets.
+    Returns dictionary (JSON serializable).
+    If export=True writes report to OUTPUT_DIR and returns 'report_path' with file name.
+    limit_list limits array sizes sent in JSON for safety.
+    """
+    try:
+        ccure_list = _ccure_fetch_all(mode=mode, stats_detail=stats_detail)
+        ccure_df = pd.DataFrame(ccure_list) if ccure_list else pd.DataFrame()
+        # normalize EmployeeID column name (if exists)
+        if not ccure_df.empty and 'EmployeeID' in ccure_df.columns:
+            ccure_df['EmployeeID_norm'] = ccure_df['EmployeeID'].astype(str).str.strip().replace({'nan': None})
+        else:
+            ccure_df['EmployeeID_norm'] = None
+
+        emp_df, cont_df = _load_local_active()
+
+        # sets (only non-null)
+        ccure_emp_set = set(ccure_df[ccure_df['EmployeeID_norm'].notna()]['EmployeeID_norm'].unique())
+        local_emp_set = set(emp_df[emp_df['employee_id'].notna()]['employee_id'].unique())
+
+        # contractors
+        local_cont_set = set(cont_df['worker_system_id'].dropna().unique())
+        ccure_cont_df = ccure_df[ccure_df.get('PersonnelType', '').apply(lambda x: (str(x).lower().find('contractor')!=-1) if pd.notna(x) else False)]
+        ccure_cont_set = set(ccure_cont_df['EmployeeID_norm'].dropna().unique())
+
+        in_ccure_not_local = sorted(list(ccure_emp_set - local_emp_set))
+        in_local_not_ccure = sorted(list(local_emp_set - ccure_emp_set))
+
+        in_ccure_cont_not_local = sorted(list(ccure_cont_set - local_cont_set))
+        in_local_cont_not_ccure = sorted(list(local_cont_set - ccure_cont_set))
+
+        # prepare sample rows (limited)
+        rows_ccure_only = ccure_df[ccure_df['EmployeeID_norm'].isin(in_ccure_not_local)].head(limit_list).to_dict(orient='records') if not ccure_df.empty else []
+        rows_local_only = emp_df[emp_df['employee_id'].isin(in_local_not_ccure)].head(limit_list).to_dict(orient='records') if not emp_df.empty else []
+        rows_ccure_cont_only = ccure_cont_df[ccure_cont_df['EmployeeID_norm'].isin(in_ccure_cont_not_local)].head(limit_list).to_dict(orient='records') if not ccure_cont_df.empty else []
+        rows_local_cont_only = cont_df[cont_df['worker_system_id'].isin(in_local_cont_not_ccure)].head(limit_list).to_dict(orient='records') if not cont_df.empty else []
+
+        # summary counts
+        ccure_summary = get_global_stats() or {}
+        summary = {
+            "ccure_total_profiles": int(ccure_summary.get("TotalProfiles") or (len(ccure_df) if not ccure_df.empty else 0)),
+            "ccure_active_profiles": int(ccure_summary.get("ActiveProfiles") or None) if ccure_summary else None,
+            "ccure_active_employees": int(ccure_summary.get("ActiveEmployees") or None) if ccure_summary else None,
+            "ccure_active_contractors": int(ccure_summary.get("ActiveContractors") or None) if ccure_summary else None,
+            "local_active_employees": int(len(emp_df)),
+            "local_active_contractors": int(len(cont_df)),
+            "delta_employees": (int(ccure_summary.get("ActiveEmployees")) - len(emp_df)) if ccure_summary and isinstance(ccure_summary.get("ActiveEmployees"), int) else None,
+            "delta_contractors": (int(ccure_summary.get("ActiveContractors")) - len(cont_df)) if ccure_summary and isinstance(ccure_summary.get("ActiveContractors"), int) else None
+        }
+
+        result = {
+            "summary": summary,
+            "lists": {
+                "in_ccure_not_local_sample": rows_ccure_only,
+                "in_local_not_ccure_sample": rows_local_only,
+                "in_ccure_contractors_not_local_sample": rows_ccure_cont_only,
+                "in_local_contractors_not_ccure_sample": rows_local_cont_only,
+            },
+            "counts": {
+                "in_ccure_not_local_count": len(in_ccure_not_local),
+                "in_local_not_ccure_count": len(in_local_not_ccure),
+                "in_ccure_contractors_not_local_count": len(in_ccure_cont_not_local),
+                "in_local_contractors_not_ccure_count": len(in_local_cont_not_ccure),
+            }
+        }
+
+        report_path = None
+        if export:
+            # write workbook
+            fname = f"ccure_vs_local_{uuid.uuid4().hex[:8]}.xlsx"
+            fp = OUTPUT_DIR / fname
+            try:
+                with pd.ExcelWriter(fp, engine="xlsxwriter") as writer:
+                    if not ccure_df.empty:
+                        ccure_df.to_excel(writer, sheet_name="ccure_all", index=False)
+                    if not emp_df.empty:
+                        emp_df.to_excel(writer, sheet_name="local_employees", index=False)
+                    if not cont_df.empty:
+                        cont_df.to_excel(writer, sheet_name="local_contractors", index=False)
+                    pd.DataFrame(result['counts'], index=[0]).to_excel(writer, sheet_name="counts", index=False)
+                    pd.DataFrame([summary]).to_excel(writer, sheet_name="summary", index=False)
+                    # detailed lists
+                    pd.DataFrame(rows_ccure_only).to_excel(writer, sheet_name="ccure_only_sample", index=False)
+                    pd.DataFrame(rows_local_only).to_excel(writer, sheet_name="local_only_sample", index=False)
+                report_path = str(fp.name)
+                result['report_path'] = report_path
+            except Exception:
+                print("[ccure_compare_service] failed to write report:", traceback.format_exc())
+                result['report_error'] = "report_write_failed"
+
+        return result
+
+    except Exception as e:
+        print("[ccure_compare_service] error:", e, traceback.format_exc())
+        return {"error": "internal_error", "message": str(e)}
+
+
+
+
+
+
+from fastapi.responses import FileResponse
+from fastapi import Query
+
+
+
+# GET /ccure/compare
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=10, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    """
+    Compare CCure profiles with local ActiveEmployee & ActiveContractor sheets.
+    mode: 'full' (try /api/employees) or 'stats' (use /api/stats?details=...)
+    Query params: mode, stats_detail, limit_list, export
+    """
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    return JSONResponse(res)
+
+
+# GET /ccure/report/{filename}  -> download generated XLSX
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    """
+    Download generated report by filename (returned as 'report_path' from /ccure/compare?export=true).
+    Only serves files inside OUTPUT_DIR.
+    """
+    safe_name = Path(filename).name  # prevent path traversal
+    full = OUTPUT_DIR / safe_name
+    if not full.exists() or not full.is_file():
+        raise HTTPException(status_code=404, detail="Report not found")
+    return FileResponse(str(full), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=safe_name)
+
+
+
+
+
+
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+
+curl "http://127.0.0.1:8000/ccure/compare?mode=full&limit_list=100"
+
+
+curl "http://127.0.0.1:8000/ccure/compare?mode=full&export=true"
+
+
+
+curl -O "http://127.0.0.1:8000/ccure/report/ccure_vs_local_xxxxxxxx.xlsx"
+
+
+
+pip install requests pandas XlsxWriter
+
+
+
+
+
+
+
+
+
+
 Initailly read below file carefully and fix only ccure data vs sheet data comparision and gave me API for testing carefully think long
 
 C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\ccure_client.py
