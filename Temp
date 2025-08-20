@@ -1,540 +1,69 @@
-# ccure_compare_service.py
-import pandas as pd
-from ccure_client import fetch_all_employees_full, fetch_all_stats, get_global_stats
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor
-from settings import OUTPUT_DIR
-from pathlib import Path
-import re
-import uuid
-import traceback
-import sys
+Initailly do only ccure with Active sheet comparision 
 
-OUTPUT_DIR = Path(OUTPUT_DIR)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+compare ccure data with excel data 
+Note - this is not attendance analytics this is diffrent 
+so for this comparision dont use live summary api strickly..
 
 
-def _normalize_empid(e):
-    if e is None:
-        return None
-    s = str(e).strip()
-    if s == "" or s.lower() in ("nan", "none", "null"):
-        return None
-    return s
 
 
-def _normalize_card(s):
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if ss == "":
-        return None
-    digits = re.sub(r'\D+', '', ss)
-    if not digits:
-        return None
-    return digits.lstrip('0') or digits
-
-
-def _load_local_active():
-    """
-    Return (emp_df, cont_df) as pandas DataFrames built from DB tables.
-    """
-    with SessionLocal() as db:
-        emps = db.query(ActiveEmployee).all()
-        conts = db.query(ActiveContractor).all()
-        emp_rows = []
-        for e in emps:
-            emp_rows.append({
-                "employee_id": _normalize_empid(e.employee_id),
-                "full_name": e.full_name,
-                "location_city": e.location_city,
-                "status": e.current_status,
-                "raw_row": e.raw_row
-            })
-        cont_rows = []
-        for c in conts:
-            cont_rows.append({
-                "worker_system_id": _normalize_empid(c.worker_system_id),
-                "ipass_id": _normalize_empid(c.ipass_id),
-                "full_name": c.full_name,
-                "location": c.location,
-                "status": c.status,
-                "raw_row": c.raw_row
-            })
-    emp_df = pd.DataFrame(emp_rows)
-    cont_df = pd.DataFrame(cont_rows)
-    return emp_df, cont_df
-
-
-def _ccure_fetch_all(mode="full", stats_detail="ActiveProfiles"):
-    """
-    mode: 'full' tries /api/employees then fallback
-          'stats' uses /api/stats?details=stats_detail
-    returns list-of-dicts or empty list
-    """
-    if mode == "stats":
-        lst = fetch_all_stats(stats_detail, limit=1000)
-        return lst or []
-    # mode full
-    lst = fetch_all_employees_full()
-    if lst is not None:
-        return lst
-    # fallback to stats
-    lst = fetch_all_stats(stats_detail, limit=1000)
-    return lst or []
-
-
-def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
-    """
-    Compare CCure -> local active sheets.
-    Returns dictionary (JSON serializable).
-    If export=True writes report to OUTPUT_DIR and returns report_path (filename only).
-    limit_list limits array sizes sent in JSON for safety.
-    """
-    try:
-        ccure_list = _ccure_fetch_all(mode=mode, stats_detail=stats_detail)
-        ccure_df = pd.DataFrame(ccure_list) if ccure_list else pd.DataFrame()
-
-        # normalize EmployeeID column name (if exists)
-        if not ccure_df.empty and 'EmployeeID' in ccure_df.columns:
-            def _norm_empid_col(x):
-                if pd.isna(x):
-                    return None
-                s = str(x).strip()
-                if s == "" or s.lower() in ("nan", "none", "null"):
-                    return None
-                return s
-            ccure_df['EmployeeID_norm'] = ccure_df['EmployeeID'].apply(_norm_empid_col)
-        else:
-            # ensure column exists (empty or filled with None)
-            ccure_df['EmployeeID_norm'] = [None] * len(ccure_df)
-
-        emp_df, cont_df = _load_local_active()
-
-        # sets (only non-null)
-        ccure_emp_set = set(ccure_df[ccure_df['EmployeeID_norm'].notna()]['EmployeeID_norm'].unique())
-        local_emp_set = set(emp_df[emp_df['employee_id'].notna()]['employee_id'].unique())
-
-        # contractors: robustly detect contractor rows even if column missing
-        if not ccure_df.empty:
-            if 'PersonnelType' in ccure_df.columns:
-                # use vectorized str.contains for reliability
-                personnel_series = ccure_df['PersonnelType'].astype(str)
-                ccure_cont_mask = personnel_series.str.contains('contractor', case=False, na=False)
-                ccure_cont_df = ccure_df[ccure_cont_mask]
-            else:
-                ccure_cont_df = pd.DataFrame()
-        else:
-            ccure_cont_df = pd.DataFrame()
-
-        local_cont_set = set(cont_df['worker_system_id'].dropna().unique())
-        ccure_cont_set = set(ccure_cont_df['EmployeeID_norm'].dropna().unique()) if not ccure_cont_df.empty else set()
-
-        in_ccure_not_local = sorted(list(ccure_emp_set - local_emp_set))
-        in_local_not_ccure = sorted(list(local_emp_set - ccure_emp_set))
-
-        in_ccure_cont_not_local = sorted(list(ccure_cont_set - local_cont_set))
-        in_local_cont_not_ccure = sorted(list(local_cont_set - ccure_cont_set))
-
-        # prepare sample rows (limited)
-        rows_ccure_only = ccure_df[ccure_df['EmployeeID_norm'].isin(in_ccure_not_local)].head(limit_list).to_dict(orient='records') if not ccure_df.empty else []
-        rows_local_only = emp_df[emp_df['employee_id'].isin(in_local_not_ccure)].head(limit_list).to_dict(orient='records') if not emp_df.empty else []
-        rows_ccure_cont_only = ccure_cont_df[ccure_cont_df['EmployeeID_norm'].isin(in_ccure_cont_not_local)].head(limit_list).to_dict(orient='records') if not ccure_cont_df.empty else []
-        rows_local_cont_only = cont_df[cont_df['worker_system_id'].isin(in_local_cont_not_ccure)].head(limit_list).to_dict(orient='records') if not cont_df.empty else []
-
-        # summary counts (best-effort from CCURE)
-        ccure_summary = get_global_stats() or {}
-        # normalize numeric values where possible
-        def _safe_int(v):
-            try:
-                return int(v)
-            except Exception:
-                return None
-
-        summary = {
-            "ccure_total_profiles": _safe_int(ccure_summary.get("TotalProfiles")) if ccure_summary else (len(ccure_df) if not ccure_df.empty else 0),
-            "ccure_active_profiles": _safe_int(ccure_summary.get("ActiveProfiles")) if ccure_summary else None,
-            "ccure_active_employees": _safe_int(ccure_summary.get("ActiveEmployees")) if ccure_summary else None,
-            "ccure_active_contractors": _safe_int(ccure_summary.get("ActiveContractors")) if ccure_summary else None,
-            "local_active_employees": int(len(emp_df)),
-            "local_active_contractors": int(len(cont_df)),
-            "delta_employees": ( _safe_int(ccure_summary.get("ActiveEmployees")) - len(emp_df) ) if ccure_summary and isinstance(_safe_int(ccure_summary.get("ActiveEmployees")), int) else None,
-            "delta_contractors": ( _safe_int(ccure_summary.get("ActiveContractors")) - len(cont_df) ) if ccure_summary and isinstance(_safe_int(ccure_summary.get("ActiveContractors")), int) else None
-        }
-
-        result = {
-            "summary": summary,
-            "lists": {
-                "in_ccure_not_local_sample": rows_ccure_only,
-                "in_local_not_ccure_sample": rows_local_only,
-                "in_ccure_contractors_not_local_sample": rows_ccure_cont_only,
-                "in_local_contractors_not_ccure_sample": rows_local_cont_only,
-            },
-            "counts": {
-                "in_ccure_not_local_count": len(in_ccure_not_local),
-                "in_local_not_ccure_count": len(in_local_not_ccure),
-                "in_ccure_contractors_not_local_count": len(in_ccure_cont_not_local),
-                "in_local_contractors_not_ccure_count": len(in_local_cont_not_ccure),
-            }
-        }
-
-        report_path = None
-        if export:
-            # write workbook
-            fname = f"ccure_vs_local_{uuid.uuid4().hex[:8]}.xlsx"
-            fp = OUTPUT_DIR / fname
-            try:
-                with pd.ExcelWriter(fp, engine="xlsxwriter") as writer:
-                    if not ccure_df.empty:
-                        ccure_df.to_excel(writer, sheet_name="ccure_all", index=False)
-                    if not emp_df.empty:
-                        emp_df.to_excel(writer, sheet_name="local_employees", index=False)
-                    if not cont_df.empty:
-                        cont_df.to_excel(writer, sheet_name="local_contractors", index=False)
-                    pd.DataFrame(result['counts'], index=[0]).to_excel(writer, sheet_name="counts", index=False)
-                    pd.DataFrame([summary]).to_excel(writer, sheet_name="summary", index=False)
-                    # detailed lists
-                    pd.DataFrame(rows_ccure_only).to_excel(writer, sheet_name="ccure_only_sample", index=False)
-                    pd.DataFrame(rows_local_only).to_excel(writer, sheet_name="local_only_sample", index=False)
-                report_path = str(fp.name)
-                result['report_path'] = report_path
-            except Exception:
-                print("[ccure_compare_service] failed to write report:", traceback.format_exc(), file=sys.stderr)
-                result['report_error'] = "report_write_failed"
-
-        return result
-
-    except Exception as e:
-        print("[ccure_compare_service] error:", e, traceback.format_exc(), file=sys.stderr)
-        return {"error": "internal_error", "message": str(e)}
-
-
-
-
-
-
-
-
-
-
-
-# app.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, Query
-from fastapi.responses import JSONResponse, FileResponse
-import shutil, uuid, json
-from settings import UPLOAD_DIR, OUTPUT_DIR
-import os
-from pathlib import Path
-
-app = FastAPI(title="Attendance Analytics")
-
-
-# GET /ccure/compare
-@app.get("/ccure/compare")
-def ccure_compare(
-    mode: str = Query("full", description="full or stats"),
-    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
-    limit_list: int = Query(200, ge=10, le=5000, description="max rows returned in list samples"),
-    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
-):
-    """
-    Compare CCure profiles with local ActiveEmployee & ActiveContractor sheets.
-    mode: 'full' (try /api/employees) or 'stats' (use /api/stats?details=...)
-    Query params: mode, stats_detail, limit_list, export
-    """
-    try:
-        from ccure_compare_service import compare_ccure_vs_sheets
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
-    return JSONResponse(res)
-
-
-# GET /ccure/report/{filename}  -> download generated XLSX
-@app.get("/ccure/report/{filename}")
-def ccure_report_download(filename: str):
-    """
-    Download generated report by filename (returned as 'report_path' from /ccure/compare?export=true).
-    Only serves files inside OUTPUT_DIR.
-    """
-    try:
-        safe_name = Path(filename).name  # prevent path traversal
-        full = Path(OUTPUT_DIR) / safe_name
-        if not full.exists() or not full.is_file():
-            raise HTTPException(status_code=404, detail="Report not found")
-        return FileResponse(
-            str(full),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=safe_name
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
-
-
-@app.post("/upload/active-employees")
-async def upload_active_employees(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.xls', '.xlsx')):
-        raise HTTPException(400, "Please upload an Excel file")
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
-    with open(dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    try:
-        from ingest_excel import ingest_employee_excel
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
-    ingest_employee_excel(dest)
-    return {"status":"ok", "path": str(dest)}
-
-@app.post("/upload/active-contractors")
-async def upload_active_contractors(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.xls', '.xlsx')):
-        raise HTTPException(400, "Please upload an Excel file")
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{file.filename}"
-    with open(dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    try:
-        from ingest_excel import ingest_contractor_excel
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
-    ingest_contractor_excel(dest)
-    return {"status":"ok", "path": str(dest)}
-
-@app.post("/ingest/live-details")
-async def ingest_live(request: Request):
-    """
-    Accepts:
-      - Raw JSON array in body (preferred)
-      - JSON object with {"details": [...]} in body
-      - multipart/form-data where a form field 'details' contains a JSON string
-    """
-    details = None
-    # Try direct JSON
-    try:
-        body = await request.json()
-        if isinstance(body, dict) and 'details' in body:
-            details = body['details']
-        else:
-            details = body
-    except Exception:
-        # not JSON, try form
-        try:
-            form = await request.form()
-            if 'details' in form:
-                raw = form['details']
-                if isinstance(raw, str):
-                    details = json.loads(raw)
-                else:
-                    try:
-                        details = json.loads((await raw.read()).decode('utf-8'))
-                    except Exception:
-                        details = list(form.getlist('details'))
-            else:
-                # attempt first field
-                first = None
-                for v in form.values():
-                    first = v
-                    break
-                if isinstance(first, str):
-                    details = json.loads(first)
-                else:
-                    raise HTTPException(status_code=400, detail="No JSON payload found")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
-
-    if not isinstance(details, (list, tuple)):
-        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
-
-    try:
-        from compare_service import ingest_live_details_list
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
-
-    try:
-        res = ingest_live_details_list(details)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
-
-    if isinstance(res, dict):
-        return {"status": "ok", **res}
-    return {"status": "ok", "inserted": len(details)}
-
-
-@app.get("/ingest/fetch-all")
-def fetch_all_and_ingest():
-    try:
-        import region_clients
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
-
-    details = region_clients.fetch_all_details()
-    if not isinstance(details, list):
-        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
-
-    try:
-        from compare_service import ingest_live_details_list
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
-
-    res = ingest_live_details_list(details)
-    if isinstance(res, dict):
-        return {"status":"ok", **res}
-    return {"status":"ok", "inserted": len(details)}
-
-
-@app.get("/reports/daily/{yyyymmdd}")
-def daily_report(yyyymmdd: str):
-    import datetime
-    try:
-        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
-
-    try:
-        from compare_service import compute_daily_attendance, compare_with_active
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
-
-    # compute attendance summary (will build attendance_summary rows)
-    compute_daily_attendance(dt)
-
-    # compare vs active and CCURE
-    summary = compare_with_active(dt)
-    return JSONResponse(summary)
-
-
-# additional endpoints to fetch CCure stats directly (optional)
-@app.get("/ccure/stats")
-def ccure_stats():
-    try:
-        import ccure_client
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ccure_client import failed: {e}")
-    try:
-        stats = ccure_client.get_global_stats()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ccure_client.get_global_stats failed: {e}")
-    return stats
-
-
-
-
-
-
-# ccure_client.py
+# region_clients.py
 import requests
-import math
 from requests.exceptions import RequestException
 
-BASE = "http://10.199.22.57:5001"
-DEFAULT_TIMEOUT = 10
-
-# Set auth headers here if CCure requires them:
-HEADERS = {
-    # "Authorization": "Bearer <TOKEN>",
-    "Accept": "application/json"
+# Edit endpoints if your hosts/ports differ
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
 }
 
+def fetch_all_regions():
+    """Return list of dicts: [{region: name, count: N}, ...]"""
+    results = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=6)
+            r.raise_for_status()
+            data = r.json()
+            realtime = data.get("realtime", {}) if isinstance(data, dict) else {}
+            total = 0
+            for site in realtime.values():
+                try:
+                    total += int(site.get("total", 0))
+                except Exception:
+                    pass
+            results.append({"region": region, "count": total})
+        except RequestException as e:
+            # log to console for now
+            print(f"[region_clients] error fetching {region} @ {url}: {e}")
+            results.append({"region": region, "count": None})
+    return results
 
-def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
-    url = BASE.rstrip("/") + path
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except RequestException as e:
-        # caller handles None
-        print(f"[ccure_client] request failed {url} params={params} -> {e}")
-        return None
-    except ValueError:
-        print(f"[ccure_client] response JSON decode error for {url}")
-        return None
-
-
-def fetch_all_employees_full():
+def fetch_all_details():
     """
-    Try to fetch a full dump from /api/employees.
-    Returns list of dicts or None on failure.
+    Return flattened 'details' list across all regions (tagged with '__region').
+    Returns an empty list if none available.
     """
-    return _safe_get("/api/employees")
-
-
-def fetch_stats_page(detail, page=1, limit=500):
-    """
-    One page of /api/stats?details=detail&page=page&limit=limit
-    Returns page dict or None.
-    """
-    params = {"details": detail, "page": page, "limit": limit}
-    return _safe_get("/api/stats", params=params)
-
-
-def fetch_all_stats(detail, limit=1000):
-    """
-    Iterate pages for /api/stats detail and return combined data list.
-    Returns list or None.
-    """
-    first = fetch_stats_page(detail, page=1, limit=limit)
-    if not first:
-        return None
-    data = first.get("data") or []
-    total = int(first.get("total") or len(data) or 0)
-    if total <= len(data):
-        return data
-    pages = int(math.ceil(total / float(limit)))
-    for p in range(2, pages + 1):
-        page_res = fetch_stats_page(detail, page=p, limit=limit)
-        if not page_res:
-            # stop early on error
-            break
-        data.extend(page_res.get("data") or [])
-    return data
-
-
-def get_global_stats():
-    """
-    Best-effort summary of CCure totals:
-    - Try /api/employees full dump first
-    - else try /api/stats endpoints
-    Returns dict or None
-    """
-    full = fetch_all_employees_full()
-    if isinstance(full, list):
-        total = len(full)
-        active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
-        active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
-        active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
-        terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
-        return {
-            "TotalProfiles": total,
-            "ActiveProfiles": active_profiles,
-            "ActiveEmployees": active_emps,
-            "ActiveContractors": active_contractors,
-            "TerminatedProfiles": terminated
-        }
-
-    # fallback: try stats endpoints individually
-    details = ["ActiveProfiles", "ActiveEmployees", "ActiveContractors",
-               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
-    out = {}
-    for d in details:
-        resp = fetch_stats_page(d, page=1, limit=1)
-        if isinstance(resp, dict) and 'total' in resp:
-            out[d] = resp['total']
-    if out:
-        return {
-            "TotalProfiles": out.get("TotalProfiles"),
-            "ActiveProfiles": out.get("ActiveProfiles"),
-            "ActiveEmployees": out.get("ActiveEmployees"),
-            "ActiveContractors": out.get("ActiveContractors"),
-            "TerminatedProfiles": out.get("TerminatedProfiles"),
-            "TerminatedEmployees": out.get("TerminatedEmployees"),
-            "TerminatedContractors": out.get("TerminatedContractors"),
-        }
-    return None
-
-
-
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=6)
+            r.raise_for_status()
+            data = r.json()
+            details = data.get("details", []) if isinstance(data, dict) else []
+            for d in details:
+                d2 = dict(d)
+                d2["__region"] = region
+                all_details.append(d2)
+        except RequestException as e:
+            print(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
+            continue
+        except Exception as e:
+            print(f"[region_clients] unexpected error for {region}: {e}")
+            continue
+    return all_details
 
 
 
@@ -1149,126 +678,120 @@ def get_global_stats_or_none():
 
 
 
-pip install fastapi uvicorn pandas requests XlsxWriter python-dateutil
+# ingest_excel.py
+import pandas as pd
+from datetime import datetime
+from sqlalchemy.exc import IntegrityError
+from db import SessionLocal, engine
+from models import Base, ActiveEmployee, ActiveContractor
+from settings import UPLOAD_DIR
+import uuid, os
 
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+# --- database setup: do NOT run create_all at import time ---
+def init_db():
+    """
+    Create DB tables if they do not exist.
+    Call this manually only when you want to initialize/repair the DB:
+      python -c "from ingest_excel import init_db; init_db()"
+    """
+    from db import engine
+    from models import Base
+    Base.metadata.create_all(bind=engine)
 
+def _first_present(row, candidates):
+    for c in candidates:
+        v = row.get(c)
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
 
-http://127.0.0.1:8000/ccure/compare?mode=full&export=true
+def ingest_employee_excel(path, uploaded_by="system"):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    # robust mapping keys
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id'])
+            if emp_id:
+                emp_id = str(emp_id).strip()
+            if not emp_id:
+                # skip rows without an employee id
+                continue
+            full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+            # robust current_status detection
+            status_candidates = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+            current_status = _first_present(row, status_candidates)
+            email = _first_present(row, ["Employee's Email",'Email','Email Address'])
+            location_city = _first_present(row, ['Location City','Location','Location Description','City'])
+            rec = ActiveEmployee(
+                employee_id=emp_id,
+                full_name=full_name,
+                email=email,
+                location_city=location_city,
+                location_desc=row.get('Location Description'),
+                current_status=current_status,
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
+            try:
+                db.merge(rec)  # upsert
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+            except Exception:
+                db.rollback()
 
+def ingest_contractor_excel(path):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            wsid = _first_present(row, ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId'])
+            if wsid:
+                wsid = str(wsid).strip()
+            if not wsid:
+                continue
+            ipass = _first_present(row, ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID'])
+            full_name = _first_present(row, ['Full Name','FullName','Name'])
+            rec = ActiveContractor(
+                worker_system_id=wsid,
+                ipass_id=ipass,
+                full_name=full_name,
+                vendor=_first_present(row, ['Vendor Company Name','Vendor']),
+                location=_first_present(row, ['Worker Location','Location']),
+                status=_first_present(row, ['Status','Current Status']),
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
+            try:
+                db.merge(rec)
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+            except Exception:
+                db.rollback()
 
-http://127.0.0.1:8000/ccure/report/<filename.xlsx>
-
-
-
-
-
-
-
-
-
-
-
-
-Let Check below Error carefully and fix it and share me Fully updated file carefully .
-
-
-(.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> uvicorn app:app --reload --host 0.0.0.0 --port 8000
-INFO:     Will watch for changes in these directories: ['C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics']
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [11308] using WatchFiles
-INFO:     Started server process [2240]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     127.0.0.1:52793 - "GET /ccure/compare?mode=full&limit_list=100 HTTP/1.1" 500 Internal Server Error
-INFO:     127.0.0.1:52793 - "GET /favicon.ico HTTP/1.1" 404 Not Found
-INFO:     127.0.0.1:52794 - "GET /ccure/compare?mode=full&export=true HTTP/1.1" 500 Internal Server Error
-INFO:     127.0.0.1:52804 - "GET /ccure/report/ccure_vs_local_xxxxxxxx.xlsx HTTP/1.1" 500 Internal Server Error
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\protocols\http\httptools_impl.py", line 409, in run_asgi
-    result = await app(  # type: ignore[func-returns-value]
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        self.scope, self.receive, self.send
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
-    await self.app(scope, receive, _send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 716, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 736, in app
-    await route.handle(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 290, in handle
-    await self.app(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 78, in app
-    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\routing.py", line 75, in app
-    response = await f(request)
-               ^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 302, in app
-    raw_response = await run_endpoint_function(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\fastapi\routing.py", line 215, in run_endpoint_function
-    return await run_in_threadpool(dependant.call, **values)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\starlette\concurrency.py", line 38, in run_in_threadpool
-    return await anyio.to_thread.run_sync(func)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\to_thread.py", line 56, in run_sync
-    return await get_async_backend().run_sync_in_worker_thread(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2476, in run_sync_in_worker_thread
-    return await future
-           ^^^^^^^^^^^^
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\.venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 967, in run
-    result = context.run(func, *args)
-  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 42, in ccure_report_download
-    safe_name = Path(filename).name  # prevent path traversal
-                ^^^^
-NameError: name 'Path' is not defined
-
-
+if __name__ == "__main__":
+    # ingestion convenience: read all uploaded files
+    for f in os.listdir(UPLOAD_DIR):
+        p = UPLOAD_DIR / f
+        if 'contractor' in f.lower() or 'contractor' in str(p).lower():
+            ingest_contractor_excel(p)
+        else:
+            ingest_employee_excel(p)
+    print("Ingestion completed.")
 
 
 
 
 
 # app.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, Query
+from fastapi.responses import JSONResponse, FileResponse
 import shutil, uuid, json
 from settings import UPLOAD_DIR, OUTPUT_DIR
 import os
-from fastapi.responses import FileResponse
-from fastapi import Query
-
+from pathlib import Path
 
 app = FastAPI(title="Attendance Analytics")
 
@@ -1301,13 +824,20 @@ def ccure_report_download(filename: str):
     Download generated report by filename (returned as 'report_path' from /ccure/compare?export=true).
     Only serves files inside OUTPUT_DIR.
     """
-    safe_name = Path(filename).name  # prevent path traversal
-    full = OUTPUT_DIR / safe_name
-    if not full.exists() or not full.is_file():
-        raise HTTPException(status_code=404, detail="Report not found")
-    return FileResponse(str(full), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=safe_name)
-
-
+    try:
+        safe_name = Path(filename).name  # prevent path traversal
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(full),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=safe_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
 
 
 @app.post("/upload/active-employees")
@@ -1459,913 +989,77 @@ def ccure_stats():
 
 
 
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\models.py
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, Date
+from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship
+from db import Base
 
+class ActiveEmployee(Base):
+    __tablename__ = "active_employees"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True, unique=True, nullable=False)
+    full_name = Column(String, index=True)
+    email = Column(String)
+    location_city = Column(String, index=True)
+    location_desc = Column(String)
+    current_status = Column(String)
+    raw_row = Column(JSON)  # store original row for reference
+    uploaded_at = Column(DateTime)
 
-# ccure_client.py
-import requests
-import math
-from requests.exceptions import RequestException
+class ActiveContractor(Base):
+    __tablename__ = "active_contractors"
+    id = Column(Integer, primary_key=True)
+    worker_system_id = Column(String, index=True, unique=True, nullable=False)
+    ipass_id = Column(String, index=True)
+    full_name = Column(String, index=True)
+    vendor = Column(String)
+    location = Column(String)
+    status = Column(String)
+    raw_row = Column(JSON)
+    uploaded_at = Column(DateTime)
 
-BASE = "http://10.199.22.57:5001"
-DEFAULT_TIMEOUT = 10
+class LiveSwipe(Base):
+    __tablename__ = "live_swipes"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, index=True)
+    employee_id = Column(String, index=True, nullable=True)
+    card_number = Column(String, index=True, nullable=True)
+    full_name = Column(String)
+    partition = Column(String, index=True)
+    floor = Column(String)
+    door = Column(String)
+    region = Column(String, index=True)
+    raw = Column(JSON)
 
-# Set auth headers here if CCure requires them:
-HEADERS = {
-    # "Authorization": "Bearer <TOKEN>",
-    "Accept": "application/json"
-}
+class AttendanceSummary(Base):
+    __tablename__ = "attendance_summary"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True)
+    date = Column(Date, index=True)
+    presence_count = Column(Integer)
+    first_seen = Column(DateTime)
+    last_seen = Column(DateTime)
+    derived = Column(JSON)  # extra stats
 
 
-def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
-    url = BASE.rstrip("/") + path
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except RequestException as e:
-        # caller handles None
-        print(f"[ccure_client] request failed {url} params={params} -> {e}")
-        return None
-    except ValueError:
-        print(f"[ccure_client] response JSON decode error for {url}")
-        return None
 
 
-def fetch_all_employees_full():
-    """
-    Try to fetch a full dump from /api/employees.
-    Returns list of dicts or None on failure.
-    """
-    return _safe_get("/api/employees")
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from settings import DB_URL
 
-def fetch_stats_page(detail, page=1, limit=500):
-    """
-    One page of /api/stats?details=detail&page=page&limit=limit
-    Returns page dict or None.
-    """
-    params = {"details": detail, "page": page, "limit": limit}
-    return _safe_get("/api/stats", params=params)
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
 
 
-def fetch_all_stats(detail, limit=1000):
-    """
-    Iterate pages for /api/stats detail and return combined data list.
-    Returns list or None.
-    """
-    first = fetch_stats_page(detail, page=1, limit=limit)
-    if not first:
-        return None
-    data = first.get("data") or []
-    total = int(first.get("total") or len(data) or 0)
-    if total <= len(data):
-        return data
-    pages = int(math.ceil(total / float(limit)))
-    for p in range(2, pages + 1):
-        page_res = fetch_stats_page(detail, page=p, limit=limit)
-        if not page_res:
-            # stop early on error
-            break
-        data.extend(page_res.get("data") or [])
-    return data
 
 
-def get_global_stats():
-    """
-    Best-effort summary of CCure totals:
-    - Try /api/employees full dump first
-    - else try /api/stats endpoints
-    Returns dict or None
-    """
-    full = fetch_all_employees_full()
-    if isinstance(full, list):
-        total = len(full)
-        active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
-        active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
-        active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
-        terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
-        return {
-            "TotalProfiles": total,
-            "ActiveProfiles": active_profiles,
-            "ActiveEmployees": active_emps,
-            "ActiveContractors": active_contractors,
-            "TerminatedProfiles": terminated
-        }
 
-    # fallback: try stats endpoints individually
-    details = ["ActiveProfiles", "ActiveEmployees", "ActiveContractors",
-               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
-    out = {}
-    for d in details:
-        resp = fetch_stats_page(d, page=1, limit=1)
-        if isinstance(resp, dict) and 'total' in resp:
-            out[d] = resp['total']
-    if out:
-        return {
-            "TotalProfiles": out.get("TotalProfiles"),
-            "ActiveProfiles": out.get("ActiveProfiles"),
-            "ActiveEmployees": out.get("ActiveEmployees"),
-            "ActiveContractors": out.get("ActiveContractors"),
-            "TerminatedProfiles": out.get("TerminatedProfiles"),
-            "TerminatedEmployees": out.get("TerminatedEmployees"),
-            "TerminatedContractors": out.get("TerminatedContractors"),
-        }
-    return None
 
 
 
 
 
-
-
-
-
-# ccure_compare_service.py
-import pandas as pd
-from ccure_client import fetch_all_employees_full, fetch_all_stats, get_global_stats
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor
-from settings import OUTPUT_DIR
-from pathlib import Path
-import re
-import uuid
-import traceback
-
-OUTPUT_DIR = Path(OUTPUT_DIR)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _normalize_empid(e):
-    if e is None:
-        return None
-    s = str(e).strip()
-    if s == "" or s.lower() in ("nan", "none", "null"):
-        return None
-    return s
-
-
-def _normalize_card(s):
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if ss == "":
-        return None
-    digits = re.sub(r'\D+', '', ss)
-    if not digits:
-        return None
-    return digits.lstrip('0') or digits
-
-
-def _load_local_active():
-    """
-    Return (emp_df, cont_df) as pandas DataFrames built from DB tables.
-    """
-    with SessionLocal() as db:
-        emps = db.query(ActiveEmployee).all()
-        conts = db.query(ActiveContractor).all()
-        emp_rows = []
-        for e in emps:
-            emp_rows.append({
-                "employee_id": _normalize_empid(e.employee_id),
-                "full_name": e.full_name,
-                "location_city": e.location_city,
-                "status": e.current_status,
-                "raw_row": e.raw_row
-            })
-        cont_rows = []
-        for c in conts:
-            cont_rows.append({
-                "worker_system_id": _normalize_empid(c.worker_system_id),
-                "ipass_id": _normalize_empid(c.ipass_id),
-                "full_name": c.full_name,
-                "location": c.location,
-                "status": c.status,
-                "raw_row": c.raw_row
-            })
-    emp_df = pd.DataFrame(emp_rows)
-    cont_df = pd.DataFrame(cont_rows)
-    return emp_df, cont_df
-
-
-def _ccure_fetch_all(mode="full", stats_detail="ActiveProfiles"):
-    """
-    mode: 'full' tries /api/employees then fallback
-          'stats' uses /api/stats?details=stats_detail
-    returns list-of-dicts or empty list
-    """
-    if mode == "stats":
-        lst = fetch_all_stats(stats_detail, limit=1000)
-        return lst or []
-    # mode full
-    lst = fetch_all_employees_full()
-    if lst is not None:
-        return lst
-    # fallback to stats
-    lst = fetch_all_stats(stats_detail, limit=1000)
-    return lst or []
-
-
-def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
-    """
-    Compare CCure -> local active sheets.
-    Returns dictionary (JSON serializable).
-    If export=True writes report to OUTPUT_DIR and returns 'report_path' with file name.
-    limit_list limits array sizes sent in JSON for safety.
-    """
-    try:
-        ccure_list = _ccure_fetch_all(mode=mode, stats_detail=stats_detail)
-        ccure_df = pd.DataFrame(ccure_list) if ccure_list else pd.DataFrame()
-        # normalize EmployeeID column name (if exists)
-        if not ccure_df.empty and 'EmployeeID' in ccure_df.columns:
-            ccure_df['EmployeeID_norm'] = ccure_df['EmployeeID'].astype(str).str.strip().replace({'nan': None})
-        else:
-            ccure_df['EmployeeID_norm'] = None
-
-        emp_df, cont_df = _load_local_active()
-
-        # sets (only non-null)
-        ccure_emp_set = set(ccure_df[ccure_df['EmployeeID_norm'].notna()]['EmployeeID_norm'].unique())
-        local_emp_set = set(emp_df[emp_df['employee_id'].notna()]['employee_id'].unique())
-
-        # contractors
-        local_cont_set = set(cont_df['worker_system_id'].dropna().unique())
-        ccure_cont_df = ccure_df[ccure_df.get('PersonnelType', '').apply(lambda x: (str(x).lower().find('contractor')!=-1) if pd.notna(x) else False)]
-        ccure_cont_set = set(ccure_cont_df['EmployeeID_norm'].dropna().unique())
-
-        in_ccure_not_local = sorted(list(ccure_emp_set - local_emp_set))
-        in_local_not_ccure = sorted(list(local_emp_set - ccure_emp_set))
-
-        in_ccure_cont_not_local = sorted(list(ccure_cont_set - local_cont_set))
-        in_local_cont_not_ccure = sorted(list(local_cont_set - ccure_cont_set))
-
-        # prepare sample rows (limited)
-        rows_ccure_only = ccure_df[ccure_df['EmployeeID_norm'].isin(in_ccure_not_local)].head(limit_list).to_dict(orient='records') if not ccure_df.empty else []
-        rows_local_only = emp_df[emp_df['employee_id'].isin(in_local_not_ccure)].head(limit_list).to_dict(orient='records') if not emp_df.empty else []
-        rows_ccure_cont_only = ccure_cont_df[ccure_cont_df['EmployeeID_norm'].isin(in_ccure_cont_not_local)].head(limit_list).to_dict(orient='records') if not ccure_cont_df.empty else []
-        rows_local_cont_only = cont_df[cont_df['worker_system_id'].isin(in_local_cont_not_ccure)].head(limit_list).to_dict(orient='records') if not cont_df.empty else []
-
-        # summary counts
-        ccure_summary = get_global_stats() or {}
-        summary = {
-            "ccure_total_profiles": int(ccure_summary.get("TotalProfiles") or (len(ccure_df) if not ccure_df.empty else 0)),
-            "ccure_active_profiles": int(ccure_summary.get("ActiveProfiles") or None) if ccure_summary else None,
-            "ccure_active_employees": int(ccure_summary.get("ActiveEmployees") or None) if ccure_summary else None,
-            "ccure_active_contractors": int(ccure_summary.get("ActiveContractors") or None) if ccure_summary else None,
-            "local_active_employees": int(len(emp_df)),
-            "local_active_contractors": int(len(cont_df)),
-            "delta_employees": (int(ccure_summary.get("ActiveEmployees")) - len(emp_df)) if ccure_summary and isinstance(ccure_summary.get("ActiveEmployees"), int) else None,
-            "delta_contractors": (int(ccure_summary.get("ActiveContractors")) - len(cont_df)) if ccure_summary and isinstance(ccure_summary.get("ActiveContractors"), int) else None
-        }
-
-        result = {
-            "summary": summary,
-            "lists": {
-                "in_ccure_not_local_sample": rows_ccure_only,
-                "in_local_not_ccure_sample": rows_local_only,
-                "in_ccure_contractors_not_local_sample": rows_ccure_cont_only,
-                "in_local_contractors_not_ccure_sample": rows_local_cont_only,
-            },
-            "counts": {
-                "in_ccure_not_local_count": len(in_ccure_not_local),
-                "in_local_not_ccure_count": len(in_local_not_ccure),
-                "in_ccure_contractors_not_local_count": len(in_ccure_cont_not_local),
-                "in_local_contractors_not_ccure_count": len(in_local_cont_not_ccure),
-            }
-        }
-
-        report_path = None
-        if export:
-            # write workbook
-            fname = f"ccure_vs_local_{uuid.uuid4().hex[:8]}.xlsx"
-            fp = OUTPUT_DIR / fname
-            try:
-                with pd.ExcelWriter(fp, engine="xlsxwriter") as writer:
-                    if not ccure_df.empty:
-                        ccure_df.to_excel(writer, sheet_name="ccure_all", index=False)
-                    if not emp_df.empty:
-                        emp_df.to_excel(writer, sheet_name="local_employees", index=False)
-                    if not cont_df.empty:
-                        cont_df.to_excel(writer, sheet_name="local_contractors", index=False)
-                    pd.DataFrame(result['counts'], index=[0]).to_excel(writer, sheet_name="counts", index=False)
-                    pd.DataFrame([summary]).to_excel(writer, sheet_name="summary", index=False)
-                    # detailed lists
-                    pd.DataFrame(rows_ccure_only).to_excel(writer, sheet_name="ccure_only_sample", index=False)
-                    pd.DataFrame(rows_local_only).to_excel(writer, sheet_name="local_only_sample", index=False)
-                report_path = str(fp.name)
-                result['report_path'] = report_path
-            except Exception:
-                print("[ccure_compare_service] failed to write report:", traceback.format_exc())
-                result['report_error'] = "report_write_failed"
-
-        return result
-
-    except Exception as e:
-        print("[ccure_compare_service] error:", e, traceback.format_exc())
-        return {"error": "internal_error", "message": str(e)}
-
-
-
-
-
-
-# compare_service.py
-import pandas as pd
-import numpy as np
-from datetime import datetime, date, timezone
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
-import re
-from dateutil import parser as dateutil_parser
-import traceback
-
-# --- Helpers -----------------------------------------------------------------
-
-def _to_native(value):
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
-    try:
-        import datetime as _dt
-        if isinstance(value, _dt.datetime):
-            try:
-                if value.tzinfo is not None:
-                    utc = value.astimezone(timezone.utc)
-                    return utc.replace(tzinfo=None).isoformat() + "Z"
-                else:
-                    return value.isoformat()
-            except Exception:
-                return str(value)
-        if hasattr(value, 'isoformat'):
-            try:
-                return value.isoformat()
-            except Exception:
-                return str(value)
-    except Exception:
-        pass
-    return value
-
-def _normalize_employee_key(x):
-    if x is None:
-        return None
-    try:
-        s = str(x).strip()
-        # drop empty placeholders
-        if s == "" or s.lower() in ("nan", "none", "na", "null"):
-            return None
-        return s
-    except Exception:
-        return None
-
-def _normalize_card_like(s):
-    """Return normalized card-like string: digits only, no spaces, trim leading zeros."""
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "":
-            return None
-        # remove non-digit characters
-        digits = re.sub(r'\D+', '', ss)
-        if digits == "":
-            return None
-        # strip leading zeros so '007' and '7' match; keep at least one digit
-        return digits.lstrip('0') or digits
-    except Exception:
-        return None
-
-def _normalize_name(s):
-    if s is None:
-        return None
-    try:
-        t = str(s).strip().lower()
-        # remove punctuation, collapse whitespace
-        t = re.sub(r'[^\w\s]', '', t)
-        t = re.sub(r'\s+', ' ', t).strip()
-        return t if t else None
-    except Exception:
-        return None
-
-# timestamp parsing helpers
-def _parse_timestamp_from_value(val):
-    if val is None:
-        return None
-    import datetime as _dt
-    # direct datetime
-    if isinstance(val, _dt.datetime):
-        dt = val
-        try:
-            if dt.tzinfo is not None:
-                return dt.astimezone(timezone.utc).replace(tzinfo=None)
-            return dt
-        except Exception:
-            return dt
-    # numeric epoch
-    try:
-        import numpy as _np
-        if isinstance(val, (int, float, _np.integer, _np.floating)):
-            v = int(val)
-            # heuristics: millisecond vs second
-            if v > 1e12:
-                return _dt.fromtimestamp(v / 1000.0, tz=timezone.utc).replace(tzinfo=None)
-            if v > 1e9:
-                return _dt.fromtimestamp(v, tz=timezone.utc).replace(tzinfo=None)
-    except Exception:
-        pass
-    # string parsing using dateutil
-    if isinstance(val, str):
-        s = val.strip()
-        if s == "":
-            return None
-        try:
-            # try iso / dateutil
-            dt = dateutil_parser.parse(s)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            return dt
-        except Exception:
-            # fallback to custom formats
-            fmts = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
-                    "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
-                    "%Y-%m-%dT%H:%M:%S")
-            for fmt in fmts:
-                try:
-                    return _dt.strptime(s, fmt)
-                except Exception:
-                    pass
-    return None
-
-def _extract_timestamp_from_detail(detail):
-    # check many likely keys
-    fields = [
-        "LocaleMessageDateTime", "LocalMessageDateTime", "LocaleMessageTime", "LocalMessageTime",
-        "LocaleMessageDate", "Timestamp", "timestamp", "Time", "LocaleTime", "LocalTime",
-        "time", "date", "LocaleMessageDateTimeUtc", "LocalMessageDateTimeUtc",
-        "Swipe_Time", "SwipeTime", "SwipeTimeLocal", "SwipeTimestamp", "SwipeDateTime"
-    ]
-    if isinstance(detail, dict):
-        for k in fields:
-            if k in detail:
-                dt = _parse_timestamp_from_value(detail.get(k))
-                if dt is not None:
-                    return dt
-        # scan all values for any parseable timestamp
-        for v in detail.values():
-            dt = _parse_timestamp_from_value(v)
-            if dt is not None:
-                return dt
-    else:
-        return _parse_timestamp_from_value(detail)
-    return None
-
-# --- Main functions ----------------------------------------------------------
-
-def ingest_live_details_list(details_list):
-    """Persist details_list into LiveSwipe. returns counts."""
-    from db import SessionLocal as _SessionLocal
-    inserted = 0
-    skipped = 0
-    with _SessionLocal() as db:
-        for d in details_list:
-            try:
-                ts_parsed = _extract_timestamp_from_detail(d)
-            except Exception:
-                ts_parsed = None
-            if ts_parsed is None:
-                # skip rows without parseable timestamp
-                skipped += 1
-                continue
-
-            # robust extraction of employee id and card fields (many alias names)
-            emp = None
-            for k in ("EmployeeID", "employee_id", "employeeId", "Employee Id", "EmpID", "Emp Id"):
-                if isinstance(d, dict) and k in d:
-                    emp = d.get(k)
-                    break
-            emp = _normalize_employee_key(emp)
-
-            card = None
-            for k in ("CardNumber", "card_number", "Card", "Card No", "CardNo", "Badge", "BadgeNo", "badge_number", "IPassID", "iPass ID"):
-                if isinstance(d, dict) and k in d:
-                    card = d.get(k)
-                    break
-            card = _normalize_card_like(card)
-
-            full_name = None
-            for k in ("ObjectName1", "FullName", "full_name", "EmpName", "Name"):
-                if isinstance(d, dict) and k in d:
-                    full_name = d.get(k)
-                    break
-
-            partition = None
-            for k in ("PartitionName2", "PartitionName1", "Partition", "PartitionName", "Region"):
-                if isinstance(d, dict) and k in d:
-                    partition = d.get(k)
-                    break
-
-            floor = d.get("Floor") if isinstance(d, dict) else None
-            door = None
-            for k in ("Door", "DoorName", "door"):
-                if isinstance(d, dict) and k in d:
-                    door = d.get(k)
-                    break
-
-            region = d.get("__region") if isinstance(d, dict) and "__region" in d else d.get("Region") if isinstance(d, dict) else None
-
-            try:
-                rec = LiveSwipe(
-                    timestamp=ts_parsed,
-                    employee_id=emp,
-                    card_number=card,
-                    full_name=full_name,
-                    partition=partition,
-                    floor=floor,
-                    door=door,
-                    region=region,
-                    raw=d
-                )
-                db.add(rec)
-                inserted += 1
-            except Exception:
-                # skip insertion errors but continue
-                db.rollback()
-                skipped += 1
-                continue
-        db.commit()
-    print(f"[ingest_live_details_list] inserted={inserted} skipped={skipped}")
-    return {"inserted": inserted, "skipped_invalid_timestamp": skipped}
-
-
-def compute_daily_attendance(target_date: date):
-    """Build AttendanceSummary rows for target_date (upserts)."""
-    with SessionLocal() as db:
-        start = datetime.combine(target_date, datetime.min.time())
-        end = datetime.combine(target_date, datetime.max.time())
-        swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-        if not swipes:
-            print(f"[compute_daily_attendance] no swipes for {target_date}")
-            return []
-
-        rows = []
-        for s in swipes:
-            rows.append({
-                "id": s.id,
-                "timestamp": s.timestamp,
-                "employee_id": _normalize_employee_key(s.employee_id),
-                "card_number": _normalize_card_like(s.card_number),
-                "full_name": s.full_name,
-                "partition": s.partition,
-                "floor": s.floor,
-                "door": s.door
-            })
-        df = pd.DataFrame(rows)
-        if df.empty:
-            print(f"[compute_daily_attendance] dataframe empty after rows -> {target_date}")
-            return []
-
-        # create grouping key: prefer employee_id, otherwise card_number
-        df['key'] = df['employee_id'].fillna(df['card_number'])
-        df = df[df['key'].notna()]
-        if df.empty:
-            print("[compute_daily_attendance] no usable keys after filling employee_id/card")
-            return []
-
-        grouped = df.groupby('key', dropna=False).agg(
-            presence_count=('id', 'count'),
-            first_seen=('timestamp', 'min'),
-            last_seen=('timestamp', 'max'),
-            full_name=('full_name', 'first'),
-            partition=('partition', 'first'),
-            card_number=('card_number', 'first')
-        ).reset_index().rename(columns={'key': 'employee_id'})
-
-        # upsert AttendanceSummary rows (merge)
-        for _, row in grouped.iterrows():
-            try:
-                derived_obj = {
-                    "partition": (row.get('partition') or None),
-                    "full_name": (row.get('full_name') or None),
-                    "card_number": (row.get('card_number') or None)
-                }
-                rec = AttendanceSummary(
-                    employee_id=str(row['employee_id']) if pd.notna(row['employee_id']) else None,
-                    date=target_date,
-                    presence_count=int(row['presence_count']),
-                    first_seen=row['first_seen'],
-                    last_seen=row['last_seen'],
-                    derived=derived_obj
-                )
-                db.merge(rec)
-            except Exception as e:
-                print("[compute_daily_attendance] upsert error:", e)
-                continue
-        db.commit()
-        print(f"[compute_daily_attendance] built {len(grouped)} attendance keys for {target_date}")
-        return grouped.to_dict(orient='records')
-
-
-def compare_with_active(target_date: date):
-    """Compare AttendanceSummary for date with ActiveEmployee & ActiveContractor and return json-safe dict."""
-    from ccure_client import get_global_stats_or_none
-    with SessionLocal() as db:
-        att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
-        if not att_rows:
-            att_df = pd.DataFrame(columns=["employee_id", "presence_count", "first_seen", "last_seen", "card_number", "partition", "full_name"])
-        else:
-            att_df = pd.DataFrame([{
-                "employee_id": _normalize_employee_key(a.employee_id),
-                "presence_count": a.presence_count,
-                "first_seen": a.first_seen,
-                "last_seen": a.last_seen,
-                "card_number": _normalize_card_like(a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None),
-                "partition": (a.derived.get('partition') if (a.derived and isinstance(a.derived, dict)) else None),
-                "full_name": (a.derived.get('full_name') if (a.derived and isinstance(a.derived, dict)) else None)
-            } for a in att_rows])
-
-        act_rows = db.query(ActiveEmployee).all()
-        contractor_rows = db.query(ActiveContractor).all()
-
-        # Build maps & active list
-        act_list = []
-        card_to_emp = {}
-        name_to_emp = {}
-
-        # Employees
-        for e in act_rows:
-            emp_id_norm = _normalize_employee_key(e.employee_id)
-            # extract card-like from raw if present
-            card_from_raw = None
-            try:
-                rr = e.raw_row or {}
-                if isinstance(rr, dict):
-                    ck_list = [
-                        "CardNumber","card_number","Card","Card No","CardNo","IPassID","IpassID","iPass ID","IPASSID",
-                        "Badge Number","BadgeNo","Badge"
-                    ]
-                    for ck in ck_list:
-                        v = rr.get(ck)
-                        if v:
-                            ckey = _normalize_card_like(v)
-                            if ckey:
-                                card_from_raw = ckey
-                                break
-                    # fallback: scan all values for numeric candidate
-                    if not card_from_raw:
-                        for v in rr.values():
-                            try:
-                                tmp = _normalize_card_like(v)
-                                if tmp and 3 <= len(tmp) <= 12:
-                                    card_from_raw = tmp
-                                    break
-                            except Exception:
-                                pass
-            except Exception:
-                card_from_raw = None
-
-            act_list.append({
-                "employee_id": emp_id_norm,
-                "full_name": e.full_name,
-                "location_city": e.location_city,
-                "status": e.current_status,
-                "card_number": card_from_raw
-            })
-            if emp_id_norm:
-                card_to_emp[emp_id_norm] = emp_id_norm
-            if card_from_raw:
-                card_to_emp[card_from_raw] = emp_id_norm
-            n = _normalize_name(e.full_name)
-            if n:
-                name_to_emp[n] = emp_id_norm
-
-        # Contractors
-        for c in contractor_rows:
-            worker_id = _normalize_employee_key(c.worker_system_id)
-            ipass = _normalize_employee_key(c.ipass_id)
-            w_ipass = ("W" + ipass) if ipass and not str(ipass).startswith("W") else ipass
-            primary_id = worker_id or ipass or None
-            act_list.append({
-                "employee_id": primary_id,
-                "full_name": c.full_name,
-                "location_city": c.location,
-                "status": c.status,
-                "card_number": None
-            })
-            if primary_id:
-                card_to_emp[primary_id] = primary_id
-            if ipass:
-                card_to_emp[ipass] = primary_id
-            if w_ipass:
-                card_to_emp[w_ipass] = primary_id
-            try:
-                rr = c.raw_row or {}
-                if isinstance(rr, dict):
-                    for ck in ("Worker System Id","Worker System ID","iPass ID","IPASSID","CardNumber","card_number"):
-                        if ck in rr and rr.get(ck):
-                            key = _normalize_card_like(rr.get(ck))
-                            if key:
-                                card_to_emp[key] = primary_id
-            except Exception:
-                pass
-            n = _normalize_name(c.full_name)
-            if n:
-                name_to_emp[n] = primary_id
-
-        act_df = pd.DataFrame(act_list)
-
-        # If no active rows, return attendance-only view
-        if act_df.empty:
-            if att_df.empty:
-                return {"by_location": [], "merged": [], "ccure": get_global_stats_or_none()}
-            att_df['partition'] = att_df.get('partition').fillna('Unknown')
-            att_df['presence_count'] = att_df['presence_count'].fillna(0)
-            att_df['present_today'] = att_df['presence_count'].apply(lambda x: bool(x and x != 0))
-            loc_group = att_df.groupby('partition', dropna=False).agg(
-                total_n=('employee_id', 'count'),
-                present_n=('present_today', 'sum')
-            ).reset_index().rename(columns={'partition':'location_city'})
-            loc_group['percent_present'] = loc_group.apply(lambda row: round((row['present_n']/row['total_n'])*100,2) if row['total_n'] and row['total_n']>0 else 0.0, axis=1)
-            by_location = [{k:_to_native(v) for k,v in r.items()} for r in loc_group.to_dict(orient='records')]
-            merged_list = []
-            for r in att_df.to_dict(orient='records'):
-                merged_list.append({
-                    "employee_id": _to_native(r.get('employee_id')),
-                    "presence_count": _to_native(r.get('presence_count')),
-                    "first_seen": _to_native(r.get('first_seen')),
-                    "last_seen": _to_native(r.get('last_seen')),
-                    "full_name": _to_native(r.get('full_name')),
-                    "location_city": _to_native(r.get('partition')),
-                    "present_today": _to_native(r.get('present_today'))
-                })
-            return {"by_location": by_location, "merged": merged_list, "ccure": get_global_stats_or_none()}
-
-        # normalize columns
-        act_df['employee_id'] = act_df['employee_id'].astype(object).apply(_normalize_employee_key)
-        att_df['employee_id'] = att_df['employee_id'].astype(object).apply(_normalize_employee_key)
-        act_df['card_number'] = act_df.get('card_number').astype(object).apply(_normalize_card_like) if 'card_number' in act_df.columns else pd.Series([pd.NA]*len(act_df))
-        att_df['card_number'] = att_df.get('card_number').astype(object).apply(_normalize_card_like) if 'card_number' in att_df.columns else pd.Series([pd.NA]*len(att_df))
-
-        # ensure card_to_emp includes act_df card_numbers
-        for r in act_df.to_dict(orient='records'):
-            c = r.get('card_number')
-            eid = r.get('employee_id')
-            if c and eid:
-                card_to_emp[c] = eid
-            if eid:
-                # also map numeric-only forms of eid
-                n = re.sub(r'\D','', str(eid))
-                if n:
-                    card_to_emp[n.lstrip('0') or n] = eid
-
-        # mapping function tries multiple strategies
-        emp_set = set([x for x in act_df['employee_id'].dropna().astype(str)])
-
-        def numeric_variants(s):
-            s = str(s)
-            clean = re.sub(r'\D','', s)
-            variants = set()
-            if clean:
-                variants.add(clean)
-                variants.add(clean.lstrip('0') or clean)
-                if not s.startswith('W'):
-                    variants.add('W' + clean)
-            return list(variants)
-
-        def remap_att_key(row):
-            primary = row.get('employee_id') or None
-            card = row.get('card_number') or None
-
-            primary_norm = _normalize_employee_key(primary)
-            card_norm = _normalize_card_like(card)
-
-            # 1) exact employee id exists in active list
-            if primary_norm and primary_norm in emp_set:
-                return primary_norm
-
-            # 2) numeric-variants of primary may map to card_to_emp
-            if primary_norm:
-                for v in numeric_variants(primary_norm):
-                    if v in card_to_emp:
-                        return card_to_emp[v]
-                if primary_norm in card_to_emp:
-                    return card_to_emp[primary_norm]
-
-            # 3) direct card mapping
-            if card_norm:
-                if card_norm in card_to_emp:
-                    return card_to_emp[card_norm]
-                if (card_norm.lstrip('0') or card_norm) in card_to_emp:
-                    return card_to_emp[card_norm.lstrip('0') or card_norm]
-                if ('W' + card_norm) in card_to_emp:
-                    return card_to_emp['W' + card_norm]
-
-            # 4) name matching fallback
-            fname = _normalize_name(row.get('full_name') or row.get('full_name_att') or None)
-            if fname and fname in name_to_emp:
-                return name_to_emp[fname]
-
-            # 5) last resort - return primary_norm (maybe non-mapped) so it still shows up
-            return primary_norm or card_norm or None
-
-        att_df['mapped_employee_id'] = att_df.apply(remap_att_key, axis=1)
-
-        # drop original employee_id column to avoid duplicate label conflict
-        att_merge_df = att_df.drop(columns=['employee_id'], errors='ignore').copy()
-
-        # merge left: act_df left_on employee_id, right_on mapped_employee_id
-        merged = pd.merge(
-            act_df,
-            att_merge_df,
-            left_on='employee_id',
-            right_on='mapped_employee_id',
-            how='left',
-            suffixes=('', '_att')
-        )
-
-        # fill and finalize
-        merged['presence_count'] = merged.get('presence_count', pd.Series([0]*len(merged))).fillna(0)
-        # ensure ints when possible
-        def safe_int(v):
-            try:
-                if pd.isna(v):
-                    return 0
-                iv = int(float(v))
-                return iv
-            except Exception:
-                return v
-        merged['presence_count'] = merged['presence_count'].apply(safe_int)
-        merged['present_today'] = merged['presence_count'].apply(lambda x: bool(x and x != 0))
-        merged['location_city'] = merged.get('location_city').fillna('Unknown')
-
-        # by_location
-        loc_group = merged.groupby('location_city', dropna=False).agg(
-            total_n=('employee_id', 'count'),
-            present_n=('present_today', 'sum')
-        ).reset_index()
-        loc_group['percent_present'] = loc_group.apply(lambda row: round((row['present_n']/row['total_n'])*100,2) if row['total_n'] and row['total_n']>0 else 0.0, axis=1)
-        by_location = [{k:_to_native(v) for k,v in r.items()} for r in loc_group.to_dict(orient='records')]
-
-        merged_list = []
-        for r in merged.to_dict(orient='records'):
-            clean = {k:_to_native(v) for k,v in r.items()}
-            # unify keys for clarity in API response
-            clean['mapped_employee_id'] = clean.get('mapped_employee_id')
-            clean['card_number_att'] = clean.get('card_number') or clean.get('card_number_att') or None
-            # include status if present
-            if 'status' not in clean:
-                clean['status'] = None
-            # ensure employee_id key exists
-            if 'employee_id' not in clean:
-                clean['employee_id'] = None
-            merged_list.append(clean)
-
-        # CCURE stats fetch (best-effort)
-        ccure_stats = get_global_stats_or_none()
-
-        # compare counts summary between CCure and Active sheets
-        try:
-            ccure_summary = ccure_stats or {}
-            cc_total_profiles = ccure_summary.get('TotalProfiles')
-            cc_active_profiles = ccure_summary.get('ActiveProfiles')
-            cc_active_emps = ccure_summary.get('ActiveEmployees')
-            cc_active_contractors = ccure_summary.get('ActiveContractors')
-        except Exception:
-            cc_total_profiles = cc_active_profiles = cc_active_emps = cc_active_contractors = None
-
-        # local sheet counts
-        active_emp_count = len(act_rows)
-        active_contract_count = len(contractor_rows)
-
-        diff = {
-            "active_sheet_employee_count": active_emp_count,
-            "active_sheet_contractor_count": active_contract_count,
-            "ccure_active_employees": cc_active_emps,
-            "ccure_active_contractors": cc_active_contractors,
-            "delta_employees": (cc_active_emps - active_emp_count) if (isinstance(cc_active_emps, int) and isinstance(active_emp_count, int)) else None,
-            "delta_contractors": (cc_active_contractors - active_contract_count) if (isinstance(cc_active_contractors, int) and isinstance(active_contract_count, int)) else None
-        }
-
-        result = {
-            "by_location": by_location,
-            "merged": merged_list,
-            "ccure": ccure_stats,
-            "count_comparison": diff
-        }
-        return result
-
-
-# helper wrapper to fetch CCURE stats without raising
-def get_global_stats_or_none():
-    try:
-        from ccure_client import get_global_stats
-        return get_global_stats()
-    except Exception:
-        return None
