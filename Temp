@@ -1,3 +1,553 @@
+# ccure_compare_service.py
+"""
+Compare CCURE profiles/stats with local ActiveEmployee & ActiveContractor sheets.
+
+Usage:
+    from ccure_compare_service import compare_ccure_vs_sheets
+    res = compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False)
+
+Notes:
+ - This module does NOT call any 'live summary' endpoints. It talks only to:
+     - ccure_client (if available) for CCURE stats/profiles (best-effort, wrapped in try/except)
+     - local DB tables ActiveEmployee and ActiveContractor
+ - Export: if export=True, an xlsx file will be written to OUTPUT_DIR (settings). The returned dict includes 'report_path'.
+"""
+
+import os
+import re
+import uuid
+import traceback
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+import numpy as np
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+from settings import OUTPUT_DIR  # ensure OUTPUT_DIR exists in your settings
+
+# ---------- Normalizers -------------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)  # keep digits only
+        if digits == "":
+            return None
+        # normalize by removing leading zeros for matching flexibility
+        normalized = digits.lstrip('0') or digits
+        return normalized
+    except Exception:
+        return None
+
+def _normalize_name(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)  # remove punctuation
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+# ---------- CCURE client wrappers (best-effort) -------------------------------
+
+def _fetch_ccure_stats() -> Optional[Dict[str, Any]]:
+    """Return ccure_client.get_global_stats() result or None if unavailable/error."""
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            return ccure_client.get_global_stats()
+    except Exception:
+        # don't raise — caller will handle None
+        return None
+    return None
+
+def _fetch_ccure_profiles(mode: str = "full", limit: int = 1000) -> List[Dict[str, Any]]:
+    """
+    Try to fetch full CCURE profiles (if ccure_client exposes such an API).
+    Returns list of dicts (possibly empty).
+    """
+    try:
+        import ccure_client
+        # several possible method names used in different integrations
+        if hasattr(ccure_client, "get_profiles"):
+            return ccure_client.get_profiles(limit=limit, mode=mode) or []
+        if hasattr(ccure_client, "fetch_profiles"):
+            return ccure_client.fetch_profiles(limit=limit, mode=mode) or []
+        if hasattr(ccure_client, "get_all_profiles"):
+            return ccure_client.get_all_profiles(limit=limit) or []
+    except Exception:
+        return []
+    return []
+
+# ---------- Helpers ----------------------------------------------------------
+
+def _extract_card_from_raw(raw: Any) -> Optional[str]:
+    """If raw is dict-like, scan common card keys and numeric-looking values."""
+    if not isinstance(raw, dict):
+        return None
+    keys = [
+        "CardNumber","card_number","Card","Card No","CardNo","Badge","BadgeNo",
+        "IPassID","iPass ID","IPASSID","Badge Number"
+    ]
+    for k in keys:
+        v = raw.get(k)
+        if v:
+            c = _normalize_card_like(v)
+            if c:
+                return c
+    # fallback: scan values for numeric string candidates
+    for v in raw.values():
+        try:
+            c = _normalize_card_like(v)
+            if c and 3 <= len(c) <= 12:
+                return c
+        except Exception:
+            continue
+    return None
+
+def _build_sheet_df(session) -> pd.DataFrame:
+    """Return dataframe of active people (employees + contractors) with normalized keys."""
+    act_rows = session.query(ActiveEmployee).all()
+    contr_rows = session.query(ActiveContractor).all()
+
+    recs = []
+    for e in act_rows:
+        empid = _normalize_employee_key(e.employee_id)
+        raw_card = _extract_card_from_raw(e.raw_row or {}) if hasattr(e, 'raw_row') else None
+        recs.append({
+            "source": "employee_sheet",
+            "employee_id": empid,
+            "full_name": e.full_name,
+            "full_name_norm": _normalize_name(e.full_name),
+            "card_number": raw_card,
+            "card_number_norm": _normalize_card_like(raw_card),
+            "location_city": e.location_city,
+            "status": e.current_status,
+            "raw_row": e.raw_row
+        })
+    for c in contr_rows:
+        wsid = _normalize_employee_key(getattr(c, "worker_system_id", None))
+        ipass = _normalize_employee_key(getattr(c, "ipass_id", None))
+        primary = wsid or ipass
+        raw_card = _extract_card_from_raw(c.raw_row or {}) if hasattr(c, 'raw_row') else None
+        recs.append({
+            "source": "contractor_sheet",
+            "employee_id": primary,
+            "full_name": c.full_name,
+            "full_name_norm": _normalize_name(c.full_name),
+            "card_number": raw_card,
+            "card_number_norm": _normalize_card_like(raw_card),
+            "location_city": getattr(c, "location", None),
+            "status": getattr(c, "status", None),
+            "raw_row": c.raw_row
+        })
+    df = pd.DataFrame(recs)
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "source","employee_id","full_name","full_name_norm","card_number","card_number_norm","location_city","status","raw_row"
+        ])
+    # Normalize columns to safe python-compatible values
+    for col in ["employee_id","card_number","full_name","full_name_norm","card_number_norm"]:
+        if col not in df.columns:
+            df[col] = None
+        else:
+            df[col] = df[col].astype(object).where(pd.notna(df[col]), None).apply(lambda x: x if x is None else str(x))
+    return df
+
+def _build_ccure_df(profiles: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Convert a list of CCURE profile dicts into a normalized DataFrame.
+    We try to extract employee id, full name, card number, partition/location.
+    """
+    rows = []
+    for p in profiles:
+        emp_keys = ["EmployeeID", "employee_id", "Employee Id", "BadgeId", "Badge"]
+        name_keys = ["FullName", "full_name", "Name", "ObjectName1"]
+        card_keys = ["CardNumber","card_number","BadgeNo","Badge","IPassID","iPass ID"]
+        loc_keys = ["PartitionName","Partition","Region","Location","Site"]
+        emp = None
+        for k in emp_keys:
+            if isinstance(p, dict) and k in p and p.get(k):
+                emp = p.get(k)
+                break
+        name = None
+        for k in name_keys:
+            if isinstance(p, dict) and k in p and p.get(k):
+                name = p.get(k)
+                break
+        card = None
+        for k in card_keys:
+            if isinstance(p, dict) and k in p and p.get(k):
+                card = p.get(k)
+                break
+        loc = None
+        for k in loc_keys:
+            if isinstance(p, dict) and k in p and p.get(k):
+                loc = p.get(k)
+                break
+        rows.append({
+            "ccure_raw": p,
+            "employee_id": _normalize_employee_key(emp),
+            "full_name": name,
+            "full_name_norm": _normalize_name(name),
+            "card_number": _normalize_card_like(card),
+            "location_city": loc
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["ccure_raw","employee_id","full_name","full_name_norm","card_number","location_city"])
+    # sanitize text columns
+    for col in ["employee_id", "full_name", "full_name_norm", "card_number", "location_city"]:
+        if col in df.columns:
+            df[col] = df[col].astype(object).where(pd.notna(df[col]), None).apply(lambda x: x if x is None else str(x))
+    return df
+
+# ---------- JSON sanitizer --------------------------------------------------
+
+def _sanitize_for_json(value):
+    """
+    Recursively convert pandas/numpy types to plain Python types suitable for json.dumps:
+      - numpy.nan / pandas NaN -> None
+      - numpy integer -> int
+      - numpy float -> float (if finite) else None
+      - pandas Timestamp/datetime -> isoformat str
+      - dict/list -> recursively sanitize
+    """
+    # primitives
+    try:
+        if value is None:
+            return None
+        # pandas / numpy NA
+        if isinstance(value, (float,)) and (pd.isna(value) or (isinstance(value, float) and (np.isnan(value) or np.isneginf(value) or np.isposinf(value)))):
+            return None
+    except Exception:
+        pass
+
+    # numpy types
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        v = float(value)
+        if not np.isfinite(v):
+            return None
+        return v
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+
+    # pandas scalars
+    try:
+        import pandas as _pd
+        if isinstance(value, _pd.Timestamp):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        if isinstance(value, _pd.Timedelta):
+            return str(value)
+    except Exception:
+        pass
+
+    # datetime
+    try:
+        import datetime as _dt
+        if isinstance(value, _dt.datetime):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        pass
+
+    # dict
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            # convert dict keys to str (JSON requires string keys)
+            try:
+                key = str(k)
+            except Exception:
+                key = repr(k)
+            out[key] = _sanitize_for_json(v)
+        return out
+
+    # list/tuple/set
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+
+    # pandas/numpy missing like pd.NA
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    # fallback: simple types
+    if isinstance(value, (str, int, float, bool)):
+        # convert nan/inf floats to None
+        if isinstance(value, float):
+            if not np.isfinite(value):
+                return None
+        return value
+
+    # fallback: convert to string
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- Comparison core --------------------------------------------------
+
+def compare_ccure_vs_sheets(mode: str = "full", stats_detail: str = "ActiveProfiles", limit_list: int = 200, export: bool = False) -> Dict[str, Any]:
+    """
+    Compare CCURE (stats / profiles) with local sheets.
+    - mode: 'full' attempts to fetch profiles; 'stats' may use only get_global_stats
+    - stats_detail: which stat detail to prefer when mode=stats (kept for parity)
+    - limit_list: how many rows to include in the sample lists
+    - export: if True, writes an xlsx report to OUTPUT_DIR and returns report_path
+    """
+    try:
+        session = SessionLocal()
+    except Exception as e:
+        return {"error": f"DB session failed: {e}", "trace": traceback.format_exc()}
+
+    try:
+        sheet_df = _build_sheet_df(session)
+        sheet_count = int(len(sheet_df))
+        sheet_emp_count = int(sheet_df[sheet_df['source'] == 'employee_sheet'].shape[0])
+        sheet_contractor_count = int(sheet_df[sheet_df['source'] == 'contractor_sheet'].shape[0])
+    except Exception as e:
+        session.close()
+        return {"error": f"Failed to read sheets from DB: {e}", "trace": traceback.format_exc()}
+
+    # fetch ccure stats & profiles (best-effort)
+    ccure_stats = _fetch_ccure_stats()
+    cc_profiles = []
+    if mode == "full":
+        try:
+            cc_profiles = _fetch_ccure_profiles(mode=mode, limit=5000)
+            if not isinstance(cc_profiles, list):
+                cc_profiles = []
+        except Exception:
+            cc_profiles = []
+    else:
+        try:
+            cc_profiles = _fetch_ccure_profiles(mode=mode, limit=2000)
+            if not isinstance(cc_profiles, list):
+                cc_profiles = []
+        except Exception:
+            cc_profiles = []
+
+    cc_df = _build_ccure_df(cc_profiles)
+    cc_count = int(len(cc_df))
+
+    # Build mapping sets for robust matching
+    sheet_emp_ids = set([_normalize_employee_key(x) for x in sheet_df['employee_id'].dropna().tolist() if _normalize_employee_key(x)])
+    sheet_card_ids = set([_normalize_card_like(x) for x in sheet_df['card_number'].dropna().tolist() if _normalize_card_like(x)])
+    sheet_names = set([_normalize_name(x) for x in sheet_df['full_name'].dropna().tolist() if _normalize_name(x)])
+
+    cc_emp_ids = set([_normalize_employee_key(x) for x in cc_df['employee_id'].dropna().tolist() if _normalize_employee_key(x)])
+    cc_card_ids = set([_normalize_card_like(x) for x in cc_df['card_number'].dropna().tolist() if _normalize_card_like(x)])
+    cc_names = set([_normalize_name(x) for x in cc_df['full_name'].dropna().tolist() if _normalize_name(x)])
+
+    # Matching helpers
+    def _match_cc_row_to_sheet(row) -> Optional[str]:
+        """Return matched sheet employee_id or None."""
+        empid = row.get('employee_id')
+        if empid and empid in sheet_emp_ids:
+            return empid
+        card = row.get('card_number')
+        if card and card in sheet_card_ids:
+            match = sheet_df[sheet_df['card_number_norm'] == card]
+            if not match.empty:
+                return match.iloc[0].get('employee_id')
+        name_norm = row.get('full_name_norm')
+        if name_norm and name_norm in sheet_names:
+            match = sheet_df[sheet_df['full_name_norm'] == name_norm]
+            if not match.empty:
+                return match.iloc[0].get('employee_id')
+        return None
+
+    def _match_sheet_row_to_cc(row) -> Optional[str]:
+        """Return matched ccure employee_id (from cc_df) or None."""
+        empid = row.get('employee_id')
+        if empid and empid in cc_emp_ids:
+            return empid
+        ccard = row.get('card_number_norm')
+        if ccard and ccard in cc_card_ids:
+            match = cc_df[cc_df['card_number'] == ccard]
+            if not match.empty:
+                return match.iloc[0].get('employee_id')
+        name_norm = row.get('full_name_norm')
+        if name_norm and name_norm in cc_names:
+            match = cc_df[cc_df['full_name_norm'] == name_norm]
+            if not match.empty:
+                return match.iloc[0].get('employee_id')
+        return None
+
+    # Compute "in CCURE but not in sheet" and vice versa
+    in_ccure_not_in_sheet = []
+    for _, r in cc_df.iterrows():
+        try:
+            matched = _match_cc_row_to_sheet(r)
+            if not matched:
+                in_ccure_not_in_sheet.append({
+                    "employee_id": r.get('employee_id') if r.get('employee_id') is not None else None,
+                    "full_name": r.get('full_name') if r.get('full_name') is not None else None,
+                    "card_number": r.get('card_number') if r.get('card_number') is not None else None,
+                    "location_city": r.get('location_city') if r.get('location_city') is not None else None,
+                    "ccure_raw": r.get('ccure_raw')
+                })
+        except Exception:
+            continue
+
+    in_sheet_not_in_ccure = []
+    for _, r in sheet_df.iterrows():
+        try:
+            matched = _match_sheet_row_to_cc(r)
+            if not matched:
+                in_sheet_not_in_ccure.append({
+                    "employee_id": r.get('employee_id') if r.get('employee_id') is not None else None,
+                    "full_name": r.get('full_name') if r.get('full_name') is not None else None,
+                    "card_number": r.get('card_number') if r.get('card_number') is not None else None,
+                    "location_city": r.get('location_city') if r.get('location_city') is not None else None,
+                    "source": r.get('source'),
+                    "raw_row": r.get('raw_row')
+                })
+        except Exception:
+            continue
+
+    # Limit samples
+    missing_sample = in_ccure_not_in_sheet[:limit_list]
+    extra_sample = in_sheet_not_in_ccure[:limit_list]
+
+    # Counts & deltas (attempt to read CCURE stats if present)
+    cc_active_emps = None
+    cc_active_contractors = None
+    try:
+        if isinstance(ccure_stats, dict):
+            # coerce possible pandas/numpy types into plain python
+            a = ccure_stats.get('ActiveEmployees') if 'ActiveEmployees' in ccure_stats else ccure_stats.get('ActiveEmployeesCount', None)
+            b = ccure_stats.get('ActiveContractors') if 'ActiveContractors' in ccure_stats else ccure_stats.get('ActiveContractorsCount', None)
+            cc_active_emps = int(a) if (a is not None and str(a).strip() != "") else None
+            cc_active_contractors = int(b) if (b is not None and str(b).strip() != "") else None
+    except Exception:
+        # fallback: leave as None
+        cc_active_emps = None
+        cc_active_contractors = None
+
+    cc_total_profiles = int(cc_count) if isinstance(cc_count, int) else None
+
+    response = {
+        "ccure": ccure_stats,
+        "ccure_profile_count": cc_total_profiles,
+        "sheet_counts": {
+            "employees": sheet_emp_count,
+            "contractors": sheet_contractor_count,
+            "total_profiles": sheet_count
+        },
+        "differences": {
+            "in_ccure_not_in_sheet_count": len(in_ccure_not_in_sheet),
+            "in_sheet_not_in_ccure_count": len(in_sheet_not_in_ccure),
+            "ccure_active_employees": cc_active_emps,
+            "ccure_active_contractors": cc_active_contractors,
+            "delta_employees": (cc_active_emps - sheet_emp_count) if (isinstance(cc_active_emps, int) and isinstance(sheet_emp_count, int)) else None,
+            "delta_contractors": (cc_active_contractors - sheet_contractor_count) if (isinstance(cc_active_contractors, int) and isinstance(sheet_contractor_count, int)) else None
+        },
+        "samples": {
+            "in_ccure_not_in_sheet": missing_sample,
+            "in_sheet_not_in_ccure": extra_sample
+        },
+        "report_path": None
+    }
+
+    # Optional export to Excel: write sheet_df, cc_df, and both sample lists
+    if export:
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            fname = f"ccure_compare_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.xlsx"
+            path = os.path.join(OUTPUT_DIR, fname)
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                try:
+                    sheet_df.to_excel(writer, sheet_name="sheet_all", index=False)
+                except Exception:
+                    pd.DataFrame(sheet_df).to_excel(writer, sheet_name="sheet_all", index=False)
+                try:
+                    cc_df.to_excel(writer, sheet_name="ccure_all", index=False)
+                except Exception:
+                    pd.DataFrame(cc_df).to_excel(writer, sheet_name="ccure_all", index=False)
+                pd.DataFrame(missing_sample).to_excel(writer, sheet_name="in_ccure_not_in_sheet", index=False)
+                pd.DataFrame(extra_sample).to_excel(writer, sheet_name="in_sheet_not_in_ccure", index=False)
+                summary_df = pd.DataFrame([{
+                    "sheet_employees": sheet_emp_count,
+                    "sheet_contractors": sheet_contractor_count,
+                    "sheet_total": sheet_count,
+                    "ccure_profiles": cc_total_profiles,
+                    "in_ccure_not_in_sheet": len(in_ccure_not_in_sheet),
+                    "in_sheet_not_in_ccure": len(in_sheet_not_in_ccure)
+                }])
+                summary_df.to_excel(writer, sheet_name="summary", index=False)
+            response["report_path"] = path
+        except Exception as e:
+            response["export_error"] = str(e)
+            response["export_trace"] = traceback.format_exc()
+
+    # Always sanitize everything before returning (remove NaN, numpy types, timestamps, etc.)
+    sanitized_response = _sanitize_for_json(response)
+
+    session.close()
+    return sanitized_response
+
+# ---------- helpers to convert pandas / values to native ---------------------
+
+def _to_native(value):
+    """Return JSON-serializable primitive (str/int/None) for pandas values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (int, float, str, bool)):
+            # guard nan/inf
+            if isinstance(value, float) and not np.isfinite(value):
+                return None
+            return value
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        return str(value)
+    return str(value)
+
+
+
+
+
+
+
 Still we got same error so fix this eerror carefully and share me fully updated file carefully.
 check each file line by line and fix this issue carefully
 
