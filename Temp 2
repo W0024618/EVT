@@ -1,3 +1,529 @@
+"""
+Compare CCURE profiles/stats with local ActiveEmployee & ActiveContractor sheets.
+Added: compute_visit_averages() - a focused function that strictly returns
+the percentage of active employees and contractors who visited today,
+aggregating live data across region_clients endpoints and using ccure stats.
+"""
+
+import os
+import re
+import uuid
+import traceback
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+import numpy as np
+import requests
+import logging
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+from settings import OUTPUT_DIR  # ensure OUTPUT_DIR exists in your settings
+
+logger = logging.getLogger("ccure_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# ---------- Normalizers -------------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)  # keep digits only
+        if digits == "":
+            return None
+        normalized = digits.lstrip('0') or digits
+        return normalized
+    except Exception:
+        return None
+
+def _normalize_name(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)  # remove punctuation
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+# ---------- CCURE client wrappers (best-effort) -------------------------------
+
+def _fetch_ccure_stats() -> Optional[Dict[str, Any]]:
+    """Return ccure_client.get_global_stats() result or None if unavailable/error."""
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            return ccure_client.get_global_stats()
+    except Exception:
+        logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+        return None
+    return None
+
+def _fetch_ccure_stats_totals_fallback():
+    """
+    If get_global_stats() is not available / incomplete, try to fetch /api/stats totals
+    using ccure_client.fetch_stats_page(detail).
+    Returns dict with integer totals or None values.
+    """
+    out = {"ActiveEmployees": None, "ActiveContractors": None, "ActiveProfiles": None}
+    try:
+        import ccure_client
+        # try each detail: 'ActiveEmployees', 'ActiveContractors' etc.
+        for key in ("ActiveEmployees", "ActiveContractors", "ActiveProfiles"):
+            try:
+                resp = None
+                if hasattr(ccure_client, "fetch_stats_page"):
+                    resp = ccure_client.fetch_stats_page(key, page=1, limit=1)
+                # If API returns dict with 'total' key -> use it
+                if isinstance(resp, dict) and "total" in resp:
+                    out[key] = int(resp.get("total") or 0)
+            except Exception:
+                continue
+    except Exception:
+        logger.debug("ccure_client.fetch_stats_page not available", exc_info=True)
+    return out
+
+# ---------- Helpers for live-summary fetching --------------------------------
+
+def _fetch_live_totals_from_region_clients(timeout=6):
+    """
+    Use region_clients.endpoints to fetch per-region live-summary(s).
+    Returns tuple (employee_total:int or None, contractor_total:int or None, sites_queried:int)
+    This function is defensive: fails per-region but continues.
+    """
+    emp_total = 0
+    contr_total = 0
+    sites = 0
+    try:
+        import region_clients
+        endpoints = getattr(region_clients, "endpoints", None)
+        if not isinstance(endpoints, dict):
+            # if region_clients doesn't expose endpoints, bail
+            return None, None, 0
+    except Exception as e:
+        logger.debug("region_clients import failed in _fetch_live_totals_from_region_clients", exc_info=True)
+        return None, None, 0
+
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            # prefer 'today' if present, else fallback to 'realtime' aggregated Employee/Contractor
+            if isinstance(data, dict):
+                if "today" in data and isinstance(data["today"], dict):
+                    t = data["today"]
+                    e = int(t.get("Employee") or 0)
+                    c = int(t.get("Contractor") or 0)
+                    emp_total += e
+                    contr_total += c
+                elif "realtime" in data and isinstance(data["realtime"], dict):
+                    # sum Employee/Contractor across realtime partitions
+                    for site in data["realtime"].values():
+                        try:
+                            emp_total += int(site.get("Employee") or 0)
+                            contr_total += int(site.get("Contractor") or 0)
+                        except Exception:
+                            pass
+                else:
+                    # fallback: try 'total' top-level
+                    if "total" in data:
+                        try:
+                            tot = int(data.get("total") or 0)
+                            # can't split into employee/contractor; skip splitting
+                            pass
+                        except Exception:
+                            pass
+            sites += 1
+        except Exception as e:
+            logger.warning(f"[compute_visit_averages] cannot fetch live-summary from {region}@{url}: {e}")
+            continue
+
+    if sites == 0:
+        return None, None, 0
+    return emp_total, contr_total, sites
+
+# ---------- JSON sanitizer --------------------------------------------------
+
+def _sanitize_for_json(value):
+    """
+    Convert pandas/numpy/datetime values to plain Python types for JSON.
+    """
+    try:
+        import pandas as _pd
+        import numpy as _np
+    except Exception:
+        _pd = None
+        _np = None
+
+    # None or pandas NA
+    try:
+        if value is None:
+            return None
+        if _pd is not None and _pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    # numpy numeric types
+    if _np is not None:
+        if isinstance(value, (_np.integer,)):
+            return int(value)
+        if isinstance(value, (_np.floating,)):
+            v = float(value)
+            if not _np.isfinite(v):
+                return None
+            return v
+        if isinstance(value, (_np.bool_, bool)):
+            return bool(value)
+
+    # pandas Timestamp
+    try:
+        if _pd is not None and isinstance(value, _pd.Timestamp):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        pass
+
+    # datetime
+    try:
+        import datetime as _dt
+        if isinstance(value, _dt.datetime):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+    except Exception:
+        pass
+
+    # dict/list -> recurse
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+
+    # primitives
+    if isinstance(value, (str, int, float, bool)):
+        try:
+            if isinstance(value, float):
+                if _np is not None and not _np.isfinite(value):
+                    return None
+                if value != value:
+                    return None
+            return value
+        except Exception:
+            return None
+
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- Compute visit averages -------------------------------------------
+
+def compute_visit_averages(timeout=6) -> Dict[str, Any]:
+    """
+    Strictly compute averages:
+      - Uses CCURE stats for ActiveEmployees and ActiveContractors (best-effort)
+      - Aggregates live 'today' Employee/Contractor counts across all region_clients endpoints
+      - Returns JSON-safe dict:
+          {
+            "live_today": {"employee": int, "contractor": int, "total": int},
+            "ccure_active": {"active_employees": int|None, "active_contractors": int|None},
+            "averages": {"employee_pct": float|None, "contractor_pct": float|None, "overall_pct": float|None},
+            "sites_queried": int,
+            "notes": "...optional..."
+          }
+    If denominators are missing or zero, percentages are returned as None.
+    """
+    notes = []
+    # 1) fetch ccure stats
+    ccure_stats = _fetch_ccure_stats()
+    active_emps = None
+    active_contracts = None
+    if isinstance(ccure_stats, dict):
+        try:
+            if "ActiveEmployees" in ccure_stats:
+                v = ccure_stats.get("ActiveEmployees")
+                active_emps = int(v) if v not in (None, "") else None
+            if "ActiveContractors" in ccure_stats:
+                v = ccure_stats.get("ActiveContractors")
+                active_contracts = int(v) if v not in (None, "") else None
+            # Some APIs name these differently; attempt alternatives
+            if active_emps is None and "ActiveEmployeesCount" in ccure_stats:
+                try:
+                    active_emps = int(ccure_stats.get("ActiveEmployeesCount"))
+                except Exception:
+                    pass
+            if active_contracts is None and "ActiveContractorsCount" in ccure_stats:
+                try:
+                    active_contracts = int(ccure_stats.get("ActiveContractorsCount"))
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Error coercing ccure_stats totals")
+    # fallback to per-detail /api/stats totals if get_global_stats returned None or missing keys
+    if active_emps is None or active_contracts is None:
+        try:
+            fallback = _fetch_ccure_stats_totals_fallback()
+            if active_emps is None:
+                active_emps = int(fallback.get("ActiveEmployees")) if fallback.get("ActiveEmployees") not in (None, "") else None
+            if active_contracts is None:
+                active_contracts = int(fallback.get("ActiveContractors")) if fallback.get("ActiveContractors") not in (None, "") else None
+        except Exception:
+            logger.debug("ccure stats fallback failed", exc_info=True)
+
+    # 2) fetch live totals across region_clients endpoints
+    live_emp = None
+    live_con = None
+    sites = 0
+    try:
+        emp_total, contr_total, sites = _fetch_live_totals_from_region_clients(timeout=timeout)
+        if emp_total is not None:
+            live_emp = int(emp_total)
+        if contr_total is not None:
+            live_con = int(contr_total)
+    except Exception:
+        logger.exception("Failed to fetch live totals")
+
+    # If live_emp/live_con none but a default single endpoint exists (try common EMEA endpoint)
+    if (live_emp is None or live_con is None) and sites == 0:
+        # try a last-resort direct call (use your default occupancy host)
+        try:
+            url = "http://10.199.22.57:3007/api/occupancy/live-summary"
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "today" in data and isinstance(data["today"], dict):
+                t = data["today"]
+                live_emp = int(t.get("Employee") or 0)
+                live_con = int(t.get("Contractor") or 0)
+                sites = 1
+                notes.append("Used default single occupancy endpoint fallback.")
+        except Exception:
+            logger.debug("fallback direct occupancy call failed", exc_info=True)
+
+    # 3) compute percentages safely
+    def safe_pct(numer, denom):
+        try:
+            if denom and denom > 0:
+                return round((numer / denom) * 100.0, 6)
+        except Exception:
+            pass
+        return None
+
+    total_live = None
+    if live_emp is not None and live_con is not None:
+        total_live = int(live_emp + live_con)
+
+    emp_pct = None
+    contr_pct = None
+    overall_pct = None
+    if live_emp is not None and active_emps not in (None, 0):
+        emp_pct = safe_pct(live_emp, active_emps)
+    if live_con is not None and active_contracts not in (None, 0):
+        contr_pct = safe_pct(live_con, active_contracts)
+    if total_live is not None and ( (active_emps or 0) + (active_contracts or 0) ) > 0:
+        overall_pct = safe_pct(total_live, ( (active_emps or 0) + (active_contracts or 0) ))
+
+    result = {
+        "live_today": {
+            "employee": _sanitize_for_json(live_emp),
+            "contractor": _sanitize_for_json(live_con),
+            "total": _sanitize_for_json(total_live)
+        },
+        "ccure_active": {
+            "active_employees": _sanitize_for_json(active_emps),
+            "active_contractors": _sanitize_for_json(active_contracts)
+        },
+        "averages": {
+            "employee_pct": _sanitize_for_json(emp_pct),
+            "contractor_pct": _sanitize_for_json(contr_pct),
+            "overall_pct": _sanitize_for_json(overall_pct)
+        },
+        "sites_queried": int(sites or 0),
+        "notes": None
+    }
+
+    if not (active_emps or active_contracts):
+        result["notes"] = "CCURE active counts unavailable; percentages may be None."
+    if sites == 0:
+        if result["notes"]:
+            result["notes"] += " No live-summary endpoints returned data."
+        else:
+            result["notes"] = "No live-summary endpoints returned data."
+
+    return _sanitize_for_json(result)
+
+# ---------------------------------------------------------------------------
+# The remainder of the compare_ccure_vs_sheets implementation may follow
+# in your project (unchanged). If you need the full compare function included
+# here I can paste/merge it — but for the averages endpoint this file is
+# sufficient as-is since compute_visit_averages is exported.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, FileResponse
+import shutil, uuid, json
+from settings import UPLOAD_DIR, OUTPUT_DIR
+from pathlib import Path
+import logging
+
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    # run compare (the function itself is defensive)
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    # Ensure result is a dict for JSONResponse
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+
+# NEW: averages endpoint (calls compute_visit_averages)
+@app.get("/ccure/averages")
+def ccure_averages(timeout: int = Query(6, description="timeout seconds for live-summary requests")):
+    """
+    Returns:
+    {
+      "live_today": { "employee": int, "contractor": int, "total": int },
+      "ccure_active": { "active_employees": int|None, "active_contractors": int|None },
+      "averages": { "employee_pct": float|None, "contractor_pct": float|None, "overall_pct": float|None },
+      "sites_queried": int,
+      "notes": null | str
+    }
+    """
+    try:
+        from ccure_compare_service import compute_visit_averages
+    except Exception as e:
+        logger.exception("compute_visit_averages import failed")
+        raise HTTPException(status_code=500, detail=f"compute_visit_averages unavailable: {e}")
+
+    try:
+        res = compute_visit_averages(timeout=timeout)
+    except Exception as e:
+        logger.exception("compute_visit_averages execution failed")
+        raise HTTPException(status_code=500, detail=f"compute_visit_averages failed: {e}")
+
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compute_visit_averages returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(full),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=safe_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+# Keep other endpoints unchanged (ingest/fetch-all, reports/daily)...
+# If you want, I can provide the rest verbatim — I left them unchanged to minimize merge issues.
+
+
+curl -s 'http://localhost:8000/ccure/averages' | jq .
+
+
+
+
+
+
+
+
+
+
 INFO:     Application startup complete.
 INFO:     127.0.0.1:59655 - "GET /ccure/averages%20%7C%20jq%20. HTTP/1.1" 404 Not Found
 INFO:     127.0.0.1:59655 - "GET /favicon.ico HTTP/1.1" 404 Not Found
