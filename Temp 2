@@ -1,3 +1,230 @@
+-- STEP 1: extract normalized swipe rows for Employees
+DECLARE @StartDate DATE = '2025-05-01';
+DECLARE @EndDate   DATE = CAST(GETDATE() AS DATE);
+DECLARE @PartitionName SYSNAME = NULL;  -- set to 'APAC.Default' or 'Denver - WU HQ' to filter, otherwise leave NULL
+
+;WITH RawSwipes AS (
+    SELECT 
+        LocaleMessageTime = DATEADD(MINUTE, -1 * j.[MessageLocaleOffset], j.[MessageUTC]),
+        j.ObjectIdentity1,
+        j.ObjectName1,
+        j.ObjectName2,
+        j.PartitionName2,
+        j.MessageType,
+        j.XmlGUID,
+        p.Text1,        -- candidate full name
+        p.Text2,
+        p.Text5 AS Department,
+        p.Text12,
+        p.Int1,
+        pt.Name AS PersonnelType,
+        t5_admit.[value] AS AdmitCode,
+        t5_dir.[value]   AS Direction,
+        t5_rej.[value]   AS Rejection_Type,
+        SCard.[value]    AS SCardValue,
+        -- 3-stage CardNumber resolution
+        CardNumber = COALESCE(
+            TRY_CAST(x.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(100)'),
+            TRY_CAST(x.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(100)'),
+            SCard.[value]
+        )
+    FROM [ACVSUJournal_00010021].[dbo].[ACVSUJournalLog] j
+    LEFT JOIN [ACVSCore].[Access].[Personnel] p ON j.ObjectIdentity1 = p.GUID
+    LEFT JOIN [ACVSCore].[Access].[PersonnelType] pt ON p.PersonnelTypeId = pt.ObjectID
+    LEFT JOIN [ACVSUJournal_00010021].[dbo].[ACVSUJournalLogxml] x ON j.XmlGUID = x.GUID
+    LEFT JOIN [ACVSUJournal_00010021].[dbo].[ACVSUJournalLogxmlShred] t5_admit
+        ON j.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+    LEFT JOIN [ACVSUJournal_00010021].[dbo].[ACVSUJournalLogxmlShred] t5_dir
+        ON j.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+    LEFT JOIN [ACVSUJournal_00010021].[dbo].[ACVSUJournalLogxmlShred] t5_rej
+        ON j.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+    LEFT JOIN (
+        SELECT GUID, [value]
+        FROM [ACVSUJournal_00010021].[dbo].[ACVSUJournalLogxmlShred]
+        WHERE [Name] IN ('Card','CHUID')
+    ) AS SCard ON j.XmlGUID = SCard.GUID
+    WHERE
+        j.MessageType IN ('CardAdmitted','CardRejected')
+        AND COALESCE(
+            TRY_CAST(x.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(100)'),
+            TRY_CAST(x.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(100)'),
+            SCard.[value]
+        ) IS NOT NULL
+        AND CONVERT(date, DATEADD(MINUTE, -1 * j.MessageLocaleOffset, j.MessageUTC)) BETWEEN @StartDate AND @EndDate
+        AND (
+            @PartitionName IS NULL OR j.PartitionName2 = @PartitionName
+        )
+)
+-- Persist only Employees and normalized columns to temp table
+SELECT
+    LocaleMessageTime,
+    ObjectIdentity1,
+    ObjectName1,
+    ObjectName2,
+    PartitionName2,
+    MessageType,
+    XmlGUID,
+    CardNumber = LTRIM(RTRIM(CardNumber)),
+    Rejection_Type,
+    AdmitCode,
+    Direction,
+    PersonnelType,
+    EmployeeID = CAST(CASE WHEN pt.Name IN ('Contractor','Terminated Contractor') THEN Text12 ELSE CAST(Int1 AS NVARCHAR(50)) END AS NVARCHAR(100)),
+    EmployeeName = COALESCE(NULLIF(Text1,''), NULLIF(Text2,''), CAST(Int1 AS NVARCHAR(50))),
+    Department
+INTO #SwipeEnriched
+FROM RawSwipes rw
+CROSS APPLY (SELECT rw.PersonnelType AS ptype) ca -- keep usable alias
+LEFT JOIN (SELECT 1 AS dummy) d ON 1=1
+WHERE rw.PersonnelType = 'Employee';
+
+
+
+
+
+SELECT TOP 20 LocaleMessageTime, EmployeeID, EmployeeName, Department, CardNumber, MessageType, Rejection_Type
+FROM #SwipeEnriched
+ORDER BY LocaleMessageTime DESC;
+
+
+
+
+
+
+
+
+
+-- STEP 2: aggregate per employee+card and build card-level summary & duplicates
+
+-- 2A: per employee + card aggregation
+SELECT
+    EmployeeID,
+    EmployeeName,
+    PersonnelType,
+    Department,
+    CardNumber,
+    FirstSeen = MIN(LocaleMessageTime),
+    LastSeen  = MAX(LocaleMessageTime),
+    TotalSwipes = COUNT(*) ,
+    RejectionCount = SUM(CASE WHEN MessageType = 'CardRejected' OR Rejection_Type IS NOT NULL THEN 1 ELSE 0 END)
+INTO #EmployeeCardAgg
+FROM #SwipeEnriched
+GROUP BY EmployeeID, EmployeeName, PersonnelType, Department, CardNumber;
+
+-- 2B: basic card-level totals
+SELECT
+    e.CardNumber,
+    TotalSwipes = SUM(e.TotalSwipes),
+    TotalRejections = SUM(e.RejectionCount),
+    DistinctEmployeesAssigned = COUNT(DISTINCT e.EmployeeID)
+INTO #CardSummaryBasic
+FROM #EmployeeCardAgg e
+GROUP BY e.CardNumber;
+
+-- 2C: build EmployeesList per card (STRING_AGG over distinct employee labels)
+SELECT
+    cs.CardNumber,
+    cs.TotalSwipes,
+    cs.TotalRejections,
+    cs.DistinctEmployeesAssigned,
+    EmployeesList = ISNULL((
+        SELECT STRING_AGG(emp, ', ')
+        FROM (
+            SELECT DISTINCT CONCAT(ISNULL(ec.EmployeeName,'Unknown'),' (',ISNULL(ec.EmployeeID,'-'),')') AS emp
+            FROM #EmployeeCardAgg ec
+            WHERE ec.CardNumber = cs.CardNumber
+        ) d
+    ), '')
+INTO #CardSummary
+FROM #CardSummaryBasic cs;
+
+-- 2D: duplicates
+SELECT
+    CardNumber,
+    DistinctEmployeesAssigned,
+    EmployeesList
+INTO #DuplicateCardAssignments
+FROM #CardSummary
+WHERE DistinctEmployeesAssigned > 1;
+
+
+
+
+SELECT TOP 20 * FROM #EmployeeCardAgg ORDER BY TotalSwipes DESC;
+SELECT TOP 50 * FROM #CardSummary ORDER BY TotalRejections DESC;
+SELECT TOP 50 * FROM #DuplicateCardAssignments ORDER BY DistinctEmployeesAssigned DESC;
+
+
+
+
+
+-- STEP 3: final reports
+
+-- A) Employee-wise card details (with card-length classification and duplicate flag + other employees list)
+SELECT
+    e.EmployeeID,
+    e.EmployeeName,
+    e.PersonnelType,
+    e.Department,
+    e.CardNumber,
+    CardLengthCategory = CASE 
+        WHEN LEN(e.CardNumber) = 5 THEN '5-digit'
+        WHEN LEN(e.CardNumber) >= 6 THEN '6plus'
+        ELSE CONCAT(LEN(e.CardNumber), ' char') 
+    END,
+    e.RejectionCount,
+    e.TotalSwipes,
+    e.FirstSeen,
+    e.LastSeen,
+    IsDuplicateCard = CASE WHEN cs.DistinctEmployeesAssigned > 1 THEN 1 ELSE 0 END,
+    OtherEmployeesUsingCard = ISNULL((
+        SELECT STRING_AGG(emp, ', ')
+        FROM (
+            SELECT DISTINCT CONCAT(ISNULL(ec.EmployeeName,'Unknown'),' (',ISNULL(ec.EmployeeID,'-'),')') as emp
+            FROM #EmployeeCardAgg ec
+            WHERE ec.CardNumber = e.CardNumber
+              AND NOT (ec.EmployeeID = e.EmployeeID)
+        ) d
+    ), '')
+FROM #EmployeeCardAgg e
+LEFT JOIN #CardSummary cs ON e.CardNumber = cs.CardNumber
+ORDER BY e.EmployeeName, e.CardNumber;
+
+-- B) Card-level rejection summary (cards ordered by rejection count desc)
+SELECT
+    CardNumber,
+    TotalSwipes,
+    TotalRejections,
+    DistinctEmployeesAssigned,
+    EmployeesList
+FROM #CardSummary
+ORDER BY TotalRejections DESC, TotalSwipes DESC;
+
+-- C) Duplicate card assignments (same card assigned to multiple employees)
+SELECT
+    CardNumber,
+    DistinctEmployeesAssigned,
+    EmployeesList
+FROM #DuplicateCardAssignments
+ORDER BY DistinctEmployeesAssigned DESC, CardNumber;
+
+-- Optional cleanup: remove temp tables (run after you confirm outputs)
+DROP TABLE IF EXISTS #SwipeEnriched;
+DROP TABLE IF EXISTS #EmployeeCardAgg;
+DROP TABLE IF EXISTS #CardSummaryBasic;
+DROP TABLE IF EXISTS #CardSummary;
+DROP TABLE IF EXISTS #DuplicateCardAssignments;
+
+
+
+
+
+
+
+
+
+
+
 Check below file carefully below File give us result like 
 
 EmployeeID	EmployeeName	PersonnelType	Department	CardNumber	CardNumber_First5
