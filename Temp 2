@@ -1,3 +1,663 @@
+# ccure_compare_service.py
+"""
+Compare CCURE profiles/stats with local sheets + compute visit averages + compliance.
+
+New: compliance stats for employees:
+ - meets_5days_8h: employees with >=5 days in last 7 days where duration >= 8 hours
+ - meets_3days_8h: employees with >=3 days in last 7 days where duration >= 8 hours
+ - defaulters: active employees who do not meet either criterion and are NOT marked as Work From Home (WFH)
+
+Outputs are JSON-safe and include location-wise breakdowns and small samples.
+"""
+
+import re
+import traceback
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+import logging
+
+logger = logging.getLogger("ccure_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, AttendanceSummary
+from settings import OUTPUT_DIR
+
+# ---------- helpers ---------------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+def _sanitize_for_json(value):
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if _np is not None and not _np.isfinite(value):
+            return None
+        return float(value)
+    if _np is not None and isinstance(value, (_np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            try:
+                key = str(k)
+            except Exception:
+                key = repr(k)
+            out[key] = _sanitize_for_json(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- classification & partition helpers ------------------------------
+
+def classify_personnel_from_detail(detail: dict) -> str:
+    """Map many CCURE / live-summary personnel strings to 'employee' or 'contractor'."""
+    try:
+        if not isinstance(detail, dict):
+            return "contractor"
+        candidate_keys = [
+            "PersonnelType", "personnelType", "personnel_type", "Personnel Type",
+            "PersonnelTypeName", "Personnel", "Type", "personnel", "PersonType", "personType"
+        ]
+        val = None
+        for k in candidate_keys:
+            if k in detail and detail.get(k) is not None:
+                val = str(detail.get(k)).strip().lower()
+                break
+        status_keys = ["Employee_Status", "Employee Status", "Status", "Profile_Disabled"]
+        status_val = None
+        for k in status_keys:
+            if k in detail and detail.get(k) is not None:
+                status_val = str(detail.get(k)).strip().lower()
+                break
+
+        if status_val is not None and "terminated" in status_val:
+            return "employee"
+        if val is None or val == "":
+            return "contractor"
+        if "employee" in val:
+            return "employee"
+        if "terminated" in val:
+            return "employee"
+        contractor_terms = ["contractor", "visitor", "property", "property management", "temp", "temp badge", "tempbadge"]
+        for t in contractor_terms:
+            if t in val:
+                return "contractor"
+        if "contract" in val or "visitor" in val:
+            return "contractor"
+        return "contractor"
+    except Exception:
+        return "contractor"
+
+def pick_partition_from_detail(detail: dict) -> str:
+    if not isinstance(detail, dict):
+        return "Unknown"
+    for k in ("PartitionName2","PartitionName1","Partition","PartitionName","Region","Location","Site","location_city","Location City"):
+        if k in detail and detail.get(k):
+            try:
+                return str(detail.get(k)).strip()
+            except Exception:
+                continue
+    if "__region" in detail and detail.get("__region"):
+        return str(detail.get("__region")).strip()
+    return "Unknown"
+
+# ---------- WFH detection helper -------------------------------------------
+
+def is_employee_wfh(active_emp_row: ActiveEmployee) -> bool:
+    """
+    Heuristic check: look for common fields/values that indicate 'Work From Home' / 'WFH' / 'Remote'
+    - checks explicit attributes if present, raw_row fields, and location_description-like fields
+    """
+    try:
+        wfh_keywords = ("work from home", "wfh", "remote", "workfromhome", "home")
+        # check common explicit booleans/flags
+        for attr in ("is_wfh", "work_from_home", "wfh", "remote_flag"):
+            if hasattr(active_emp_row, attr):
+                try:
+                    val = getattr(active_emp_row, attr)
+                    if isinstance(val, bool) and val:
+                        return True
+                    if isinstance(val, str) and any(k in val.strip().lower() for k in wfh_keywords):
+                        return True
+                except Exception:
+                    pass
+        # check location / location_description / location_city / description
+        for attr in ("location_description", "location_desc", "location_description1", "base_location", "location", "location_city"):
+            if hasattr(active_emp_row, attr):
+                try:
+                    v = getattr(active_emp_row, attr)
+                    if v and isinstance(v, str):
+                        s = v.strip().lower()
+                        if any(k in s for k in wfh_keywords):
+                            return True
+                except Exception:
+                    pass
+        # check raw_row JSON/dict for keywords
+        try:
+            rr = getattr(active_emp_row, "raw_row", None)
+            if rr and isinstance(rr, dict):
+                for k, v in rr.items():
+                    try:
+                        if v and isinstance(v, str) and any(word in v.strip().lower() for word in wfh_keywords):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+# ---------- main compute function -----------------------------------------
+
+def compute_visit_averages(timeout: int = 6) -> Dict[str, Any]:
+    """
+    Returns:
+      - headcount (AttendanceSummary today)
+      - live_headcount (region_clients)
+      - ccure_active (reported + derived)
+      - averages (head/live vs ccure)
+      - compliance: meets_5days_8h, meets_3days_8h, defaulters (with WFH exclusion)
+    """
+    notes = []
+    today = date.today()
+    week_start = today - timedelta(days=6)  # last 7 days inclusive
+
+    # --- HEADCOUNT: AttendanceSummary for today
+    head_total = 0
+    head_per_location = {}
+    try:
+        session = SessionLocal()
+        # today's records
+        att_rows_today = session.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+        # build quick lookups for sheet employees/contractors to classify
+        act_emps = session.query(ActiveEmployee).all()
+        act_contrs = session.query(ActiveContractor).all()
+        emp_id_set = set()
+        contr_id_set = set()
+        for e in act_emps:
+            v = _normalize_employee_key(getattr(e, "employee_id", None))
+            if v:
+                emp_id_set.add(v)
+        for c in act_contrs:
+            wid = _normalize_employee_key(getattr(c, "worker_system_id", None))
+            ip = _normalize_employee_key(getattr(c, "ipass_id", None))
+            primary = wid or ip
+            if primary:
+                contr_id_set.add(primary)
+        if att_rows_today:
+            for a in att_rows_today:
+                key = _normalize_employee_key(a.employee_id)
+                partition = None
+                try:
+                    if a.derived and isinstance(a.derived, dict):
+                        partition = a.derived.get("partition")
+                except Exception:
+                    partition = None
+                loc = partition or "Unknown"
+                if not isinstance(loc, str) or not loc.strip():
+                    loc = "Unknown"
+                if loc not in head_per_location:
+                    head_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                if (a.presence_count or 0) > 0:
+                    head_total += 1
+                    head_per_location[loc]["total"] += 1
+                    # classify
+                    classified = "contractor"  # default per your rule for unknown -> contractor
+                    if key and key in emp_id_set:
+                        classified = "employee"
+                    elif key and key in contr_id_set:
+                        classified = "contractor"
+                    else:
+                        # fallback using derived card_number
+                        try:
+                            card = (a.derived.get("card_number") if (a.derived and isinstance(a.derived, dict)) else None)
+                        except Exception:
+                            card = None
+                        if _normalize_card_like(card):
+                            classified = "contractor"
+                        else:
+                            classified = "contractor"
+                    head_per_location[loc][classified] += 1
+        session.expunge_all()
+    except Exception:
+        logger.exception("Error computing HeadCount")
+        notes.append("Failed to compute HeadCount; see server logs.")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # --- LIVE HEADCOUNT via region_clients
+    live_total = 0
+    live_per_location = {}
+    sites_queried = 0
+    try:
+        import region_clients
+        regions_info = []
+        try:
+            if hasattr(region_clients, "fetch_all_regions"):
+                regions_info = region_clients.fetch_all_regions() or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_regions failed")
+        details = []
+        try:
+            if hasattr(region_clients, "fetch_all_details"):
+                details = region_clients.fetch_all_details() or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_details failed")
+        sites_queried = len(regions_info) if isinstance(regions_info, list) else 0
+        if regions_info:
+            for r in regions_info:
+                try:
+                    c = r.get("count") if isinstance(r, dict) else None
+                    ci = _safe_int(c)
+                    if ci is not None:
+                        live_total += int(ci)
+                except Exception:
+                    continue
+        # classify details
+        derived_detail_sum = 0
+        if details and isinstance(details, list):
+            for d in details:
+                try:
+                    loc = pick_partition_from_detail(d) or "Unknown"
+                    if not isinstance(loc, str) or not loc.strip():
+                        loc = "Unknown"
+                    pclass = classify_personnel_from_detail(d)
+                    if loc not in live_per_location:
+                        live_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                    live_per_location[loc]["total"] += 1
+                    live_per_location[loc][pclass] += 1
+                    derived_detail_sum += 1
+                except Exception:
+                    continue
+            if live_total == 0 and derived_detail_sum > 0:
+                live_total = derived_detail_sum
+            else:
+                if live_total != derived_detail_sum:
+                    notes.append(f"Region totals ({live_total}) differ from detail rows ({derived_detail_sum}); using region totals for overall and details for breakdown.")
+        else:
+            notes.append("No per-person details available from region_clients; live breakdown unavailable.")
+    except Exception:
+        logger.exception("Error computing Live HeadCount")
+        notes.append("Failed to compute Live HeadCount; see logs.")
+        live_total = live_total or 0
+
+    # --- CCURE stats (reported + derived)
+    reported_active_emps = None
+    reported_active_contractors = None
+    derived_active_emps = None
+    derived_active_contractors = None
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            stats = ccure_client.get_global_stats()
+            if isinstance(stats, dict):
+                reported_active_emps = _safe_int(stats.get("ActiveEmployees"))
+                reported_active_contractors = _safe_int(stats.get("ActiveContractors"))
+    except Exception:
+        logger.debug("ccure_client unavailable", exc_info=True)
+    # try derive from profiles if available
+    try:
+        profiles = []
+        try:
+            if hasattr(ccure_client, "fetch_all_employees_full"):
+                profiles = ccure_client.fetch_all_employees_full() or []
+            elif hasattr(ccure_client, "fetch_all_employees"):
+                profiles = ccure_client.fetch_all_employees() or []
+        except Exception:
+            profiles = []
+        if isinstance(profiles, list) and profiles:
+            ecount = 0
+            ccount = 0
+            for p in profiles:
+                try:
+                    if not isinstance(p, dict):
+                        continue
+                    pt = None
+                    for k in ("PersonnelType","personnelType","Personnel","Type"):
+                        if k in p and p.get(k):
+                            pt = str(p.get(k)).strip().lower()
+                            break
+                    st = None
+                    for k in ("Employee_Status","Employee Status","Status","Profile_Disabled"):
+                        if k in p and p.get(k) is not None:
+                            st = p.get(k)
+                            break
+                    active_flag = None
+                    if isinstance(st, bool):
+                        active_flag = (st is False)
+                    elif isinstance(st, str):
+                        active_flag = (str(st).strip().lower() == "active")
+                    if pt and active_flag:
+                        if "employee" in pt or "terminated" in pt:
+                            ecount += 1
+                        elif "contractor" in pt or "visitor" in pt or "temp" in pt or "property" in pt:
+                            ccount += 1
+                except Exception:
+                    continue
+            if (ecount + ccount) > 0:
+                derived_active_emps = int(ecount)
+                derived_active_contractors = int(ccount)
+    except Exception:
+        logger.debug("ccure profile derivation failed", exc_info=True)
+
+    # --- COMPLIANCE: analyze last 7 days AttendanceSummary per active employee
+    compliance = {
+        "meets_5days_8h": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}},
+        "meets_3days_8h": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}},
+        "defaulters": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}, "sample": []}
+    }
+
+    try:
+        session = SessionLocal()
+        # load active employees and build mapping for card matching
+        active_emps = session.query(ActiveEmployee).all()
+        # mapping: normalized employee id -> ActiveEmployee object
+        emp_map = {}
+        card_to_emp = {}  # mapping card -> emp_id string
+        for e in active_emps:
+            eid = _normalize_employee_key(getattr(e, "employee_id", None))
+            emp_map[eid] = e
+            # look into raw_row for card keys
+            try:
+                rr = getattr(e, "raw_row", None)
+                if rr and isinstance(rr, dict):
+                    for ck in ("CardNumber","card_number","Card","Card No","CardNo","Badge","BadgeNo","IPassID","iPass ID","IPASSID"):
+                        if ck in rr and rr.get(ck):
+                            cn = _normalize_card_like(rr.get(ck))
+                            if cn:
+                                card_to_emp[cn] = eid
+            except Exception:
+                pass
+        # fetch last 7 days attendance summary rows
+        att_rows_range = session.query(AttendanceSummary).filter(AttendanceSummary.date >= week_start, AttendanceSummary.date <= today).all()
+        # group by employee key (the AttendanceSummary.employee_id is the key used earlier)
+        rows_by_key = {}
+        for r in att_rows_range:
+            key = _normalize_employee_key(r.employee_id)
+            if key not in rows_by_key:
+                rows_by_key[key] = []
+            rows_by_key[key].append(r)
+        # Now evaluate each active employee
+        meets_5 = []
+        meets_3 = []
+        defaulters_list = []
+        ccure_emp_denom = reported_active_emps if reported_active_emps is not None else derived_active_emps
+        for eid, e in emp_map.items():
+            # Skip None keys (some active employees may not have id) - still evaluate by scanning rows_by_key by card mapping
+            # Gather attendance rows corresponding to this employee by exact id and card variants
+            candidate_rows = []
+            if eid and eid in rows_by_key:
+                candidate_rows.extend(rows_by_key[eid])
+            # try card mapping: search rows_by_key keys that are digits and match card_to_emp mapping
+            # collect by scanning all keys that map to this emp (numerical variants)
+            for k in list(rows_by_key.keys()):
+                if not k:
+                    continue
+                # direct card mapping
+                k_norm = _normalize_card_like(k)
+                if k_norm and k_norm in card_to_emp and card_to_emp[k_norm] == eid:
+                    candidate_rows.extend(rows_by_key[k])
+            # dedupe candidate_rows by date
+            by_date = {}
+            for r in candidate_rows:
+                try:
+                    d = r.date
+                    if d not in by_date:
+                        by_date[d] = r
+                    else:
+                        # choose one with timestamps present or larger presence_count
+                        if (r.presence_count or 0) > (by_date[d].presence_count or 0):
+                            by_date[d] = r
+                except Exception:
+                    continue
+            # compute days with >=8 hours
+            days_with_8h = 0
+            days_present = 0
+            for d, row in by_date.items():
+                if (row.presence_count or 0) > 0:
+                    days_present += 1
+                    # compute duration
+                    try:
+                        if row.first_seen and row.last_seen:
+                            dur = (row.last_seen - row.first_seen).total_seconds() / 3600.0
+                            if dur >= 8.0:
+                                days_with_8h += 1
+                    except Exception:
+                        # if timestamps invalid, skip duration for that day
+                        pass
+            meets5 = (days_with_8h >= 5)
+            meets3 = (days_with_8h >= 3)
+            # detect WFH nomination - skip defaulter if WFH
+            wfh_flag = is_employee_wfh(e)
+            # collect location
+            location = None
+            for loc_attr in ("location_city", "location", "base_location", "location_description", "location_desc"):
+                if hasattr(e, loc_attr):
+                    v = getattr(e, loc_attr)
+                    if v and isinstance(v, str) and v.strip():
+                        location = v.strip()
+                        break
+            if not location:
+                # try raw_row
+                try:
+                    rr = getattr(e, "raw_row", None)
+                    if rr and isinstance(rr, dict):
+                        for ck in ("Partition", "PartitionName", "Location", "Site", "location_city", "Location City"):
+                            if ck in rr and rr.get(ck):
+                                location = str(rr.get(ck)).strip()
+                                break
+                except Exception:
+                    pass
+            if not location:
+                location = "Unknown"
+            # tally
+            if meets5:
+                meets_5.append((eid, e, location))
+            if meets3:
+                meets_3.append((eid, e, location))
+            if (not meets5) and (not meets3):
+                # candidate defaulter unless WFH
+                if not wfh_flag:
+                    defaulters_list.append((eid, e, location))
+        # compute counts and by_location breakdown
+        def _build_location_counts(list_of_tuples):
+            loc_map = {}
+            for (_id, e_obj, loc) in list_of_tuples:
+                if not loc:
+                    loc = "Unknown"
+                if loc not in loc_map:
+                    loc_map[loc] = {"count": 0}
+                loc_map[loc]["count"] += 1
+            return loc_map
+
+        meets_5_count = len(meets_5)
+        meets_3_count = len(meets_3)
+        defaulter_count = len(defaulters_list)
+
+        compliance["meets_5days_8h"]["count"] = int(meets_5_count)
+        compliance["meets_5days_8h"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(meets_5).items()}
+        compliance["meets_3days_8h"]["count"] = int(meets_3_count)
+        compliance["meets_3days_8h"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(meets_3).items()}
+        compliance["defaulters"]["count"] = int(defaulter_count)
+        compliance["defaulters"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(defaulters_list).items()}
+
+        # percentages vs CCURE active employees denom
+        denom_emp = reported_active_emps if reported_active_emps is not None else derived_active_emps
+        if isinstance(denom_emp, int) and denom_emp > 0:
+            compliance["meets_5days_8h"]["percent_of_ccure_employees"] = round((meets_5_count / denom_emp) * 100.0, 2)
+            compliance["meets_3days_8h"]["percent_of_ccure_employees"] = round((meets_3_count / denom_emp) * 100.0, 2)
+            compliance["defaulters"]["percent_of_ccure_employees"] = round((defaulter_count / denom_emp) * 100.0, 2)
+        else:
+            compliance["meets_5days_8h"]["percent_of_ccure_employees"] = None
+            compliance["meets_3days_8h"]["percent_of_ccure_employees"] = None
+            compliance["defaulters"]["percent_of_ccure_employees"] = None
+
+        # defaulters sample (first 50)
+        sample = []
+        for (eid, e_obj, loc) in defaulters_list[:50]:
+            try:
+                sample.append({
+                    "employee_id": _sanitize_for_json(eid),
+                    "full_name": _sanitize_for_json(getattr(e_obj, "full_name", None)),
+                    "location": _sanitize_for_json(loc),
+                    "wfh_flag": bool(is_employee_wfh(e_obj))
+                })
+            except Exception:
+                continue
+        compliance["defaulters"]["sample"] = sample
+
+        session.expunge_all()
+        session.close()
+    except Exception:
+        logger.exception("Error computing compliance section")
+        notes.append("Failed to compute compliance metrics; check server logs for trace.")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # --- compute percentages (head/live vs ccure)
+    def safe_pct(n, denom):
+        try:
+            if n is None or denom is None:
+                return None
+            d = float(denom)
+            if d == 0.0:
+                return None
+            return round((float(n) / d) * 100.0, 2)
+        except Exception:
+            return None
+
+    cc_emp_denom = reported_active_emps if reported_active_emps is not None else derived_active_emps
+    cc_con_denom = reported_active_contractors if reported_active_contractors is not None else derived_active_contractors
+    cc_total_denom = None
+    if isinstance(cc_emp_denom, int) and isinstance(cc_con_denom, int):
+        cc_total_denom = cc_emp_denom + cc_con_denom
+
+    head_emp_total = sum(v.get("employee", 0) for v in head_per_location.values())
+    head_con_total = sum(v.get("contractor", 0) for v in head_per_location.values())
+    live_emp_total = sum(v.get("employee", 0) for v in live_per_location.values())
+    live_con_total = sum(v.get("contractor", 0) for v in live_per_location.values())
+
+    # build final result
+    result = {
+        "date": today.isoformat(),
+        "headcount": {
+            "total_visited_today": int(head_total),
+            "employee": int(head_emp_total),
+            "contractor": int(head_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in head_per_location.items() }
+        },
+        "live_headcount": {
+            "currently_present_total": int(live_total),
+            "employee": int(live_emp_total),
+            "contractor": int(live_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in live_per_location.items() }
+        },
+        "ccure_active": {
+            "active_employees_reported": _safe_int(reported_active_emps),
+            "active_contractors_reported": _safe_int(reported_active_contractors),
+            "derived_active_employees_from_profiles": _safe_int(derived_active_emps),
+            "derived_active_contractors_from_profiles": _safe_int(derived_active_contractors)
+        },
+        "averages": {
+            "headcount_employee_pct_vs_ccure": _sanitize_for_json(safe_pct(head_emp_total, cc_emp_denom)),
+            "headcount_contractor_pct_vs_ccure": _sanitize_for_json(safe_pct(head_con_total, cc_con_denom)),
+            "headcount_overall_pct_vs_ccure": _sanitize_for_json(safe_pct(head_total, cc_total_denom)),
+            "live_employee_pct_vs_ccure": _sanitize_for_json(safe_pct(live_emp_total, cc_emp_denom)),
+            "live_contractor_pct_vs_ccure": _sanitize_for_json(safe_pct(live_con_total, cc_con_denom)),
+            "live_overall_pct_vs_ccure": _sanitize_for_json(safe_pct(live_total, cc_total_denom)),
+            "avg_headcount_per_site": _sanitize_for_json(round(head_total / sites_queried, 2) if sites_queried and sites_queried > 0 else None),
+            "avg_live_per_site": _sanitize_for_json(round(live_total / sites_queried, 2) if sites_queried and sites_queried > 0 else None)
+        },
+        "compliance": _sanitize_for_json(compliance),
+        "sites_queried": int(sites_queried),
+        "notes": " | ".join(notes) if notes else None
+    }
+
+    return _sanitize_for_json(result)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 http://localhost:8000/ccure/averages
 
 {
