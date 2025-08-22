@@ -1,3 +1,467 @@
+# ccure_compare_service.py
+"""
+Compare CCURE profiles/stats with local sheets + compute visit averages (updated).
+compute_visit_averages now:
+ - computes HeadCount (total visited today using AttendanceSummary)
+ - computes Live HeadCount (currently present using region_clients live details)
+ - classifies personnel according to your rules
+ - returns overall + per-location summaries and percentages vs CCURE active counts
+"""
+
+import re
+import traceback
+from datetime import date, datetime
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+import numpy as np
+import logging
+
+logger = logging.getLogger("ccure_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, AttendanceSummary
+from settings import OUTPUT_DIR
+
+# ---------- small helpers ----------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+def _sanitize_for_json(value):
+    try:
+        import pandas as _pd, numpy as _np
+    except Exception:
+        _pd = None
+        _np = None
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if _np is not None and not _np.isfinite(value):
+            return None
+        return float(value)
+    if _np is not None and isinstance(value, (_np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- personnel classification per your rules -------------------------
+
+def classify_personnel_from_detail(detail: dict) -> str:
+    """
+    Return "employee" or "contractor" according to rules:
+      - if PersonnelType contains 'employee' -> employee
+      - if any status or personnel string contains 'terminated' -> employee
+      - if PersonnelType contains 'contractor' or 'visitor' or 'property' or 'temp' -> contractor
+      - if None or unknown -> contractor (as requested)
+    """
+    try:
+        if not isinstance(detail, dict):
+            return "contractor"
+        # check personnel type fields (many variants)
+        candidate_keys = [
+            "PersonnelType", "personnelType", "personnel_type", "Personnel Type",
+            "PersonnelTypeName", "Personnel", "Type", "personnel", "PersonType", "personType"
+        ]
+        val = None
+        for k in candidate_keys:
+            if k in detail and detail.get(k) is not None:
+                val = str(detail.get(k)).strip().lower()
+                break
+        # check status fields too
+        status_keys = ["Employee_Status", "Employee Status", "Status", "Profile_Disabled"]
+        status_val = None
+        for k in status_keys:
+            if k in detail and detail.get(k) is not None:
+                status_val = str(detail.get(k)).strip().lower()
+                break
+
+        # apply mapping rules
+        if status_val is not None and "terminated" in status_val:
+            return "employee"
+        if val is None or val == "":
+            # user requested None -> treat as contractor
+            return "contractor"
+        # normalized checks
+        if "employee" in val:
+            return "employee"
+        if "terminated" in val:
+            return "employee"
+        # contractor-like terms (explicit list)
+        contractor_terms = ["contractor", "visitor", "property", "property management", "temp", "temp badge", "tempbadge"]
+        for t in contractor_terms:
+            if t in val:
+                return "contractor"
+        # fallback: if it contains 'contract' or 'visitor'
+        if "contract" in val or "visitor" in val:
+            return "contractor"
+        # anything unknown: treat as contractor per your rule ("None - as Contractot")
+        return "contractor"
+    except Exception:
+        return "contractor"
+
+def pick_partition_from_detail(detail: dict) -> str:
+    """
+    Try common partition/location fields, fallback to __region or Unknown.
+    """
+    if not isinstance(detail, dict):
+        return "Unknown"
+    for k in ("PartitionName2","PartitionName1","Partition","PartitionName","Region","Location","Site","location_city","Location City"):
+        if k in detail and detail.get(k):
+            try:
+                return str(detail.get(k)).strip()
+            except Exception:
+                continue
+    # fallback to __region if region_clients attached it
+    if "__region" in detail and detail.get("__region"):
+        return str(detail.get("__region")).strip()
+    return "Unknown"
+
+# ---------- compute_visit_averages ------------------------------------------
+
+def compute_visit_averages(timeout: int = 6) -> Dict[str, Any]:
+    """
+    Returns combined statistics:
+      - HeadCount (AttendanceSummary for today) totals & location-wise breakdown
+      - Live HeadCount (currently present from region_clients.details) totals & location-wise breakdown
+      - CCURE active counts (reported + derived)
+      - Percentages computed both ways (HeadCount vs CCURE, Live vs CCURE)
+    """
+    notes = []
+    today = date.today()
+
+    # 1) HeadCount (Total visited today) - use AttendanceSummary
+    head_total = 0
+    head_per_location = {}  # location -> {"total":n, "employee":n, "contractor":n}
+    try:
+        session = SessionLocal()
+        att_rows = session.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+        # build quick mapping sets for local sheets
+        emp_rows = session.query(ActiveEmployee).all()
+        contr_rows = session.query(ActiveContractor).all()
+        emp_id_set = set()
+        contr_id_set = set()
+        # ActiveEmployee employee_id mapping
+        for e in emp_rows:
+            v = _normalize_employee_key(getattr(e, "employee_id", None))
+            if v:
+                emp_id_set.add(v)
+        # ActiveContractor primary id mapping (worker_system_id/ipass)
+        for c in contr_rows:
+            wid = _normalize_employee_key(getattr(c, "worker_system_id", None))
+            ip = _normalize_employee_key(getattr(c, "ipass_id", None))
+            primary = wid or ip
+            if primary:
+                contr_id_set.add(primary)
+        # process attendance summary rows
+        if att_rows:
+            for a in att_rows:
+                # attendance employee_id is a key (employee_id or card)
+                key = _normalize_employee_key(a.employee_id)
+                # derived partition stored in derived JSON (if created by compute_daily_attendance)
+                partition = None
+                try:
+                    if a.derived and isinstance(a.derived, dict):
+                        partition = a.derived.get("partition")
+                except Exception:
+                    partition = None
+                loc = partition or "Unknown"
+                loc = loc if isinstance(loc, str) and loc.strip() else "Unknown"
+                # ensure structure
+                if loc not in head_per_location:
+                    head_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                # count presence (presence_count > 0 means visited today)
+                if (a.presence_count or 0) > 0:
+                    head_total += 1
+                    head_per_location[loc]["total"] += 1
+                    # classify by matching keys to sheet lists
+                    classified = None
+                    if key and key in emp_id_set:
+                        classified = "employee"
+                    elif key and key in contr_id_set:
+                        classified = "contractor"
+                    else:
+                        # fallback to card_number in derived
+                        card = None
+                        try:
+                            if a.derived and isinstance(a.derived, dict):
+                                card = a.derived.get("card_number")
+                        except Exception:
+                            card = None
+                        card_norm = _normalize_card_like(card)
+                        if card_norm:
+                            # if card matches any contractor ipass or active employee card data - we would need extra mapping
+                            # but in absence, treat unknown as contractor per your rule
+                            classified = "contractor"
+                        else:
+                            # default: treat unknown as contractor per your instruction
+                            classified = "contractor"
+                    head_per_location[loc][classified] += 1
+        session.expunge_all()
+    except Exception:
+        logger.exception("Error computing HeadCount (AttendanceSummary)")
+        notes.append("Failed to compute HeadCount from AttendanceSummary; results incomplete.")
+        head_total = head_total or 0
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # 2) Live HeadCount (currently present) - use region_clients.fetch_all_details() + fetch_all_regions()
+    live_total = 0
+    live_per_location = {}  # loc -> {"total":n, "employee":n, "contractor":n}
+    sites_queried = 0
+    try:
+        import region_clients
+        # region totals (counts) and details list
+        regions_info = []
+        try:
+            if hasattr(region_clients, "fetch_all_regions"):
+                regions_info = region_clients.fetch_all_regions() or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_regions failed")
+        details = []
+        try:
+            if hasattr(region_clients, "fetch_all_details"):
+                details = region_clients.fetch_all_details() or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_details failed")
+            details = []
+
+        # compute sites_queried and live_total from regions_info when available
+        sites_queried = len(regions_info) if isinstance(regions_info, list) else 0
+        if regions_info and isinstance(regions_info, list):
+            for r in regions_info:
+                try:
+                    c = r.get("count") if isinstance(r, dict) else None
+                    ci = _safe_int(c)
+                    if ci is not None:
+                        live_total += int(ci)
+                except Exception:
+                    continue
+
+        # classify each detail item and group by partition
+        if details and isinstance(details, list) and len(details) > 0:
+            # If region totals were missing above (live_total == 0), we sum details.
+            derived_detail_sum = 0
+            for d in details:
+                try:
+                    loc = pick_partition_from_detail(d) or "Unknown"
+                    if not isinstance(loc, str) or not loc.strip():
+                        loc = "Unknown"
+                    pclass = classify_personnel_from_detail(d)  # "employee" or "contractor"
+                    # increment
+                    if loc not in live_per_location:
+                        live_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                    live_per_location[loc]["total"] += 1
+                    live_per_location[loc][pclass] += 1
+                    derived_detail_sum += 1
+                except Exception:
+                    continue
+            # if region_info totals were zero or inconsistent, prefer details sum for overall live_total
+            if live_total == 0 and derived_detail_sum > 0:
+                live_total = derived_detail_sum
+            else:
+                # If both exist and mismatch, keep region_info totals as authoritative for overall number,
+                # but the per-location breakdown comes from details.
+                if live_total != derived_detail_sum:
+                    notes.append(f"Region totals ({live_total}) differ from detail rows ({derived_detail_sum}); using region totals for overall and details for breakdown.")
+        else:
+            # no details available -> fall back to region totals only
+            notes.append("No per-person details available from region_clients; live breakdown by location is unavailable.")
+    except Exception:
+        logger.exception("Error computing Live HeadCount")
+        notes.append("Failed to compute Live HeadCount from region_clients.")
+        live_total = live_total or 0
+
+    # 3) CCURE counts (reported + derived)
+    reported_active_emps = None
+    reported_active_contractors = None
+    derived_active_emps = None
+    derived_active_contractors = None
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            stats = ccure_client.get_global_stats()
+            if isinstance(stats, dict):
+                reported_active_emps = _safe_int(stats.get("ActiveEmployees"))
+                reported_active_contractors = _safe_int(stats.get("ActiveContractors"))
+    except Exception:
+        logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+    # try derived from profiles if available (best-effort)
+    try:
+        profiles = []
+        try:
+            if hasattr(ccure_client, "fetch_all_employees_full"):
+                profiles = ccure_client.fetch_all_employees_full() or []
+            elif hasattr(ccure_client, "fetch_all_employees"):
+                profiles = ccure_client.fetch_all_employees() or []
+        except Exception:
+            profiles = []
+        if isinstance(profiles, list) and len(profiles) > 0:
+            ecount = 0
+            ccount = 0
+            for p in profiles:
+                try:
+                    if not isinstance(p, dict):
+                        continue
+                    # personnel type detection
+                    pt = None
+                    for k in ("PersonnelType","personnelType","Personnel","Type"):
+                        if k in p and p.get(k):
+                            pt = str(p.get(k)).strip().lower()
+                            break
+                    st = None
+                    for k in ("Employee_Status","Employee Status","Status","Profile_Disabled"):
+                        if k in p and p.get(k) is not None:
+                            st = p.get(k)
+                            break
+                    active_flag = None
+                    if isinstance(st, bool):
+                        # if Profile_Disabled boolean present: False -> active
+                        active_flag = (st is False)
+                    elif isinstance(st, str):
+                        active_flag = (str(st).strip().lower() == "active")
+                    # classification
+                    if pt and active_flag:
+                        if "employee" in pt or "terminated" in pt:
+                            ecount += 1
+                        elif "contractor" in pt or "visitor" in pt or "temp" in pt or "property" in pt:
+                            ccount += 1
+                except Exception:
+                    continue
+            if (ecount + ccount) > 0:
+                derived_active_emps = int(ecount)
+                derived_active_contractors = int(ccount)
+    except Exception:
+        logger.debug("ccure profile derivation failed", exc_info=True)
+
+    # 4) compute percentages both ways: HeadCount vs CCURE, Live vs CCURE
+    def safe_pct(n, denom):
+        try:
+            if n is None or denom is None:
+                return None
+            d = float(denom)
+            if d == 0:
+                return None
+            return round((float(n) / d) * 100.0, 2)
+        except Exception:
+            return None
+
+    # pick ccure denominators (prefer reported else derived)
+    cc_emp_denom = reported_active_emps if reported_active_emps is not None else derived_active_emps
+    cc_con_denom = reported_active_contractors if reported_active_contractors is not None else derived_active_contractors
+    cc_total_denom = None
+    if isinstance(cc_emp_denom, int) and isinstance(cc_con_denom, int):
+        cc_total_denom = cc_emp_denom + cc_con_denom
+
+    # headcount totals for employee/contractor across locations
+    head_emp_total = sum(loc_stats.get("employee", 0) for loc_stats in head_per_location.values())
+    head_con_total = sum(loc_stats.get("contractor", 0) for loc_stats in head_per_location.values())
+    # live totals for employee/contractor across locations (prefer per-location sum if available)
+    live_emp_total = sum(loc_stats.get("employee", 0) for loc_stats in live_per_location.values())
+    live_con_total = sum(loc_stats.get("contractor", 0) for loc_stats in live_per_location.values())
+
+    result = {
+        "date": today.isoformat(),
+        "headcount": {
+            "total_visited_today": int(head_total),
+            "employee": int(head_emp_total),
+            "contractor": int(head_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in head_per_location.items() }
+        },
+        "live_headcount": {
+            "currently_present_total": int(live_total),
+            "employee": int(live_emp_total),
+            "contractor": int(live_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in live_per_location.items() }
+        },
+        "ccure_active": {
+            "active_employees_reported": _safe_int(reported_active_emps),
+            "active_contractors_reported": _safe_int(reported_active_contractors),
+            "derived_active_employees_from_profiles": _safe_int(derived_active_emps),
+            "derived_active_contractors_from_profiles": _safe_int(derived_active_contractors)
+        },
+        "averages": {
+            # HeadCount-based percentages (HeadCount / CCURE)
+            "headcount_employee_pct_vs_ccure": _sanitize_for_json(safe_pct(head_emp_total, cc_emp_denom)),
+            "headcount_contractor_pct_vs_ccure": _sanitize_for_json(safe_pct(head_con_total, cc_con_denom)),
+            "headcount_overall_pct_vs_ccure": _sanitize_for_json(safe_pct(head_total, cc_total_denom)),
+            # Live-based percentages (Live / CCURE)
+            "live_employee_pct_vs_ccure": _sanitize_for_json(safe_pct(live_emp_total, cc_emp_denom)),
+            "live_contractor_pct_vs_ccure": _sanitize_for_json(safe_pct(live_con_total, cc_con_denom)),
+            "live_overall_pct_vs_ccure": _sanitize_for_json(safe_pct(live_total, cc_total_denom)),
+            # average per site numbers
+            "avg_headcount_per_site": _sanitize_for_json(round(head_total / sites_queried, 2) if sites_queried and sites_queried > 0 else None),
+            "avg_live_per_site": _sanitize_for_json(round(live_total / sites_queried, 2) if sites_queried and sites_queried > 0 else None)
+        },
+        "sites_queried": int(sites_queried),
+        "notes": " | ".join(notes) if notes else None
+    }
+
+    return _sanitize_for_json(result)
+
+
+
+
+
+
+
+
+
+
+
+
 http://localhost:8000/ccure/averages
 
 {
