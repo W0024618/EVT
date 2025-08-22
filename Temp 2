@@ -1,3 +1,503 @@
+# ccure_compare_service.py
+"""
+Compare CCURE profiles/stats with local sheets + compute visit averages.
+
+Provides:
+ - compare_ccure_vs_sheets(...)  (existing compare endpoint)
+ - compute_visit_averages(timeout=6)  (used by /ccure/averages)
+"""
+
+import os
+import re
+import uuid
+import traceback
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+import numpy as np
+import logging
+
+logger = logging.getLogger("ccure_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+from settings import OUTPUT_DIR
+
+# ---------- small helpers ----------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        normalized = digits.lstrip('0') or digits
+        return normalized
+    except Exception:
+        return None
+
+def _normalize_name(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+def _sanitize_for_json(value):
+    """VERY conservative JSON sanitizer to avoid NaN / numpy types / timestamps."""
+    try:
+        import pandas as _pd
+        import numpy as _np
+    except Exception:
+        _pd = None
+        _np = None
+
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if _np is not None and not _np.isfinite(value):
+            return None
+        return float(value)
+    if _np is not None and isinstance(value, (_np.integer,)):
+        return int(value)
+    if _np is not None and isinstance(value, (_np.floating,)):
+        v = float(value)
+        if not _np.isfinite(v):
+            return None
+        return v
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            try:
+                key = str(k)
+            except Exception:
+                key = repr(k)
+            out[key] = _sanitize_for_json(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- CCURE wrappers --------------------------------------------------
+
+def _fetch_ccure_stats() -> Optional[Dict[str, Any]]:
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            return ccure_client.get_global_stats()
+    except Exception:
+        logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+        return None
+    return None
+
+def _fetch_ccure_profiles() -> List[Dict[str, Any]]:
+    """Try to fetch full profiles list if ccure_client exposes a method."""
+    try:
+        import ccure_client
+        # earlier implementations provide fetch_all_employees_full() or fetch_all_employees()
+        for fn in ("fetch_all_employees_full", "fetch_all_employees", "fetch_all_profiles", "fetch_profiles", "fetch_all"):
+            if hasattr(ccure_client, fn):
+                try:
+                    res = getattr(ccure_client, fn)()
+                    if isinstance(res, list):
+                        return res
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return []
+
+# ---------- region client usage ---------------------------------------------
+
+def _fetch_live_region_summary(timeout: int = 6):
+    """
+    Uses region_clients.fetch_all_regions() and fetch_all_details() (best-effort).
+    Returns (regions_info_list, details_list)
+    """
+    try:
+        import region_clients
+    except Exception:
+        logger.debug("region_clients not available", exc_info=True)
+        return [], []
+
+    regions_info = []
+    details = []
+    try:
+        if hasattr(region_clients, "fetch_all_regions"):
+            regions_info = region_clients.fetch_all_regions()
+    except Exception:
+        logger.exception("fetch_all_regions failed")
+
+    try:
+        if hasattr(region_clients, "fetch_all_details"):
+            details = region_clients.fetch_all_details()
+    except Exception:
+        logger.exception("fetch_all_details failed")
+
+    return regions_info or [], details or []
+
+# ---------- compute_visit_averages ------------------------------------------
+
+def compute_visit_averages(timeout: int = 6) -> Dict[str, Any]:
+    """
+    Returns a JSON-safe dict:
+    {
+      "live_today": {"employee": int, "contractor": int, "unknown": int, "total": int},
+      "ccure_active": {"active_employees_reported": int|None, "active_contractors_reported": int|None,
+                       "derived_active_employees": int|None, "derived_active_contractors": int|None},
+      "averages": {"employee_pct": float|None, "contractor_pct": float|None, "overall_pct": float|None, "avg_per_site": float|None},
+      "sites_queried": int,
+      "notes": "..."
+    }
+    """
+    notes = []
+    # 1) live summary from region_clients
+    regions_info, details = _fetch_live_region_summary(timeout=timeout)
+
+    sites_queried = 0
+    live_total = 0
+    try:
+        # regions_info expected: [{"region": "namer", "count": 123}, ...]
+        sites_queried = len(regions_info)
+        for r in regions_info:
+            try:
+                c = r.get("count") if isinstance(r, dict) else None
+                if c is None:
+                    continue
+                ci = _safe_int(c)
+                if ci is None:
+                    continue
+                live_total += int(ci)
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("Error computing live_total from regions_info")
+
+    # 2) try to classify details into employee/contractor/unknown
+    live_emp = 0
+    live_contractor = 0
+    live_unknown = 0
+
+    if isinstance(details, list) and len(details) > 0:
+        for d in details:
+            try:
+                if not isinstance(d, dict):
+                    live_unknown += 1
+                    continue
+                # possible keys containing personnel type
+                candidate_keys = [
+                    "PersonnelType", "personnelType", "personnel_type", "Personnel Type",
+                    "PersonnelTypeName", "Personnel", "Type", "personnel", "PersonType", "personType"
+                ]
+                found = None
+                for k in candidate_keys:
+                    if k in d and d.get(k) is not None:
+                        found = str(d.get(k)).strip()
+                        break
+                if not found:
+                    # some live-summary detail items may carry "personnelType" nested or 'Personnel' under different casing
+                    # try scanning all string values for the words 'employee' or 'contractor'
+                    looked = False
+                    for v in d.values():
+                        if isinstance(v, str):
+                            sv = v.strip().lower()
+                            if "employee" in sv or "contractor" in sv:
+                                found = v
+                                looked = True
+                                break
+                    if not looked:
+                        found = None
+
+                if found:
+                    low = found.strip().lower()
+                    if "employee" in low:
+                        live_emp += 1
+                    elif "contractor" in low:
+                        live_contractor += 1
+                    else:
+                        live_unknown += 1
+                else:
+                    # fallback: try to use presence of employee id or worker id fields
+                    if any(k in d for k in ("EmployeeID","employee_id","EmpID","Worker System Id","Worker System ID","worker_system_id")):
+                        # ambiguous, but treat as employee by default if we see EmployeeID
+                        # if it looks like a contractor id (prefix W or such) we'd need more logic; keep unknown
+                        live_unknown += 1
+                    else:
+                        live_unknown += 1
+            except Exception:
+                live_unknown += 1
+    else:
+        notes.append("No 'details' available from region_clients; only total counts used (breakdown unknown).")
+
+    # If the details-based total differs from the regions_info total, we keep both but prefer region total for overall
+    # if details classified sum > 0 we compute derived_total_details
+    derived_details_total = live_emp + live_contractor + live_unknown
+    if derived_details_total > 0 and live_total != derived_details_total:
+        notes.append(f"Region totals ({live_total}) differ from classified detail rows ({derived_details_total}). Using region totals for overall counts and details for breakdown where available.")
+
+    # If details unavailable, attempt to estimate breakdown proportionally using CCURE reported counts (as fallback)
+    ccure_stats = _fetch_ccure_stats()
+    reported_active_emps = None
+    reported_active_contractors = None
+    if isinstance(ccure_stats, dict):
+        reported_active_emps = _safe_int(ccure_stats.get("ActiveEmployees"))
+        reported_active_contractors = _safe_int(ccure_stats.get("ActiveContractors"))
+
+    # Also try deriving active counts from profiles if accessible
+    derived_active_emps = None
+    derived_active_contractors = None
+    try:
+        profiles = _fetch_ccure_profiles()
+        if isinstance(profiles, list) and len(profiles) > 0:
+            # scan profiles
+            emp_count = 0
+            contractor_count = 0
+            for p in profiles:
+                try:
+                    if not isinstance(p, dict):
+                        continue
+                    # detect personnel type
+                    pt = None
+                    for k in ("PersonnelType","personnelType","Personnel","Type"):
+                        if k in p and p.get(k):
+                            pt = str(p.get(k)).strip().lower()
+                            break
+                    # detect status
+                    st = None
+                    for k in ("Employee_Status","Employee Status","Status","Profile_Disabled"):
+                        if k in p and p.get(k) is not None:
+                            st = p.get(k)
+                            break
+                    active = None
+                    if isinstance(st, bool):
+                        active = (not st) if isinstance(st, bool) else None  # handle Profile_Disabled boolean patterns (if Profile_Disabled False -> active)
+                        # but because sources differ, we'll not rely solely on this
+                    elif isinstance(st, str):
+                        s = st.strip().lower()
+                        active = (s == "active")
+                    else:
+                        active = None
+                    if pt and active:
+                        if pt.startswith("employee"):
+                            emp_count += 1
+                        elif pt.startswith("contractor"):
+                            contractor_count += 1
+                except Exception:
+                    continue
+            if emp_count + contractor_count > 0:
+                derived_active_emps = int(emp_count)
+                derived_active_contractors = int(contractor_count)
+    except Exception:
+        logger.exception("Fetching/deriving profiles failed")
+
+    # If we have no detail breakdown but have region total and ccure counts -> estimate breakdown:
+    if derived_details_total == 0 and live_total and (reported_active_emps or reported_active_contractors):
+        # allocate proportionally using reported CCURE active counts
+        re = reported_active_emps or 0
+        rc = reported_active_contractors or 0
+        denom = (re + rc) or None
+        if denom and denom > 0:
+            try:
+                prop_e = float(re) / float(denom)
+                prop_c = float(rc) / float(denom)
+                est_emp = int(round(live_total * prop_e))
+                est_contractor = int(round(live_total * prop_c))
+                # avoid overshoot
+                if est_emp + est_contractor != live_total:
+                    # adjust by difference
+                    diff = live_total - (est_emp + est_contractor)
+                    est_emp += diff  # put remainder to employees (arbitrary but deterministic)
+                live_emp = est_emp
+                live_contractor = est_contractor
+                live_unknown = 0
+                notes.append("No per-person 'details' available; breakdown estimated proportionally from CCURE reported active counts.")
+            except Exception:
+                notes.append("Failed to estimate breakdown from CCURE counts.")
+        else:
+            notes.append("No per-person details and insufficient CCURE counts to estimate employee/contractor breakdown.")
+
+    # Now compute percentages (safe math)
+    def safe_pct(n, denom):
+        try:
+            if n is None or denom is None:
+                return None
+            dn = float(denom)
+            if dn == 0:
+                return None
+            return round((float(n) / dn) * 100.0, 2)
+        except Exception:
+            return None
+
+    # overall denominator (ccure reported active total prefer reported then derived)
+    cc_emp = reported_active_emps
+    cc_con = reported_active_contractors
+    if cc_emp is None or cc_con is None:
+        # try derived
+        if derived_active_emps is not None and derived_active_contractors is not None:
+            cc_emp = derived_active_emps if cc_emp is None else cc_emp
+            cc_con = derived_active_contractors if cc_con is None else cc_con
+
+    denom_all = None
+    if cc_emp is not None and cc_con is not None:
+        denom_all = (cc_emp + cc_con) if (isinstance(cc_emp, int) and isinstance(cc_con, int)) else None
+
+    employee_pct = safe_pct(live_emp, cc_emp) if cc_emp is not None else None
+    contractor_pct = safe_pct(live_contractor, cc_con) if cc_con is not None else None
+    overall_pct = safe_pct(live_total, denom_all) if denom_all is not None else None
+
+    avg_per_site = None
+    try:
+        if sites_queried and sites_queried > 0:
+            avg_per_site = round(float(live_total) / float(sites_queried), 2)
+    except Exception:
+        avg_per_site = None
+
+    # Build result dict
+    result = {
+        "live_today": {
+            "employee": int(live_emp),
+            "contractor": int(live_contractor),
+            "unknown": int(live_unknown),
+            "total": int(live_total)
+        },
+        "ccure_active": {
+            "active_employees_reported": _safe_int(reported_active_emps),
+            "active_contractors_reported": _safe_int(reported_active_contractors),
+            "derived_active_employees_from_profiles": _safe_int(derived_active_emps),
+            "derived_active_contractors_from_profiles": _safe_int(derived_active_contractors)
+        },
+        "averages": {
+            "employee_pct": _sanitize_for_json(employee_pct),
+            "contractor_pct": _sanitize_for_json(contractor_pct),
+            "overall_pct": _sanitize_for_json(overall_pct),
+            "avg_per_site": _sanitize_for_json(avg_per_site)
+        },
+        "sites_queried": int(sites_queried),
+        "notes": " | ".join(notes) if notes else None
+    }
+
+    return _sanitize_for_json(result)
+
+
+# ---------- compare function (kept minimal here, you can extend) -------------
+
+def compare_ccure_vs_sheets(mode: str = "full", stats_detail: str = "ActiveProfiles", limit_list: int = 200, export: bool = False) -> Dict[str, Any]:
+    """
+    Lightweight wrapper that uses previous logic - if you already have a longer implementation, keep that.
+    For now this function attempts to load ccure stats and sheet counts and returns basic diffs + samples.
+    """
+
+    try:
+        session = SessionLocal()
+    except Exception as e:
+        return {"error": f"DB session failed: {e}", "trace": traceback.format_exc()}
+
+    # build sheet counts
+    try:
+        act_rows = session.query(ActiveEmployee).all()
+        contractor_rows = session.query(ActiveContractor).all()
+        sheet_emp_count = len(act_rows)
+        sheet_contractor_count = len(contractor_rows)
+    except Exception as e:
+        session.close()
+        return {"error": f"Failed to read sheets: {e}", "trace": traceback.format_exc()}
+
+    ccure_stats = _fetch_ccure_stats()
+    ccure_profile_count = None
+    if isinstance(ccure_stats, dict) and ccure_stats.get("TotalProfiles") is not None:
+        try:
+            ccure_profile_count = int(ccure_stats.get("TotalProfiles"))
+        except Exception:
+            ccure_profile_count = None
+
+    # Basic difference summary
+    reported_active_emps = None
+    reported_active_contractors = None
+    if isinstance(ccure_stats, dict):
+        reported_active_emps = _safe_int(ccure_stats.get("ActiveEmployees"))
+        reported_active_contractors = _safe_int(ccure_stats.get("ActiveContractors"))
+
+    diff = {
+        "sheet_counts": {
+            "employees": int(sheet_emp_count),
+            "contractors": int(sheet_contractor_count),
+            "total_profiles": int(sheet_emp_count + sheet_contractor_count)
+        },
+        "ccure": ccure_stats,
+        "ccure_profile_count": _safe_int(ccure_profile_count),
+        "differences": {
+            "ccure_active_employees": _safe_int(reported_active_emps),
+            "ccure_active_contractors": _safe_int(reported_active_contractors),
+            "delta_employees": (reported_active_emps - sheet_emp_count) if (isinstance(reported_active_emps, int) and isinstance(sheet_emp_count, int)) else None,
+            "delta_contractors": (reported_active_contractors - sheet_contractor_count) if (isinstance(reported_active_contractors, int) and isinstance(sheet_contractor_count, int)) else None
+        },
+        "samples": {
+            "in_ccure_employees_not_in_sheet": [],
+            "in_ccure_contractors_not_in_sheet": []
+        }
+    }
+
+    session.close()
+    return _sanitize_for_json(diff)
+
+
+
+
+
+
+
+http://localhost:8000/ccure/averages
+
+
+
+
+
+
+
+
 Calculate Average and percentage initailly and give me correct API responece
 
 C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
