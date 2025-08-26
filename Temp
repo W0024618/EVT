@@ -1,3 +1,1061 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+
+# --- DB / models imports (your existing project modules) ---
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+# optional: ccure compare service and others are imported inside endpoints when needed
+
+# --- settings (assumes these exist in your project) ---
+try:
+    from settings import UPLOAD_DIR, OUTPUT_DIR
+except Exception:
+    # fallback defaults
+    UPLOAD_DIR = "./uploads"
+    OUTPUT_DIR = "./output"
+
+# --- app & logging setup ---
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# ------------------------------------------------------------------
+# Small SSE broadcaster (in-process). Minimal, works for single-process deployments.
+# Each connected client gets its own asyncio.Queue; we push payloads to all queues.
+# ------------------------------------------------------------------
+_broadcaster_clients = set()  # set of asyncio.Queue
+
+def broadcast_ccure_update(payload: dict):
+    """
+    Non-blocking broadcast to all connected SSE clients.
+    Uses asyncio.get_event_loop().call_soon_threadsafe to schedule queue.put_nowait
+    so it is safe to call from sync endpoints.
+    """
+    if not _broadcaster_clients:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # no running loop (shouldn't happen in normal uvicorn) - try to schedule via new loop
+        loop = None
+
+    for q in list(_broadcaster_clients):
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                # fallback: attempt put_nowait (may raise)
+                q.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to push payload to SSE client (will remove client)")
+            try:
+                _broadcaster_clients.discard(q)
+            except Exception:
+                pass
+
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    """
+    Async generator yielding SSE data lines from provided queue.
+    The generator will exit when client disconnects and finally block will allow cleanup.
+    """
+    try:
+        # Keep yielding as items arrive
+        while True:
+            payload = await client_queue.get()
+            # send JSON payload as a single SSE "data:" event
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                # fallback if non-serializable
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            yield f"data: {data}\n\n"
+    finally:
+        # cleanup of queue is handled by the endpoint wrapper
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    """
+    SSE endpoint that streams ccure/averages updates.
+    Frontend should connect to '/api/ccure/stream' (vite proxy routes to /ccure/stream).
+    """
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    generator = _sse_event_generator(q)
+
+    async def cleanup():
+        try:
+            _broadcaster_clients.discard(q)
+        except Exception:
+            pass
+
+    # StreamingResponse will iterate the async generator and keep connection open
+    response = StreamingResponse(generator, media_type="text/event-stream")
+    # When the response is finished/closed, ensure the queue is removed
+    # There is no direct callback here; but the generator's finally will be called on disconnect;
+    # ensure queue removal as well (best-effort)
+    # return response (queue removal occurs in generator finally / broadcast failure handlers)
+    return response
+
+# ------------------------------------------------------------------
+# Helper functions (normalizers / region guesser)
+# ------------------------------------------------------------------
+def _guess_region_from_text(txt: str) -> str:
+    """Return 'apac','emea','laca','namer' or 'unknown' using substring keywords."""
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    # APAC keywords
+    if any(k in s for k in ("pune","mumbai","bangalore","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    # EMEA keywords
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    # LACA keywords
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    # NAMER keywords
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+# ------------------------------------------------------------------
+# HEADCOUNT endpoint (exact '/headcount' path) - unchanged logic
+# ------------------------------------------------------------------
+@app.get("/headcount")
+def api_headcount():
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        with SessionLocal() as db:
+            try:
+                emp_rows = db.query(ActiveEmployee).all()
+            except Exception:
+                logger.exception("Failed to query ActiveEmployee")
+                emp_rows = []
+            try:
+                contr_rows = db.query(ActiveContractor).all()
+            except Exception:
+                logger.exception("Failed to query ActiveContractor")
+                contr_rows = []
+
+            def _loc_from_employee(e):
+                return getattr(e, "location_city", None) or getattr(e, "location", None) or getattr(e, "Location", None)
+
+            def _loc_from_contractor(c):
+                return getattr(c, "location", None) or getattr(c, "location_city", None) or getattr(c, "Location", None)
+
+            for e in emp_rows:
+                loc = _loc_from_employee(e)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+            for c in contr_rows:
+                loc = _loc_from_contractor(c)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# ------------------------------------------------------------------
+# Build ccure averages payload (extracted helper)
+# ------------------------------------------------------------------
+def build_ccure_averages():
+    """
+    Builds the payload dictionary that /ccure/averages returns.
+    This code mirrors the previous /ccure/averages handler (kept intact) but returns a dict.
+    """
+    try:
+        today = date.today()
+
+        with SessionLocal() as db:
+            # Fetch AttendanceSummary rows for today
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            # Build active employee and contractor id sets
+            active_employee_ids = set()
+            active_contractor_primary_ids = set()
+
+            try:
+                emps = db.query(ActiveEmployee).all()
+                for e in emps:
+                    if getattr(e, "employee_id", None):
+                        active_employee_ids.add(str(e.employee_id).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveEmployee rows")
+
+            try:
+                contrs = db.query(ActiveContractor).all()
+                for c in contrs:
+                    primary = getattr(c, "worker_system_id", None) or getattr(c, "ipass_id", None) or getattr(c, "worker_id", None)
+                    if primary:
+                        active_contractor_primary_ids.add(str(primary).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveContractor rows")
+
+            # Map attendance keys -> employee/contractor counts.
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+            for a in att_rows:
+                key = (a.employee_id or "").strip() if a.employee_id else None
+                if not key:
+                    try:
+                        key = (a.derived.get('card_number') or "").strip() if (a.derived and isinstance(a.derived, dict)) else None
+                    except Exception:
+                        key = None
+                if not key:
+                    unknown_count += 1
+                    continue
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if key in active_employee_ids:
+                    live_emp += 1
+                elif key in active_contractor_primary_ids:
+                    live_contr += 1
+                else:
+                    numeric = re.sub(r'\D+', '', key)
+                    if numeric:
+                        if numeric in active_employee_ids or numeric.lstrip('0') in active_employee_ids:
+                            live_emp += 1
+                        elif numeric in active_contractor_primary_ids or numeric.lstrip('0') in active_contractor_primary_ids:
+                            live_contr += 1
+                        else:
+                            unknown_count += 1
+                    else:
+                        unknown_count += 1
+
+            live_total_reported = live_emp + live_contr + unknown_count
+            live_total_details = len(att_rows)
+
+            # 7-day average headcount (unique keys present per day)
+            try:
+                start_7 = today - timedelta(days=6)
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_7, AttendanceSummary.date <= today).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                daily_counts = [len(by_date.get(start_7 + timedelta(days=i), set())) for i in range(7)]
+                avg7 = int(round(sum(daily_counts) / 7.0)) if any(daily_counts) else 0
+            except Exception:
+                logger.exception("Failed computing 7-day average")
+                avg7 = None
+
+        # get CCURE stats if available
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        # percentages vs CCURE
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg7,
+                # backwards-compat fields UI may use
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg7
+            }
+        }
+
+        return resp
+    except Exception:
+        logger.exception("build_ccure_averages failed")
+        raise
+
+# ------------------------------------------------------------------
+# /ccure/averages endpoint - uses helper and broadcasts to SSE clients
+# ------------------------------------------------------------------
+@app.get("/ccure/averages")
+def ccure_averages():
+    """
+    Returns the ccure averages payload and broadcasts to connected SSE clients.
+    """
+    try:
+        resp = build_ccure_averages()
+        # broadcast to SSE clients (best-effort; non-blocking)
+        try:
+            broadcast_ccure_update(resp)
+        except Exception:
+            logger.exception("broadcast failed in /ccure/averages (non-fatal)")
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("ccure_averages failed")
+        raise HTTPException(status_code=500, detail=f"ccure averages error: {exc}")
+
+# ------------------------------------------------------------------
+# The rest of your existing endpoints (compare, upload, ingest, reports)
+# Minor change: after ingest_live successfully ingests, compute & broadcast new ccure averages
+# ------------------------------------------------------------------
+
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(full),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=safe_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    # After upload/ingest, try to broadcast updated averages (best-effort)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_employees")
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_contractors")
+    return {"status":"ok", "path": str(dest)}
+
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    """
+    Accepts:
+      - Raw JSON array in body (preferred)
+      - JSON object with {"details": [...]} in body
+      - multipart/form-data where a form field 'details' contains a JSON string
+    """
+    details = None
+    # Try direct JSON
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        # not JSON, try form
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                # attempt first field
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    try:
+        res = ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    # After successful ingest, recompute/broadcast ccure averages (best-effort)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after ingest_live (non-fatal)")
+
+    if isinstance(res, dict):
+        return {"status": "ok", **res}
+    return {"status": "ok", "inserted": len(details)}
+
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    res = ingest_live_details_list(details)
+    # broadcast
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after fetch-all")
+    if isinstance(res, dict):
+        return {"status":"ok", **res}
+    return {"status":"ok", "inserted": len(details)}
+
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+
+    try:
+        from compare_service import compute_daily_attendance, compare_with_active
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    # compute attendance summary (will build attendance_summary rows)
+    compute_daily_attendance(dt)
+
+    # compare vs active and CCURE
+    summary = compare_with_active(dt)
+
+    # broadcast new averages (best-effort)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after daily_report")
+
+    return JSONResponse(summary)
+
+
+# additional endpoint to fetch CCure stats directly (optional)
+@app.get("/ccure/stats")
+def ccure_stats():
+    try:
+        import ccure_client
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client import failed: {e}")
+    try:
+        stats = ccure_client.get_global_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client.get_global_stats failed: {e}")
+    return stats
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box, Typography, CircularProgress, IconButton, Button, Paper, Divider,
+  LinearProgress, Snackbar, Alert
+} from '@mui/material';
+import HomeIcon from '@mui/icons-material/Home';
+import DescriptionIcon from '@mui/icons-material/Description';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import MapChart from '../components/MapChart.jsx';
+import api from '../api';
+import { useNavigate, Link } from 'react-router-dom';
+
+/*
+  Important:
+  - Do NOT mix /api/headcount and /api/ccure/averages.
+  - Region cards (APAC/EMEA/LACA/NAMER) come only from /api/headcount.
+  - Live vs CCURE Summary comes only from /api/ccure/averages.
+  - Initial region totals are zero (keeps previous UI behaviour).
+  - We implement polling for headcount and SSE for ccure/averages (realtime via SSE).
+*/
+
+export default function GlobalPage() {
+  const navigate = useNavigate();
+
+  // Region totals (headcount) - default to zeros so UI shows 0 immediately (preserve previous behaviour)
+  const [counts, setCounts] = useState({ apac: 0, emea: 0, laca: 0, namer: 0 });
+  const [selected, setSelected] = useState('global');
+
+  // Averages/ccure state (left panel)
+  const [averages, setAverages] = useState(null);
+  const [loadingAverages, setLoadingAverages] = useState(true);
+  const [averagesError, setAveragesError] = useState(null);
+
+  // upload state
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
+
+  const fileInputEmpRef = useRef();
+  const fileInputContrRef = useRef();
+  const [snack, setSnack] = useState({ open: false, severity: 'info', message: '' });
+
+  // Polling refs for safe scheduling and backoff
+  const headcountRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
+  const averagesRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
+
+  // -----------------------
+  // HEADCOUNT POLLING ONLY (unchanged)
+  // -----------------------
+  useEffect(() => {
+    let mounted = true;
+
+    const fetchHeadcount = async () => {
+      if (!mounted) return;
+      if (headcountRef.current.isFetching) return;
+      headcountRef.current.isFetching = true;
+
+      try {
+        // Important: only call /headcount here (proxy rewrites /api -> backend)
+        const res = await api.get('/headcount');
+        if (!mounted) return;
+        const d = res.data;
+        // We expect an object with keys apac/emea/laca/namer (defensive)
+        if (d && typeof d === 'object') {
+          const newCounts = {
+            apac: Number(d.apac || 0),
+            emea: Number(d.emea || 0),
+            laca: Number(d.laca || 0),
+            namer: Number(d.namer || 0),
+          };
+          setCounts(prev => {
+            if (
+              prev.apac === newCounts.apac &&
+              prev.emea === newCounts.emea &&
+              prev.laca === newCounts.laca &&
+              prev.namer === newCounts.namer
+            ) {
+              return prev;
+            }
+            return newCounts;
+          });
+        } else {
+          console.warn('[headcount] unexpected response shape - ignoring', d);
+        }
+        headcountRef.current.failureCount = 0;
+      } catch (err) {
+        headcountRef.current.failureCount = (headcountRef.current.failureCount || 0) + 1;
+        console.warn('[headcount] fetch failed:', err?.message || err);
+      } finally {
+        headcountRef.current.isFetching = false;
+        const f = headcountRef.current.failureCount || 0;
+        const backoffMs = 15000 * Math.pow(2, Math.min(Math.max(f - 1, 0), 4)); // 15s..240s
+        headcountRef.current.timerId = setTimeout(fetchHeadcount, backoffMs);
+      }
+    };
+
+    fetchHeadcount();
+
+    return () => {
+      mounted = false;
+      if (headcountRef.current.timerId) clearTimeout(headcountRef.current.timerId);
+      headcountRef.current.isFetching = false;
+    };
+  }, []); // run once
+
+  // -----------------------
+  // AVERAGES: use SSE (server-sent events) with fallback initial fetch
+  // -----------------------
+  useEffect(() => {
+    let stopped = false;
+    let es = null;
+    let backoff = 1000;
+
+    const connect = () => {
+      if (stopped) return;
+      try {
+        es = new EventSource('/api/ccure/stream');
+      } catch (err) {
+        console.warn('SSE creation failed', err);
+        es = null;
+      }
+
+      if (!es) {
+        // fallback to polling if EventSource not supported or creation failed
+        initialFetch(); // try initial fetch once
+        return;
+      }
+
+      es.onopen = () => {
+        console.info('[SSE] connected to /api/ccure/stream');
+        backoff = 1000;
+        setAveragesError(null);
+      };
+
+      es.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          setAverages(payload);
+          setLoadingAverages(false);
+          setAveragesError(null);
+        } catch (e) {
+          console.warn('Failed to parse SSE message', e);
+        }
+      };
+
+      es.onerror = (err) => {
+        console.warn('[SSE] error/closed, attempting reconnect', err);
+        try { es.close(); } catch (e) {}
+        es = null;
+        if (stopped) return;
+        // exponential backoff reconnect
+        setTimeout(() => {
+          backoff = Math.min(backoff * 2, 30000);
+          connect();
+        }, backoff);
+      };
+    };
+
+    const initialFetch = async () => {
+      setLoadingAverages(true);
+      setAveragesError(null);
+      try {
+        const res = await api.get('/ccure/averages');
+        setAverages(res.data);
+        setLoadingAverages(false);
+        setAveragesError(null);
+      } catch (err) {
+        console.warn('initial /ccure/averages fetch failed', err);
+        setLoadingAverages(false);
+        setAveragesError(err);
+      }
+    };
+
+    // Start with initial fetch so UI is populated quickly, then open SSE
+    initialFetch();
+    connect();
+
+    return () => {
+      stopped = true;
+      if (es) {
+        try { es.close(); } catch (e) {}
+        es = null;
+      }
+    };
+  }, []); // run once
+
+  // -----------------------
+  // Upload helper (unchanged)
+  // -----------------------
+  const handleUpload = async (file, type) => {
+    if (!file) return;
+    const endpoint = type === 'employee' ? '/upload/active-employees' : '/upload/active-contractors';
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+
+    setUploading(true);
+    setUploadResult(null);
+    setUploadError(null);
+
+    try {
+      const res = await api.post(endpoint, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000
+      });
+      setUploadResult(res.data);
+      setSnack({ open: true, severity: 'success', message: `Upload successful: ${file.name}` });
+      // Optionally re-fetch averages/headcount after successful upload:
+      try { await api.get('/ccure/averages').then(r => setAverages(r.data)); } catch (_) {}
+      try { await api.get('/headcount').then(r => {
+        const d = r.data;
+        if (d && typeof d === 'object') {
+          setCounts(prev => ({
+            apac: Number(d.apac || prev.apac || 0),
+            emea: Number(d.emea || prev.emea || 0),
+            laca: Number(d.laca || prev.laca || 0),
+            namer: Number(d.namer || prev.namer || 0)
+          }));
+        }
+      }) } catch (_) {}
+    } catch (err) {
+      console.error('Upload failed', err);
+      setUploadError(err);
+      setSnack({ open: true, severity: 'error', message: `Upload failed: ${file.name}` });
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const onChooseEmployeeFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'employee'); e.target.value = null; };
+  const onChooseContractorFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'contractor'); e.target.value = null; };
+
+  // safe helper for nested averages paths
+  const safe = (path, fallback = null) => {
+    if (!averages) return fallback;
+    try {
+      return path.split('.').reduce((a, k) => (a && a[k] !== undefined ? a[k] : fallback), averages);
+    } catch {
+      return fallback;
+    }
+  };
+
+  // derived
+  const liveEmployee = safe('live_today.employee', safe('live_headcount.employee', null));
+  const liveContractor = safe('live_today.contractor', safe('live_headcount.contractor', null));
+  const liveTotalReported = safe('live_today.total_reported', safe('live_headcount.currently_present_total', null));
+  const liveTotalDetails = safe('live_today.total_from_details', null);
+
+  const ccureActiveEmployees = safe('ccure_active.active_employees', safe('ccure_active.ccure_active_employees_reported', null));
+  const ccureActiveContractors = safe('ccure_active.active_contractors', safe('ccure_active.ccure_active_contractors_reported', null));
+
+  const empPct = safe('averages.employee_pct', safe('averages.head_emp_pct_vs_ccure_today', null));
+  const conPct = safe('averages.contractor_pct', safe('averages.head_contractor_pct_vs_ccure_today', null));
+  const overallPct = safe('averages.overall_pct', safe('averages.headcount_overall_pct_vs_ccure_today', null));
+  const avg7 = safe('averages.avg_headcount_last_7_days', safe('averages.history_avg_overall_last_7_days', null));
+
+  // Render (unchanged)
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+      {/* Header */}
+      <Box px={2} py={1} sx={{ backgroundColor: 'black', color: '#fff', borderBottom: '4px solid #FFD700', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Box>
+          <IconButton component={Link} to="/" sx={{ color: '#FFC72C' }}><HomeIcon fontSize="medium" /></IconButton>
+          <IconButton component={Link} to="/reports" sx={{ color: '#FFC72C', ml: 1 }}><DescriptionIcon fontSize="medium" /></IconButton>
+        </Box>
+
+        <Box sx={{ flexGrow: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Box component="img" src="/wu-head-logo.png" alt="WU Logo" sx={{ height: { xs: 30, md: 55 }, mr: 2 }} />
+          <Typography variant="h5" sx={{ fontWeight: 'bold', color: 'primary.main' }}>Global Headcount Dashboard</Typography>
+        </Box>
+
+        <Box sx={{ width: 120 }} />
+      </Box>
+
+      {/* Region Cards */}
+      <Box sx={{ display: 'flex', gap: 2, p: 2, flexWrap: 'wrap', justifyContent: 'center' }}>
+        {[
+          { key: 'apac', label: 'APAC', url: 'http://10.199.22.57:3000/', textColor: '#f5650c' },
+          { key: 'emea', label: 'EMEA', url: 'http://10.199.22.57:3001/', textColor: '#11e6ed' },
+          { key: 'laca', label: 'LACA', url: 'http://10.199.22.57:3003/', textColor: '#FF2DD1' },
+          { key: 'namer', label: 'NAMER', url: 'http://10.199.22.57:3002/', textColor: '#a6e61c' },
+        ].map(region => (
+          <Box
+            key={region.key}
+            onClick={() => { window.location.href = region.url; }}
+            sx={{
+              cursor: 'pointer',
+              width: 200,
+              height: 80,
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              border: '4px solid rgba(255, 204, 0, 0.89)',
+              borderRadius: 2,
+              boxShadow: 3,
+              color: region.textColor,
+              '&:hover': { opacity: 0.9 },
+            }}
+          >
+            <Typography variant="subtitle1" sx={{ fontWeight: 'bold', color: region.textColor, fontSize: { xs: '1.3rem' } }}>{region.label}</Typography>
+            <Typography variant="h3" sx={{ fontWeight: 700, fontSize: { xs: '1.5rem', sm: '1.8rem' }, color: region.textColor }}>
+              {typeof counts[region.key] === 'number' ? counts[region.key] : 0}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+
+      {/* Main */}
+      <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+        <Box sx={{ width: 360, p: 2, bgcolor: 'background.paper', borderRight: '1px solid rgba(255,255,255,0.06)', overflowY: 'auto' }}>
+          <Typography variant="h6" sx={{ mb: 1, color: 'primary.main' }}>Live vs CCURE Summary</Typography>
+
+          {loadingAverages ? (
+            <Box sx={{ py: 2 }}><LinearProgress /></Box>
+          ) : averagesError ? (
+            <Alert severity="error">Failed to load CCURE averages</Alert>
+          ) : averages ? (
+            <>
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">CCURE Active (reported)</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Box>
+                    <Typography variant="h5" sx={{ fontWeight: 700 }}>{ccureActiveEmployees ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Employees</Typography>
+                  </Box>
+                  <Box sx={{ textAlign: 'right' }}>
+                    <Typography variant="h5" sx={{ fontWeight: 700 }}>{ccureActiveContractors ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Contractors</Typography>
+                  </Box>
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="subtitle2" color="text.secondary">Live Today</Typography>
+                  <Typography variant="caption" color="text.secondary">{averages.date ?? ''}</Typography>
+                </Box>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{liveEmployee ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Employee</Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{liveContractor ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Contractor</Typography>
+                  </Box>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Totals</Typography>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                    <Typography variant="body2">Reported total</Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>{liveTotalReported ?? '—'}</Typography>
+                  </Box>
+                  {liveTotalDetails != null && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                      <Typography variant="body2">Detail rows total</Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 700 }}>{liveTotalDetails}</Typography>
+                    </Box>
+                  )}
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">Percentages vs CCURE</Typography>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">Employees</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{empPct != null ? `${empPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2">Contractors</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{conPct != null ? `${conPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                  <Typography variant="body2">Overall</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{overallPct != null ? `${overallPct}%` : '—'}</Typography>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+                <Typography variant="caption" color="text.secondary">Averages</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">7-day avg headcount</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{avg7 ?? '—'}</Typography>
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1 }}>Upload Active Sheets</Typography>
+
+                <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputEmpRef} onChange={onChooseEmployeeFile} />
+                <Button variant="contained" startIcon={<UploadFileIcon />} sx={{ mr: 1 }} onClick={() => fileInputEmpRef.current && fileInputEmpRef.current.click()} disabled={uploading}>
+                  Upload Employees
+                </Button>
+
+                <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputContrRef} onChange={onChooseContractorFile} />
+                <Button variant="outlined" startIcon={<UploadFileIcon />} onClick={() => fileInputContrRef.current && fileInputContrRef.current.click()} disabled={uploading}>
+                  Upload Contractors
+                </Button>
+
+                {uploading && <Box sx={{ mt: 1 }}><LinearProgress /></Box>}
+                {uploadResult && <Typography variant="caption" color="success.main" sx={{ mt: 1, display: 'block' }}>Upload OK</Typography>}
+                {uploadError && <Typography variant="caption" color="error.main" sx={{ mt: 1, display: 'block' }}>Upload error</Typography>}
+              </Paper>
+
+              {averages.notes && (
+                <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.02)' }}>
+                  <Typography variant="caption" color="text.secondary">Notes</Typography>
+                  <Typography variant="body2" sx={{ mt: 1 }}>{averages.notes}</Typography>
+                </Paper>
+              )}
+            </>
+          ) : (
+            <Typography variant="body2" color="text.secondary">No data</Typography>
+          )}
+        </Box>
+
+        <Box sx={{ flex: 1, height: '100%', position: 'relative' }}>
+          <MapChart selected={selected} onClickSite={r => setSelected(r)} initialZoom={1.8} />
+        </Box>
+      </Box>
+
+      <Snackbar open={snack.open} autoHideDuration={3500} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>
+        <Alert severity={snack.severity} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>{snack.message}</Alert>
+      </Snackbar>
+    </Box>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ===== add near top of app.py imports =====
 import asyncio
 from fastapi.responses import StreamingResponse
