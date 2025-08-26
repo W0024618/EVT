@@ -1,3 +1,1751 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+from typing import Optional, Dict, Any
+
+# --- DB / models imports (your existing project modules) ---
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+# --- settings (assumes these exist in your project) ---
+try:
+    from settings import UPLOAD_DIR, OUTPUT_DIR
+except Exception:
+    UPLOAD_DIR = "./uploads"
+    OUTPUT_DIR = "./output"
+
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# SSE broadcaster (unchanged)
+_broadcaster_clients = set()
+
+def broadcast_ccure_update(payload: dict):
+    if not _broadcaster_clients:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    for q in list(_broadcaster_clients):
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to push payload to SSE client (will remove client)")
+            try:
+                _broadcaster_clients.discard(q)
+            except Exception:
+                pass
+
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    try:
+        while True:
+            payload = await client_queue.get()
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            yield f"data: {data}\n\n"
+    finally:
+        try:
+            _broadcaster_clients.discard(client_queue)
+        except Exception:
+            pass
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    generator = _sse_event_generator(q)
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
+
+# Helper functions (unchanged)
+def _guess_region_from_text(txt: str) -> str:
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    if any(k in s for k in ("pune","mumbai","bangalore","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+@app.get("/headcount")
+def api_headcount():
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        with SessionLocal() as db:
+            try:
+                emp_rows = db.query(ActiveEmployee).all()
+            except Exception:
+                logger.exception("Failed to query ActiveEmployee")
+                emp_rows = []
+            try:
+                contr_rows = db.query(ActiveContractor).all()
+            except Exception:
+                logger.exception("Failed to query ActiveContractor")
+                contr_rows = []
+
+            def _loc_from_employee(e):
+                return getattr(e, "location_city", None) or getattr(e, "location", None) or getattr(e, "Location", None)
+
+            def _loc_from_contractor(c):
+                return getattr(c, "location", None) or getattr(c, "location_city", None) or getattr(c, "Location", None)
+
+            for e in emp_rows:
+                loc = _loc_from_employee(e)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+            for c in contr_rows:
+                loc = _loc_from_contractor(c)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# --- NOTE ---
+# We keep build_ccure_averages for backward compatibility with components that expect it.
+# The richer compute_visit_averages is implemented in ccure_compare_service.py and is preferred.
+
+def build_ccure_averages():
+    try:
+        today = date.today()
+        with SessionLocal() as db:
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            active_employee_ids = set()
+            active_contractor_primary_ids = set()
+
+            try:
+                emps = db.query(ActiveEmployee).all()
+                for e in emps:
+                    if getattr(e, "employee_id", None):
+                        active_employee_ids.add(str(e.employee_id).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveEmployee rows")
+
+            try:
+                contrs = db.query(ActiveContractor).all()
+                for c in contrs:
+                    primary = getattr(c, "worker_system_id", None) or getattr(c, "ipass_id", None) or getattr(c, "worker_id", None)
+                    if primary:
+                        active_contractor_primary_ids.add(str(primary).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveContractor rows")
+
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+            for a in att_rows:
+                key = (a.employee_id or "").strip() if a.employee_id else None
+                if not key:
+                    try:
+                        key = (a.derived.get('card_number') or "").strip() if (a.derived and isinstance(a.derived, dict)) else None
+                    except Exception:
+                        key = None
+                if not key:
+                    unknown_count += 1
+                    continue
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if key in active_employee_ids:
+                    live_emp += 1
+                elif key in active_contractor_primary_ids:
+                    live_contr += 1
+                else:
+                    numeric = re.sub(r'\D+', '', key)
+                    if numeric:
+                        if numeric in active_employee_ids or numeric.lstrip('0') in active_employee_ids:
+                            live_emp += 1
+                        elif numeric in active_contractor_primary_ids or numeric.lstrip('0') in active_contractor_primary_ids:
+                            live_contr += 1
+                        else:
+                            unknown_count += 1
+                    else:
+                        unknown_count += 1
+
+            live_total_reported = live_emp + live_contr + unknown_count
+            live_total_details = len(att_rows)
+
+            try:
+                start_7 = today - timedelta(days=6)
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_7, AttendanceSummary.date <= today).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                daily_counts = [len(by_date.get(start_7 + timedelta(days=i), set())) for i in range(7)]
+                avg7 = int(round(sum(daily_counts) / 7.0)) if any(daily_counts) else 0
+            except Exception:
+                logger.exception("Failed computing 7-day average")
+                avg7 = None
+
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg7,
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg7
+            }
+        }
+
+        return resp
+    except Exception:
+        logger.exception("build_ccure_averages failed")
+        raise
+
+# New endpoint: verify counts and percentages (realtime, head, history)
+@app.get("/ccure/verify")
+def ccure_verify():
+    """
+    Returns a concise verification payload containing:
+      - CCURE reported counts (employees/contractors)
+      - Live realtime (region_clients) counts (employee/contractor)
+      - Headcount (AttendanceSummary or fallback) counts (employee/contractor)
+      - History-today counts (if available from history endpoints)
+      - Percentages:
+          * realtime_vs_ccure (live / ccure_reported)
+          * headcount_vs_ccure (attendance summary head / ccure_reported)
+          * history_today_vs_ccure (history endpoint today's counts / ccure_reported)
+    """
+    try:
+        # Prefer the richer compute_visit_averages if available
+        try:
+            from ccure_compare_service import compute_visit_averages
+            detailed = compute_visit_averages(timeout=6)
+            # compute_visit_averages returns sanitized dict already
+            # We build a compact verification payload
+            if isinstance(detailed, dict):
+                # extract main counts
+                head = detailed.get("headcount", {}) or {}
+                live = detailed.get("live_headcount", {}) or {}
+                ccure = detailed.get("ccure_active", {}) or {}
+                averages = detailed.get("averages", {}) or {}
+
+                def safe_get(d, k):
+                    v = d.get(k)
+                    return int(v) if isinstance(v, (int, float)) else (int(v) if v is not None and str(v).isdigit() else None)
+
+                head_emp = safe_get(head, "employee") or 0
+                head_con = safe_get(head, "contractor") or 0
+                live_emp = safe_get(live, "employee") or 0
+                live_con = safe_get(live, "contractor") or 0
+                cc_emp = ccure.get("ccure_active_employees_reported") or ccure.get("active_employees")
+                cc_con = ccure.get("ccure_active_contractors_reported") or ccure.get("active_contractors")
+
+                # history today (if provided by compute_visit_averages as part of history aggregations)
+                history_today_emp = None
+                history_today_con = None
+                # some implementations add history fields in 'averages' or top-level notes; be defensive:
+                if "history_avg_overall_last_7_days" in averages:
+                    # no per-day 'today' in averages - try to find computed history entry inside notes or other keys
+                    pass
+
+                # but compute_visit_averages includes history_* in averages; check for keys we added:
+                history_emp = averages.get("history_avg_employee_last_7_days")
+                history_con = averages.get("history_avg_contractor_last_7_days")
+
+                # percentages (already computed in averages)
+                realtime_emp_pct = averages.get("live_employee_pct_vs_ccure")
+                realtime_con_pct = averages.get("live_contractor_pct_vs_ccure")
+                head_emp_pct = averages.get("head_emp_pct_vs_ccure_today")
+                head_con_pct = averages.get("head_contractor_pct_vs_ccure_today")
+                history_emp_pct = averages.get("history_employee_pct_vs_ccure")
+                history_con_pct = averages.get("history_contractor_pct_vs_ccure")
+
+                payload = {
+                    "date": detailed.get("date"),
+                    "ccure_active_employees": cc_emp,
+                    "ccure_active_contractors": cc_con,
+                    "live_realtime_employees": live_emp,
+                    "live_realtime_contractors": live_con,
+                    "headcount_employees": head_emp,
+                    "headcount_contractors": head_con,
+                    "history_avg_employee_last_7_days": history_emp,
+                    "history_avg_contractor_last_7_days": history_con,
+                    "percent_realtime_vs_ccure_employee": realtime_emp_pct,
+                    "percent_realtime_vs_ccure_contractor": realtime_con_pct,
+                    "percent_head_vs_ccure_employee": head_emp_pct,
+                    "percent_head_vs_ccure_contractor": head_con_pct,
+                    "percent_history_vs_ccure_employee": history_emp_pct,
+                    "percent_history_vs_ccure_contractor": history_con_pct,
+                    "notes": detailed.get("notes")
+                }
+                return JSONResponse(payload)
+        except Exception:
+            logger.debug("compute_visit_averages not available or failed; falling back to build_ccure_averages()", exc_info=True)
+
+        # Fallback: use build_ccure_averages (less rich)
+        resp = build_ccure_averages()
+        # map fields
+        cc = resp.get("ccure_active", {}) or {}
+        live = resp.get("live_today", {}) or {}
+        av = resp.get("averages", {}) or {}
+        payload = {
+            "date": resp.get("date"),
+            "ccure_active_employees": cc.get("active_employees"),
+            "ccure_active_contractors": cc.get("active_contractors"),
+            "live_realtime_employees": live.get("employee"),
+            "live_realtime_contractors": live.get("contractor"),
+            "headcount_employees": live.get("employee"),  # build_ccure_averages uses live as head-like fallback
+            "headcount_contractors": live.get("contractor"),
+            "history_avg_employee_last_7_days": av.get("history_avg_overall_last_7_days") if av else None,
+            "percent_realtime_vs_ccure_employee": av.get("employee_pct"),
+            "percent_realtime_vs_ccure_contractor": av.get("contractor_pct"),
+            "percent_head_vs_ccure_employee": av.get("head_emp_pct_vs_ccure_today"),
+            "percent_head_vs_ccure_contractor": av.get("head_contractor_pct_vs_ccure_today"),
+            "notes": resp.get("notes")
+        }
+        return JSONResponse(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("ccure_verify failed")
+        raise HTTPException(status_code=500, detail=f"ccure verify error: {exc}")
+
+# Rest of endpoints unchanged (compare, upload, ingest, etc.)
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(str(full),
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            filename=safe_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_employees")
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_contractors")
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    details = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    try:
+        res = ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after ingest_live (non-fatal)")
+
+    if isinstance(res, dict):
+        return {"status": "ok", **res}
+    return {"status": "ok", "inserted": len(details)}
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    res = ingest_live_details_list(details)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after fetch-all")
+    if isinstance(res, dict):
+        return {"status":"ok", **res}
+    return {"status":"ok", "inserted": len(details)}
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+
+    try:
+        from compare_service import compute_daily_attendance, compare_with_active
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    compute_daily_attendance(dt)
+    summary = compare_with_active(dt)
+
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after daily_report")
+
+    return JSONResponse(summary)
+
+@app.get("/ccure/stats")
+def ccure_stats():
+    try:
+        import ccure_client
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client import failed: {e}")
+    try:
+        stats = ccure_client.get_global_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client.get_global_stats failed: {e}")
+    return stats
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ccure_compare_service.py
+"""
+Compare CCURE profiles/stats with local sheets + compute visit averages + compliance.
+
+Key changes:
+ - History averages use only working days (Monday-Friday).
+ - compute_visit_averages now extracts history_today counts (if available) and computes
+   history_today vs ccure percentages.
+ - The function preserves previous fallbacks (AttendanceSummary, LiveSwipe, region_clients).
+"""
+
+import re
+import traceback
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Any, Optional, Set
+
+import logging
+
+logger = logging.getLogger("ccure_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, AttendanceSummary, LiveSwipe
+from settings import OUTPUT_DIR
+
+# ---------- small helpers ----------------------------------------------------
+
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+def _sanitize_for_json(value):
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+    if value is None:
+        return None
+    if isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if _np is not None and not _np.isfinite(value):
+            return None
+        return float(value)
+    if _np is not None and isinstance(value, (_np.integer,)):
+        return int(value)
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            try:
+                key = str(k)
+            except Exception:
+                key = repr(k)
+            out[key] = _sanitize_for_json(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+# ---------- ccure helpers ---------------------------------------------------
+
+def _fetch_ccure_stats():
+    try:
+        import ccure_client
+        if hasattr(ccure_client, "get_global_stats"):
+            return ccure_client.get_global_stats()
+    except Exception:
+        logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+    return None
+
+def _fetch_ccure_profiles():
+    try:
+        import ccure_client
+        for fn in ("fetch_all_employees_full", "fetch_all_employees", "fetch_all_profiles", "fetch_profiles", "fetch_all"):
+            if hasattr(ccure_client, fn):
+                try:
+                    res = getattr(ccure_client, fn)()
+                    if isinstance(res, list):
+                        return res
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return []
+
+def _extract_ccure_locations_from_profiles(profiles: List[dict]) -> Set[str]:
+    locs = set()
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        for k in ("Partition", "PartitionName", "Location", "Location City", "location_city", "location", "Site", "BaseLocation"):
+            v = p.get(k) if isinstance(p, dict) else None
+            if v and isinstance(v, str) and v.strip():
+                locs.add(v.strip())
+    return locs
+
+# ---------- classification & partition helpers ------------------------------
+
+def classify_personnel_from_detail(detail: dict) -> str:
+    try:
+        if not isinstance(detail, dict):
+            return "contractor"
+        candidate_keys = [
+            "PersonnelType", "personnelType", "personnel_type", "Personnel Type",
+            "PersonnelTypeName", "Personnel", "Type", "personnel", "PersonType", "personType"
+        ]
+        val = None
+        for k in candidate_keys:
+            if k in detail and detail.get(k) is not None:
+                val = str(detail.get(k)).strip().lower()
+                break
+        status_keys = ["Employee_Status", "Employee Status", "Status", "Profile_Disabled"]
+        status_val = None
+        for k in status_keys:
+            if k in detail and detail.get(k) is not None:
+                status_val = str(detail.get(k)).strip().lower()
+                break
+
+        if status_val is not None and "terminated" in status_val:
+            return "employee"
+        if val is None or val == "":
+            return "contractor"
+        if "employee" in val:
+            return "employee"
+        if "terminated" in val:
+            return "employee"
+        contractor_terms = ["contractor", "visitor", "property", "property management", "temp", "temp badge", "tempbadge"]
+        for t in contractor_terms:
+            if t in val:
+                return "contractor"
+        if "contract" in val or "visitor" in val:
+            return "contractor"
+        return "contractor"
+    except Exception:
+        return "contractor"
+
+def pick_partition_from_detail(detail: dict) -> str:
+    if not isinstance(detail, dict):
+        return "Unknown"
+    for k in ("PartitionName2","PartitionName1","Partition","PartitionName","Region","Location","Site","location_city","Location City"):
+        if k in detail and detail.get(k):
+            try:
+                return str(detail.get(k)).strip()
+            except Exception:
+                continue
+    if "__region" in detail and detail.get("__region"):
+        return str(detail.get("__region")).strip()
+    return "Unknown"
+
+def is_employee_wfh(active_emp_row: ActiveEmployee) -> bool:
+    try:
+        wfh_keywords = ("work from home", "wfh", "remote", "workfromhome", "home")
+        for attr in ("is_wfh", "work_from_home", "wfh", "remote_flag"):
+            if hasattr(active_emp_row, attr):
+                try:
+                    val = getattr(active_emp_row, attr)
+                    if isinstance(val, bool) and val:
+                        return True
+                    if isinstance(val, str) and any(k in val.strip().lower() for k in wfh_keywords):
+                        return True
+                except Exception:
+                    pass
+        for attr in ("location_description", "location_desc", "location_description1", "base_location", "location", "location_city"):
+            if hasattr(active_emp_row, attr):
+                try:
+                    v = getattr(active_emp_row, attr)
+                    if v and isinstance(v, str):
+                        s = v.strip().lower()
+                        if any(k in s for k in wfh_keywords):
+                            return True
+                except Exception:
+                    pass
+        try:
+            rr = getattr(active_emp_row, "raw_row", None)
+            if rr and isinstance(rr, dict):
+                for k, v in rr.items():
+                    try:
+                        if v and isinstance(v, str) and any(word in v.strip().lower() for word in wfh_keywords):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+# ---------- utility: fallback headcount builder from LiveSwipe --------------
+
+def build_headcount_from_liveswipes_for_today(session) -> (int, Dict[str, Dict[str, int]]):
+    start = datetime.combine(date.today(), datetime.min.time())
+    end = datetime.combine(date.today(), datetime.max.time())
+    swipes = session.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+    if not swipes:
+        return 0, {}
+    seen_keys = {}
+    per_loc = {}
+    for s in swipes:
+        key = _normalize_employee_key(s.employee_id) or _normalize_card_like(s.card_number)
+        if not key:
+            key = f"nokey_{s.id}"
+        rec = seen_keys.get(key)
+        ts = s.timestamp
+        if rec is None:
+            seen_keys[key] = {"first_seen": ts, "last_seen": ts, "partition": (s.partition or "Unknown"), "class": None, "card": s.card_number, "raw": s.raw}
+        else:
+            if ts and rec.get("first_seen") and ts < rec["first_seen"]:
+                rec["first_seen"] = ts
+            if ts and rec.get("last_seen") and ts > rec["last_seen"]:
+                rec["last_seen"] = ts
+    for k, v in seen_keys.items():
+        loc = v.get("partition") or "Unknown"
+        if not isinstance(loc, str) or not loc.strip():
+            loc = "Unknown"
+        if loc not in per_loc:
+            per_loc[loc] = {"total": 0, "employee": 0, "contractor": 0}
+        per_loc[loc]["total"] += 1
+        classified = "contractor"
+        raw = v.get("raw")
+        if isinstance(raw, dict):
+            try:
+                classified = classify_personnel_from_detail(raw)
+            except Exception:
+                classified = "contractor"
+        per_loc[loc][classified] += 1
+    total = sum(p["total"] for p in per_loc.values())
+    return int(total), per_loc
+
+# ---------- main compute function -----------------------------------------
+
+def compute_visit_averages(timeout: int = 6) -> Dict[str, Any]:
+    notes = []
+    today = date.today()
+    week_start = today - timedelta(days=6)  # last 7 days inclusive (DB side)
+    # --- gather CCURE stats and profiles early
+    ccure_stats = _fetch_ccure_stats()
+    reported_active_emps = _safe_int(ccure_stats.get("ActiveEmployees")) if isinstance(ccure_stats, dict) else None
+    reported_active_contractors = _safe_int(ccure_stats.get("ActiveContractors")) if isinstance(ccure_stats, dict) else None
+
+    ccure_profiles = _fetch_ccure_profiles()
+    ccure_locations = _extract_ccure_locations_from_profiles(ccure_profiles) if isinstance(ccure_profiles, list) else set()
+
+    # -------- HEADCOUNT (AttendanceSummary fallback logic) ----------
+    head_total = 0
+    head_per_location: Dict[str, Dict[str, int]] = {}
+    try:
+        session = SessionLocal()
+        att_rows_today = session.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+        if not att_rows_today:
+            # Try compute_daily_attendance if available
+            try:
+                from compare_service import compute_daily_attendance as _compute_daily_attendance
+                try:
+                    built = _compute_daily_attendance(today)
+                    if isinstance(built, list) and len(built) > 0:
+                        att_rows_today = session.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+                        notes.append("AttendanceSummary was missing; built from LiveSwipe via compute_daily_attendance().")
+                except Exception:
+                    logger.exception("compute_daily_attendance execution failed; falling back")
+            except Exception:
+                logger.debug("compare_service.compute_daily_attendance not importable; falling back", exc_info=True)
+
+            if not att_rows_today:
+                built_total, built_per_loc = build_headcount_from_liveswipes_for_today(session)
+                head_total = built_total
+                head_per_location = built_per_loc
+                if head_total > 0:
+                    notes.append("AttendanceSummary for today empty; built headcount from LiveSwipe rows (non-persistent fallback).")
+        if att_rows_today:
+            act_emps = session.query(ActiveEmployee).all()
+            act_contrs = session.query(ActiveContractor).all()
+            emp_id_set = set()
+            contr_id_set = set()
+            card_to_emp = {}
+            for e in act_emps:
+                v = _normalize_employee_key(getattr(e, "employee_id", None))
+                if v:
+                    emp_id_set.add(v)
+                try:
+                    rr = getattr(e, "raw_row", None)
+                    if rr and isinstance(rr, dict):
+                        for ck in ("CardNumber","card_number","Card","Card No","CardNo","Badge","BadgeNo","IPassID","iPass ID","IPASSID"):
+                            if ck in rr and rr.get(ck):
+                                cn = _normalize_card_like(rr.get(ck))
+                                if cn:
+                                    card_to_emp[cn] = v
+                except Exception:
+                    pass
+            for c in act_contrs:
+                wid = _normalize_employee_key(getattr(c, "worker_system_id", None))
+                ip = _normalize_employee_key(getattr(c, "ipass_id", None))
+                primary = wid or ip
+                if primary:
+                    contr_id_set.add(primary)
+
+            for a in att_rows_today:
+                key = _normalize_employee_key(a.employee_id)
+                partition = None
+                try:
+                    if a.derived and isinstance(a.derived, dict):
+                        partition = a.derived.get("partition")
+                except Exception:
+                    partition = None
+                loc = partition or "Unknown"
+                if not isinstance(loc, str) or not loc.strip():
+                    loc = "Unknown"
+                if loc not in head_per_location:
+                    head_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                if (a.presence_count or 0) > 0:
+                    head_total += 1
+                    head_per_location[loc]["total"] += 1
+                    cls = "contractor"
+                    if key and key in emp_id_set:
+                        cls = "employee"
+                    elif key and key in contr_id_set:
+                        cls = "contractor"
+                    else:
+                        try:
+                            card = (a.derived.get("card_number") if (a.derived and isinstance(a.derived, dict)) else None)
+                        except Exception:
+                            card = None
+                        cnorm = _normalize_card_like(card)
+                        if cnorm and cnorm in card_to_emp:
+                            cls = "employee" if card_to_emp.get(cnorm) in emp_id_set else "contractor"
+                        else:
+                            cls = "contractor"
+                    head_per_location[loc][cls] += 1
+        session.expunge_all()
+    except Exception:
+        logger.exception("Error computing HeadCount")
+        notes.append("Failed to compute HeadCount from DB; see server logs.")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # --- LIVE HEADCOUNT via region_clients (realtime) ----------
+    live_total = 0
+    live_per_location: Dict[str, Dict[str, int]] = {}
+    sites_queried = 0
+    details = []
+    try:
+        import region_clients
+        regions_info = []
+        try:
+            if hasattr(region_clients, "fetch_all_regions"):
+                regions_info = region_clients.fetch_all_regions(timeout=timeout) or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_regions failed")
+        try:
+            if hasattr(region_clients, "fetch_all_details"):
+                details = region_clients.fetch_all_details(timeout=timeout) or []
+        except Exception:
+            logger.exception("region_clients.fetch_all_details failed")
+        sites_queried = len(regions_info) if isinstance(regions_info, list) else 0
+        if regions_info:
+            for r in regions_info:
+                try:
+                    c = r.get("count") if isinstance(r, dict) else None
+                    ci = _safe_int(c)
+                    if ci is not None:
+                        live_total += int(ci)
+                except Exception:
+                    continue
+        derived_detail_sum = 0
+        if details and isinstance(details, list):
+            for d in details:
+                try:
+                    loc = pick_partition_from_detail(d) or "Unknown"
+                    if not isinstance(loc, str) or not loc.strip():
+                        loc = "Unknown"
+                    pclass = classify_personnel_from_detail(d)
+                    if loc not in live_per_location:
+                        live_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                    live_per_location[loc]["total"] += 1
+                    live_per_location[loc][pclass] += 1
+                    derived_detail_sum += 1
+                except Exception:
+                    continue
+            if live_total == 0 and derived_detail_sum > 0:
+                live_total = derived_detail_sum
+            else:
+                if live_total != derived_detail_sum:
+                    notes.append(f"Region totals ({live_total}) differ from detail rows ({derived_detail_sum}); using region totals for overall and details for breakdown.")
+        else:
+            notes.append("No per-person details available from region_clients; live breakdown unavailable.")
+    except Exception:
+        logger.exception("Error computing Live HeadCount")
+        notes.append("Failed to compute Live HeadCount; see logs.")
+        live_total = live_total or 0
+
+    # --- FALLBACK: build headcount from region_clients details if head_total == 0 ----------
+    if (head_total == 0) and details:
+        try:
+            seen_keys = set()
+            for d in details:
+                try:
+                    key = _normalize_employee_key(d.get("EmployeeID")) or _normalize_card_like(d.get("CardNumber")) or (d.get("PersonGUID") if d.get("PersonGUID") else None)
+                    if not key:
+                        key = _normalize_employee_key(d.get("employee_id")) or _normalize_card_like(d.get("Card")) or None
+                    if not key:
+                        continue
+                    key = str(key)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    loc = pick_partition_from_detail(d) or "Unknown"
+                    pclass = classify_personnel_from_detail(d)
+                    if loc not in head_per_location:
+                        head_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                    head_per_location[loc]["total"] += 1
+                    head_per_location[loc][pclass] += 1
+                    head_total += 1
+                except Exception:
+                    continue
+            if head_total > 0:
+                notes.append("AttendanceSummary and LiveSwipe empty; built headcount from region_clients live-summary details (fallback).")
+        except Exception:
+            logger.exception("Error building headcount from region details fallback")
+
+    # --- Compliance section (unchanged, omitted here to keep function readable) ---
+    compliance = {
+        "meets_5days_8h": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}},
+        "meets_3days_8h": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}},
+        "defaulters": {"count": 0, "percent_of_ccure_employees": None, "by_location": {}, "sample": []}
+    }
+    try:
+        session = SessionLocal()
+        active_emps = session.query(ActiveEmployee).all()
+        emp_map = {}
+        card_to_emp = {}
+        for e in active_emps:
+            eid = _normalize_employee_key(getattr(e, "employee_id", None))
+            emp_map[eid] = e
+            try:
+                rr = getattr(e, "raw_row", None)
+                if rr and isinstance(rr, dict):
+                    for ck in ("CardNumber","card_number","Card","Card No","CardNo","Badge","BadgeNo","IPassID","iPass ID","IPASSID"):
+                        if ck in rr and rr.get(ck):
+                            cn = _normalize_card_like(rr.get(ck))
+                            if cn:
+                                card_to_emp[cn] = eid
+            except Exception:
+                pass
+
+        att_rows_range = session.query(AttendanceSummary).filter(AttendanceSummary.date >= week_start, AttendanceSummary.date <= today).all()
+        rows_by_key = {}
+        for r in att_rows_range:
+            key = _normalize_employee_key(r.employee_id)
+            if key not in rows_by_key:
+                rows_by_key[key] = []
+            rows_by_key[key].append(r)
+
+        meets_5 = []
+        meets_3 = []
+        defaulters_list = []
+        for eid, e in emp_map.items():
+            candidate_rows = []
+            if eid and eid in rows_by_key:
+                candidate_rows.extend(rows_by_key[eid])
+            for k in list(rows_by_key.keys()):
+                if not k:
+                    continue
+                k_norm = _normalize_card_like(k)
+                if k_norm and k_norm in card_to_emp and card_to_emp[k_norm] == eid:
+                    candidate_rows.extend(rows_by_key[k])
+            by_date = {}
+            for r in candidate_rows:
+                try:
+                    d = r.date
+                    if d not in by_date:
+                        by_date[d] = r
+                    else:
+                        if (r.presence_count or 0) > (by_date[d].presence_count or 0):
+                            by_date[d] = r
+                except Exception:
+                    continue
+            days_with_8h = 0
+            for d, row in by_date.items():
+                if (row.presence_count or 0) > 0:
+                    try:
+                        if row.first_seen and row.last_seen:
+                            dur = (row.last_seen - row.first_seen).total_seconds() / 3600.0
+                            if dur >= 8.0:
+                                days_with_8h += 1
+                    except Exception:
+                        pass
+            meets5 = (days_with_8h >= 5)
+            meets3 = (days_with_8h >= 3)
+            wfh_flag = is_employee_wfh(e)
+            location = None
+            for loc_attr in ("location_city", "location", "base_location", "location_desc", "location_description"):
+                if hasattr(e, loc_attr):
+                    v = getattr(e, loc_attr)
+                    if v and isinstance(v, str) and v.strip():
+                        location = v.strip()
+                        break
+            if not location:
+                try:
+                    rr = getattr(e, "raw_row", None)
+                    if rr and isinstance(rr, dict):
+                        for ck in ("Partition","PartitionName","Location","Site","location_city","Location City"):
+                            if ck in rr and rr.get(ck):
+                                location = str(rr.get(ck)).strip()
+                                break
+                except Exception:
+                    pass
+            if not location:
+                location = "Unknown"
+
+            if meets5:
+                meets_5.append((eid, e, location))
+            if meets3:
+                meets_3.append((eid, e, location))
+            if (not meets5) and (not meets3):
+                if not wfh_flag:
+                    defaulters_list.append((eid, e, location))
+
+        def _build_location_counts(list_of_tuples):
+            loc_map = {}
+            for (_id, e_obj, loc) in list_of_tuples:
+                if not loc:
+                    loc = "Unknown"
+                if ccure_locations:
+                    if loc not in ccure_locations:
+                        continue
+                if loc not in loc_map:
+                    loc_map[loc] = {"count": 0}
+                loc_map[loc]["count"] += 1
+            return loc_map
+
+        meets_5_count = len(meets_5)
+        meets_3_count = len(meets_3)
+        defaulter_count = len(defaulters_list)
+
+        compliance["meets_5days_8h"]["count"] = int(meets_5_count)
+        compliance["meets_5days_8h"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(meets_5).items()}
+        compliance["meets_3days_8h"]["count"] = int(meets_3_count)
+        compliance["meets_3days_8h"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(meets_3).items()}
+        compliance["defaulters"]["count"] = int(defaulter_count)
+        compliance["defaulters"]["by_location"] = {k: {"count": int(v["count"])} for k, v in _build_location_counts(defaulters_list).items()}
+
+        denom_emp = reported_active_emps if reported_active_emps is not None else None
+        if isinstance(denom_emp, int) and denom_emp > 0:
+            compliance["meets_5days_8h"]["percent_of_ccure_employees"] = round((meets_5_count / denom_emp) * 100.0, 2)
+            compliance["meets_3days_8h"]["percent_of_ccure_employees"] = round((meets_3_count / denom_emp) * 100.0, 2)
+            compliance["defaulters"]["percent_of_ccure_employees"] = round((defaulter_count / denom_emp) * 100.0, 2)
+        else:
+            compliance["meets_5days_8h"]["percent_of_ccure_employees"] = None
+            compliance["meets_3days_8h"]["percent_of_ccure_employees"] = None
+            compliance["defaulters"]["percent_of_ccure_employees"] = None
+
+        sample = []
+        for (eid, e_obj, loc) in defaulters_list[:50]:
+            try:
+                sample.append({
+                    "employee_id": _sanitize_for_json(eid),
+                    "full_name": _sanitize_for_json(getattr(e_obj, "full_name", None)),
+                    "location": _sanitize_for_json(loc),
+                    "wfh_flag": bool(is_employee_wfh(e_obj))
+                })
+            except Exception:
+                continue
+        compliance["defaulters"]["sample"] = sample
+
+        session.expunge_all()
+        session.close()
+    except Exception:
+        logger.exception("Error computing compliance section")
+        notes.append("Failed to compute compliance metrics; check server logs for trace.")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # --- Averages from AttendanceSummary (DB) - per-location & overall (unchanged) ---
+    avg_headcount_last_7_days = None
+    avg_headcount_per_site_last_7_days = None
+    avg_by_location_last_7_days: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        session = SessionLocal()
+        act_emps = session.query(ActiveEmployee).all()
+        act_contrs = session.query(ActiveContractor).all()
+        emp_id_set = set()
+        contr_id_set = set()
+        card_to_emp = {}
+        for e in act_emps:
+            eid = _normalize_employee_key(getattr(e, "employee_id", None))
+            if eid:
+                emp_id_set.add(eid)
+            try:
+                rr = getattr(e, "raw_row", None) or {}
+                if isinstance(rr, dict):
+                    for ck in ("CardNumber","card_number","Card","Card No","CardNo","IPassID","iPass ID","IPASSID","Badge","BadgeNo"):
+                        if ck in rr and rr.get(ck):
+                            cn = _normalize_card_like(rr.get(ck))
+                            if cn:
+                                card_to_emp[cn] = eid
+            except Exception:
+                pass
+        for c in act_contrs:
+            wid = _normalize_employee_key(getattr(c, "worker_system_id", None))
+            ip = _normalize_employee_key(getattr(c, "ipass_id", None))
+            primary = wid or ip
+            if primary:
+                contr_id_set.add(primary)
+            try:
+                rr = getattr(c, "raw_row", None) or {}
+                if isinstance(rr, dict):
+                    for ck in ("Worker System Id","Worker System ID","iPass ID","IPASSID","CardNumber","card_number"):
+                        if ck in rr and rr.get(ck):
+                            cn = _normalize_card_like(rr.get(ck))
+                            if cn:
+                                card_to_emp[cn] = primary
+            except Exception:
+                pass
+
+        loc_day_vals: Dict[str, Dict[str, List[int]]] = {}
+        days = []
+        for i in range(0, 7):
+            d = today - timedelta(days=i)
+            days.append(d)
+            rows = session.query(AttendanceSummary).filter(AttendanceSummary.date == d).all()
+            per_loc_counts: Dict[str, Dict[str, int]] = {}
+            if rows:
+                for r in rows:
+                    try:
+                        if (r.presence_count or 0) <= 0:
+                            continue
+                        partition = None
+                        try:
+                            if r.derived and isinstance(r.derived, dict):
+                                partition = r.derived.get("partition")
+                        except Exception:
+                            partition = None
+                        loc = partition or "Unknown"
+                        if not isinstance(loc, str) or not loc.strip():
+                            loc = "Unknown"
+                        if loc not in per_loc_counts:
+                            per_loc_counts[loc] = {"employee": 0, "contractor": 0, "total": 0}
+                        key = _normalize_employee_key(r.employee_id)
+                        cls = "contractor"
+                        if key and key in emp_id_set:
+                            cls = "employee"
+                        elif key and key in contr_id_set:
+                            cls = "contractor"
+                        else:
+                            try:
+                                card = (r.derived.get("card_number") if (r.derived and isinstance(r.derived, dict)) else None)
+                            except Exception:
+                                card = None
+                            cnorm = _normalize_card_like(card)
+                            if cnorm and cnorm in card_to_emp and card_to_emp.get(cnorm) in emp_id_set:
+                                cls = "employee"
+                            elif cnorm and cnorm in card_to_emp and card_to_emp.get(cnorm) in contr_id_set:
+                                cls = "contractor"
+                            else:
+                                cls = "contractor"
+                        per_loc_counts[loc][cls] += 1
+                        per_loc_counts[loc]["total"] += 1
+                    except Exception:
+                        continue
+            for loc, counts in per_loc_counts.items():
+                if loc not in loc_day_vals:
+                    loc_day_vals[loc] = {"employee": [], "contractor": [], "total": []}
+                loc_day_vals[loc]["employee"].append(counts.get("employee", 0))
+                loc_day_vals[loc]["contractor"].append(counts.get("contractor", 0))
+                loc_day_vals[loc]["total"].append(counts.get("total", 0))
+
+        for loc, lists in loc_day_vals.items():
+            emp_list = lists.get("employee", [])
+            con_list = lists.get("contractor", [])
+            tot_list = lists.get("total", [])
+            days_counted = len(tot_list)
+            avg_emp = round(sum(emp_list) / float(days_counted), 2) if days_counted and sum(emp_list) is not None else 0.0
+            avg_con = round(sum(con_list) / float(days_counted), 2) if days_counted and sum(con_list) is not None else 0.0
+            avg_tot = round(sum(tot_list) / float(days_counted), 2) if days_counted and sum(tot_list) is not None else 0.0
+            avg_by_location_last_7_days[loc] = {
+                "history_days_counted": int(days_counted),
+                "avg_employee_last_7_days": _sanitize_for_json(avg_emp),
+                "avg_contractor_last_7_days": _sanitize_for_json(avg_con),
+                "avg_overall_last_7_days": _sanitize_for_json(avg_tot)
+            }
+
+        days_totals = []
+        for d in days:
+            rows = session.query(AttendanceSummary).filter(AttendanceSummary.date == d).all()
+            day_total = 0
+            if rows:
+                for r in rows:
+                    if (r.presence_count or 0) > 0:
+                        day_total += 1
+            days_totals.append(day_total)
+        if days_totals:
+            avg_headcount_last_7_days = round(sum(days_totals) / float(len(days_totals)), 2)
+            if sites_queried and sites_queried > 0:
+                avg_headcount_per_site_last_7_days = round((sum(days_totals) / float(len(days_totals))) / float(sites_queried), 2)
+        session.close()
+    except Exception:
+        logger.exception("Error computing averages from AttendanceSummary")
+        notes.append("Failed to compute historical averages from AttendanceSummary; partial results only.")
+
+    # --- HISTORY AVERAGES: use region_clients.fetch_all_history (ONLY WORKING DAYS) ----------
+    history_emp_avg = None
+    history_contractor_avg = None
+    history_overall_avg = None
+    history_days = 0
+    history_avg_by_location_last_7_days: Dict[str, Dict[str, Any]] = {}
+    history_today_emp = None
+    history_today_con = None
+
+    try:
+        import region_clients
+        if hasattr(region_clients, "fetch_all_history"):
+            entries = region_clients.fetch_all_history(timeout=timeout) or []
+            agg_by_date = {}
+            agg_partitions_by_date = {}
+            for e in entries:
+                try:
+                    dstr = e.get("date")
+                    if not dstr:
+                        continue
+                    region_obj = e.get("region") if isinstance(e.get("region"), dict) else None
+                    emp = None
+                    con = None
+                    tot = None
+                    if region_obj and isinstance(region_obj, dict):
+                        emp = _safe_int(region_obj.get("Employee"))
+                        con = _safe_int(region_obj.get("Contractor"))
+                        tot = _safe_int(region_obj.get("total")) or ((emp or 0) + (con or 0))
+                    else:
+                        emp = _safe_int(e.get("Employee") or (e.get("region") and e.get("region").get("Employee") if isinstance(e.get("region"), dict) else None))
+                        con = _safe_int(e.get("Contractor") or (e.get("region") and e.get("region").get("Contractor") if isinstance(e.get("region"), dict) else None))
+                        tot = _safe_int(e.get("total") or ((emp or 0) + (con or 0)))
+                    if emp is None and con is None:
+                        try:
+                            robj = e.get("region") or {}
+                            if isinstance(robj, dict):
+                                emp = _safe_int(robj.get("Employee"))
+                                con = _safe_int(robj.get("Contractor"))
+                                tot = _safe_int(robj.get("total"))
+                        except Exception:
+                            pass
+                    if emp is None and con is None:
+                        continue
+                    if tot is None:
+                        tot = (emp or 0) + (con or 0)
+                    if dstr not in agg_by_date:
+                        agg_by_date[dstr] = {"employee": 0, "contractor": 0, "total": 0, "counted_regions": 0}
+                    agg_by_date[dstr]["employee"] += (emp or 0)
+                    agg_by_date[dstr]["contractor"] += (con or 0)
+                    agg_by_date[dstr]["total"] += (tot or 0)
+                    agg_by_date[dstr]["counted_regions"] += 1
+
+                    parts = e.get("partitions") if isinstance(e.get("partitions"), dict) else {}
+                    if dstr not in agg_partitions_by_date:
+                        agg_partitions_by_date[dstr] = {}
+                    for pname, pstat in parts.items():
+                        try:
+                            p_emp = _safe_int(pstat.get("Employee"))
+                            p_con = _safe_int(pstat.get("Contractor"))
+                            p_tot = _safe_int(pstat.get("total")) or ((p_emp or 0) + (p_con or 0))
+                            if pname not in agg_partitions_by_date[dstr]:
+                                agg_partitions_by_date[dstr][pname] = {"employee": 0, "contractor": 0, "total": 0}
+                            agg_partitions_by_date[dstr][pname]["employee"] += (p_emp or 0)
+                            agg_partitions_by_date[dstr][pname]["contractor"] += (p_con or 0)
+                            agg_partitions_by_date[dstr][pname]["total"] += (p_tot or 0)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            # find history_today if present
+            today_iso = today.isoformat()
+            if today_iso in agg_by_date:
+                history_today_emp = agg_by_date[today_iso].get("employee", 0)
+                history_today_con = agg_by_date[today_iso].get("contractor", 0)
+
+            # collect up to last 7 WORKING days (Mon-Fri) from the available agg_by_date.
+            # We'll scan back up to 14 calendar days to find up to 7 working days with data.
+            day_vals_emp = []
+            day_vals_con = []
+            day_vals_tot = []
+            selected_dates = []
+            max_scan = 14
+            working_days_needed = 7
+            for i in range(0, max_scan):
+                if len(selected_dates) >= working_days_needed:
+                    break
+                d = today - timedelta(days=i)
+                if d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday -> skip weekends
+                    continue
+                d_iso = d.isoformat()
+                entry = agg_by_date.get(d_iso)
+                if entry:
+                    day_vals_emp.append(entry.get("employee", 0))
+                    day_vals_con.append(entry.get("contractor", 0))
+                    day_vals_tot.append(entry.get("total", 0))
+                    selected_dates.append(d_iso)
+
+            if day_vals_emp:
+                history_emp_avg = round(sum(day_vals_emp) / float(len(day_vals_emp)), 2)
+            if day_vals_con:
+                history_contractor_avg = round(sum(day_vals_con) / float(len(day_vals_con)), 2)
+            if day_vals_tot:
+                history_overall_avg = round(sum(day_vals_tot) / float(len(day_vals_tot)), 2)
+            history_days = len(day_vals_tot)
+            if history_days == 0:
+                notes.append("History endpoints returned no usable weekday rows; history averages not available.")
+
+            # Per-partition averages across those selected_dates (weekday-only)
+            partition_day_values: Dict[str, Dict[str, List[int]]] = {}
+            for d_iso in selected_dates:
+                per_parts = agg_partitions_by_date.get(d_iso, {})
+                for pname, pvals in per_parts.items():
+                    if pname not in partition_day_values:
+                        partition_day_values[pname] = {"employee": [], "contractor": [], "total": []}
+                    partition_day_values[pname]["employee"].append(pvals.get("employee", 0))
+                    partition_day_values[pname]["contractor"].append(pvals.get("contractor", 0))
+                    partition_day_values[pname]["total"].append(pvals.get("total", 0))
+            for pname, lists in partition_day_values.items():
+                emp_list = lists.get("employee", [])
+                con_list = lists.get("contractor", [])
+                tot_list = lists.get("total", [])
+                days_counted = len(tot_list)
+                if days_counted == 0:
+                    continue
+                avg_emp = round(sum(emp_list) / float(days_counted), 2)
+                avg_con = round(sum(con_list) / float(days_counted), 2)
+                avg_tot = round(sum(tot_list) / float(days_counted), 2)
+                history_avg_by_location_last_7_days[pname] = {
+                    "history_days_counted": int(days_counted),
+                    "avg_employee_last_7_days": _sanitize_for_json(avg_emp),
+                    "avg_contractor_last_7_days": _sanitize_for_json(avg_con),
+                    "avg_overall_last_7_days": _sanitize_for_json(avg_tot)
+                }
+
+    except Exception:
+        logger.exception("Error fetching/processing history endpoints")
+        notes.append("Failed to compute history averages from region history endpoints; partial results.")
+
+    # Fallback: if DB-based avg empty, use history_overall_avg
+    if (not avg_headcount_last_7_days or avg_headcount_last_7_days == 0) and history_overall_avg:
+        try:
+            avg_headcount_last_7_days = history_overall_avg
+            avg_headcount_per_site_last_7_days = round(history_overall_avg / float(sites_queried), 2) if sites_queried and sites_queried > 0 else None
+            notes.append("avg_headcount_last_7_days derived from region history endpoints (weekday-only avg) due to missing AttendanceSummary historical data.")
+        except Exception:
+            pass
+
+    # --- compute percentages (head/live vs CCURE reported)
+    def safe_pct(n, denom):
+        try:
+            if n is None or denom is None:
+                return None
+            d = float(denom)
+            if d == 0.0:
+                return None
+            return round((float(n) / d) * 100.0, 2)
+        except Exception:
+            return None
+
+    cc_emp_denom = reported_active_emps
+    cc_con_denom = reported_active_contractors
+    cc_total_denom = None
+    if isinstance(cc_emp_denom, int) and isinstance(cc_con_denom, int):
+        cc_total_denom = cc_emp_denom + cc_con_denom
+
+    head_emp_total = sum(v.get("employee", 0) for v in head_per_location.values())
+    head_con_total = sum(v.get("contractor", 0) for v in head_per_location.values())
+    live_emp_total = sum(v.get("employee", 0) for v in live_per_location.values())
+    live_con_total = sum(v.get("contractor", 0) for v in live_per_location.values())
+
+    head_emp_pct_vs_ccure_today = _sanitize_for_json(safe_pct(head_emp_total, cc_emp_denom))
+    head_con_pct_vs_ccure_today = _sanitize_for_json(safe_pct(head_con_total, cc_con_denom))
+    head_overall_pct_vs_ccure_today = _sanitize_for_json(safe_pct(head_total, cc_total_denom))
+
+    live_emp_pct_vs_ccure_today = _sanitize_for_json(safe_pct(live_emp_total, cc_emp_denom))
+    live_con_pct_vs_ccure_today = _sanitize_for_json(safe_pct(live_con_total, cc_con_denom))
+    live_overall_pct_vs_ccure_today = _sanitize_for_json(safe_pct(live_total, cc_total_denom))
+
+    history_emp_pct_vs_ccure = _sanitize_for_json(safe_pct(history_emp_avg, cc_emp_denom))
+    history_con_pct_vs_ccure = _sanitize_for_json(safe_pct(history_contractor_avg, cc_con_denom))
+    history_overall_pct_vs_ccure = _sanitize_for_json(safe_pct(history_overall_avg, cc_total_denom))
+
+    # Additionally, compute today-history-percent if history_today_* exists
+    history_today_emp_pct_vs_ccure = _sanitize_for_json(safe_pct(history_today_emp, cc_emp_denom))
+    history_today_con_pct_vs_ccure = _sanitize_for_json(safe_pct(history_today_con, cc_con_denom))
+
+    result = {
+        "date": today.isoformat(),
+        "headcount": {
+            "total_visited_today": int(head_total),
+            "employee": int(head_emp_total),
+            "contractor": int(head_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in head_per_location.items() }
+        },
+        "live_headcount": {
+            "currently_present_total": int(live_total),
+            "employee": int(live_emp_total),
+            "contractor": int(live_con_total),
+            "by_location": { loc: {"total": int(stats.get("total", 0)), "employee": int(stats.get("employee", 0)), "contractor": int(stats.get("contractor", 0))} for loc, stats in live_per_location.items() }
+        },
+        "ccure_active": {
+            "ccure_active_employees_reported": _safe_int(reported_active_emps),
+            "ccure_active_contractors_reported": _safe_int(reported_active_contractors)
+        },
+        "averages": {
+            "head_emp_pct_vs_ccure_today": head_emp_pct_vs_ccure_today,
+            "head_contractor_pct_vs_ccure_today": head_con_pct_vs_ccure_today,
+            "headcount_overall_pct_vs_ccure_today": head_overall_pct_vs_ccure_today,
+            "live_employee_pct_vs_ccure": live_emp_pct_vs_ccure_today,
+            "live_contractor_pct_vs_ccure": live_con_pct_vs_ccure_today if False else _sanitize_for_json(safe_pct(live_con_total, cc_con_denom)),
+            "live_overall_pct_vs_ccure": live_overall_pct_vs_ccure_today,
+            "avg_headcount_last_7_days": _sanitize_for_json(avg_headcount_last_7_days),
+            "avg_headcount_per_site_last_7_days": _sanitize_for_json(avg_headcount_per_site_last_7_days),
+            "avg_live_per_site": _sanitize_for_json(round(live_total / sites_queried, 2) if sites_queried and sites_queried > 0 else None),
+
+            # history endpoint weekday-only averages
+            "history_avg_employee_last_7_days": _sanitize_for_json(history_emp_avg),
+            "history_avg_contractor_last_7_days": _sanitize_for_json(history_contractor_avg),
+            "history_avg_overall_last_7_days": _sanitize_for_json(history_overall_avg),
+            "history_days_counted": int(history_days) if history_days is not None else None,
+            "history_employee_pct_vs_ccure": history_emp_pct_vs_ccure,
+            "history_contractor_pct_vs_ccure": history_con_pct_vs_ccure,
+            "history_overall_pct_vs_ccure": history_overall_pct_vs_ccure,
+
+            # history-today specific metrics (if present)
+            "history_today_employee_count": int(history_today_emp) if history_today_emp is not None else None,
+            "history_today_contractor_count": int(history_today_con) if history_today_con is not None else None,
+            "history_today_employee_pct_vs_ccure": history_today_emp_pct_vs_ccure,
+            "history_today_contractor_pct_vs_ccure": history_today_con_pct_vs_ccure,
+
+            "avg_by_location_last_7_days": _sanitize_for_json(avg_by_location_last_7_days),
+            "history_avg_by_location_last_7_days": _sanitize_for_json(history_avg_by_location_last_7_days)
+        },
+        "compliance": _sanitize_for_json(compliance),
+        "sites_queried": int(sites_queried),
+        "notes": " | ".join(notes) if notes else None
+    }
+
+    return _sanitize_for_json(result)
+
+
+
+
+
+
+
+
+
+
+
+
+# region_clients.py
+import requests
+from requests.exceptions import RequestException
+from datetime import datetime
+import logging
+
+logger = logging.getLogger("region_clients")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    import sys
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Edit endpoints if your hosts/ports differ
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+history_endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/history",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
+}
+
+def fetch_all_regions(timeout=6):
+    results = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            realtime = data.get("realtime", {}) if isinstance(data, dict) else {}
+            total = 0
+            for site in realtime.values():
+                try:
+                    total += int(site.get("total", 0))
+                except Exception:
+                    pass
+            results.append({"region": region, "count": total})
+        except RequestException as e:
+            logger.warning(f"[region_clients] error fetching live-summary for {region} @ {url}: {e}")
+            results.append({"region": region, "count": None})
+        except Exception as e:
+            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
+            results.append({"region": region, "count": None})
+    return results
+
+def fetch_all_details(timeout=6):
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            details = data.get("details", []) if isinstance(data, dict) else []
+            for d in details:
+                d2 = dict(d)
+                d2["__region"] = region
+                all_details.append(d2)
+        except RequestException as e:
+            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
+            continue
+        except Exception as e:
+            logger.exception(f"[region_clients] unexpected error for {region} details: {e}")
+            continue
+    return all_details
+
+def fetch_history_for_region(region, timeout=6):
+    url = history_endpoints.get(region)
+    if not url:
+        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
+        return []
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        summary = data.get("summaryByDate", []) if isinstance(data, dict) else []
+        out = []
+        for s in summary:
+            try:
+                s2 = dict(s)
+                s2["__region"] = region
+                out.append(s2)
+            except Exception:
+                continue
+        return out
+    except RequestException as e:
+        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
+        return []
+    except Exception as e:
+        logger.exception(f"[region_clients] unexpected error fetching history for {region}: {e}")
+        return []
+
+def fetch_all_history(timeout=6):
+    all_entries = []
+    for region in history_endpoints.keys():
+        try:
+            entries = fetch_history_for_region(region, timeout=timeout)
+            if entries:
+                all_entries.extend(entries)
+        except Exception:
+            logger.exception(f"[region_clients] error aggregating history for {region}")
+            continue
+    return all_entries
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Lets Clear Each Thing 
 1) Attendance Comparision first 
 a) Compare ccure-Active Employee with realtime HeadCount
