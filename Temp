@@ -1,3 +1,490 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, FileResponse
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+
+# --- DB / models imports (your existing project modules) ---
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+# optional: ccure compare service and others are imported inside endpoints when needed
+
+# --- settings (assumes these exist in your project) ---
+try:
+    from settings import UPLOAD_DIR, OUTPUT_DIR
+except Exception:
+    # fallback defaults
+    UPLOAD_DIR = "./uploads"
+    OUTPUT_DIR = "./output"
+
+# --- app & logging setup ---
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# ------------------------------------------------------------------
+# Helper functions (normalizers / region guesser)
+# ------------------------------------------------------------------
+def _guess_region_from_text(txt: str) -> str:
+    """Return 'apac','emea','laca','namer' or 'unknown' using substring keywords."""
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    # APAC keywords
+    if any(k in s for k in ("pune","mumbai","bangalore","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    # EMEA keywords
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    # LACA keywords
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    # NAMER keywords
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+# ------------------------------------------------------------------
+# HEADCOUNT endpoint (exact '/headcount' path)
+# ------------------------------------------------------------------
+@app.get("/headcount")
+def api_headcount():
+    """
+    Return headcount totals keyed by region: { apac, emea, laca, namer }.
+    Counts rows in ActiveEmployee + ActiveContractor and assigns them to regions
+    using a best-effort keyword match on location fields (location_city, location, etc).
+    """
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        with SessionLocal() as db:
+            try:
+                emp_rows = db.query(ActiveEmployee).all()
+            except Exception:
+                logger.exception("Failed to query ActiveEmployee")
+                emp_rows = []
+            try:
+                contr_rows = db.query(ActiveContractor).all()
+            except Exception:
+                logger.exception("Failed to query ActiveContractor")
+                contr_rows = []
+
+            def _loc_from_employee(e):
+                return getattr(e, "location_city", None) or getattr(e, "location", None) or getattr(e, "Location", None)
+
+            def _loc_from_contractor(c):
+                return getattr(c, "location", None) or getattr(c, "location_city", None) or getattr(c, "Location", None)
+
+            for e in emp_rows:
+                loc = _loc_from_employee(e)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+            for c in contr_rows:
+                loc = _loc_from_contractor(c)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# ------------------------------------------------------------------
+# /ccure/averages endpoint - shaped for GlobalPage.jsx
+# ------------------------------------------------------------------
+@app.get("/ccure/averages")
+def ccure_averages():
+    """
+    Returns a JSON structure used by the frontend's GlobalPage.
+    Best-effort values:
+      - live_today: counts for employee/contractor (from AttendanceSummary)
+      - ccure_active: values from ccure_client.get_global_stats() if available
+      - averages: percentage comparisons and 7-day avg headcount
+      - date and optional notes
+    """
+    try:
+        today = date.today()
+
+        with SessionLocal() as db:
+            # Fetch AttendanceSummary rows for today
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            # Build active employee and contractor id sets
+            active_employee_ids = set()
+            active_contractor_primary_ids = set()
+
+            try:
+                emps = db.query(ActiveEmployee).all()
+                for e in emps:
+                    if getattr(e, "employee_id", None):
+                        active_employee_ids.add(str(e.employee_id).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveEmployee rows")
+
+            try:
+                contrs = db.query(ActiveContractor).all()
+                for c in contrs:
+                    primary = getattr(c, "worker_system_id", None) or getattr(c, "ipass_id", None) or getattr(c, "worker_id", None)
+                    if primary:
+                        active_contractor_primary_ids.add(str(primary).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveContractor rows")
+
+            # Map attendance keys -> employee/contractor counts.
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+            for a in att_rows:
+                key = (a.employee_id or "").strip() if a.employee_id else None
+                if not key:
+                    try:
+                        key = (a.derived.get('card_number') or "").strip() if (a.derived and isinstance(a.derived, dict)) else None
+                    except Exception:
+                        key = None
+                if not key:
+                    unknown_count += 1
+                    continue
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if key in active_employee_ids:
+                    live_emp += 1
+                elif key in active_contractor_primary_ids:
+                    live_contr += 1
+                else:
+                    numeric = re.sub(r'\D+', '', key)
+                    if numeric:
+                        if numeric in active_employee_ids or numeric.lstrip('0') in active_employee_ids:
+                            live_emp += 1
+                        elif numeric in active_contractor_primary_ids or numeric.lstrip('0') in active_contractor_primary_ids:
+                            live_contr += 1
+                        else:
+                            unknown_count += 1
+                    else:
+                        unknown_count += 1
+
+            live_total_reported = live_emp + live_contr + unknown_count
+            live_total_details = len(att_rows)
+
+            # 7-day average headcount (unique keys present per day)
+            try:
+                start_7 = today - timedelta(days=6)
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_7, AttendanceSummary.date <= today).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                daily_counts = [len(by_date.get(start_7 + timedelta(days=i), set())) for i in range(7)]
+                avg7 = int(round(sum(daily_counts) / 7.0)) if any(daily_counts) else 0
+            except Exception:
+                logger.exception("Failed computing 7-day average")
+                avg7 = None
+
+        # get CCURE stats if available
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        # percentages vs CCURE
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg7,
+                # backwards-compat fields UI may use
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg7
+            }
+        }
+
+        return JSONResponse(resp)
+    except Exception as exc:
+        logger.exception("ccure_averages failed")
+        raise HTTPException(status_code=500, detail=f"ccure averages error: {exc}")
+
+# ------------------------------------------------------------------
+# The rest of your existing endpoints (compare, upload, ingest, reports)
+# ------------------------------------------------------------------
+
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(full),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=safe_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    return {"status":"ok", "path": str(dest)}
+
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    """
+    Accepts:
+      - Raw JSON array in body (preferred)
+      - JSON object with {"details": [...]} in body
+      - multipart/form-data where a form field 'details' contains a JSON string
+    """
+    details = None
+    # Try direct JSON
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        # not JSON, try form
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                # attempt first field
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    try:
+        res = ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    if isinstance(res, dict):
+        return {"status": "ok", **res}
+    return {"status": "ok", "inserted": len(details)}
+
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    res = ingest_live_details_list(details)
+    if isinstance(res, dict):
+        return {"status":"ok", **res}
+    return {"status":"ok", "inserted": len(details)}
+
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+
+    try:
+        from compare_service import compute_daily_attendance, compare_with_active
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    # compute attendance summary (will build attendance_summary rows)
+    compute_daily_attendance(dt)
+
+    # compare vs active and CCURE
+    summary = compare_with_active(dt)
+    return JSONResponse(summary)
+
+
+# additional endpoint to fetch CCure stats directly (optional)
+@app.get("/ccure/stats")
+def ccure_stats():
+    try:
+        import ccure_client
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client import failed: {e}")
+    try:
+        stats = ccure_client.get_global_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client.get_global_stats failed: {e}")
+    return stats
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
 from fastapi.responses import JSONResponse, FileResponse
