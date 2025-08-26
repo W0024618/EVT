@@ -1,3 +1,685 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+
+# --- DB / models imports (your existing project modules) ---
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor, LiveSwipe, AttendanceSummary
+
+# --- settings (assumes these exist in your project) ---
+try:
+    from settings import UPLOAD_DIR, OUTPUT_DIR
+except Exception:
+    # fallback defaults
+    UPLOAD_DIR = "./uploads"
+    OUTPUT_DIR = "./output"
+
+# --- app & logging setup ---
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# -------------------------------
+# CORS (allow frontend dev server to connect directly to Python SSE)
+# Adjust origins as needed for production — do NOT use '*' in prod.
+# -------------------------------
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    # add if you have other dev hosts or ports
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------------------
+# Small SSE broadcaster (in-process). Minimal, works for single-process deployments.
+# Each connected client gets its own asyncio.Queue; we push payloads to all queues.
+# ------------------------------------------------------------------
+_broadcaster_clients = set()  # set of asyncio.Queue
+
+def broadcast_ccure_update(payload: dict):
+    """
+    Non-blocking broadcast to all connected SSE clients.
+    Uses asyncio.get_event_loop().call_soon_threadsafe to schedule queue.put_nowait
+    so it is safe to call from sync endpoints.
+    """
+    if not _broadcaster_clients:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+
+    for q in list(_broadcaster_clients):
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to push payload to SSE client (will remove client)")
+            try:
+                _broadcaster_clients.discard(q)
+            except Exception:
+                pass
+
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    """
+    Async generator yielding SSE data lines from provided queue.
+    When client disconnects, finally block removes the queue from broadcaster set.
+    """
+    try:
+        while True:
+            payload = await client_queue.get()
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            # single "data:" block per payload
+            yield f"data: {data}\n\n"
+    finally:
+        # Ensure client queue is removed when generator stops (disconnect)
+        try:
+            _broadcaster_clients.discard(client_queue)
+        except Exception:
+            pass
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    """
+    SSE endpoint that streams ccure/averages updates.
+    Frontend may connect directly to `http://localhost:8000/ccure/stream`
+    (or set VITE_PY_BACKEND to point there in dev).
+    """
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    generator = _sse_event_generator(q)
+
+    # Use headers that help with streaming and intermediate proxies
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # for nginx buffering disable if used
+    }
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
+
+# ------------------------------------------------------------------
+# Helper functions (normalizers / region guesser)
+# ------------------------------------------------------------------
+def _guess_region_from_text(txt: str) -> str:
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    if any(k in s for k in ("pune","mumbai","bangalore","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+# ------------------------------------------------------------------
+# HEADCOUNT endpoint (exact '/headcount' path) - unchanged logic
+# ------------------------------------------------------------------
+@app.get("/headcount")
+def api_headcount():
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        with SessionLocal() as db:
+            try:
+                emp_rows = db.query(ActiveEmployee).all()
+            except Exception:
+                logger.exception("Failed to query ActiveEmployee")
+                emp_rows = []
+            try:
+                contr_rows = db.query(ActiveContractor).all()
+            except Exception:
+                logger.exception("Failed to query ActiveContractor")
+                contr_rows = []
+
+            def _loc_from_employee(e):
+                return getattr(e, "location_city", None) or getattr(e, "location", None) or getattr(e, "Location", None)
+
+            def _loc_from_contractor(c):
+                return getattr(c, "location", None) or getattr(c, "location_city", None) or getattr(c, "Location", None)
+
+            for e in emp_rows:
+                loc = _loc_from_employee(e)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+            for c in contr_rows:
+                loc = _loc_from_contractor(c)
+                region = _guess_region_from_text(loc)
+                totals[region] = totals.get(region, 0) + 1
+
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# ------------------------------------------------------------------
+# Build ccure averages payload (extracted helper) -- unchanged behaviour
+# ------------------------------------------------------------------
+def build_ccure_averages():
+    try:
+        today = date.today()
+
+        with SessionLocal() as db:
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            active_employee_ids = set()
+            active_contractor_primary_ids = set()
+
+            try:
+                emps = db.query(ActiveEmployee).all()
+                for e in emps:
+                    if getattr(e, "employee_id", None):
+                        active_employee_ids.add(str(e.employee_id).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveEmployee rows")
+
+            try:
+                contrs = db.query(ActiveContractor).all()
+                for c in contrs:
+                    primary = getattr(c, "worker_system_id", None) or getattr(c, "ipass_id", None) or getattr(c, "worker_id", None)
+                    if primary:
+                        active_contractor_primary_ids.add(str(primary).strip())
+            except Exception:
+                logger.exception("Failed to load ActiveContractor rows")
+
+            # Map attendance keys -> employee/contractor counts.
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+            for a in att_rows:
+                key = (a.employee_id or "").strip() if a.employee_id else None
+                if not key:
+                    try:
+                        key = (a.derived.get('card_number') or "").strip() if (a.derived and isinstance(a.derived, dict)) else None
+                    except Exception:
+                        key = None
+                if not key:
+                    unknown_count += 1
+                    continue
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if key in active_employee_ids:
+                    live_emp += 1
+                elif key in active_contractor_primary_ids:
+                    live_contr += 1
+                else:
+                    numeric = re.sub(r'\D+', '', key)
+                    if numeric:
+                        if numeric in active_employee_ids or numeric.lstrip('0') in active_employee_ids:
+                            live_emp += 1
+                        elif numeric in active_contractor_primary_ids or numeric.lstrip('0') in active_contractor_primary_ids:
+                            live_contr += 1
+                        else:
+                            unknown_count += 1
+                    else:
+                        unknown_count += 1
+
+            live_total_reported = live_emp + live_contr + unknown_count
+            live_total_details = len(att_rows)
+
+            # 7-day average headcount (unique keys present per day)
+            try:
+                start_7 = today - timedelta(days=6)
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_7, AttendanceSummary.date <= today).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                daily_counts = [len(by_date.get(start_7 + timedelta(days=i), set())) for i in range(7)]
+                avg7 = int(round(sum(daily_counts) / 7.0)) if any(daily_counts) else 0
+            except Exception:
+                logger.exception("Failed computing 7-day average")
+                avg7 = None
+
+        # get CCURE stats if available
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg7,
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg7
+            }
+        }
+
+        return resp
+    except Exception:
+        logger.exception("build_ccure_averages failed")
+        raise
+
+# ------------------------------------------------------------------
+# /ccure/averages endpoint - uses helper and broadcasts to SSE clients
+# ------------------------------------------------------------------
+@app.get("/ccure/averages")
+def ccure_averages():
+    try:
+        resp = build_ccure_averages()
+        try:
+            broadcast_ccure_update(resp)
+        except Exception:
+            logger.exception("broadcast failed in /ccure/averages (non-fatal)")
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("ccure_averages failed")
+        raise HTTPException(status_code=500, detail=f"ccure averages error: {exc}")
+
+# ------------------------------------------------------------------
+# The rest of your existing endpoints (compare, upload, ingest, reports)
+# Minor changes: after ingest operations we attempt to broadcast updated averages
+# ------------------------------------------------------------------
+
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = Path(OUTPUT_DIR) / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(full),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=safe_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_employee_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_employee_excel(dest)
+    # broadcast updated averages
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_employees")
+    return {"status":"ok", "path": str(dest)}
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(400, "Please upload an Excel file")
+    dest = Path(UPLOAD_DIR) / f"{uuid.uuid4().hex}_{file.filename}"
+    with open(dest, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        from ingest_excel import ingest_contractor_excel
+    except Exception as e:
+        logger.exception("ingest_excel import failed")
+        raise HTTPException(status_code=500, detail=f"ingest_excel import failed: {e}")
+    ingest_contractor_excel(dest)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after upload_active_contractors")
+    return {"status":"ok", "path": str(dest)}
+
+
+@app.post("/ingest/live-details")
+async def ingest_live(request: Request):
+    details = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and 'details' in body:
+            details = body['details']
+        else:
+            details = body
+    except Exception:
+        try:
+            form = await request.form()
+            if 'details' in form:
+                raw = form['details']
+                if isinstance(raw, str):
+                    details = json.loads(raw)
+                else:
+                    try:
+                        details = json.loads((await raw.read()).decode('utf-8'))
+                    except Exception:
+                        details = list(form.getlist('details'))
+            else:
+                first = None
+                for v in form.values():
+                    first = v
+                    break
+                if isinstance(first, str):
+                    details = json.loads(first)
+                else:
+                    raise HTTPException(status_code=400, detail="No JSON payload found")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse request body as JSON or form: {e}")
+
+    if not isinstance(details, (list, tuple)):
+        raise HTTPException(status_code=400, detail="Expected top-level array (JSON list) of detail objects")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    try:
+        res = ingest_live_details_list(details)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest details: {e}")
+
+    # After successful ingest, recompute/broadcast ccure averages (best-effort)
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after ingest_live (non-fatal)")
+
+    if isinstance(res, dict):
+        return {"status": "ok", **res}
+    return {"status": "ok", "inserted": len(details)}
+
+
+@app.get("/ingest/fetch-all")
+def fetch_all_and_ingest():
+    try:
+        import region_clients
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"region_clients unavailable: {e}")
+
+    details = region_clients.fetch_all_details()
+    if not isinstance(details, list):
+        raise HTTPException(status_code=500, detail="Unexpected data from region_clients.fetch_all_details")
+
+    try:
+        from compare_service import ingest_live_details_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    res = ingest_live_details_list(details)
+    # broadcast
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after fetch-all")
+    if isinstance(res, dict):
+        return {"status":"ok", **res}
+    return {"status":"ok", "inserted": len(details)}
+
+
+@app.get("/reports/daily/{yyyymmdd}")
+def daily_report(yyyymmdd: str):
+    import datetime
+    try:
+        dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Date must be in YYYYMMDD format")
+
+    try:
+        from compare_service import compute_daily_attendance, compare_with_active
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"compare_service import failed: {e}")
+
+    compute_daily_attendance(dt)
+    summary = compare_with_active(dt)
+
+    try:
+        resp = build_ccure_averages()
+        broadcast_ccure_update(resp)
+    except Exception:
+        logger.exception("Failed to broadcast after daily_report")
+
+    return JSONResponse(summary)
+
+
+@app.get("/ccure/stats")
+def ccure_stats():
+    try:
+        import ccure_client
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client import failed: {e}")
+    try:
+        stats = ccure_client.get_global_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ccure_client.get_global_stats failed: {e}")
+    return stats
+
+
+
+
+
+
+
+// AVERAGES: use SSE (direct to Python backend) with fallback initial fetch
+useEffect(() => {
+  let stopped = false;
+  let es = null;
+  let backoff = 1000;
+
+  // Allow override via VITE_PY_BACKEND; otherwise assume python at :8000
+  const PY_BACKEND = (import.meta.env.VITE_PY_BACKEND || `${window.location.protocol}//${window.location.hostname}:8000`).replace(/\/$/, '');
+
+  const connect = () => {
+    if (stopped) return;
+    try {
+      // Directly connect to Python SSE endpoint (bypasses Vite proxy for streaming)
+      es = new EventSource(`${PY_BACKEND}/ccure/stream`);
+    } catch (err) {
+      console.warn('SSE creation failed', err);
+      es = null;
+    }
+
+    if (!es) {
+      // fallback to polling if EventSource not supported or creation failed
+      initialFetch();
+      return;
+    }
+
+    es.onopen = () => {
+      console.info('[SSE] connected to', `${PY_BACKEND}/ccure/stream`);
+      backoff = 1000;
+      setAveragesError(null);
+    };
+
+    es.onmessage = (evt) => {
+      try {
+        const payload = JSON.parse(evt.data);
+        setAverages(payload);
+        setLoadingAverages(false);
+        setAveragesError(null);
+      } catch (e) {
+        console.warn('Failed to parse SSE message', e);
+      }
+    };
+
+    es.onerror = (err) => {
+      console.warn('[SSE] error/closed, attempting reconnect', err);
+      try { es.close(); } catch (e) {}
+      es = null;
+      if (stopped) return;
+      // exponential backoff reconnect (capped)
+      setTimeout(() => {
+        backoff = Math.min(backoff * 2, 30000);
+        connect();
+      }, backoff);
+    };
+  };
+
+  const initialFetch = async () => {
+    setLoadingAverages(true);
+    setAveragesError(null);
+    try {
+      const res = await api.get('/ccure/averages');
+      setAverages(res.data);
+      setLoadingAverages(false);
+      setAveragesError(null);
+    } catch (err) {
+      console.warn('initial /ccure/averages fetch failed', err);
+      setLoadingAverages(false);
+      setAveragesError(err);
+    }
+  };
+
+  // Start with initial fetch so UI is populated quickly, then open SSE
+  initialFetch();
+  connect();
+
+  return () => {
+    stopped = true;
+    if (es) {
+      try { es.close(); } catch (e) {}
+      es = null;
+    }
+  };
+}, []);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 When I Upadte this File We Got this Error in Console and 
 and 
 
