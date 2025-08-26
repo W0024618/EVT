@@ -1,3 +1,258 @@
+def compute_visit_averages(timeout: int = 6) -> Dict[str, Any]:
+    """
+    Strictly compute averages and return a JSON-serializable dict.
+    Keys:
+      - live_today: {employee, contractor, total_reported, total_from_details}
+      - ccure_active: {active_employees, active_contractors}
+      - averages: {employee_pct, contractor_pct, overall_pct}
+      - sites_queried: int
+      - notes: optional string
+    This function is defensive: when region totals differ from detail sums we return both numbers
+    and add a clarifying note.
+    """
+    notes = []
+    # 1) fetch CCURE reported totals (best-effort)
+    cc_active_emps = None
+    cc_active_contrs = None
+    try:
+        ccure_stats = _fetch_ccure_stats()
+        if isinstance(ccure_stats, dict):
+            if ccure_stats.get("ActiveEmployees") not in (None, ""):
+                try:
+                    cc_active_emps = int(ccure_stats.get("ActiveEmployees"))
+                except Exception:
+                    pass
+            if ccure_stats.get("ActiveContractors") not in (None, ""):
+                try:
+                    cc_active_contrs = int(ccure_stats.get("ActiveContractors"))
+                except Exception:
+                    pass
+            # try alternatives
+            if cc_active_emps is None:
+                try:
+                    cc_active_emps = int(ccure_stats.get("ActiveEmployeesCount")) if ccure_stats.get("ActiveEmployeesCount") not in (None, "") else None
+                except Exception:
+                    pass
+            if cc_active_contrs is None:
+                try:
+                    cc_active_contrs = int(ccure_stats.get("ActiveContractorsCount")) if ccure_stats.get("ActiveContractorsCount") not in (None, "") else None
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # fallback: try detail per-stat calls if available
+    if (cc_active_emps is None) or (cc_active_contrs is None):
+        try:
+            fb = _fetch_ccure_stats_totals_fallback()
+            if cc_active_emps is None:
+                v = fb.get("ActiveEmployees")
+                cc_active_emps = int(v) if v not in (None, "") else None
+            if cc_active_contrs is None:
+                v = fb.get("ActiveContractors")
+                cc_active_contrs = int(v) if v not in (None, "") else None
+        except Exception:
+            pass
+
+    # 2) fetch region totals and details
+    sites_queried = 0
+    region_totals_sum = 0     # sum of region 'count' values
+    details_sum = 0          # sum of per-person detail rows
+    live_emp_total_from_regions = None
+    live_con_total_from_regions = None
+
+    live_per_location = {}
+    details = []
+
+    try:
+        import region_clients
+    except Exception:
+        notes.append("region_clients import failed; live totals unavailable.")
+        region_clients = None
+
+    if region_clients is not None:
+        # fetch region summaries
+        try:
+            regions_info = region_clients.fetch_all_regions(timeout=timeout) or []
+            sites_queried = len(regions_info)
+            for r in regions_info:
+                try:
+                    c = r.get("count")
+                    if c is not None:
+                        region_totals_sum += int(c)
+                except Exception:
+                    continue
+        except Exception:
+            notes.append("Failed to fetch region summary totals.")
+
+        # fetch details
+        try:
+            details = region_clients.fetch_all_details(timeout=timeout) or []
+        except Exception:
+            notes.append("Failed to fetch region details (per-person).")
+            details = []
+
+        # build per-location breakdown from details (dedupe by EmployeeID/Card when possible)
+        seen_keys = set()
+        for d in details:
+            try:
+                # Dedup key: EmployeeID || CardNumber || PersonGUID
+                empid = d.get("EmployeeID") or d.get("employee_id")
+                card = d.get("CardNumber") or d.get("Card") or d.get("card_number")
+                guid = d.get("PersonGUID")
+                key = None
+                if empid:
+                    key = str(empid).strip()
+                elif card:
+                    k = re.sub(r'\D+', '', str(card))
+                    key = k if k else None
+                elif guid:
+                    key = str(guid).strip()
+                if not key:
+                    # fallback: use combination of object name + door + time (likely unique)
+                    key = (d.get("ObjectName1") or "") + "|" + (d.get("Door") or "") + "|" + str(d.get("LocaleMessageTime") or "")
+                if key in seen_keys:
+                    # already counted
+                    continue
+                seen_keys.add(key)
+
+                loc = pick_partition_from_detail(d) or "Unknown"
+                cls = classify_personnel_from_detail(d) or "contractor"
+                if loc not in live_per_location:
+                    live_per_location[loc] = {"total": 0, "employee": 0, "contractor": 0}
+                live_per_location[loc]["total"] += 1
+                if cls not in ("employee", "contractor"):
+                    cls = "contractor"
+                live_per_location[loc][cls] += 1
+                details_sum += 1
+            except Exception:
+                continue
+
+        # If the region summary provides explicit Employee/Contractor split, try to get those too
+        try:
+            # attempt to synthesize employee/contractor totals from per-region 'today' if possible
+            emp_tot = 0
+            con_tot = 0
+            have_emp_con = False
+            for r in regions_info:
+                try:
+                    url = r.get("url")
+                    # we already have the region summary object returned by fetch_all_regions - but it only gave 'count'
+                    # so attempt to fetch the endpoint directly and read 'today' or 'realtime' employee/contractor.
+                    if not url:
+                        continue
+                    rr = requests.get(url, timeout=timeout)
+                    rr.raise_for_status()
+                    d = rr.json()
+                    if isinstance(d, dict) and "today" in d and isinstance(d["today"], dict):
+                        dt = d["today"]
+                        e = int(dt.get("Employee") or 0)
+                        c = int(dt.get("Contractor") or 0)
+                        emp_tot += e
+                        con_tot += c
+                        have_emp_con = True
+                    elif isinstance(d, dict) and "realtime" in d and isinstance(d["realtime"], dict):
+                        # sum across partitions
+                        for site in d["realtime"].values():
+                            try:
+                                emp_tot += int(site.get("Employee") or 0)
+                                con_tot += int(site.get("Contractor") or 0)
+                                have_emp_con = True
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+            if have_emp_con:
+                live_emp_total_from_regions = int(emp_tot)
+                live_con_total_from_regions = int(con_tot)
+        except Exception:
+            # ignore; we still can use details_sum and region_totals_sum
+            pass
+
+    # choose top-level live totals: prefer 'reported' totals from regions if available (region_totals_sum)
+    live_total_reported = region_totals_sum if region_totals_sum else None
+    live_total_details = details_sum if details_sum else None
+
+    # If we managed to compute Employee/Contractor totals directly from region endpoints, use those,
+    # otherwise derive from details (per-location).
+    if live_emp_total_from_regions is not None and live_con_total_from_regions is not None:
+        live_employee = int(live_emp_total_from_regions)
+        live_contractor = int(live_con_total_from_regions)
+        # If region_total was not set, use sum of employee+contractor
+        if live_total_reported is None:
+            live_total_reported = live_employee + live_contractor
+    else:
+        # derive from per-location details (we built live_per_location from details earlier)
+        live_employee = sum(v.get("employee", 0) for v in live_per_location.values())
+        live_contractor = sum(v.get("contractor", 0) for v in live_per_location.values())
+        if live_total_reported is None:
+            live_total_reported = live_employee + live_contractor
+
+    # compute overall total (we keep both)
+    live_total_overall = live_total_reported
+
+    # 3) compute percentages vs ccure reported totals
+    def safe_pct(n, d):
+        try:
+            if n is None or d is None or d == 0:
+                return None
+            return round((float(n) / float(d)) * 100.0, 3)
+        except Exception:
+            return None
+
+    emp_pct = safe_pct(live_employee, cc_active_emps)
+    con_pct = safe_pct(live_contractor, cc_active_contrs)
+    overall_pct = None
+    if (cc_active_emps or 0) + (cc_active_contrs or 0) > 0:
+        overall_pct = safe_pct((live_employee + live_contractor), ((cc_active_emps or 0) + (cc_active_contrs or 0)))
+
+    # prepare final dict with both reported totals and details totals to avoid ambiguity
+    result = {
+        "live_today": {
+            "employee": _sanitize_for_json(live_employee),
+            "contractor": _sanitize_for_json(live_contractor),
+            "total_reported": _sanitize_for_json(live_total_reported),
+            "total_from_details": _sanitize_for_json(live_total_details)
+        },
+        "ccure_active": {
+            "active_employees": _sanitize_for_json(cc_active_emps),
+            "active_contractors": _sanitize_for_json(cc_active_contrs)
+        },
+        "averages": {
+            "employee_pct": _sanitize_for_json(emp_pct),
+            "contractor_pct": _sanitize_for_json(con_pct),
+            "overall_pct": _sanitize_for_json(overall_pct)
+        },
+        "sites_queried": int(sites_queried or 0),
+        "notes": None
+    }
+
+    # Add note(s) if totals differ
+    if (live_total_reported is not None) and (live_total_details is not None) and (int(live_total_reported) != int(live_total_details)):
+        result["notes"] = f"Region totals ({live_total_reported}) differ from detail rows ({live_total_details}); returning both 'total_reported' and 'total_from_details'."
+    elif result["notes"] is None and notes:
+        result["notes"] = " | ".join(notes)
+
+    return _sanitize_for_json(result)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 http://localhost:8000/ccure/averages
 
 
