@@ -1,3 +1,490 @@
+// frontend/src/pages/GlobalPage.jsx
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box, Typography, CircularProgress, IconButton, Button, Paper, Divider,
+  LinearProgress, Snackbar, Alert
+} from '@mui/material';
+import HomeIcon from '@mui/icons-material/Home';
+import DescriptionIcon from '@mui/icons-material/Description';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import MapChart from '../components/MapChart.jsx';
+import api from '../api';
+import { useNavigate, Link } from 'react-router-dom';
+
+/*
+  Important:
+  - Do NOT mix /api/headcount and /api/ccure/averages.
+  - Region cards (APAC/EMEA/LACA/NAMER) come only from /api/headcount.
+  - Live vs CCURE Summary comes only from /api/ccure/averages.
+  - Initial region totals are zero (keeps previous UI behaviour).
+  - We implement polling for both endpoints independently with backoff on failures.
+*/
+
+export default function GlobalPage() {
+  const navigate = useNavigate();
+
+  // Region totals (headcount) - default to zeros so UI shows 0 immediately (preserve previous behaviour)
+  const [counts, setCounts] = useState({ apac: 0, emea: 0, laca: 0, namer: 0 });
+  const [selected, setSelected] = useState('global');
+
+  // Averages/ccure state (left panel)
+  const [averages, setAverages] = useState(null);
+  const [loadingAverages, setLoadingAverages] = useState(true);
+  const [averagesError, setAveragesError] = useState(null);
+
+  // upload state
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
+
+  const fileInputEmpRef = useRef();
+  const fileInputContrRef = useRef();
+  const [snack, setSnack] = useState({ open: false, severity: 'info', message: '' });
+
+  // Polling refs for safe scheduling and backoff
+  const headcountRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
+  const averagesRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
+
+  // -----------------------
+  // HEADCOUNT POLLING ONLY
+  // -----------------------
+  useEffect(() => {
+    let mounted = true;
+
+    const fetchHeadcount = async () => {
+      if (!mounted) return;
+      if (headcountRef.current.isFetching) return;
+      headcountRef.current.isFetching = true;
+
+      try {
+        // Important: only call /headcount here (proxy rewrites /api -> backend)
+        const res = await api.get('/headcount');
+        if (!mounted) return;
+        const d = res.data;
+        // We expect an object with keys apac/emea/laca/namer (defensive)
+        if (d && typeof d === 'object') {
+          const newCounts = {
+            apac: Number(d.apac || 0),
+            emea: Number(d.emea || 0),
+            laca: Number(d.laca || 0),
+            namer: Number(d.namer || 0),
+          };
+          setCounts(prev => {
+            // Only update if changed to avoid flicker/re-renders
+            if (
+              prev.apac === newCounts.apac &&
+              prev.emea === newCounts.emea &&
+              prev.laca === newCounts.laca &&
+              prev.namer === newCounts.namer
+            ) {
+              return prev;
+            }
+            return newCounts;
+          });
+        } else {
+          console.warn('[headcount] unexpected response shape - ignoring', d);
+        }
+        headcountRef.current.failureCount = 0;
+      } catch (err) {
+        headcountRef.current.failureCount = (headcountRef.current.failureCount || 0) + 1;
+        console.warn('[headcount] fetch failed:', err?.message || err);
+        // Keep previous counts (do not set to null or zeros)
+      } finally {
+        headcountRef.current.isFetching = false;
+        // schedule next fetch (with simple exponential backoff based on failureCount)
+        const f = headcountRef.current.failureCount || 0;
+        const backoffMs = 15000 * Math.pow(2, Math.min(Math.max(f - 1, 0), 4)); // 15s..240s
+        headcountRef.current.timerId = setTimeout(fetchHeadcount, backoffMs);
+      }
+    };
+
+    fetchHeadcount();
+
+    return () => {
+      mounted = false;
+      if (headcountRef.current.timerId) clearTimeout(headcountRef.current.timerId);
+      headcountRef.current.isFetching = false;
+    };
+  }, []); // run once
+
+  // -----------------------
+  // AVERAGES POLLING ONLY (ccure/averages)
+  // -----------------------
+  useEffect(() => {
+    let mounted = true;
+
+    const fetchAverages = async () => {
+      if (!mounted) return;
+      if (averagesRef.current.isFetching) return;
+      averagesRef.current.isFetching = true;
+      setLoadingAverages(true);
+      setAveragesError(null);
+
+      try {
+        const res = await api.get('/ccure/averages');
+        if (!mounted) return;
+        setAverages(res.data);
+        averagesRef.current.failureCount = 0;
+      } catch (err) {
+        averagesRef.current.failureCount = (averagesRef.current.failureCount || 0) + 1;
+        setAveragesError(err);
+        console.warn('[averages] fetch failed:', err?.message || err);
+      } finally {
+        averagesRef.current.isFetching = false;
+        setLoadingAverages(false);
+        const f = averagesRef.current.failureCount || 0;
+        const backoffMs = 30000 * Math.pow(2, Math.min(Math.max(f - 1, 0), 4)); // 30s..~480s
+        averagesRef.current.timerId = setTimeout(fetchAverages, backoffMs);
+      }
+    };
+
+    fetchAverages();
+
+    return () => {
+      mounted = false;
+      if (averagesRef.current.timerId) clearTimeout(averagesRef.current.timerId);
+      averagesRef.current.isFetching = false;
+    };
+  }, []);
+
+  // -----------------------
+  // Upload helper (unchanged endpoints)
+  // -----------------------
+  const handleUpload = async (file, type) => {
+    if (!file) return;
+    const endpoint = type === 'employee' ? '/upload/active-employees' : '/upload/active-contractors';
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+
+    setUploading(true);
+    setUploadResult(null);
+    setUploadError(null);
+
+    try {
+      const res = await api.post(endpoint, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000
+      });
+      setUploadResult(res.data);
+      setSnack({ open: true, severity: 'success', message: `Upload successful: ${file.name}` });
+      // Optionally re-fetch averages/headcount after successful upload:
+      try { await api.get('/ccure/averages').then(r => setAverages(r.data)); } catch (_) {}
+      try { await api.get('/headcount').then(r => {
+        const d = r.data;
+        if (d && typeof d === 'object') {
+          setCounts(prev => ({
+            apac: Number(d.apac || prev.apac || 0),
+            emea: Number(d.emea || prev.emea || 0),
+            laca: Number(d.laca || prev.laca || 0),
+            namer: Number(d.namer || prev.namer || 0)
+          }));
+        }
+      }) } catch (_) {}
+    } catch (err) {
+      console.error('Upload failed', err);
+      setUploadError(err);
+      setSnack({ open: true, severity: 'error', message: `Upload failed: ${file.name}` });
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const onChooseEmployeeFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'employee'); e.target.value = null; };
+  const onChooseContractorFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'contractor'); e.target.value = null; };
+
+  // safe helper for nested averages paths
+  const safe = (path, fallback = null) => {
+    if (!averages) return fallback;
+    try {
+      return path.split('.').reduce((a, k) => (a && a[k] !== undefined ? a[k] : fallback), averages);
+    } catch {
+      return fallback;
+    }
+  };
+
+  // derived
+  const liveEmployee = safe('live_today.employee', safe('live_headcount.employee', null));
+  const liveContractor = safe('live_today.contractor', safe('live_headcount.contractor', null));
+  const liveTotalReported = safe('live_today.total_reported', safe('live_headcount.currently_present_total', null));
+  const liveTotalDetails = safe('live_today.total_from_details', null);
+
+  const ccureActiveEmployees = safe('ccure_active.active_employees', safe('ccure_active.ccure_active_employees_reported', null));
+  const ccureActiveContractors = safe('ccure_active.active_contractors', safe('ccure_active.ccure_active_contractors_reported', null));
+
+  const empPct = safe('averages.employee_pct', safe('averages.head_emp_pct_vs_ccure_today', null));
+  const conPct = safe('averages.contractor_pct', safe('averages.head_contractor_pct_vs_ccure_today', null));
+  const overallPct = safe('averages.overall_pct', safe('averages.headcount_overall_pct_vs_ccure_today', null));
+  const avg7 = safe('averages.avg_headcount_last_7_days', safe('averages.history_avg_overall_last_7_days', null));
+
+  // Render
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+      {/* Header */}
+      <Box px={2} py={1} sx={{ backgroundColor: 'black', color: '#fff', borderBottom: '4px solid #FFD700', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Box>
+          <IconButton component={Link} to="/" sx={{ color: '#FFC72C' }}><HomeIcon fontSize="medium" /></IconButton>
+          <IconButton component={Link} to="/reports" sx={{ color: '#FFC72C', ml: 1 }}><DescriptionIcon fontSize="medium" /></IconButton>
+        </Box>
+
+        <Box sx={{ flexGrow: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Box component="img" src="/wu-head-logo.png" alt="WU Logo" sx={{ height: { xs: 30, md: 55 }, mr: 2 }} />
+          <Typography variant="h5" sx={{ fontWeight: 'bold', color: 'primary.main' }}>Global Headcount Dashboard</Typography>
+        </Box>
+
+        <Box sx={{ width: 120 }} />
+      </Box>
+
+      {/* Region Cards */}
+      <Box sx={{ display: 'flex', gap: 2, p: 2, flexWrap: 'wrap', justifyContent: 'center' }}>
+        {[
+          { key: 'apac', label: 'APAC', url: 'http://10.199.22.57:3000/', textColor: '#f5650c' },
+          { key: 'emea', label: 'EMEA', url: 'http://10.199.22.57:3001/', textColor: '#11e6ed' },
+          { key: 'laca', label: 'LACA', url: 'http://10.199.22.57:3003/', textColor: '#FF2DD1' },
+          { key: 'namer', label: 'NAMER', url: 'http://10.199.22.57:3002/', textColor: '#a6e61c' },
+        ].map(region => (
+          <Box
+            key={region.key}
+            onClick={() => { window.location.href = region.url; }}
+            sx={{
+              cursor: 'pointer',
+              width: 200,
+              height: 80,
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              border: '4px solid rgba(255, 204, 0, 0.89)',
+              borderRadius: 2,
+              boxShadow: 3,
+              color: region.textColor,
+              '&:hover': { opacity: 0.9 },
+            }}
+          >
+            <Typography variant="subtitle1" sx={{ fontWeight: 'bold', color: region.textColor, fontSize: { xs: '1.3rem' } }}>{region.label}</Typography>
+            <Typography variant="h3" sx={{ fontWeight: 700, fontSize: { xs: '1.5rem', sm: '1.8rem' }, color: region.textColor }}>
+              {typeof counts[region.key] === 'number' ? counts[region.key] : 0}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+
+      {/* Main */}
+      <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+        <Box sx={{ width: 360, p: 2, bgcolor: 'background.paper', borderRight: '1px solid rgba(255,255,255,0.06)', overflowY: 'auto' }}>
+          <Typography variant="h6" sx={{ mb: 1, color: 'primary.main' }}>Live vs CCURE Summary</Typography>
+
+          {loadingAverages ? (
+            <Box sx={{ py: 2 }}><LinearProgress /></Box>
+          ) : averagesError ? (
+            <Alert severity="error">Failed to load CCURE averages</Alert>
+          ) : averages ? (
+            <>
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">CCURE Active (reported)</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Box>
+                    <Typography variant="h5" sx={{ fontWeight: 700 }}>{ccureActiveEmployees ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Employees</Typography>
+                  </Box>
+                  <Box sx={{ textAlign: 'right' }}>
+                    <Typography variant="h5" sx={{ fontWeight: 700 }}>{ccureActiveContractors ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Contractors</Typography>
+                  </Box>
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="subtitle2" color="text.secondary">Live Today</Typography>
+                  <Typography variant="caption" color="text.secondary">{averages.date ?? ''}</Typography>
+                </Box>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{liveEmployee ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Employee</Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 700 }}>{liveContractor ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Contractor</Typography>
+                  </Box>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Totals</Typography>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                    <Typography variant="body2">Reported total</Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>{liveTotalReported ?? '—'}</Typography>
+                  </Box>
+                  {liveTotalDetails != null && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                      <Typography variant="body2">Detail rows total</Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 700 }}>{liveTotalDetails}</Typography>
+                    </Box>
+                  )}
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">Percentages vs CCURE</Typography>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">Employees</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{empPct != null ? `${empPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2">Contractors</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{conPct != null ? `${conPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                  <Typography variant="body2">Overall</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{overallPct != null ? `${overallPct}%` : '—'}</Typography>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+                <Typography variant="caption" color="text.secondary">Averages</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">7-day avg headcount</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{avg7 ?? '—'}</Typography>
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.03)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1 }}>Upload Active Sheets</Typography>
+
+                <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputEmpRef} onChange={onChooseEmployeeFile} />
+                <Button variant="contained" startIcon={<UploadFileIcon />} sx={{ mr: 1 }} onClick={() => fileInputEmpRef.current && fileInputEmpRef.current.click()} disabled={uploading}>
+                  Upload Employees
+                </Button>
+
+                <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputContrRef} onChange={onChooseContractorFile} />
+                <Button variant="outlined" startIcon={<UploadFileIcon />} onClick={() => fileInputContrRef.current && fileInputContrRef.current.click()} disabled={uploading}>
+                  Upload Contractors
+                </Button>
+
+                {uploading && <Box sx={{ mt: 1 }}><LinearProgress /></Box>}
+                {uploadResult && <Typography variant="caption" color="success.main" sx={{ mt: 1, display: 'block' }}>Upload OK</Typography>}
+                {uploadError && <Typography variant="caption" color="error.main" sx={{ mt: 1, display: 'block' }}>Upload error</Typography>}
+              </Paper>
+
+              {averages.notes && (
+                <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.02)' }}>
+                  <Typography variant="caption" color="text.secondary">Notes</Typography>
+                  <Typography variant="body2" sx={{ mt: 1 }}>{averages.notes}</Typography>
+                </Paper>
+              )}
+            </>
+          ) : (
+            <Typography variant="body2" color="text.secondary">No data</Typography>
+          )}
+        </Box>
+
+        <Box sx={{ flex: 1, height: '100%', position: 'relative' }}>
+          <MapChart selected={selected} onClickSite={r => setSelected(r)} initialZoom={1.8} />
+        </Box>
+      </Box>
+
+      <Snackbar open={snack.open} autoHideDuration={3500} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>
+        <Alert severity={snack.severity} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>{snack.message}</Alert>
+      </Snackbar>
+    </Box>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+// frontend/src/api.js
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: '/api',         // frontend calls '/api/...' and vite proxy rewrites it
+  timeout: 120000,
+  headers: {
+    'Accept': 'application/json',
+  }
+});
+
+api.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    // friendly log for dev
+    console.error('[API ERROR]', err?.config?.method?.toUpperCase(), err?.config?.url, err?.response?.status, err?.message);
+    return Promise.reject(err);
+  }
+);
+
+export default api;
+
+
+
+
+
+
+
+// frontend/vite.config.js
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+
+const BACKEND_PORT = process.env.BACKEND_PORT || 8000;
+const BACKEND_HOST = `http://localhost:${BACKEND_PORT}`;
+
+export default defineConfig({
+  plugins: [react()],
+  publicDir: path.resolve(__dirname, '../public'),
+  resolve: {
+    alias: {
+      // Keep single copies of MUI/emotion to avoid runtime errors such as
+      // "createTheme_default is not a function" caused by duplicate copies.
+      '@mui/material': path.resolve(__dirname, 'node_modules/@mui/material'),
+      '@emotion/react': path.resolve(__dirname, 'node_modules/@emotion/react'),
+      '@emotion/styled': path.resolve(__dirname, 'node_modules/@emotion/styled'),
+    }
+  },
+  server: {
+    port: 5173,
+    hmr: { overlay: false },
+    proxy: {
+      // Proxy '/api/*' to backend, removing the '/api' prefix
+      '/api': {
+        target: BACKEND_HOST,
+        changeOrigin: true,
+        secure: false,
+        rewrite: (p) => p.replace(/^\/api/, ''),
+        timeout: 120000
+      }
+    }
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Initially Check both file Commenteed and UnCommented and Fix issue 
 Fix this issue and share me fully updted file carefully
 APAC
