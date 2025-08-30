@@ -1,922 +1,708 @@
-# data_compare_service.py
-"""
-Compare CCURE active lists (employees & contractors) with uploaded Active sheets (DB).
-Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
-
-Saves an Excel report to OUTPUT_DIR when export=True.
-"""
-
-from datetime import datetime
-import os
-import re
-import uuid
-import logging
-import sys
-import pandas as pd
-
-logger = logging.getLogger("data_compare_service")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# Settings fallback (matches app.py pattern)
-try:
-    from settings import OUTPUT_DIR
-except Exception:
-    OUTPUT_DIR = "./output"
-
-# DB / models
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor
-
-# ccure client helper (already present in project)
-try:
-    import ccure_client
-except Exception:
-    ccure_client = None
-    logger.warning("ccure_client not importable; CCURE calls will return None")
-
-# ---------- small normalizers (kept local to avoid circular imports) ----------
-def _normalize_employee_key(x):
-    if x is None:
-        return None
-    try:
-        s = str(x).strip()
-        if s == "" or s.lower() in ("nan", "none", "na", "null"):
-            return None
-        return s
-    except Exception:
-        return None
-
-def _normalize_card_like(s):
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "":
-            return None
-        digits = re.sub(r'\D+', '', ss)
-        if digits == "":
-            return None
-        return digits.lstrip('0') or digits
-    except Exception:
-        return None
-
-def _normalize_name(s):
-    if s is None:
-        return None
-    try:
-        t = str(s).strip().lower()
-        t = re.sub(r'[^\w\s]', '', t)
-        t = re.sub(r'\s+', ' ', t).strip()
-        return t if t else None
-    except Exception:
-        return None
-
-def _make_w_variant(s):
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if ss.upper().startswith('W'):
-        return ss
-    return 'W' + ss
-
-# numeric variants (e.g. strip non-digits, add/remove W)
-def _numeric_variants(s):
-    out = set()
-    if s is None:
-        return out
-    try:
-        s = str(s)
-        clean = re.sub(r'\D', '', s)
-        if clean:
-            out.add(clean)
-            out.add(clean.lstrip('0') or clean)
-            out.add('W' + clean)
-    except Exception:
-        pass
-    return out
-
-# small safe-int helper
-def _safe_int(v):
-    try:
-        if v is None:
-            return None
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return None
-
-# ---------- CCURE fetch helpers ----------
-def _fetch_ccure_list(detail_name):
-    """
-    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries ccure_client.fetch_stats_page(detail_name).
-    Returns list of dicts or [].
-    """
-    if ccure_client is None:
-        logger.warning("ccure_client missing - cannot fetch CCURE lists")
-        return []
-    try:
-        if hasattr(ccure_client, "fetch_all_stats"):
-            res = ccure_client.fetch_all_stats(detail_name, limit=500)
-            return res or []
-    except Exception:
-        logger.exception("fetch_all_stats failed")
-    # fallback to multiple page fetch
-    try:
-        data = []
-        page = 1
-        limit = 500
-        while True:
-            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
-            if not page_res:
-                break
-            part = page_res.get("data") or []
-            if not part:
-                break
-            data.extend(part)
-            total = int(page_res.get("total") or len(data) or 0)
-            if len(data) >= total:
-                break
-            page += 1
-            if page > 1000:
-                break
-        return data
-    except Exception:
-        logger.exception("per-page fetch failed for %s", detail_name)
-        return []
-
-# ---------- DB loaders ----------
-def _load_active_employees_db():
-    """Return (set of normalized employee_ids, dict mapping id -> row sample, total_rows)"""
-    with SessionLocal() as db:
-        rows = db.query(ActiveEmployee).all()
-        ids = set()
-        mapping = {}
-        for r in rows:
-            nid = _normalize_employee_key(r.employee_id)
-            if nid:
-                ids.add(nid)
-                mapping[nid] = {
-                    "employee_id": nid,
-                    "full_name": getattr(r, "full_name", None),
-                    "location_city": getattr(r, "location_city", None),
-                    "status": getattr(r, "current_status", None)
-                }
-        total_rows = len(rows)
-        return ids, mapping, total_rows
-
-def _load_active_contractors_db():
-    """Return (set of candidate contractor ids, mapping, total_rows)"""
-    with SessionLocal() as db:
-        rows = db.query(ActiveContractor).all()
-        ids = set()
-        mapping = {}
-        for r in rows:
-            wsid = _normalize_employee_key(getattr(r, "worker_system_id", None))
-            ipass = _normalize_employee_key(getattr(r, "ipass_id", None))
-            if wsid:
-                ids.add(wsid)
-                mapping[wsid] = {"worker_system_id": wsid, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-            if ipass:
-                ids.add(ipass)
-                mapping[ipass] = {"ipass_id": ipass, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-                wvar = _make_w_variant(ipass)
-                ids.add(wvar)
-                mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-            # also add numeric variants if worker id numeric-ish
-            for cand in (wsid, ipass):
-                for v in _numeric_variants(cand):
-                    ids.add(v)
-                    if v not in mapping:
-                        mapping[v] = {"derived_id": v, "full_name": getattr(r, "full_name", None)}
-        total_rows = len(rows)
-        return ids, mapping, total_rows
-
-# helper: robust match a ccure id (cid) against DB emp ids+names
-def _employee_matches_db(cid, emp_ids_db, emp_map_db, ccure_row):
-    # direct
-    if cid in emp_ids_db:
-        return True
-    # numeric variants
-    for v in _numeric_variants(cid):
-        if v in emp_ids_db:
-            return True
-    # integer equality against DB keys
-    try:
-        ci = _safe_int(cid)
-        if ci is not None:
-            for dbk in emp_ids_db:
-                if _safe_int(dbk) == ci:
-                    return True
-    except Exception:
-        pass
-    # card-like comparison
-    card_cid = _normalize_card_like(cid)
-    if card_cid:
-        for dbk in emp_ids_db:
-            if _normalize_card_like(dbk) == card_cid:
-                return True
-    # name fallback: if CCURE row provides a name, try normalized match against DB full_name
-    try:
-        name = None
-        if isinstance(ccure_row, dict):
-            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
-        normname = _normalize_name(name)
-        if normname:
-            for dbk, dbv in emp_map_db.items():
-                if _normalize_name(dbv.get("full_name")) == normname:
-                    return True
-    except Exception:
-        pass
-    return False
-
-# helper: robust match for contractors (same strategies)
-def _contractor_matches_db(cid, contr_ids_db, contr_map_db, ccure_row):
-    if cid in contr_ids_db:
-        return True
-    for v in _numeric_variants(cid):
-        if v in contr_ids_db:
-            return True
-    try:
-        ci = _safe_int(cid)
-        if ci is not None:
-            for dbk in contr_ids_db:
-                if _safe_int(dbk) == ci:
-                    return True
-    except Exception:
-        pass
-    card_cid = _normalize_card_like(cid)
-    if card_cid:
-        for dbk in contr_ids_db:
-            if _normalize_card_like(dbk) == card_cid:
-                return True
-    try:
-        name = None
-        if isinstance(ccure_row, dict):
-            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
-        normname = _normalize_name(name)
-        if normname:
-            for dbk, dbv in contr_map_db.items():
-                if _normalize_name(dbv.get("full_name")) == normname:
-                    return True
-    except Exception:
-        pass
-    return False
-
-# ---------- core compare function ----------
-def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
-    """
-    mode: 'full' or 'stats' (keeps signature compatible with app.py)
-    stats_detail: used when mode='stats' (ignored here)
-    limit_list: sample limit for returned lists
-    export: if True, writes an Excel report to OUTPUT_DIR and returns 'report_path' in result
-    """
-    result = {
-        "ccure_active_employees_count": None,
-        "ccure_active_contractors_count": None,
-        "active_sheet_employee_count": None,
-        "active_sheet_contractor_count": None,
-        "missing_employees_count": None,
-        "missing_contractors_count": None,
-        "missing_employees_sample": [],
-        "missing_contractors_sample": [],
-        "report_path": None
-    }
-
-    # 1) fetch CCURE lists
-    ccure_emps = _fetch_ccure_list("ActiveEmployees")
-    ccure_contrs = _fetch_ccure_list("ActiveContractors")
-
-    result["ccure_active_employees_count"] = len(ccure_emps)
-    result["ccure_active_contractors_count"] = len(ccure_contrs)
-
-    # 2) load DB sheets (now returning total rows as third value)
-    emp_ids_db, emp_map_db, emp_total_rows = _load_active_employees_db()
-    contr_ids_db, contr_map_db, contr_total_rows = _load_active_contractors_db()
-
-    # use actual DB row counts (not the variant-set size) for reporting
-    result["active_sheet_employee_count"] = int(emp_total_rows)
-    result["active_sheet_contractor_count"] = int(contr_total_rows)
-
-    # 3) build ccure id sets for employees
-    ccure_emp_id_set = set()
-    ccure_emp_rows_by_id = {}
-    for row in ccure_emps:
-        try:
-            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
-            if not eid:
-                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
-            if not eid:
-                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
-                if fname:
-                    eid = f"name::{fname}"
-            if eid:
-                ccure_emp_id_set.add(eid)
-                ccure_emp_rows_by_id[eid] = row
-        except Exception:
-            continue
-
-    # 4) employees missing = ccure_emp_id_set - emp_ids_db (but consider numeric variants, int equality, card-like, name match)
-    expanded_emp_db_ids = set(emp_ids_db)
-    for v in list(emp_ids_db):
-        for nv in _numeric_variants(v):
-            expanded_emp_db_ids.add(nv)
-
-    missing_emp_ids = []
-    for cid in ccure_emp_id_set:
-        try:
-            # name style keys handled separately
-            if str(cid).startswith("name::"):
-                name = cid.split("::", 1)[1]
-                found = False
-                for dbk, dbv in emp_map_db.items():
-                    n = _normalize_name(dbv.get("full_name"))
-                    if n and n == name:
-                        found = True
-                        break
-                if not found:
-                    missing_emp_ids.append(cid)
-                continue
-
-            # try the robust matching helper
-            ccure_row = ccure_emp_rows_by_id.get(cid) or {}
-            if _employee_matches_db(cid, expanded_emp_db_ids, emp_map_db, ccure_row):
-                continue
-
-            # last-chance: check numeric variants of cid vs DB
-            found = False
-            for v in _numeric_variants(cid):
-                if v in expanded_emp_db_ids:
-                    found = True
-                    break
-            if not found:
-                missing_emp_ids.append(cid)
-        except Exception:
-            # safe: treat as missing if any unexpected error for that row
-            missing_emp_ids.append(cid)
-
-    result["missing_employees_count"] = len(missing_emp_ids)
-    samp_emp = []
-    for mid in missing_emp_ids[:limit_list]:
-        r = ccure_emp_rows_by_id.get(mid) or {}
-        samp_emp.append({
-            "ccure_key": mid,
-            "EmployeeID": r.get("EmployeeID"),
-            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
-            "PersonnelType": r.get("PersonnelType"),
-            "raw": r
-        })
-    result["missing_employees_sample"] = samp_emp
-
-    # 5) contractors
-    ccure_contr_id_set = set()
-    ccure_contr_rows_by_id = {}
-    for row in ccure_contrs:
-        try:
-            cand_ids = []
-            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
-            if e1:
-                cand_ids.append(e1)
-            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
-            if ip:
-                cand_ids.append(ip)
-                cand_ids.append(_make_w_variant(ip))
-            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
-            if cardlike:
-                cand_ids.append(cardlike)
-                cand_ids.extend(list(_numeric_variants(cardlike)))
-            if not cand_ids:
-                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
-                if fname:
-                    cand_ids.append(f"name::{fname}")
-            for cid in cand_ids:
-                if cid:
-                    ccure_contr_id_set.add(cid)
-                    ccure_contr_rows_by_id[cid] = row
-            if not cand_ids:
-                key = f"unknown::{uuid.uuid4().hex[:8]}"
-                ccure_contr_id_set.add(key)
-                ccure_contr_rows_by_id[key] = row
-        except Exception:
-            continue
-
-    expanded_contr_db_ids = set(contr_ids_db)
-    for v in list(contr_ids_db):
-        for nv in _numeric_variants(v):
-            expanded_contr_db_ids.add(nv)
-
-    missing_contr_ids = []
-    for cid in ccure_contr_id_set:
-        try:
-            if str(cid).startswith("name::"):
-                name = cid.split("::", 1)[1]
-                found = False
-                for dbk, dbv in contr_map_db.items():
-                    n = _normalize_name(dbv.get("full_name"))
-                    if n and n == name:
-                        found = True
-                        break
-                if not found:
-                    missing_contr_ids.append(cid)
-                continue
-
-            ccure_row = ccure_contr_rows_by_id.get(cid) or {}
-            if _contractor_matches_db(cid, expanded_contr_db_ids, contr_map_db, ccure_row):
-                continue
-
-            found = False
-            for v in _numeric_variants(cid):
-                if v in expanded_contr_db_ids:
-                    found = True
-                    break
-            if not found:
-                missing_contr_ids.append(cid)
-        except Exception:
-            missing_contr_ids.append(cid)
-
-    result["missing_contractors_count"] = len(missing_contr_ids)
-    samp_contr = []
-    for mid in missing_contr_ids[:limit_list]:
-        r = ccure_contr_rows_by_id.get(mid) or {}
-        samp_contr.append({
-            "ccure_key": mid,
-            "EmployeeID": r.get("EmployeeID"),
-            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
-            "VendorCompany": r.get("Vendor Company Name") or r.get("Vendor"),
-            "raw": r
-        })
-    result["missing_contractors_sample"] = samp_contr
-
-    # 6) optionally export report
-    if export:
-        try:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            fname = f"missing_vs_ccure_{ts}.xlsx"
-            fullpath = os.path.join(OUTPUT_DIR, fname)
-            df_emp = pd.DataFrame(samp_emp) if samp_emp else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","PersonnelType"])
-            df_con = pd.DataFrame(samp_contr) if samp_contr else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","VendorCompany"])
-            try:
-                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
-                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
-                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
-                result["report_path"] = fname
-            except Exception:
-                with pd.ExcelWriter(fullpath) as writer:
-                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
-                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
-                result["report_path"] = fname
-        except Exception:
-            logger.exception("Failed to export report")
-            result["report_path"] = None
-
-    return result
+Understand Our Process 
+from Frontend there is option for 
+Upload Active Employee Sheet 
+Upload Contractor Sheet 
+and generate Comparision Report 
 
 
 
 
 
 
+// frontend/src/pages/GlobalPage.jsx
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box, Typography, CircularProgress, IconButton, Button, Paper, Divider,
+  LinearProgress, Snackbar, Alert, List, ListItem, ListItemText
+} from '@mui/material';
+import HomeIcon from '@mui/icons-material/Home';
+import DescriptionIcon from '@mui/icons-material/Description';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import MapChart from '../components/MapChart.jsx';
+import api from '../api';
+import { useNavigate, Link } from 'react-router-dom';
 
+/*
+  Important:
+  - Do NOT mix /api/headcount and /api/ccure/verify.
+  - Region cards (APAC/EMEA/LACA/NAMER) come only from /api/headcount.
+  - Live vs CCURE Summary now comes from /api/ccure/verify?raw=true.
+  - Initial region totals are zero (keeps previous UI behaviour).
+  - We implement polling for headcount and SSE for ccure/stream (realtime via SSE).
+*/
 
+export default function GlobalPage() {
+  const navigate = useNavigate();
 
+  // Region totals (headcount) - default to zeros so UI shows 0 immediately (preserve previous behaviour)
+  const [counts, setCounts] = useState({ apac: 0, emea: 0, laca: 0, namer: 0 });
+  const [selected, setSelected] = useState('global');
 
+  // Averages/ccure state (left panel)
+  const [averages, setAverages] = useState(null);
+  const [loadingAverages, setLoadingAverages] = useState(true);
+  const [averagesError, setAveragesError] = useState(null);
 
+  // upload state
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
 
+  // top-row file inputs
+  const fileInputEmpRef = useRef();
+  const fileInputContrRef = useRef();
+  const [snack, setSnack] = useState({ open: false, severity: 'info', message: '' });
 
+  // date-range state for top-right controls
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
 
+  // Polling refs for safe scheduling and backoff
+  const headcountRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
+  const averagesRef = useRef({ timerId: null, failureCount: 0, isFetching: false });
 
-in Below API Responce i have review some issue and mismatch counting which is need to fix....
-http://localhost:8000/ccure/compare?mode=full&limit_list=200&export=false
+  // -----------------------
+  // HEADCOUNT POLLING ONLY (unchanged)
+  // -----------------------
+  useEffect(() => {
+    let mounted = true;
 
-{
-  "ccure_active_employees_count": 8584,  -- This is correct 
-  "ccure_active_contractors_count": 652,-- this is correct 
-  "active_sheet_employee_count": 8658,   -- When i check manually Active Sheet Entry there are below the Employe ID  8671 rows here we got mismatch count...
-  "active_sheet_contractor_count": 31340,---- also When i check manually Active Contractor sheet there are 6740 Entry so excel file is not reading correct ...
-  "missing_employees_count": 395,
-  "missing_contractors_count": 4,
-  "missing_employees_sample": [
+    const fetchHeadcount = async () => {
+      if (!mounted) return;
+      if (headcountRef.current.isFetching) return;
+      headcountRef.current.isFetching = true;
 
-
-debug data  "missing_employees_count": 395,
-this is wrong when i Compare manually Employee is Present in Sheet still we got missing EMployee details ..
-Ex below This Employee is Present in ACtive Employee Sheet still their name is present in list 
-so need to chcek each entry carefully with name , with , With Employee ID carefully ...
-and fix the issue carefully.
- {
-      "ccure_key": "318206",
-      "EmployeeID": "318206",
-      "EmpName": "Kamalieu, Hugues Bienvenu",
-      "PersonnelType": "Employee",
-      "raw": {
-        "id": 2097195564,
-        "EmpName": "Kamalieu, Hugues Bienvenu",
-        "EmployeeID": "318206",
-        "PersonnelType": "Employee",
-        "Manager_Name": "Nathalie Tsopgni",
-        "Manager_WU_ID": "0",
-        "Profile_Disabled": false,
-        "Total_Cards": 0,
-        "Active_Cards": 1,
-        "Employee_Status": "Active",
-        "imageUrl": "/api/employees/2097195564/image"
+      try {
+        // Important: only call /headcount here (proxy rewrites /api -> backend)
+        const res = await api.get('/headcount');
+        if (!mounted) return;
+        const d = res.data;
+        // We expect an object with keys apac/emea/laca/namer (defensive)
+        if (d && typeof d === 'object') {
+          const newCounts = {
+            apac: Number(d.apac || 0),
+            emea: Number(d.emea || 0),
+            laca: Number(d.laca || 0),
+            namer: Number(d.namer || 0),
+          };
+          setCounts(prev => {
+            if (
+              prev.apac === newCounts.apac &&
+              prev.emea === newCounts.emea &&
+              prev.laca === newCounts.laca &&
+              prev.namer === newCounts.namer
+            ) {
+              return prev;
+            }
+            return newCounts;
+          });
+        } else {
+          console.warn('[headcount] unexpected response shape - ignoring', d);
+        }
+        headcountRef.current.failureCount = 0;
+      } catch (err) {
+        headcountRef.current.failureCount = (headcountRef.current.failureCount || 0) + 1;
+        console.warn('[headcount] fetch failed:', err?.message || err);
+      } finally {
+        headcountRef.current.isFetching = false;
+        const f = headcountRef.current.failureCount || 0;
+        const backoffMs = 15000 * Math.pow(2, Math.min(Math.max(f - 1, 0), 4)); // 15s..240s
+        headcountRef.current.timerId = setTimeout(fetchHeadcount, backoffMs);
       }
-    },
+    };
+
+    fetchHeadcount();
+
+    return () => {
+      mounted = false;
+      if (headcountRef.current.timerId) clearTimeout(headcountRef.current.timerId);
+      headcountRef.current.isFetching = false;
+    };
+  }, []); // run once
 
 
 
+  // AVERAGES: use SSE (direct to Python backend) with fallback initial fetch
+  useEffect(() => {
+    let stopped = false;
+    let es = null;
+    let backoff = 1000;
+
+    // Allow override via VITE_PY_BACKEND; otherwise assume python at :8000
+    const PY_BACKEND = (import.meta.env.VITE_PY_BACKEND || `${window.location.protocol}//${window.location.hostname}:8000`).replace(/\/$/, '');
+
+    const connect = () => {
+      if (stopped) return;
+      try {
+        // Directly connect to Python SSE endpoint (bypasses Vite proxy for streaming)
+        es = new EventSource(`${PY_BACKEND}/ccure/stream`);
+      } catch (err) {
+        console.warn('SSE creation failed', err);
+        es = null;
+      }
+
+      if (!es) {
+        // fallback to polling if EventSource not supported or creation failed
+        initialFetch();
+        return;
+      }
+
+      es.onopen = () => {
+        console.info('[SSE] connected to', `${PY_BACKEND}/ccure/stream`);
+        backoff = 1000;
+        setAveragesError(null);
+      };
+
+      es.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          setAverages(payload);
+          setLoadingAverages(false);
+          setAveragesError(null);
+        } catch (e) {
+          console.warn('Failed to parse SSE message', e);
+        }
+      };
+
+      es.onerror = (err) => {
+        console.warn('[SSE] error/closed, attempting reconnect', err);
+        try { es.close(); } catch (e) {}
+        es = null;
+        if (stopped) return;
+        // exponential backoff reconnect (capped)
+        setTimeout(() => {
+          backoff = Math.min(backoff * 2, 30000);
+          connect();
+        }, backoff);
+      };
+    };
+
+    const initialFetch = async () => {
+      setLoadingAverages(true);
+      setAveragesError(null);
+      try {
+        // <-- changed: call verify endpoint (raw=true) instead of /ccure/averages
+        const res = await api.get('/ccure/verify?raw=true');
+        setAverages(res.data);
+        setLoadingAverages(false);
+        setAveragesError(null);
+      } catch (err) {
+        console.warn('initial /ccure/verify?raw=true fetch failed', err);
+        setLoadingAverages(false);
+        setAveragesError(err);
+      }
+    };
+
+    // Start with initial fetch so UI is populated quickly, then open SSE
+    initialFetch();
+    connect();
+
+    return () => {
+      stopped = true;
+      if (es) {
+        try { es.close(); } catch (e) {}
+        es = null;
+      }
+    };
+  }, []);
 
 
 
+  // -----------------------
+  // Upload helper (unchanged)
+  // -----------------------
+  const handleUpload = async (file, type) => {
+    if (!file) return;
+    const endpoint = type === 'employee' ? '/upload/active-employees' : '/upload/active-contractors';
+    const fd = new FormData();
+    fd.append('file', file, file.name);
 
+    setUploading(true);
+    setUploadResult(null);
+    setUploadError(null);
 
-
-# data_compare_service.py
-"""
-Compare CCURE active lists (employees & contractors) with uploaded Active sheets (DB).
-Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
-
-Saves an Excel report to OUTPUT_DIR when export=True.
-"""
-
-from datetime import datetime
-import os
-import re
-import uuid
-import logging
-import sys
-import pandas as pd
-
-logger = logging.getLogger("data_compare_service")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# Settings fallback (matches app.py pattern)
-try:
-    from settings import OUTPUT_DIR
-except Exception:
-    OUTPUT_DIR = "./output"
-
-# DB / models
-from db import SessionLocal
-from models import ActiveEmployee, ActiveContractor
-
-# ccure client helper (already present in project)
-try:
-    import ccure_client
-except Exception:
-    ccure_client = None
-    logger.warning("ccure_client not importable; CCURE calls will return None")
-
-# ---------- small normalizers (kept local to avoid circular imports) ----------
-def _normalize_employee_key(x):
-    if x is None:
-        return None
-    try:
-        s = str(x).strip()
-        if s == "" or s.lower() in ("nan", "none", "na", "null"):
-            return None
-        return s
-    except Exception:
-        return None
-
-def _normalize_card_like(s):
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "":
-            return None
-        digits = re.sub(r'\D+', '', ss)
-        if digits == "":
-            return None
-        return digits.lstrip('0') or digits
-    except Exception:
-        return None
-
-def _normalize_name(s):
-    if s is None:
-        return None
-    try:
-        t = str(s).strip().lower()
-        t = re.sub(r'[^\w\s]', '', t)
-        t = re.sub(r'\s+', ' ', t).strip()
-        return t if t else None
-    except Exception:
-        return None
-
-def _make_w_variant(s):
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if ss.upper().startswith('W'):
-        return ss
-    return 'W' + ss
-
-# numeric variants (e.g. strip non-digits, add/remove W)
-def _numeric_variants(s):
-    out = set()
-    if s is None:
-        return out
-    try:
-        s = str(s)
-        clean = re.sub(r'\D', '', s)
-        if clean:
-            out.add(clean)
-            out.add(clean.lstrip('0') or clean)
-            out.add('W' + clean)
-    except Exception:
-        pass
-    return out
-
-# ---------- CCURE fetch helpers ----------
-def _fetch_ccure_list(detail_name):
-    """
-    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries ccure_client.fetch_stats_page(detail_name).
-    Returns list of dicts or [].
-    """
-    if ccure_client is None:
-        logger.warning("ccure_client missing - cannot fetch CCURE lists")
-        return []
-    try:
-        if hasattr(ccure_client, "fetch_all_stats"):
-            res = ccure_client.fetch_all_stats(detail_name, limit=500)
-            return res or []
-    except Exception:
-        logger.exception("fetch_all_stats failed")
-    # fallback to multiple page fetch
-    try:
-        data = []
-        page = 1
-        limit = 500
-        while True:
-            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
-            if not page_res:
-                break
-            part = page_res.get("data") or []
-            if not part:
-                break
-            data.extend(part)
-            total = int(page_res.get("total") or len(data) or 0)
-            if len(data) >= total:
-                break
-            page += 1
-            if page > 1000:
-                break
-        return data
-    except Exception:
-        logger.exception("per-page fetch failed for %s", detail_name)
-        return []
-
-# ---------- DB loaders ----------
-def _load_active_employees_db():
-    """Return set of normalized employee_ids and a dict mapping id -> row for samples"""
-    with SessionLocal() as db:
-        rows = db.query(ActiveEmployee).all()
-        ids = set()
-        mapping = {}
-        for r in rows:
-            nid = _normalize_employee_key(r.employee_id)
-            if nid:
-                ids.add(nid)
-                mapping[nid] = {
-                    "employee_id": nid,
-                    "full_name": r.full_name,
-                    "location_city": getattr(r, "location_city", None),
-                    "status": getattr(r, "current_status", None)
-                }
-        return ids, mapping
-
-def _load_active_contractors_db():
-    """Return set of candidate contractor ids (worker_system_id, ipass, W-ipass) and mapping"""
-    with SessionLocal() as db:
-        rows = db.query(ActiveContractor).all()
-        ids = set()
-        mapping = {}
-        for r in rows:
-            wsid = _normalize_employee_key(getattr(r, "worker_system_id", None))
-            ipass = _normalize_employee_key(getattr(r, "ipass_id", None))
-            if wsid:
-                ids.add(wsid)
-                mapping[wsid] = {"worker_system_id": wsid, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-            if ipass:
-                ids.add(ipass)
-                mapping[ipass] = {"ipass_id": ipass, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-                wvar = _make_w_variant(ipass)
-                ids.add(wvar)
-                mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
-            # also add numeric variants if worker id numeric-ish
-            for cand in (wsid, ipass):
-                for v in _numeric_variants(cand):
-                    ids.add(v)
-                    if v not in mapping:
-                        mapping[v] = {"derived_id": v, "full_name": r.full_name}
-        return ids, mapping
-
-# ---------- core compare function ----------
-def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
-    """
-    mode: 'full' or 'stats' (keeps signature compatible with app.py)
-    stats_detail: used when mode='stats' (ignored here)
-    limit_list: sample limit for returned lists
-    export: if True, writes an Excel report to OUTPUT_DIR and returns 'report_path' in result
-    """
-    result = {
-        "ccure_active_employees_count": None,
-        "ccure_active_contractors_count": None,
-        "active_sheet_employee_count": None,
-        "active_sheet_contractor_count": None,
-        "missing_employees_count": None,
-        "missing_contractors_count": None,
-        "missing_employees_sample": [],
-        "missing_contractors_sample": [],
-        "report_path": None
+    try {
+      const res = await api.post(endpoint, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000
+      });
+      setUploadResult(res.data);
+      setSnack({ open: true, severity: 'success', message: `Upload successful: ${file.name}` });
+      // Optionally re-fetch averages/headcount after successful upload:
+      try { await api.get('/ccure/verify?raw=true').then(r => setAverages(r.data)); } catch (_) {}
+      try { await api.get('/headcount').then(r => {
+        const d = r.data;
+        if (d && typeof d === 'object') {
+          setCounts(prev => ({
+            apac: Number(d.apac || prev.apac || 0),
+            emea: Number(d.emea || prev.emea || 0),
+            laca: Number(d.laca || prev.laca || 0),
+            namer: Number(d.namer || prev.namer || 0)
+          }));
+        }
+      }) } catch (_) {}
+    } catch (err) {
+      console.error('Upload failed', err);
+      setUploadError(err);
+      setSnack({ open: true, severity: 'error', message: `Upload failed: ${file.name}` });
+    } finally {
+      setUploading(false);
     }
+  };
 
-    # 1) fetch CCURE lists
-    ccure_emps = _fetch_ccure_list("ActiveEmployees")
-    ccure_contrs = _fetch_ccure_list("ActiveContractors")
+  const onChooseEmployeeFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'employee'); e.target.value = null; };
+  const onChooseContractorFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) handleUpload(f, 'contractor'); e.target.value = null; };
 
-    result["ccure_active_employees_count"] = len(ccure_emps)
-    result["ccure_active_contractors_count"] = len(ccure_contrs)
+  // apply date range to re-fetch /ccure/verify
+  const applyDateRange = async () => {
+    if (!startDate || !endDate) {
+      setSnack({ open: true, severity: 'warning', message: 'Please select start and end dates' });
+      return;
+    }
+    setLoadingAverages(true);
+    setAveragesError(null);
+    try {
+      const res = await api.get(`/ccure/verify?raw=true&start_date=${startDate}&end_date=${endDate}`);
+      setAverages(res.data);
+      setLoadingAverages(false);
+      setSnack({ open: true, severity: 'success', message: 'Averages updated' });
+    } catch (err) {
+      console.warn('applyDateRange failed', err);
+      setLoadingAverages(false);
+      setAveragesError(err);
+      setSnack({ open: true, severity: 'error', message: 'Failed to update averages' });
+    }
+  };
 
-    # 2) load DB sheets
-    emp_ids_db, emp_map_db = _load_active_employees_db()
-    contr_ids_db, contr_map_db = _load_active_contractors_db()
+  // safe helper for nested averages paths
+  const safe = (path, fallback = null) => {
+    if (!averages) return fallback;
+    try {
+      return path.split('.').reduce((a, k) => (a && a[k] !== undefined ? a[k] : fallback), averages);
+    } catch {
+      return fallback;
+    }
+  };
 
-    result["active_sheet_employee_count"] = len(emp_ids_db)
-    result["active_sheet_contractor_count"] = len(contr_ids_db)
+  // Derived values (updated to match /ccure/verify response shape)
+ 
+  const ccureActiveEmployees = safe('ccure_reported.employees',
+    safe('ccure_active.active_employees',
+      safe('ccure_active.ccure_active_employees_reported', null)
+    )
+  );
+  const ccureActiveContractors = safe('ccure_reported.contractors',
+    safe('ccure_active.active_contractors',
+      safe('ccure_active.ccure_active_contractors_reported', null)
+    )
+  );
 
-    # 3) build ccure id sets for employees
-    ccure_emp_id_set = set()
-    ccure_emp_rows_by_id = {}
-    for row in ccure_emps:
-        try:
-            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
-            if not eid:
-                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
-            if not eid:
-                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
-                if fname:
-                    eid = f"name::{fname}"
-            if eid:
-                ccure_emp_id_set.add(eid)
-                ccure_emp_rows_by_id[eid] = row
-        except Exception:
-            continue
+  // headcount attendance summary (from AttendanceSummary / union)
+  const headTotalVisited = safe('headcount_attendance_summary.total_visited_today',
+    safe('headcount_details.total_visited_today', null)
+  );
+  const headEmployee = safe('headcount_attendance_summary.employee',
+    safe('headcount_details.employee', null)
+  );
+  const headContractor = safe('headcount_attendance_summary.contractor',
+    safe('headcount_details.contractor', null)
+  );
 
-    # 4) employees missing = ccure_emp_id_set - emp_ids_db (but consider numeric variants)
-    expanded_emp_db_ids = set(emp_ids_db)
-    for v in list(emp_ids_db):
-        for nv in _numeric_variants(v):
-            expanded_emp_db_ids.add(nv)
+  // live headcount from region clients
+  const liveCurrentTotal = safe('live_headcount_region_clients.currently_present_total',
+    safe('live_headcount_details.currently_present_total',
+      null
+    )
+  );
+  const liveEmp = safe('live_headcount_region_clients.employee',
+    safe('live_headcount_details.employee', null)
+  );
+  const liveContr = safe('live_headcount_region_clients.contractor',
+    safe('live_headcount_details.contractor', null)
+  );
 
-    missing_emp_ids = []
-    for cid in ccure_emp_id_set:
-        if str(cid).startswith("name::"):
-            name = cid.split("::", 1)[1]
-            found = False
-            for dbk, dbv in emp_map_db.items():
-                n = _normalize_name(dbv.get("full_name"))
-                if n and n == name:
-                    found = True
-                    break
-            if not found:
-                missing_emp_ids.append(cid)
-            continue
-        if cid in expanded_emp_db_ids:
-            continue
-        found = False
-        for v in _numeric_variants(cid):
-            if v in expanded_emp_db_ids:
-                found = True
-                break
-        if not found:
-            missing_emp_ids.append(cid)
+  // percentages (prefer top-level percentages_vs_ccure, fallback into averages compatibility keys)
+  const empPct = safe('percentages_vs_ccure.head_employee_pct_vs_ccure_today',
+    safe('averages.head_emp_pct_vs_ccure_today', null)
+  );
+  const conPct = safe('percentages_vs_ccure.head_contractor_pct_vs_ccure_today',
+    safe('averages.head_contractor_pct_vs_ccure_today', null)
+  );
+  const overallPct = safe('percentages_vs_ccure.head_overall_pct_vs_ccure_today',
+    safe('averages.headcount_overall_pct_vs_ccure_today', null)
+  );
 
-    result["missing_employees_count"] = len(missing_emp_ids)
-    samp_emp = []
-    for mid in missing_emp_ids[:limit_list]:
-        r = ccure_emp_rows_by_id.get(mid) or {}
-        samp_emp.append({
-            "ccure_key": mid,
-            "EmployeeID": r.get("EmployeeID"),
-            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
-            "PersonnelType": r.get("PersonnelType"),
-            "raw": r
-        })
-    result["missing_employees_sample"] = samp_emp
+  // averages / 7-day
+  const avg7 = safe('averages.history_avg_overall_last_7_days',
+    safe('averages.avg_headcount_last_7_days',
+      safe('averages.avg_headcount_last_7_days_db', null)
+    )
+  );
 
-    # 5) contractors
-    ccure_contr_id_set = set()
-    ccure_contr_rows_by_id = {}
-    for row in ccure_contrs:
-        try:
-            cand_ids = []
-            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
-            if e1:
-                cand_ids.append(e1)
-            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
-            if ip:
-                cand_ids.append(ip)
-                cand_ids.append(_make_w_variant(ip))
-            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
-            if cardlike:
-                cand_ids.append(cardlike)
-                cand_ids.extend(list(_numeric_variants(cardlike)))
-            if not cand_ids:
-                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
-                if fname:
-                    cand_ids.append(f"name::{fname}")
-            for cid in cand_ids:
-                if cid:
-                    ccure_contr_id_set.add(cid)
-                    ccure_contr_rows_by_id[cid] = row
-            if not cand_ids:
-                key = f"unknown::{uuid.uuid4().hex[:8]}"
-                ccure_contr_id_set.add(key)
-                ccure_contr_rows_by_id[key] = row
-        except Exception:
-            continue
+  // date
+  const respDate = safe('date', null);
 
-    expanded_contr_db_ids = set(contr_ids_db)
-    for v in list(contr_ids_db):
-        for nv in _numeric_variants(v):
-            expanded_contr_db_ids.add(nv)
+  // location-wise averages map (history_avg_by_location_last_7_days)
+  const locationAvgsObj = safe('averages.history_avg_by_location_last_7_days',
+    safe('history_avg_by_location_last_7_days',
+      safe('raw.averages.history_avg_by_location_last_7_days', {})
+    )
+  );
 
-    missing_contr_ids = []
-    for cid in ccure_contr_id_set:
-        if str(cid).startswith("name::"):
-            name = cid.split("::", 1)[1]
-            found = False
-            for dbk, dbv in contr_map_db.items():
-                n = _normalize_name(dbv.get("full_name"))
-                if n and n == name:
-                    found = True
-                    break
-            if not found:
-                missing_contr_ids.append(cid)
-            continue
-        if cid in expanded_contr_db_ids:
-            continue
-        found = False
-        for v in _numeric_variants(cid):
-            if v in expanded_contr_db_ids:
-                found = True
-                break
-        if not found:
-            missing_contr_ids.append(cid)
+  // convert to array for rendering (sort by avg_overall desc if present)
+  const locationAvgsList = React.useMemo(() => {
+    if (!locationAvgsObj || typeof locationAvgsObj !== 'object') return [];
+    const arr = Object.entries(locationAvgsObj).map(([loc, vals]) => {
+      return {
+        location: loc,
+        avg_employee_last_7_days: vals.avg_employee_last_7_days ?? vals.history_avg_employee_last_7_days ?? vals.avg_employee ?? null,
+        avg_contractor_last_7_days: vals.avg_contractor_last_7_days ?? vals.history_avg_contractor_last_7_days ?? vals.avg_contractor ?? null,
+        avg_overall_last_7_days: vals.avg_overall_last_7_days ?? vals.history_avg_overall_last_7_days ?? vals.avg_overall ?? null,
+        history_days_counted: vals.history_days_counted ?? null
+      };
+    });
+    // sort descending by overall avg (nulls to end)
+    arr.sort((a, b) => (b.avg_overall_last_7_days ?? -Infinity) - (a.avg_overall_last_7_days ?? -Infinity));
+    return arr;
+  }, [locationAvgsObj]);
 
-    result["missing_contractors_count"] = len(missing_contr_ids)
-    samp_contr = []
-    for mid in missing_contr_ids[:limit_list]:
-        r = ccure_contr_rows_by_id.get(mid) or {}
-        samp_contr.append({
-            "ccure_key": mid,
-            "EmployeeID": r.get("EmployeeID"),
-            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
-            "VendorCompany": r.get("Vendor Company Name") or r.get("Vendor"),
-            "raw": r
-        })
-    result["missing_contractors_sample"] = samp_contr
+  // ------------------------------------------------------------
+  // derive global total from headcount regions (APAC+EMEA+LACA+NAMER)
+  // ------------------------------------------------------------
+  const globalCount = Number((counts.apac || 0)) + Number((counts.emea || 0)) + Number((counts.laca || 0)) + Number((counts.namer || 0));
 
-    # 6) optionally export report
-    if export:
-        try:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            fname = f"missing_vs_ccure_{ts}.xlsx"
-            fullpath = os.path.join(OUTPUT_DIR, fname)
-            df_emp = pd.DataFrame(samp_emp) if samp_emp else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","PersonnelType"])
-            df_con = pd.DataFrame(samp_contr) if samp_contr else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","VendorCompany"])
-            try:
-                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
-                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
-                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
-                result["report_path"] = fname
-            except Exception:
-                with pd.ExcelWriter(fullpath) as writer:
-                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
-                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
-                result["report_path"] = fname
-        except Exception:
-            logger.exception("Failed to export report")
-            result["report_path"] = None
+  // Helper style used to hide scrollbars but allow scrolling
+  const hideScrollbarSx = {
+    overflowY: 'auto',
+    // hide scrollbar visual (webkit)
+    '&::-webkit-scrollbar': { width: 0, height: 0 },
+    // firefox
+    scrollbarWidth: 'none',
+    // ie
+    msOverflowStyle: 'none',
+  };
 
-    return result
+  // Render
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', bgcolor: 'background.default' }}>
+      {/* Header */}
+      <Box px={2} py={1} sx={{ backgroundColor: 'black', color: '#fff', borderBottom: '4px solid #FFD700', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Box>
+          <IconButton component={Link} to="/" sx={{ color: '#FFC72C' }}><HomeIcon fontSize="medium" /></IconButton>
+          <IconButton component={Link} to="/reports" sx={{ color: '#FFC72C', ml: 1 }}><DescriptionIcon fontSize="medium" /></IconButton>
+        </Box>
+
+        <Box sx={{ flexGrow: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Box component="img" src="/wu-head-logo.png" alt="WU Logo" sx={{ height: { xs: 30, md: 55 }, mr: 2 }} />
+          <Typography variant="h5" sx={{ fontWeight: 'bold', color: 'primary.main' }}>Global Headcount Dashboard</Typography>
+        </Box>
+
+        <Box sx={{ width: 120 }} />
+      </Box>
+
+      {/* Top row: Uploads | GLOBAL + Region Cards | Date selectors */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 5, p: 1, flexWrap: 'wrap' }}>
+        {/* Left: two small Upload boxes stacked (Employee above Contractor) */}
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+          <Paper sx={{ p: 1, width: 200, boxShadow: 1 }}>
+            {/* <Typography variant="caption" color="text.secondary">Upload Active Employee Sheet</Typography> */}
+            <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputEmpRef} onChange={onChooseEmployeeFile} />
+            <Button variant="contained" size="small" startIcon={<UploadFileIcon />} sx={{ mt: 1, width: '100%' }} onClick={() => fileInputEmpRef.current && fileInputEmpRef.current.click()} disabled={uploading}>
+              Upload Employee
+            </Button>
+          </Paper>
+
+          <Paper sx={{ p: 0, width: 200, boxShadow: 1 }}>
+            {/* <Typography variant="caption" color="text.secondary">Upload Active Contractor Sheet</Typography> */}
+            <input type="file" accept=".xls,.xlsx" style={{ display: 'none' }} ref={fileInputContrRef} onChange={onChooseContractorFile} />
+            <Button variant="outlined" size="small" startIcon={<UploadFileIcon />} sx={{ mt: 1, width: '100%' }} onClick={() => fileInputContrRef.current && fileInputContrRef.current.click()} disabled={uploading}>
+              Upload Contractor
+            </Button>
+          </Paper>
+        </Box>
+
+        {/* Middle: region cards */}
+        <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+          {[
+            { key: 'global', label: 'GLOBAL', count: globalCount, url: null, textColor: '#ffff' },
+            { key: 'apac', label: 'APAC', count: counts.apac, url: 'http://10.199.22.57:3000/', textColor: '#ffff' },
+            { key: 'emea', label: 'EMEA', count: counts.emea, url: 'http://10.199.22.57:3001/', textColor: '#ffff' },
+            { key: 'laca', label: 'LACA', count: counts.laca, url: 'http://10.199.22.57:3003/', textColor: '#ffff' },
+            { key: 'namer', label: 'NAMER', count: counts.namer, url:'http://10.199.22.57:3002/', textColor: '#ffff' },
+          ].map(region => (
+            <Box
+              key={region.key}
+              onClick={() => {
+                if (region.key === 'global') {
+                  const el = document.querySelector('[data-global-left-panel]');
+                  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                  setSelected('global');
+                  return;
+                }
+                // external region dashboards for others
+                if (region.url) window.location.href = region.url;
+              }}
+              sx={{
+                cursor: 'pointer',
+                width: 200,
+                height: 80,
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'center',
+                alignItems: 'center',
+                border: '4px solid rgba(255, 204, 0, 0.89)',
+                borderRadius: 2,
+                boxShadow: 3,
+                color: region.textColor,
+                '&:hover': { opacity: 0.95 },
+              }}
+            >
+              <Typography variant="subtitle1" sx={{ fontWeight: 'bold', color: region.textColor, fontSize: { xs: '1.1rem' } }}>{region.label}</Typography>
+              <Typography variant="h4" sx={{ fontWeight: 800, fontSize: { xs: '1.2rem', sm: '1.6rem' }, color: region.textColor }}>
+                {region.count ?? 0}
+              </Typography>
+            </Box>
+          ))}
+        </Box>
+
+        {/* Right: date selectors (Start & End side-by-side; Apply below right-aligned) */}
+        <Box sx={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
+          <Paper sx={{ p: 1, display: 'flex', gap: 1, alignItems: 'center', boxShadow: 1 }}>
+            <Box sx={{ display: 'flex', flexDirection: 'column', width: 160 }}>
+              <Typography variant="caption" color="text.secondary">Select Start date</Typography>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                style={{ width: '100%', height: 32, borderRadius: 4, border: '1px solid rgba(255,255,255,0.06)', padding: 4, background: 'transparent', color: 'inherit' }}
+              />
+            </Box>
+
+            <Box sx={{ display: 'flex', flexDirection: 'column', width: 160 }}>
+              <Typography variant="caption" color="text.secondary">Select End date</Typography>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                style={{ width: '100%', height: 32, borderRadius: 4, border: '1px solid rgba(255,255,255,0.06)', padding: 4, background: 'transparent', color: 'inherit' }}
+              />
+            </Box>
+          </Paper>
+
+          <Box sx={{ width: '100%', display: 'flex', justifyContent: 'space-between', mt: 0, alignItems: 'center' }}>
+            <Button size="small" variant="contained" onClick={applyDateRange}>Apply</Button>
+          </Box>
+        </Box>
+      </Box>
+
+      {/* Main: left summary | center map | right averages */}
+      <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+        {/* Left detail panel */}
+        <Box
+          data-global-left-panel
+          sx={{
+            width: { xs: 320, md: 360 },
+            minWidth: { md: 320 },
+            p: 2,
+            bgcolor: 'background.paper',
+            borderRight: '1px solid rgba(255,255,255,0.06)',
+            display: 'flex',
+            flexDirection: 'column',
+            ...hideScrollbarSx,
+            // ensure left panel takes full height and internal content can scroll (hidden scrollbar)
+            height: '100%',
+          }}
+        >
+          <Typography variant="h6" sx={{ mb: 1, color: 'primary.main' }}>Live vs CCURE Summary</Typography>
+
+          {loadingAverages ? (
+            <Box sx={{ py: 2 }}><LinearProgress /></Box>
+          ) : averagesError ? (
+            <Alert severity="error">Failed to load CCURE averages</Alert>
+          ) : averages ? (
+            <>
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.02)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">CCURE Active (reported)</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1, alignItems: 'center' }}>
+                  <Box>
+                    <Typography variant="h4" sx={{ fontWeight: 800 }}>{ccureActiveEmployees ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Employees</Typography>
+                  </Box>
+                  <Box sx={{ textAlign: 'right' }}>
+                    <Typography variant="h5" sx={{ fontWeight: 800 }}>{ccureActiveContractors ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Active Contractors</Typography>
+                  </Box>
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.02)' }} elevation={0}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="subtitle2" color="text.secondary">Live Today</Typography>
+                  <Typography variant="caption" color="text.secondary">{respDate ?? ''}</Typography>
+                </Box>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Box>
+                    <Typography variant="h5" sx={{ fontWeight: 800 }}>{headEmployee ?? liveEmp ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Employee</Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="h5" sx={{ fontWeight: 800 }}>{headContractor ?? liveContr ?? '—'}</Typography>
+                    <Typography variant="caption" color="text.secondary">Contractor</Typography>
+                  </Box>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Totals</Typography>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.75 }}>
+                    <Typography variant="body2">Attendance total (today)</Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>{headTotalVisited ?? '—'}</Typography>
+                  </Box>
+
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                    <Typography variant="body2">Live region total</Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 700 }}>{liveCurrentTotal ?? '—'}</Typography>
+                  </Box>
+
+                  {/** Provide a detail rows total if available in response */}
+                  {safe('headcount_details.total_visited_today', null) != null && (
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                      <Typography variant="body2">Detail rows total</Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 700 }}>{safe('headcount_details.total_visited_today', '—')}</Typography>
+                    </Box>
+                  )}
+                </Box>
+              </Paper>
+
+              <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.02)' }} elevation={0}>
+                <Typography variant="subtitle2" color="text.secondary">Percentages vs CCURE</Typography>
+
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">Employees</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{empPct != null ? `${empPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2">Contractors</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{conPct != null ? `${conPct}%` : '—'}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.5 }}>
+                  <Typography variant="body2">Overall</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{overallPct != null ? `${overallPct}%` : '—'}</Typography>
+                </Box>
+
+                <Divider sx={{ my: 1 }} />
+                <Typography variant="caption" color="text.secondary">Averages</Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                  <Typography variant="body2">7-day avg headcount</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{avg7 ?? '—'}</Typography>
+                </Box>
+              </Paper>
+
+              {/* Upload controls intentionally removed from this left panel (moved to top-row) */}
+
+              {averages.notes && (
+                <Paper sx={{ p: 2, mb: 2, bgcolor: 'rgba(255,255,255,0.01)' }}>
+                  <Typography variant="body2" sx={{ mt: 1 }}>{averages.notes}</Typography>
+                </Paper>
+              )}
+            </>
+          ) : (
+            <Typography variant="body2" color="text.secondary">No data</Typography>
+          )}
+        </Box>
+
+        {/* Center: map (flex) */}
+        <Box sx={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column' }}>
+          <Box sx={{ flex: 1, minHeight: 0 }}>
+            <MapChart selected={selected} onClickSite={r => setSelected(r)} initialZoom={1.8} />
+          </Box>
+        </Box>
+
+        {/* Right side: Location averages panel */}
+        <Box
+          sx={{
+            width: { xs: 320, md: 360 },
+            minWidth: { md: 320 },
+            borderLeft: '1px solid rgba(255,255,255,0.06)',
+            bgcolor: 'background.paper',
+            p: 2,
+            display: 'flex',
+            flexDirection: 'column',
+            ...hideScrollbarSx,
+            height: '100%',
+          }}
+        >
+          <Typography variant="h6" sx={{ mb: 1, color: 'primary.main' }}>Location Averages</Typography>
+
+          {loadingAverages ? (
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', py: 4 }}>
+              <CircularProgress />
+            </Box>
+          ) : averagesError ? (
+            <Alert severity="error">Failed to load location averages</Alert>
+          ) : locationAvgsList.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">No location averages available</Typography>
+          ) : (
+            <List dense disablePadding sx={{ flex: 1 }}>
+              {locationAvgsList.map(item => (
+                <ListItem key={item.location} sx={{ alignItems: 'flex-start', py: 1.25, borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                  <ListItemText
+                    primary={
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Typography sx={{ fontWeight: 800 }}>{item.location}</Typography>
+                        <Typography variant="body2" sx={{ fontWeight: 800 }}>{item.avg_overall_last_7_days != null ? Math.round(item.avg_overall_last_7_days) : '—'}</Typography>
+                      </Box>
+                    }
+                    secondary={
+                      <Box sx={{ display: 'flex', gap: 2, mt: 0.5, flexWrap: 'wrap' }}>
+                        <Typography variant="caption" color="text.secondary">Emp: <strong>{item.avg_employee_last_7_days != null ? Math.round(item.avg_employee_last_7_days) : '—'}</strong></Typography>
+                        <Typography variant="caption" color="text.secondary">Contr: <strong>{item.avg_contractor_last_7_days != null ? Math.round(item.avg_contractor_last_7_days) : '—'}</strong></Typography>
+                        {item.history_days_counted != null && <Typography variant="caption" color="text.secondary">Days: {item.history_days_counted}</Typography>}
+                      </Box>
+                    }
+                  />
+                </ListItem>
+              ))}
+            </List>
+          )}
+        </Box>
+      </Box>
+
+      <Snackbar open={snack.open} autoHideDuration={3500} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>
+        <Alert severity={snack.severity} onClose={() => setSnack(prev => ({ ...prev, open: false }))}>{snack.message}</Alert>
+      </Snackbar>
+    </Box>
+  );
+}
 
 
 
 
+
+
+
+
+
+refer above frontend option 
+
+when we upload ACtive sheet from frontend in one time 
+
+then this sheet need to store here 
+
+
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\data
+
+C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\data\raw_uploads
+
+
+When i upload new sheet then remove previous data and and consider new data here dont need to store sheet data into db beacuse Every Monady need to Update new Contractor Sheet 
+and every month we need to Update Active Employee sheet ..
+here both sheet ....
+
+
+As per logic update below file and give me Correct output..
 
 
 
@@ -1693,3 +1479,848 @@ def ccure_report_download(filename: str):
 
 # Upload / ingest endpoints left unchanged; they call build_ccure_averages which now uses AttendanceSummary only
 # End of file
+
+
+
+
+
+
+
+
+
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\db.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from settings import DB_URL
+
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+
+
+
+
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\ingest_excel.py
+import pandas as pd
+from datetime import datetime
+from sqlalchemy.exc import IntegrityError
+from db import SessionLocal, engine
+from models import Base, ActiveEmployee, ActiveContractor
+from settings import UPLOAD_DIR
+import uuid, os
+
+# --- database setup: do NOT run create_all at import time ---
+def init_db():
+    """
+    Create DB tables if they do not exist.
+    Call this manually only when you want to initialize/repair the DB:
+      python -c "from ingest_excel import init_db; init_db()"
+    """
+    from db import engine
+    from models import Base
+    Base.metadata.create_all(bind=engine)
+
+def _first_present(row, candidates):
+    for c in candidates:
+        v = row.get(c)
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+def ingest_employee_excel(path, uploaded_by="system"):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    # robust mapping keys
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id'])
+            if emp_id:
+                emp_id = str(emp_id).strip()
+            if not emp_id:
+                # skip rows without an employee id
+                continue
+            full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+            # robust current_status detection
+            status_candidates = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+            current_status = _first_present(row, status_candidates)
+            email = _first_present(row, ["Employee's Email",'Email','Email Address'])
+            location_city = _first_present(row, ['Location City','Location','Location Description','City'])
+            rec = ActiveEmployee(
+                employee_id=emp_id,
+                full_name=full_name,
+                email=email,
+                location_city=location_city,
+                location_desc=row.get('Location Description'),
+                current_status=current_status,
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
+            try:
+                db.merge(rec)  # upsert
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+            except Exception:
+                db.rollback()
+
+def ingest_contractor_excel(path):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            wsid = _first_present(row, ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId'])
+            if wsid:
+                wsid = str(wsid).strip()
+            if not wsid:
+                continue
+            ipass = _first_present(row, ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID'])
+            full_name = _first_present(row, ['Full Name','FullName','Name'])
+            rec = ActiveContractor(
+                worker_system_id=wsid,
+                ipass_id=ipass,
+                full_name=full_name,
+                vendor=_first_present(row, ['Vendor Company Name','Vendor']),
+                location=_first_present(row, ['Worker Location','Location']),
+                status=_first_present(row, ['Status','Current Status']),
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
+            try:
+                db.merge(rec)
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+            except Exception:
+                db.rollback()
+
+if __name__ == "__main__":
+    # ingestion convenience: read all uploaded files
+    for f in os.listdir(UPLOAD_DIR):
+        p = UPLOAD_DIR / f
+        if 'contractor' in f.lower() or 'contractor' in str(p).lower():
+            ingest_contractor_excel(p)
+        else:
+            ingest_employee_excel(p)
+    print("Ingestion completed.")
+
+
+
+
+
+
+
+
+
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\models.py
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, Date
+from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship
+from db import Base
+
+class ActiveEmployee(Base):
+    __tablename__ = "active_employees"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True, unique=True, nullable=False)
+    full_name = Column(String, index=True)
+    email = Column(String)
+    location_city = Column(String, index=True)
+    location_desc = Column(String)
+    current_status = Column(String)
+    raw_row = Column(JSON)  # store original row for reference
+    uploaded_at = Column(DateTime)
+
+class ActiveContractor(Base):
+    __tablename__ = "active_contractors"
+    id = Column(Integer, primary_key=True)
+    worker_system_id = Column(String, index=True, unique=True, nullable=False)
+    ipass_id = Column(String, index=True)
+    full_name = Column(String, index=True)
+    vendor = Column(String)
+    location = Column(String)
+    status = Column(String)
+    raw_row = Column(JSON)
+    uploaded_at = Column(DateTime)
+
+class LiveSwipe(Base):
+    __tablename__ = "live_swipes"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, index=True)
+    employee_id = Column(String, index=True, nullable=True)
+    card_number = Column(String, index=True, nullable=True)
+    full_name = Column(String)
+    partition = Column(String, index=True)
+    floor = Column(String)
+    door = Column(String)
+    region = Column(String, index=True)
+    raw = Column(JSON)
+
+class AttendanceSummary(Base):
+    __tablename__ = "attendance_summary"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True)
+    date = Column(Date, index=True)
+    presence_count = Column(Integer)
+    first_seen = Column(DateTime)
+    last_seen = Column(DateTime)
+    derived = Column(JSON)  # extra stats
+
+
+
+
+
+
+
+
+
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\region_clients.py
+import requests
+from requests.exceptions import RequestException
+from datetime import datetime
+import logging
+import time
+
+logger = logging.getLogger("region_clients")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    import sys
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Edit endpoints if your hosts/ports differ
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+history_endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/history",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
+}
+
+DEFAULT_ATTEMPTS = 2
+DEFAULT_BACKOFF = 0.8
+
+def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            try:
+                return r.json()
+            except ValueError:
+                try:
+                    return {"_raw_text": r.text}
+                except Exception:
+                    return None
+        except RequestException as e:
+            last_err = e
+            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
+    return None
+
+def fetch_all_regions(timeout=6):
+    results = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            realtime = {}
+            if isinstance(data, dict):
+                realtime = data.get("realtime", {}) or {}
+            total = 0
+            for site in realtime.values():
+                try:
+                    total += int(site.get("total", 0))
+                except Exception:
+                    pass
+            # fallback: some live-summary payloads return top-level partitions directly
+            if total == 0 and isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict) and "total" in v:
+                        try:
+                            total += int(v.get("total", 0))
+                        except Exception:
+                            pass
+            results.append({"region": region, "count": total})
+        except Exception as e:
+            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
+            results.append({"region": region, "count": None})
+    return results
+
+def fetch_all_details(timeout=6):
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            details = []
+            if isinstance(data, dict):
+                details = data.get("details", []) or []
+                if not details:
+                    for k, v in data.items():
+                        if k in ("details", "list", "people", "items") and isinstance(v, list):
+                            details = v
+                            break
+            for d in details:
+                try:
+                    d2 = dict(d)
+                    d2["__region"] = region
+                    all_details.append(d2)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
+            continue
+    return all_details
+
+def fetch_history_for_region(region, timeout=6):
+    url = history_endpoints.get(region)
+    if not url:
+        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
+        return []
+    try:
+        data = _do_get_with_retries(url, timeout=timeout) or {}
+        summary = []
+        if isinstance(data, dict):
+            candidates = []
+            for key in ("summaryByDate", "summary", "data", "entries"):
+                if key in data and isinstance(data.get(key), list):
+                    candidates = data.get(key)
+                    break
+            if not candidates:
+                if isinstance(data.get("results"), list):
+                    candidates = data.get("results")
+                else:
+                    if "date" in data:
+                        candidates = [data]
+            for s in candidates:
+                try:
+                    s2 = dict(s)
+                    s2["__region"] = region
+                    summary.append(s2)
+                except Exception:
+                    continue
+        elif isinstance(data, list):
+            for s in data:
+                try:
+                    s2 = dict(s)
+                    s2["__region"] = region
+                    summary.append(s2)
+                except Exception:
+                    continue
+        return summary
+    except Exception as e:
+        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
+        return []
+
+def fetch_all_history(timeout=6):
+    all_entries = []
+    for region in history_endpoints.keys():
+        try:
+            entries = fetch_history_for_region(region, timeout=timeout)
+            if entries:
+                all_entries.extend(entries)
+        except Exception:
+            logger.exception(f"[region_clients] error aggregating history for {region}")
+            continue
+    return all_entries
+
+
+
+
+
+
+
+
+
+
+# data_compare_service.py
+"""
+Compare CCURE active lists (employees & contractors) with uploaded Active sheets (DB).
+Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
+
+Saves an Excel report to OUTPUT_DIR when export=True.
+"""
+
+from datetime import datetime
+import os
+import re
+import uuid
+import logging
+import sys
+import pandas as pd
+
+logger = logging.getLogger("data_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Settings fallback (matches app.py pattern)
+try:
+    from settings import OUTPUT_DIR
+except Exception:
+    OUTPUT_DIR = "./output"
+
+# DB / models
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+
+# ccure client helper (already present in project)
+try:
+    import ccure_client
+except Exception:
+    ccure_client = None
+    logger.warning("ccure_client not importable; CCURE calls will return None")
+
+# ---------- small normalizers (kept local to avoid circular imports) ----------
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s):
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _normalize_name(s):
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _make_w_variant(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss.upper().startswith('W'):
+        return ss
+    return 'W' + ss
+
+# numeric variants (e.g. strip non-digits, add/remove W)
+def _numeric_variants(s):
+    out = set()
+    if s is None:
+        return out
+    try:
+        s = str(s)
+        clean = re.sub(r'\D', '', s)
+        if clean:
+            out.add(clean)
+            out.add(clean.lstrip('0') or clean)
+            out.add('W' + clean)
+    except Exception:
+        pass
+    return out
+
+# small safe-int helper
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# ---------- CCURE fetch helpers ----------
+def _fetch_ccure_list(detail_name):
+    """
+    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries ccure_client.fetch_stats_page(detail_name).
+    Returns list of dicts or [].
+    """
+    if ccure_client is None:
+        logger.warning("ccure_client missing - cannot fetch CCURE lists")
+        return []
+    try:
+        if hasattr(ccure_client, "fetch_all_stats"):
+            res = ccure_client.fetch_all_stats(detail_name, limit=500)
+            return res or []
+    except Exception:
+        logger.exception("fetch_all_stats failed")
+    # fallback to multiple page fetch
+    try:
+        data = []
+        page = 1
+        limit = 500
+        while True:
+            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
+            if not page_res:
+                break
+            part = page_res.get("data") or []
+            if not part:
+                break
+            data.extend(part)
+            total = int(page_res.get("total") or len(data) or 0)
+            if len(data) >= total:
+                break
+            page += 1
+            if page > 1000:
+                break
+        return data
+    except Exception:
+        logger.exception("per-page fetch failed for %s", detail_name)
+        return []
+
+# ---------- DB loaders ----------
+def _load_active_employees_db():
+    """Return (set of normalized employee_ids, dict mapping id -> row sample, total_rows)"""
+    with SessionLocal() as db:
+        rows = db.query(ActiveEmployee).all()
+        ids = set()
+        mapping = {}
+        for r in rows:
+            nid = _normalize_employee_key(r.employee_id)
+            if nid:
+                ids.add(nid)
+                mapping[nid] = {
+                    "employee_id": nid,
+                    "full_name": getattr(r, "full_name", None),
+                    "location_city": getattr(r, "location_city", None),
+                    "status": getattr(r, "current_status", None)
+                }
+        total_rows = len(rows)
+        return ids, mapping, total_rows
+
+def _load_active_contractors_db():
+    """Return (set of candidate contractor ids, mapping, total_rows)"""
+    with SessionLocal() as db:
+        rows = db.query(ActiveContractor).all()
+        ids = set()
+        mapping = {}
+        for r in rows:
+            wsid = _normalize_employee_key(getattr(r, "worker_system_id", None))
+            ipass = _normalize_employee_key(getattr(r, "ipass_id", None))
+            if wsid:
+                ids.add(wsid)
+                mapping[wsid] = {"worker_system_id": wsid, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+            if ipass:
+                ids.add(ipass)
+                mapping[ipass] = {"ipass_id": ipass, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+                wvar = _make_w_variant(ipass)
+                ids.add(wvar)
+                mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": getattr(r, "full_name", None), "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+            # also add numeric variants if worker id numeric-ish
+            for cand in (wsid, ipass):
+                for v in _numeric_variants(cand):
+                    ids.add(v)
+                    if v not in mapping:
+                        mapping[v] = {"derived_id": v, "full_name": getattr(r, "full_name", None)}
+        total_rows = len(rows)
+        return ids, mapping, total_rows
+
+# helper: robust match a ccure id (cid) against DB emp ids+names
+def _employee_matches_db(cid, emp_ids_db, emp_map_db, ccure_row):
+    # direct
+    if cid in emp_ids_db:
+        return True
+    # numeric variants
+    for v in _numeric_variants(cid):
+        if v in emp_ids_db:
+            return True
+    # integer equality against DB keys
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in emp_ids_db:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    # card-like comparison
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in emp_ids_db:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    # name fallback: if CCURE row provides a name, try normalized match against DB full_name
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in emp_map_db.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+# helper: robust match for contractors (same strategies)
+def _contractor_matches_db(cid, contr_ids_db, contr_map_db, ccure_row):
+    if cid in contr_ids_db:
+        return True
+    for v in _numeric_variants(cid):
+        if v in contr_ids_db:
+            return True
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in contr_ids_db:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in contr_ids_db:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in contr_map_db.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+# ---------- core compare function ----------
+def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
+    """
+    mode: 'full' or 'stats' (keeps signature compatible with app.py)
+    stats_detail: used when mode='stats' (ignored here)
+    limit_list: sample limit for returned lists
+    export: if True, writes an Excel report to OUTPUT_DIR and returns 'report_path' in result
+    """
+    result = {
+        "ccure_active_employees_count": None,
+        "ccure_active_contractors_count": None,
+        "active_sheet_employee_count": None,
+        "active_sheet_contractor_count": None,
+        "missing_employees_count": None,
+        "missing_contractors_count": None,
+        "missing_employees_sample": [],
+        "missing_contractors_sample": [],
+        "report_path": None
+    }
+
+    # 1) fetch CCURE lists
+    ccure_emps = _fetch_ccure_list("ActiveEmployees")
+    ccure_contrs = _fetch_ccure_list("ActiveContractors")
+
+    result["ccure_active_employees_count"] = len(ccure_emps)
+    result["ccure_active_contractors_count"] = len(ccure_contrs)
+
+    # 2) load DB sheets (now returning total rows as third value)
+    emp_ids_db, emp_map_db, emp_total_rows = _load_active_employees_db()
+    contr_ids_db, contr_map_db, contr_total_rows = _load_active_contractors_db()
+
+    # use actual DB row counts (not the variant-set size) for reporting
+    result["active_sheet_employee_count"] = int(emp_total_rows)
+    result["active_sheet_contractor_count"] = int(contr_total_rows)
+
+    # 3) build ccure id sets for employees
+    ccure_emp_id_set = set()
+    ccure_emp_rows_by_id = {}
+    for row in ccure_emps:
+        try:
+            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
+            if not eid:
+                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
+            if not eid:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    eid = f"name::{fname}"
+            if eid:
+                ccure_emp_id_set.add(eid)
+                ccure_emp_rows_by_id[eid] = row
+        except Exception:
+            continue
+
+    # 4) employees missing = ccure_emp_id_set - emp_ids_db (but consider numeric variants, int equality, card-like, name match)
+    expanded_emp_db_ids = set(emp_ids_db)
+    for v in list(emp_ids_db):
+        for nv in _numeric_variants(v):
+            expanded_emp_db_ids.add(nv)
+
+    missing_emp_ids = []
+    for cid in ccure_emp_id_set:
+        try:
+            # name style keys handled separately
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in emp_map_db.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_emp_ids.append(cid)
+                continue
+
+            # try the robust matching helper
+            ccure_row = ccure_emp_rows_by_id.get(cid) or {}
+            if _employee_matches_db(cid, expanded_emp_db_ids, emp_map_db, ccure_row):
+                continue
+
+            # last-chance: check numeric variants of cid vs DB
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_emp_db_ids:
+                    found = True
+                    break
+            if not found:
+                missing_emp_ids.append(cid)
+        except Exception:
+            # safe: treat as missing if any unexpected error for that row
+            missing_emp_ids.append(cid)
+
+    result["missing_employees_count"] = len(missing_emp_ids)
+    samp_emp = []
+    for mid in missing_emp_ids[:limit_list]:
+        r = ccure_emp_rows_by_id.get(mid) or {}
+        samp_emp.append({
+            "ccure_key": mid,
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "PersonnelType": r.get("PersonnelType"),
+            "raw": r
+        })
+    result["missing_employees_sample"] = samp_emp
+
+    # 5) contractors
+    ccure_contr_id_set = set()
+    ccure_contr_rows_by_id = {}
+    for row in ccure_contrs:
+        try:
+            cand_ids = []
+            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
+            if e1:
+                cand_ids.append(e1)
+            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
+            if ip:
+                cand_ids.append(ip)
+                cand_ids.append(_make_w_variant(ip))
+            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
+            if cardlike:
+                cand_ids.append(cardlike)
+                cand_ids.extend(list(_numeric_variants(cardlike)))
+            if not cand_ids:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    cand_ids.append(f"name::{fname}")
+            for cid in cand_ids:
+                if cid:
+                    ccure_contr_id_set.add(cid)
+                    ccure_contr_rows_by_id[cid] = row
+            if not cand_ids:
+                key = f"unknown::{uuid.uuid4().hex[:8]}"
+                ccure_contr_id_set.add(key)
+                ccure_contr_rows_by_id[key] = row
+        except Exception:
+            continue
+
+    expanded_contr_db_ids = set(contr_ids_db)
+    for v in list(contr_ids_db):
+        for nv in _numeric_variants(v):
+            expanded_contr_db_ids.add(nv)
+
+    missing_contr_ids = []
+    for cid in ccure_contr_id_set:
+        try:
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in contr_map_db.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_contr_ids.append(cid)
+                continue
+
+            ccure_row = ccure_contr_rows_by_id.get(cid) or {}
+            if _contractor_matches_db(cid, expanded_contr_db_ids, contr_map_db, ccure_row):
+                continue
+
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_contr_db_ids:
+                    found = True
+                    break
+            if not found:
+                missing_contr_ids.append(cid)
+        except Exception:
+            missing_contr_ids.append(cid)
+
+    result["missing_contractors_count"] = len(missing_contr_ids)
+    samp_contr = []
+    for mid in missing_contr_ids[:limit_list]:
+        r = ccure_contr_rows_by_id.get(mid) or {}
+        samp_contr.append({
+            "ccure_key": mid,
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "VendorCompany": r.get("Vendor Company Name") or r.get("Vendor"),
+            "raw": r
+        })
+    result["missing_contractors_sample"] = samp_contr
+
+    # 6) optionally export report
+    if export:
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = f"missing_vs_ccure_{ts}.xlsx"
+            fullpath = os.path.join(OUTPUT_DIR, fname)
+            df_emp = pd.DataFrame(samp_emp) if samp_emp else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","PersonnelType"])
+            df_con = pd.DataFrame(samp_contr) if samp_contr else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","VendorCompany"])
+            try:
+                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+            except Exception:
+                with pd.ExcelWriter(fullpath) as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+        except Exception:
+            logger.exception("Failed to export report")
+            result["report_path"] = None
+
+    return result
+
+
+
+
