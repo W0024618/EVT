@@ -1,3 +1,420 @@
+# data_compare_service.py
+"""
+Compare CCURE active lists (employees & contractors) with uploaded Active sheets (DB).
+Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
+
+Saves an Excel report to OUTPUT_DIR when export=True.
+"""
+
+from datetime import datetime
+import os
+import re
+import uuid
+import logging
+import sys
+import pandas as pd
+
+logger = logging.getLogger("data_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Settings fallback (matches app.py pattern)
+try:
+    from settings import OUTPUT_DIR
+except Exception:
+    OUTPUT_DIR = "./output"
+
+# DB / models
+from db import SessionLocal
+from models import ActiveEmployee, ActiveContractor
+
+# ccure client helper (already present in project)
+try:
+    import ccure_client
+except Exception:
+    ccure_client = None
+    logger.warning("ccure_client not importable; CCURE calls will return None")
+
+# ---------- small normalizers (kept local to avoid circular imports) ----------
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s):
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _normalize_name(s):
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _make_w_variant(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss.upper().startswith('W'):
+        return ss
+    return 'W' + ss
+
+# numeric variants (e.g. strip non-digits, add/remove W)
+def _numeric_variants(s):
+    out = set()
+    if s is None:
+        return out
+    try:
+        s = str(s)
+        clean = re.sub(r'\D', '', s)
+        if clean:
+            out.add(clean)
+            out.add(clean.lstrip('0') or clean)
+            out.add('W' + clean)
+    except Exception:
+        pass
+    return out
+
+# ---------- CCURE fetch helpers ----------
+def _fetch_ccure_list(detail_name):
+    """
+    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries ccure_client.fetch_stats_page(detail_name).
+    Returns list of dicts or [].
+    """
+    if ccure_client is None:
+        logger.warning("ccure_client missing - cannot fetch CCURE lists")
+        return []
+    try:
+        if hasattr(ccure_client, "fetch_all_stats"):
+            res = ccure_client.fetch_all_stats(detail_name, limit=500)
+            return res or []
+    except Exception:
+        logger.exception("fetch_all_stats failed")
+    # fallback to multiple page fetch
+    try:
+        data = []
+        page = 1
+        limit = 500
+        while True:
+            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
+            if not page_res:
+                break
+            part = page_res.get("data") or []
+            if not part:
+                break
+            data.extend(part)
+            total = int(page_res.get("total") or len(data) or 0)
+            if len(data) >= total:
+                break
+            page += 1
+            if page > 1000:
+                break
+        return data
+    except Exception:
+        logger.exception("per-page fetch failed for %s", detail_name)
+        return []
+
+# ---------- DB loaders ----------
+def _load_active_employees_db():
+    """Return set of normalized employee_ids and a dict mapping id -> row for samples"""
+    with SessionLocal() as db:
+        rows = db.query(ActiveEmployee).all()
+        ids = set()
+        mapping = {}
+        for r in rows:
+            nid = _normalize_employee_key(r.employee_id)
+            if nid:
+                ids.add(nid)
+                mapping[nid] = {
+                    "employee_id": nid,
+                    "full_name": r.full_name,
+                    "location_city": getattr(r, "location_city", None),
+                    "status": getattr(r, "current_status", None)
+                }
+        return ids, mapping
+
+def _load_active_contractors_db():
+    """Return set of candidate contractor ids (worker_system_id, ipass, W-ipass) and mapping"""
+    with SessionLocal() as db:
+        rows = db.query(ActiveContractor).all()
+        ids = set()
+        mapping = {}
+        for r in rows:
+            wsid = _normalize_employee_key(getattr(r, "worker_system_id", None))
+            ipass = _normalize_employee_key(getattr(r, "ipass_id", None))
+            if wsid:
+                ids.add(wsid)
+                mapping[wsid] = {"worker_system_id": wsid, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+            if ipass:
+                ids.add(ipass)
+                mapping[ipass] = {"ipass_id": ipass, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+                wvar = _make_w_variant(ipass)
+                ids.add(wvar)
+                mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": r.full_name, "vendor": getattr(r, "vendor", None), "location": getattr(r, "location", None)}
+            # also add numeric variants if worker id numeric-ish
+            for cand in (wsid, ipass):
+                for v in _numeric_variants(cand):
+                    ids.add(v)
+                    if v not in mapping:
+                        mapping[v] = {"derived_id": v, "full_name": r.full_name}
+        return ids, mapping
+
+# ---------- core compare function ----------
+def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
+    """
+    mode: 'full' or 'stats' (keeps signature compatible with app.py)
+    stats_detail: used when mode='stats' (ignored here)
+    limit_list: sample limit for returned lists
+    export: if True, writes an Excel report to OUTPUT_DIR and returns 'report_path' in result
+    """
+    result = {
+        "ccure_active_employees_count": None,
+        "ccure_active_contractors_count": None,
+        "active_sheet_employee_count": None,
+        "active_sheet_contractor_count": None,
+        "missing_employees_count": None,
+        "missing_contractors_count": None,
+        "missing_employees_sample": [],
+        "missing_contractors_sample": [],
+        "report_path": None
+    }
+
+    # 1) fetch CCURE lists
+    ccure_emps = _fetch_ccure_list("ActiveEmployees")
+    ccure_contrs = _fetch_ccure_list("ActiveContractors")
+
+    result["ccure_active_employees_count"] = len(ccure_emps)
+    result["ccure_active_contractors_count"] = len(ccure_contrs)
+
+    # 2) load DB sheets
+    emp_ids_db, emp_map_db = _load_active_employees_db()
+    contr_ids_db, contr_map_db = _load_active_contractors_db()
+
+    result["active_sheet_employee_count"] = len(emp_ids_db)
+    result["active_sheet_contractor_count"] = len(contr_ids_db)
+
+    # 3) build ccure id sets for employees
+    ccure_emp_id_set = set()
+    ccure_emp_rows_by_id = {}
+    for row in ccure_emps:
+        try:
+            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
+            if not eid:
+                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
+            if not eid:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    eid = f"name::{fname}"
+            if eid:
+                ccure_emp_id_set.add(eid)
+                ccure_emp_rows_by_id[eid] = row
+        except Exception:
+            continue
+
+    # 4) employees missing = ccure_emp_id_set - emp_ids_db (but consider numeric variants)
+    expanded_emp_db_ids = set(emp_ids_db)
+    for v in list(emp_ids_db):
+        for nv in _numeric_variants(v):
+            expanded_emp_db_ids.add(nv)
+
+    missing_emp_ids = []
+    for cid in ccure_emp_id_set:
+        if str(cid).startswith("name::"):
+            name = cid.split("::", 1)[1]
+            found = False
+            for dbk, dbv in emp_map_db.items():
+                n = _normalize_name(dbv.get("full_name"))
+                if n and n == name:
+                    found = True
+                    break
+            if not found:
+                missing_emp_ids.append(cid)
+            continue
+        if cid in expanded_emp_db_ids:
+            continue
+        found = False
+        for v in _numeric_variants(cid):
+            if v in expanded_emp_db_ids:
+                found = True
+                break
+        if not found:
+            missing_emp_ids.append(cid)
+
+    result["missing_employees_count"] = len(missing_emp_ids)
+    samp_emp = []
+    for mid in missing_emp_ids[:limit_list]:
+        r = ccure_emp_rows_by_id.get(mid) or {}
+        samp_emp.append({
+            "ccure_key": mid,
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "PersonnelType": r.get("PersonnelType"),
+            "raw": r
+        })
+    result["missing_employees_sample"] = samp_emp
+
+    # 5) contractors
+    ccure_contr_id_set = set()
+    ccure_contr_rows_by_id = {}
+    for row in ccure_contrs:
+        try:
+            cand_ids = []
+            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
+            if e1:
+                cand_ids.append(e1)
+            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
+            if ip:
+                cand_ids.append(ip)
+                cand_ids.append(_make_w_variant(ip))
+            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
+            if cardlike:
+                cand_ids.append(cardlike)
+                cand_ids.extend(list(_numeric_variants(cardlike)))
+            if not cand_ids:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    cand_ids.append(f"name::{fname}")
+            for cid in cand_ids:
+                if cid:
+                    ccure_contr_id_set.add(cid)
+                    ccure_contr_rows_by_id[cid] = row
+            if not cand_ids:
+                key = f"unknown::{uuid.uuid4().hex[:8]}"
+                ccure_contr_id_set.add(key)
+                ccure_contr_rows_by_id[key] = row
+        except Exception:
+            continue
+
+    expanded_contr_db_ids = set(contr_ids_db)
+    for v in list(contr_ids_db):
+        for nv in _numeric_variants(v):
+            expanded_contr_db_ids.add(nv)
+
+    missing_contr_ids = []
+    for cid in ccure_contr_id_set:
+        if str(cid).startswith("name::"):
+            name = cid.split("::", 1)[1]
+            found = False
+            for dbk, dbv in contr_map_db.items():
+                n = _normalize_name(dbv.get("full_name"))
+                if n and n == name:
+                    found = True
+                    break
+            if not found:
+                missing_contr_ids.append(cid)
+            continue
+        if cid in expanded_contr_db_ids:
+            continue
+        found = False
+        for v in _numeric_variants(cid):
+            if v in expanded_contr_db_ids:
+                found = True
+                break
+        if not found:
+            missing_contr_ids.append(cid)
+
+    result["missing_contractors_count"] = len(missing_contr_ids)
+    samp_contr = []
+    for mid in missing_contr_ids[:limit_list]:
+        r = ccure_contr_rows_by_id.get(mid) or {}
+        samp_contr.append({
+            "ccure_key": mid,
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "VendorCompany": r.get("Vendor Company Name") or r.get("Vendor"),
+            "raw": r
+        })
+    result["missing_contractors_sample"] = samp_contr
+
+    # 6) optionally export report
+    if export:
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = f"missing_vs_ccure_{ts}.xlsx"
+            fullpath = os.path.join(OUTPUT_DIR, fname)
+            df_emp = pd.DataFrame(samp_emp) if samp_emp else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","PersonnelType"])
+            df_con = pd.DataFrame(samp_contr) if samp_contr else pd.DataFrame(columns=["ccure_key","EmployeeID","EmpName","VendorCompany"])
+            try:
+                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+            except Exception:
+                with pd.ExcelWriter(fullpath) as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+        except Exception:
+            logger.exception("Failed to export report")
+            result["report_path"] = None
+
+    return result
+
+
+
+
+
+
+
+
+    try:
+        from ccure_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("ccure_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+
+
+
+
+    try:
+        from data_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("data_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+
+
+
+
+
+
+
+curl -v "http://localhost:8000/ccure/compare?mode=full&limit_list=20&export=false"
+
+
+
+
+
+
+
+
+
+
+
 We got this error to check below file carefully and fix this error carefully
 if need also check ccure_compare_service.py file make seprate file dont make changes in previous file make only update data_compare_service.js
 
