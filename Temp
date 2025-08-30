@@ -1,3 +1,374 @@
+# app.py (only the upload-related additions shown; keep the rest of your existing app.py)
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from pathlib import Path
+import shutil, os, time, logging
+
+# ... your existing imports and app initialization above ...
+
+# --- ensure DATA / RAW paths (use settings if available) ---
+try:
+    from settings import DATA_DIR, RAW_UPLOAD_DIR
+    DATA_DIR = Path(DATA_DIR)
+    RAW_UPLOAD_DIR = Path(RAW_UPLOAD_DIR)
+except Exception:
+    # default layout in your request:
+    DATA_DIR = Path(__file__).resolve().parents[0] / "data"
+    RAW_UPLOAD_DIR = DATA_DIR / "raw_uploads"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXT = (".xls", ".xlsx", ".csv")
+
+def _save_upload_and_rotate(upload_file: UploadFile, kind: str) -> dict:
+    """
+    kind: "employee" or "contractor"
+    Behavior:
+      - remove previous canonical file for this kind in DATA_DIR (e.g. active_employees.*)
+      - remove previous raw files in RAW_UPLOAD_DIR that match kind pattern (optional)
+      - save new raw file in RAW_UPLOAD_DIR with timestamped name
+      - also copy it to canonical DATA_DIR/<kind>_active.xlsx (keeps consistent name)
+    Returns: info dict with filenames and sizes
+    """
+    fname = Path(upload_file.filename).name
+    ext = "".join(Path(fname).suffixes) or ""
+    ext = ext.lower()
+    if not any(fname.lower().endswith(s) for s in ALLOWED_EXT):
+        raise HTTPException(status_code=400, detail="Only .xls .xlsx .csv allowed")
+
+    # canonical names we use internally
+    canonical_name = f"active_{kind}.xlsx"  # we'll always write xlsx (but preserve original raw file)
+    canonical_path = DATA_DIR / canonical_name
+
+    # remove previous canonical file(s) for this kind (if exist)
+    try:
+        for p in DATA_DIR.glob(f"active_{kind}.*"):
+            try:
+                p.unlink()
+            except Exception:
+                logging.warning("Could not remove old file %s", p)
+    except Exception:
+        pass
+
+    # Optionally remove previous raw uploads for same kind (keeps only latest raw)
+    try:
+        for p in RAW_UPLOAD_DIR.iterdir():
+            if p.is_file() and kind in p.name.lower():
+                try:
+                    p.unlink()
+                except Exception:
+                    logging.warning("Could not remove old raw file %s", p)
+    except Exception:
+        pass
+
+    # save raw file with timestamp
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    raw_save_name = f"{ts}_{kind}_{fname}"
+    raw_path = RAW_UPLOAD_DIR / raw_save_name
+    with raw_path.open("wb") as out_f:
+        # upload_file.file is a SpooledTemporaryFile
+        shutil.copyfileobj(upload_file.file, out_f)
+    # ensure file pointer is closed for UploadFile
+    try:
+        upload_file.file.close()
+    except Exception:
+        pass
+
+    # copy raw -> canonical (if csv, convert by saving as-is but canonical ext stays xlsx)
+    # We'll write canonical as the uploaded bytes (if xlsx/xls) or use pandas conversion for csv -> xlsx.
+    # Simpler: if CSV uploaded, save canonical as CSV; keep canonical extension same as original.
+    try:
+        if raw_path.suffix.lower() == ".csv":
+            # keep canonical CSV name if CSV provided (so canonical might be .csv)
+            canonical_path = DATA_DIR / f"active_{kind}.csv"
+            shutil.copy(raw_path, canonical_path)
+        else:
+            # for xls/xlsx, copy raw to canonical (keep same extension if original xlsx/xls)
+            shutil.copy(raw_path, canonical_path)
+    except Exception:
+        logging.exception("Failed to write canonical file")
+
+    info = {
+        "raw_saved": str(raw_path),
+        "canonical_saved": str(canonical_path),
+        "original_filename": fname,
+        "size_bytes": raw_path.stat().st_size if raw_path.exists() else None
+    }
+    return info
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    try:
+        info = _save_upload_and_rotate(file, kind="employee")
+        return JSONResponse({"status": "ok", "detail": info})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("upload_active_employees failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    try:
+        info = _save_upload_and_rotate(file, kind="contractor")
+        return JSONResponse({"status": "ok", "detail": info})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("upload_active_contractors failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# data_compare_service.py (only the parts changed/replaced are shown)
+import os
+import re
+import uuid
+import logging
+import sys
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+
+logger = logging.getLogger("data_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# fallback OUTPUT_DIR
+try:
+    from settings import OUTPUT_DIR, DATA_DIR, RAW_UPLOAD_DIR
+    OUTPUT_DIR = Path(OUTPUT_DIR)
+    DATA_DIR = Path(DATA_DIR)
+    RAW_UPLOAD_DIR = Path(RAW_UPLOAD_DIR)
+except Exception:
+    OUTPUT_DIR = Path("./output")
+    DATA_DIR = Path(__file__).resolve().parents[0] / "data"
+    RAW_UPLOAD_DIR = DATA_DIR / "raw_uploads"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------- small normalizers (kept local) ----------
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s):
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _normalize_name(s):
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _make_w_variant(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss.upper().startswith('W'):
+        return ss
+    return 'W' + ss
+
+def _numeric_variants(s):
+    out = set()
+    if s is None:
+        return out
+    try:
+        s = str(s)
+        clean = re.sub(r'\D', '', s)
+        if clean:
+            out.add(clean)
+            out.add(clean.lstrip('0') or clean)
+            out.add('W' + clean)
+    except Exception:
+        pass
+    return out
+
+# ---------- helpers to find/load latest sheet from disk ----------
+def _find_latest_file_for_kind(kind: str):
+    """
+    kind == 'employee' or 'contractor'
+    Prefer canonical file in DATA_DIR: active_<kind>.*,
+    otherwise pick latest in RAW_UPLOAD_DIR that contains the kind token.
+    """
+    # 1) check canonical in DATA_DIR
+    cand = None
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_{kind}{ext}"
+        if p.exists():
+            cand = p
+            break
+    if cand:
+        return cand
+
+    # 2) fallback: find latest raw file with kind token in RAW_UPLOAD_DIR
+    files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and kind in p.name.lower() and p.suffix.lower() in (".xlsx", ".xls", ".csv")]
+    if not files:
+        # last fallback: any active_{kind}.* in RAW_UPLOAD_DIR
+        files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and f"active_{kind}" in p.name.lower()]
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0]
+
+def _read_table(path: Path):
+    try:
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path, dtype=str)
+        else:
+            df = pd.read_excel(path, sheet_name=0, dtype=str)
+        # normalize column names
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.fillna("")  # prevent NaN later
+    except Exception:
+        logger.exception("Failed reading uploaded file %s", path)
+        return pd.DataFrame()
+
+def _first_present_from_row(row, candidates):
+    for c in candidates:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+            return row[c]
+    # try case-insensitive match
+    for k in row.index:
+        for c in candidates:
+            if k.strip().lower() == c.strip().lower():
+                val = row[k]
+                if pd.notna(val) and str(val).strip() != "":
+                    return val
+    return None
+
+# ---------- disk-based loaders to replace DB loaders ----------
+def _load_active_employees_disk():
+    """
+    Return (set of normalized employee_ids, dict mapping id -> row sample, total_rows)
+    Reads the latest employee sheet from data/.
+    """
+    path = _find_latest_file_for_kind("employee")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    # candidate columns for employee id / name
+    id_cols = ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','EmployeeID','Employee_Id']
+    name_cols = ['Full Name','FullName','EmpName','Name','First Name','FirstName','Last Name']
+    location_cols = ['Location City','Location','Location Description','City']
+    status_cols = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        emp_id = _first_present_from_row(row, id_cols)
+        if emp_id is None or str(emp_id).strip() == "":
+            # skip rows without an employee id
+            continue
+        emp_id = str(emp_id).strip()
+        ids.add(emp_id)
+        full_name = _first_present_from_row(row, name_cols) or ""
+        mapping[emp_id] = {
+            "employee_id": emp_id,
+            "full_name": full_name,
+            "location_city": _first_present_from_row(row, location_cols),
+            "status": _first_present_from_row(row, status_cols),
+            "raw": raw_row
+        }
+    return ids, mapping, len(df)
+
+def _load_active_contractors_disk():
+    """
+    Return (set of candidate contractor ids, mapping, total_rows)
+    Reads latest contractor sheet from data/.
+    """
+    path = _find_latest_file_for_kind("contractor")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    wsid_cols = ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId','WorkerId']
+    ipass_cols = ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID','IpassID']
+    name_cols = ['Full Name','FullName','Name']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        wsid = _first_present_from_row(row, wsid_cols)
+        ipass = _first_present_from_row(row, ipass_cols)
+        if wsid:
+            wsid = str(wsid).strip()
+            ids.add(wsid)
+            mapping[wsid] = {"worker_system_id": wsid, "full_name": _first_present_from_row(row,name_cols), "raw": raw_row}
+        if ipass:
+            ipass = str(ipass).strip()
+            ids.add(ipass)
+            mapping[ipass] = {"ipass_id": ipass, "full_name": _first_present_from_row(row,name_cols), "raw": raw_row}
+            # also add W-variant
+            wvar = _make_w_variant(ipass)
+            ids.add(wvar)
+            mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": _first_present_from_row(row,name_cols), "raw": raw_row}
+        # also add numeric variants
+        for cand in (wsid, ipass):
+            if cand:
+                for v in _numeric_variants(cand):
+                    ids.add(v)
+                    if v not in mapping:
+                        mapping[v] = {"derived_id": v, "full_name": _first_present_from_row(row,name_cols), "raw": raw_row}
+    return ids, mapping, len(df)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Understand Our Process 
 from Frontend there is option for 
 Upload Active Employee Sheet 
