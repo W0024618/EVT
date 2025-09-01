@@ -1,3 +1,691 @@
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\data_compare_service.py
+"""
+Compare CCURE active lists (employees & contractors) with uploaded Active sheets (from disk).
+Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
+
+When export=True, writes Excel report to OUTPUT_DIR and returns 'report_path'.
+"""
+
+from datetime import datetime
+import os
+import re
+import uuid
+import logging
+import sys
+from pathlib import Path
+import pandas as pd
+
+logger = logging.getLogger("data_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Settings fallback (matches app.py pattern)
+try:
+    from settings import OUTPUT_DIR as SETTINGS_OUTPUT_DIR, DATA_DIR as SETTINGS_DATA_DIR, RAW_UPLOAD_DIR as SETTINGS_RAW_UPLOAD_DIR
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    RAW_UPLOAD_DIR = Path(SETTINGS_RAW_UPLOAD_DIR)
+except Exception:
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    RAW_UPLOAD_DIR = DATA_DIR / "raw_uploads"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ccure client helper (optional)
+try:
+    import ccure_client
+except Exception:
+    ccure_client = None
+    logger.warning("ccure_client not importable; CCURE calls will return None")
+
+# ---------- small normalizers (kept local) ----------
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s):
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _normalize_name(s):
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _make_w_variant(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss.upper().startswith('W'):
+        return ss
+    return 'W' + ss
+
+def _numeric_variants(s):
+    out = set()
+    if s is None:
+        return out
+    try:
+        s = str(s)
+        clean = re.sub(r'\D', '', s)
+        if clean:
+            out.add(clean)
+            out.add(clean.lstrip('0') or clean)
+            out.add('W' + clean)
+    except Exception:
+        pass
+    return out
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# ---------- CCURE fetch helpers ----------
+def _fetch_ccure_list(detail_name):
+    """
+    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries per-page fetch.
+    Returns list of dicts or [].
+    """
+    if ccure_client is None:
+        logger.warning("ccure_client missing - cannot fetch CCURE lists")
+        return []
+    try:
+        if hasattr(ccure_client, "fetch_all_stats"):
+            res = ccure_client.fetch_all_stats(detail_name, limit=500)
+            return res or []
+    except Exception:
+        logger.exception("fetch_all_stats failed")
+    # fallback to paged fetch if available
+    try:
+        data = []
+        page = 1
+        limit = 500
+        while True:
+            if not hasattr(ccure_client, "fetch_stats_page"):
+                break
+            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
+            if not page_res:
+                break
+            part = page_res.get("data") or []
+            if not part:
+                break
+            data.extend(part)
+            total = int(page_res.get("total") or len(data) or 0)
+            if len(data) >= total:
+                break
+            page += 1
+            if page > 1000:
+                break
+        return data
+    except Exception:
+        logger.exception("per-page fetch failed for %s", detail_name)
+        return []
+
+# ---------- helpers to find/load latest sheet from disk ----------
+def _find_latest_file_for_kind(kind: str):
+    """
+    kind == 'employee' or 'contractor'
+    Prefer canonical file in DATA_DIR: active_<kind>.*,
+    otherwise pick latest in RAW_UPLOAD_DIR that contains the kind token.
+    """
+    # 1) canonical in DATA_DIR
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_{kind}{ext}"
+        if p.exists():
+            return p
+
+    # 2) fallback: find latest raw file with kind token in RAW_UPLOAD_DIR
+    try:
+        files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and kind in p.name.lower() and p.suffix.lower() in (".xlsx", ".xls", ".csv")]
+        if not files:
+            # last fallback: any active_{kind}.* in RAW_UPLOAD_DIR
+            files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and f"active_{kind}" in p.name.lower()]
+        if not files:
+            return None
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0]
+    except Exception:
+        return None
+
+def _read_table(path: Path):
+    try:
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path, dtype=str)
+        else:
+            df = pd.read_excel(path, sheet_name=0, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.fillna("")
+    except Exception:
+        logger.exception("Failed to read file %s", path)
+        return pd.DataFrame()
+
+def _first_present_from_row(row, candidates):
+    for c in candidates:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+            return row[c]
+    for k in row.index:
+        for c in candidates:
+            if k.strip().lower() == c.strip().lower():
+                val = row[k]
+                if pd.notna(val) and str(val).strip() != "":
+                    return val
+    return None
+
+# ---------- disk-based loaders to replace DB loaders ----------
+def _load_active_employees_disk():
+    """
+    Return (set of normalized employee_ids, dict mapping id -> row sample, total_rows)
+    Reads the latest employee sheet from data/.
+    """
+    path = _find_latest_file_for_kind("employee")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    id_cols = ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','Employee_Id']
+    name_cols = ['Full Name','FullName','EmpName','Name','First Name','FirstName','Last Name']
+    location_cols = ['Location City','Location','Location Description','City']
+    status_cols = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        emp_id = _first_present_from_row(row, id_cols)
+        if emp_id is None or str(emp_id).strip() == "":
+            continue
+        emp_id = str(emp_id).strip()
+        ids.add(emp_id)
+        full_name = _first_present_from_row(row, name_cols) or ""
+        mapping[emp_id] = {
+            "employee_id": emp_id,
+            "full_name": full_name,
+            "location_city": _first_present_from_row(row, location_cols),
+            "status": _first_present_from_row(row, status_cols),
+            "raw": raw_row
+        }
+    return ids, mapping, len(df)
+
+def _load_active_contractors_disk():
+    """
+    Return (set of candidate contractor ids, mapping, total_rows)
+    Reads latest contractor sheet from data/.
+    """
+    path = _find_latest_file_for_kind("contractor")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    wsid_cols = ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId','WorkerId']
+    ipass_cols = ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID','IpassID']
+    name_cols = ['Full Name','FullName','Name']
+    vendor_cols = ['Vendor Company Name','Vendor']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        wsid = _first_present_from_row(row, wsid_cols)
+        ipass = _first_present_from_row(row, ipass_cols)
+        full_name = _first_present_from_row(row, name_cols)
+        if wsid:
+            wsid = str(wsid).strip()
+            ids.add(wsid)
+            mapping[wsid] = {"worker_system_id": wsid, "full_name": full_name, "vendor": _first_present_from_row(row, vendor_cols), "raw": raw_row}
+        if ipass:
+            ipass = str(ipass).strip()
+            ids.add(ipass)
+            mapping[ipass] = {"ipass_id": ipass, "full_name": full_name, "vendor": _first_present_from_row(row, vendor_cols), "raw": raw_row}
+            wvar = _make_w_variant(ipass)
+            ids.add(wvar)
+            mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": full_name, "raw": raw_row}
+        for cand in (wsid, ipass):
+            if cand:
+                for v in _numeric_variants(cand):
+                    ids.add(v)
+                    if v not in mapping:
+                        mapping[v] = {"derived_id": v, "full_name": full_name, "raw": raw_row}
+    return ids, mapping, len(df)
+
+# ---------- helpers to match ccure -> disk lists (same logic as before) ----------
+def _employee_matches_disk(cid, emp_ids_disk, emp_map_disk, ccure_row):
+    if cid in emp_ids_disk:
+        return True
+    for v in _numeric_variants(cid):
+        if v in emp_ids_disk:
+            return True
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in emp_ids_disk:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in emp_ids_disk:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in emp_map_disk.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _contractor_matches_disk(cid, contr_ids_disk, contr_map_disk, ccure_row):
+    if cid in contr_ids_disk:
+        return True
+    for v in _numeric_variants(cid):
+        if v in contr_ids_disk:
+            return True
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in contr_ids_disk:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in contr_ids_disk:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in contr_map_disk.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+# ---------- core compare function ----------
+def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
+    """
+    Main public function used by /ccure/compare.
+    Reads latest uploaded sheets from disk instead of DB tables.
+    """
+    result = {
+        "ccure_active_employees_count": None,
+        "ccure_active_contractors_count": None,
+        "active_sheet_employee_count": None,
+        "active_sheet_contractor_count": None,
+        "missing_employees_count": None,
+        "missing_contractors_count": None,
+        "missing_employees_sample": [],
+        "missing_contractors_sample": [],
+        "report_path": None
+    }
+
+    # 1) fetch CCURE lists
+    ccure_emps = _fetch_ccure_list("ActiveEmployees")
+    ccure_contrs = _fetch_ccure_list("ActiveContractors")
+
+    result["ccure_active_employees_count"] = len(ccure_emps)
+    result["ccure_active_contractors_count"] = len(ccure_contrs)
+
+    # 2) load uploaded sheets from disk (preferred) — returns (ids_set, mapping, total_rows)
+    emp_ids_disk, emp_map_disk, emp_total_rows = _load_active_employees_disk()
+    contr_ids_disk, contr_map_disk, contr_total_rows = _load_active_contractors_disk()
+
+    result["active_sheet_employee_count"] = int(emp_total_rows)
+    result["active_sheet_contractor_count"] = int(contr_total_rows)
+
+    # 3) build ccure id sets for employees
+    ccure_emp_id_set = set()
+    ccure_emp_rows_by_id = {}
+    for row in ccure_emps:
+        try:
+            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
+            if not eid:
+                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
+            if not eid:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    eid = f"name::{fname}"
+            if eid:
+                ccure_emp_id_set.add(eid)
+                ccure_emp_rows_by_id[eid] = row
+        except Exception:
+            continue
+
+    # 4) employees missing = ccure_emp_id_set - emp_ids_disk (but consider numeric variants, int equality, card-like, name match)
+    expanded_emp_disk_ids = set(emp_ids_disk)
+    for v in list(emp_ids_disk):
+        for nv in _numeric_variants(v):
+            expanded_emp_disk_ids.add(nv)
+
+    missing_emp_ids = []
+    for cid in ccure_emp_id_set:
+        try:
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in emp_map_disk.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_emp_ids.append(cid)
+                continue
+
+            ccure_row = ccure_emp_rows_by_id.get(cid) or {}
+            if _employee_matches_disk(cid, expanded_emp_disk_ids, emp_map_disk, ccure_row):
+                continue
+
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_emp_disk_ids:
+                    found = True
+                    break
+            if not found:
+                missing_emp_ids.append(cid)
+        except Exception:
+            missing_emp_ids.append(cid)
+
+    result["missing_employees_count"] = len(missing_emp_ids)
+    samp_emp = []
+    for mid in missing_emp_ids[:limit_list]:
+        r = ccure_emp_rows_by_id.get(mid) or {}
+
+        # extract manager/profile/status from raw if present
+        manager_name = r.get("Manager_Name") or r.get("ManagerName") or r.get("Manager") or r.get("Manager_WU_ID")
+        profile_disabled = r.get("Profile_Disabled") if "Profile_Disabled" in r else r.get("profile_disabled") if "profile_disabled" in r else r.get("ProfileDisabled") if "ProfileDisabled" in r else None
+        employee_status = r.get("Employee_Status") or r.get("Employee Status") or r.get("Status") or r.get("employee_status")
+
+        # ensure string conversion for boolean-like values
+        if isinstance(profile_disabled, bool):
+            profile_disabled = str(profile_disabled)
+
+        # vendorCompany doesn't apply to employees — keep blank
+        vendor_company = r.get("Vendor Company Name") or r.get("Vendor") or r.get("vendor") or ""
+
+        # build sample row with both old and new key names for compatibility
+        samp_emp.append({
+            "ccure_key": mid,
+            # old keys (kept for compatibility)
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "PersonnelType": r.get("PersonnelType"),
+            "VendorCompany": vendor_company,
+            "Manager_Name": manager_name,
+            "Profile_Disabled": profile_disabled,
+            "Employee_Status": employee_status,
+            # new/canonical lowerCamel keys requested
+            "employeeId": r.get("EmployeeID") or r.get("employee_id") or r.get("Employee Id"),
+            "empName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "personnelType": r.get("PersonnelType"),
+            "vendorCompany": vendor_company,
+            "managerName": manager_name,
+            "profileDisabled": profile_disabled,
+            "employeeStatus": employee_status,
+            "raw": r
+        })
+    result["missing_employees_sample"] = samp_emp
+
+    # 5) contractors
+    ccure_contr_id_set = set()
+    ccure_contr_rows_by_id = {}
+    for row in ccure_contrs:
+        try:
+            cand_ids = []
+            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
+            if e1:
+                cand_ids.append(e1)
+            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
+            if ip:
+                cand_ids.append(ip)
+                cand_ids.append(_make_w_variant(ip))
+            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
+            if cardlike:
+                cand_ids.append(cardlike)
+                cand_ids.extend(list(_numeric_variants(cardlike)))
+            if not cand_ids:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    cand_ids.append(f"name::{fname}")
+            for cid in cand_ids:
+                if cid:
+                    ccure_contr_id_set.add(cid)
+                    ccure_contr_rows_by_id[cid] = row
+            if not cand_ids:
+                key = f"unknown::{uuid.uuid4().hex[:8]}"
+                ccure_contr_id_set.add(key)
+                ccure_contr_rows_by_id[key] = row
+        except Exception:
+            continue
+
+    expanded_contr_disk_ids = set(contr_ids_disk)
+    for v in list(contr_ids_disk):
+        for nv in _numeric_variants(v):
+            expanded_contr_disk_ids.add(nv)
+
+    missing_contr_ids = []
+    for cid in ccure_contr_id_set:
+        try:
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in contr_map_disk.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_contr_ids.append(cid)
+                continue
+
+            ccure_row = ccure_contr_rows_by_id.get(cid) or {}
+            if _contractor_matches_disk(cid, expanded_contr_disk_ids, contr_map_disk, ccure_row):
+                continue
+
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_contr_disk_ids:
+                    found = True
+                    break
+            if not found:
+                missing_contr_ids.append(cid)
+        except Exception:
+            missing_contr_ids.append(cid)
+
+    result["missing_contractors_count"] = len(missing_contr_ids)
+    samp_contr = []
+    for mid in missing_contr_ids[:limit_list]:
+        r = ccure_contr_rows_by_id.get(mid) or {}
+
+        # vendor/company
+        vendor_company = r.get("Vendor Company Name") or r.get("Vendor") or r.get("vendor") or ""
+
+        # personnel, manager, profile, status extraction
+        personnel_type = r.get("PersonnelType") or r.get("Personnel_Type") or r.get("Personnel Type") or None
+        manager_name = r.get("Manager_Name") or r.get("ManagerName") or r.get("Manager") or r.get("Manager_WU_ID")
+        profile_disabled = r.get("Profile_Disabled") if "Profile_Disabled" in r else r.get("profile_disabled") if "profile_disabled" in r else None
+        employee_status = r.get("Employee_Status") or r.get("Employee Status") or r.get("Status") or r.get("employee_status")
+
+        if isinstance(profile_disabled, bool):
+            profile_disabled = str(profile_disabled)
+
+        samp_contr.append({
+            "ccure_key": mid,
+            # old keys kept
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "VendorCompany": vendor_company,
+            "PersonnelType": personnel_type,
+            "Manager_Name": manager_name,
+            "Profile_Disabled": profile_disabled,
+            "Employee_Status": employee_status,
+            # new requested lowerCamel keys
+            "employeeId": r.get("EmployeeID") or r.get("employee_id") or r.get("Employee Id"),
+            "empName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "vendorCompany": vendor_company,
+            "personnelType": personnel_type,
+            "managerName": manager_name,
+            "profileDisabled": profile_disabled,
+            "employeeStatus": employee_status,
+            "raw": r
+        })
+    result["missing_contractors_sample"] = samp_contr
+
+    # 6) optionally export report
+    if export:
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = f"missing_vs_ccure_{ts}.xlsx"
+            fullpath = OUTPUT_DIR / fname
+
+            # Canonical column set requested (lowerCamel)
+            columns = ["ccure_key", "employeeId", "empName", "vendorCompany", "personnelType", "managerName", "profileDisabled", "employeeStatus"]
+
+            # Build DataFrames and ensure columns order (fill missing with empty string)
+            if samp_emp:
+                df_emp = pd.DataFrame(samp_emp)
+                # reindex to requested columns; missing columns will be added with NaN
+                df_emp = df_emp.reindex(columns=columns).fillna("")
+            else:
+                df_emp = pd.DataFrame(columns=columns)
+
+            if samp_contr:
+                df_con = pd.DataFrame(samp_contr)
+                df_con = df_con.reindex(columns=columns).fillna("")
+            else:
+                df_con = pd.DataFrame(columns=columns)
+
+            try:
+                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+            except Exception:
+                # fallback to default engine
+                with pd.ExcelWriter(fullpath) as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+        except Exception:
+            logger.exception("Failed to export report")
+            result["report_path"] = None
+
+    return result
+
+
+
+
+
+
+#export 
+
+def export_uploaded_sheets():
+    """
+    Create a single xlsx workbook with:
+      - Sheet "Employee" -> contents of latest canonical employee sheet (if present)
+      - Sheet "Contractor" -> contents of latest canonical contractor sheet (if present)
+    Writes file into OUTPUT_DIR and returns the filename (not full path).
+    """
+    try:
+        emp_path = _find_latest_file_for_kind("employee")
+        contr_path = _find_latest_file_for_kind("contractor")
+
+        # Ensure OUTPUT_DIR exists
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        fname = f"uploaded_sheets_{ts}.xlsx"
+        fullpath = OUTPUT_DIR / fname
+
+        # Read tables (if present) or create empty dataframe placeholders
+        if emp_path and emp_path.exists():
+            df_emp = _read_table(emp_path)
+        else:
+            df_emp = pd.DataFrame()
+
+        if contr_path and contr_path.exists():
+            df_con = _read_table(contr_path)
+        else:
+            df_con = pd.DataFrame()
+
+        # Write to one workbook (try openpyxl if available)
+        try:
+            with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                df_emp.to_excel(writer, sheet_name="Employee", index=False)
+                df_con.to_excel(writer, sheet_name="Contractor", index=False)
+        except Exception:
+            # fallback to default engine
+            with pd.ExcelWriter(fullpath) as writer:
+                df_emp.to_excel(writer, sheet_name="Employee", index=False)
+                df_con.to_excel(writer, sheet_name="Contractor", index=False)
+
+        return fname
+    except Exception:
+        logger.exception("export_uploaded_sheets failed")
+        return None
+
+
+# Expose public function name expected by app.py
+__all__ =  ["compare_ccure_vs_sheets", "compare_ccure_vs_sheets", "export_uploaded_sheets"]  # keep backwards compatibility
+# End of data_compare_service.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i think we need to update Backend file also 
 so update in backend 
 as per Frontend structure update Backend file carefully...
