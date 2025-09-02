@@ -1,3 +1,521 @@
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\data_compare_service_v2.py
+"""
+New comparison service (v2)
+
+Features:
+- Loads canonical Active Employee sheet from DATA_DIR/active_employee.*
+- Filters by Region Code, Location City, Location Description, Location State/Province
+- Cross-checks against AttendanceSummary DB (today and Mon-Fri of current week)
+- Calculates:
+    - total active in selection (from sheet)
+    - visited today count and percentage vs sheet total
+    - current status (on leave) counts
+    - employee type counts (Regular vs WFH, etc.)
+    - For Regular employees: compute days present in Mon-Fri week, counts for present>=3, present==5
+    - Defaulter lists (present only 1 time, present <3 times) with leave flag
+- Optional export to Excel (writes to OUTPUT_DIR, returns filename)
+- Public function: compare_ccure_vs_sheets(...) - backwards-compatible signature with optional extra filters
+"""
+import sys
+import re
+import uuid
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from typing import Optional, Dict, Any, List
+
+import pandas as pd
+
+# DB imports (same as your project)
+from db import SessionLocal
+from models import AttendanceSummary, ActiveEmployee
+
+# Use settings if present to find DATA_DIR / OUTPUT_DIR
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("data_compare_service_v2")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _find_active_employee_file():
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_employee{ext}"
+        if p.exists():
+            return p
+    # try case-insensitive search
+    for p in DATA_DIR.iterdir():
+        if p.is_file() and "active_employee" in p.name.lower():
+            return p
+    return None
+
+def _normalize_key(k):
+    if k is None:
+        return None
+    return str(k).strip()
+
+def _safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+def _week_monday_and_friday(ref_date: Optional[date] = None):
+    if ref_date is None:
+        ref_date = date.today()
+    # ISO weekday: Monday=1
+    iso = ref_date.isoweekday()
+    monday = ref_date - timedelta(days=(iso - 1))
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+def _maybe_mark_on_leave(status_str: Optional[str]) -> bool:
+    if not status_str:
+        return False
+    s = str(status_str).strip().lower()
+    for tok in ("leave", "vacation", "on leave", "holiday", "sabbatical", "furlough", "loa"):
+        if tok in s:
+            return True
+    return False
+
+# ----------------------------
+# Core loader: active employees (sheet)
+# ----------------------------
+def load_active_employees_dataframe() -> pd.DataFrame:
+    """
+    Loads canonical active_employee spreadsheet into a normalized DataFrame.
+    Returns DataFrame with (at least) these normalized columns:
+      employee_id, full_name, location_city, location_desc, location_state, region_code,
+      current_status, employee_type, raw_row (JSON)
+    """
+    src = _find_active_employee_file()
+    if not src:
+        raise FileNotFoundError(f"Active employee canonical file not found in {DATA_DIR}")
+    ext = src.suffix.lower()
+    if ext in (".xls", ".xlsx"):
+        df = pd.read_excel(src, sheet_name=0, dtype=str)
+    else:
+        df = pd.read_csv(src, dtype=str)
+
+    # normalize column names (strip)
+    df.columns = [c.strip() for c in df.columns]
+
+    def _first_present(row, candidates):
+        for c in candidates:
+            if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+                return row[c]
+        return None
+
+    # build normalized rows
+    rows = []
+    for _, row in df.iterrows():
+        emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id'])
+        full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or (
+            f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+        )
+        location_city = _first_present(row, ['Location City','Location City ' ,'Location','City','LocationCity'])
+        location_desc = _first_present(row, ['Location Description','Location Description ','LocationDescription'])
+        location_state = _first_present(row, ['Location State / Province','Location State / Province ','Location State','State','Province'])
+        region_code = _first_present(row, ['Region Code','Region','RegionCode'])
+        current_status = _first_present(row, ['Current Status','Status','Employee Status','Employee_Status'])
+        employee_type = _first_present(row, ['Employee Type','Type','Time Type'])
+        rows.append({
+            "employee_id": _normalize_key(emp_id),
+            "full_name": _normalize_key(full_name),
+            "location_city": _normalize_key(location_city),
+            "location_desc": _normalize_key(location_desc),
+            "location_state": _normalize_key(location_state),
+            "region_code": (str(region_code).strip() if region_code is not None else None),
+            "current_status": _normalize_key(current_status),
+            "employee_type": _normalize_key(employee_type),
+            "raw_row": row.to_dict()
+        })
+    ndf = pd.DataFrame(rows)
+    # ensure columns exist
+    for col in ("employee_id","full_name","location_city","location_desc","location_state","region_code","current_status","employee_type","raw_row"):
+        if col not in ndf:
+            ndf[col] = None
+    # drop rows without employee_id (these cannot be matched)
+    ndf = ndf[ndf["employee_id"].notna() & (ndf["employee_id"].str.strip() != "")]
+    ndf.reset_index(drop=True, inplace=True)
+    return ndf
+
+# ----------------------------
+# Attendance summary queries
+# ----------------------------
+
+def _fetch_presence_for_employees(employee_ids: List[str], start_date: date, end_date: date) -> Dict[str, Dict[date,int]]:
+    """
+    Robust fetch presence: chunked queries + fallback broad query + normalization.
+    Returns mapping { employee_id_from_sheet: { date_obj: 0/1, ... }, ... }
+
+    Notes:
+      - Works if DB employee_id values are formatted slightly differently (leading zeros,
+        non-digit chars). We do chunked IN queries (fast) and, if those return nothing,
+        we fallback to pulling the full date-range rows and matching in Python using normalization.
+      - Ensures each employee has a 0/1 entry for every date in the range.
+    """
+    if not employee_ids:
+        return {}
+
+    # ensure keys are strings and trimmed
+    orig_ids = [str(e).strip() for e in employee_ids]
+    norm_id_set = set([s for s in orig_ids if s])
+
+    # prepare result container keyed by original (trimmed) employee id
+    result: Dict[str, Dict[date, int]] = {eid: {} for eid in orig_ids}
+
+    rows = []
+    chunk_size = 500
+    try:
+        with SessionLocal() as db:
+            # chunked IN queries first (fast if DB matches exactly)
+            for i in range(0, len(orig_ids), chunk_size):
+                chunk = orig_ids[i:i+chunk_size]
+                try:
+                    q = db.query(AttendanceSummary).filter(
+                        AttendanceSummary.date >= start_date,
+                        AttendanceSummary.date <= end_date,
+                        AttendanceSummary.employee_id.in_(chunk)
+                    )
+                    rows_chunk = q.all()
+                    if rows_chunk:
+                        rows.extend(rows_chunk)
+                except Exception:
+                    logger.exception("chunked query failed for _fetch_presence_for_employees (continuing)")
+                    continue
+
+            # fallback: if no rows found (or very few), fetch all AttendanceSummary rows in date-range
+            # and do normalized matching in Python. This handles format mismatches.
+            if not rows:
+                try:
+                    rows = db.query(AttendanceSummary).filter(
+                        AttendanceSummary.date >= start_date,
+                        AttendanceSummary.date <= end_date
+                    ).all()
+                    logger.info("[presence_fetch] fallback broad query returned %d rows for %s -> %s", len(rows), start_date, end_date)
+                except Exception:
+                    logger.exception("fallback broad query failed in _fetch_presence_for_employees")
+                    rows = []
+    except Exception:
+        logger.exception("DB session error in _fetch_presence_for_employees")
+        rows = []
+
+    # Build mapping from DB rows into normalized keys
+    for r in rows:
+        try:
+            raw_eid = r.employee_id
+            if raw_eid is None:
+                continue
+            db_key = str(raw_eid).strip()
+            match_key = None
+
+            # direct match
+            if db_key in norm_id_set:
+                match_key = db_key
+            else:
+                # try remove non-digits and leading zeros
+                digits = re.sub(r'\D+', '', db_key)
+                if digits:
+                    cand = digits.lstrip('0') or digits
+                    if cand in norm_id_set:
+                        match_key = cand
+
+                # try reverse: if any orig id equals db_key after stripping its leading zeros
+                if match_key is None:
+                    for o in orig_ids:
+                        if o == db_key or o.lstrip('0') == db_key or db_key.lstrip('0') == o:
+                            match_key = o
+                            break
+
+            if not match_key:
+                # no match to any requested employee id; skip
+                continue
+
+            d = r.date
+            present = 0
+            try:
+                present = int(r.presence_count or 0)
+            except Exception:
+                present = 1 if (r.presence_count and str(r.presence_count).strip() != "0") else 0
+
+            result.setdefault(match_key, {})
+            # if multiple rows for same employee/date exist, treat any positive as presence
+            prev = result[match_key].get(d, 0)
+            result[match_key][d] = 1 if (prev == 1 or present > 0) else 0
+        except Exception:
+            continue
+
+    # ensure each employee has entries for every date in the range (fill zeros)
+    cur = start_date
+    while cur <= end_date:
+        for eid in orig_ids:
+            result.setdefault(eid, {})
+            if cur not in result[eid]:
+                result[eid][cur] = 0
+        cur = cur + timedelta(days=1)
+
+    # logging to help debug counts (will appear in server logs)
+    try:
+        total_date_entries = sum(len(d) for d in result.values())
+        logger.info("[presence_fetch] built presence_map for %d employees (total date-entries=%d)", len(result), total_date_entries)
+    except Exception:
+        pass
+
+    return result
+
+# ----------------------------
+# Main comparison function
+# ----------------------------
+def compare_ccure_vs_sheets(
+    mode: str = "full",
+    stats_detail: str = "ActiveProfiles",
+    limit_list: int = 200,
+    export: bool = False,
+    # extra optional filters (if present, will be applied)
+    region_filter: Optional[str] = None,        # e.g. "APAC"
+    location_city: Optional[str] = None,       # e.g. "Pune"
+    location_state: Optional[str] = None,
+    location_description: Optional[str] = None,
+    week_ref_date: Optional[str] = None        # "YYYY-MM-DD" - week to evaluate (Mon-Fri)
+) -> Dict[str, Any]:
+    """
+    Rich comparison API:
+      - mode/stats_detail kept for compatibility
+      - additional optional filters: region_filter, location_city, location_state, location_description
+      - week_ref_date optional: if provided, week considered is that date's Mon-Fri; else current week
+      - export: if True, writes an excel summary report to OUTPUT_DIR and returns filename in result
+    """
+    try:
+        # load active employees
+        df = load_active_employees_dataframe()
+    except Exception as e:
+        logger.exception("Failed to load active employees")
+        return {"error": f"active sheet load failed: {e}"}
+
+    # normalize filters
+    rf = region_filter.strip().lower() if region_filter else None
+    lc = location_city.strip().lower() if location_city else None
+    ls = location_state.strip().lower() if location_state else None
+    ld = location_description.strip().lower() if location_description else None
+
+    # apply filters
+    sel = df.copy()
+    if rf:
+        sel = sel[sel["region_code"].fillna("").str.strip().str.lower() == rf]
+    if lc:
+        sel = sel[sel["location_city"].fillna("").str.strip().str.lower() == lc]
+    if ls:
+        sel = sel[sel["location_state"].fillna("").str.strip().str.lower() == ls]
+    if ld:
+        sel = sel[sel["location_desc"].fillna("").str.strip().str.lower() == ld]
+
+    total_active = len(sel)
+    # gather lists
+    employee_ids = sel["employee_id"].astype(str).str.strip().tolist()
+
+    # get "today" headcount by checking AttendanceSummary presence_count > 0 for date==today
+    today = date.today()
+    monday, friday = _week_monday_and_friday(date.fromisoformat(week_ref_date)) if week_ref_date else _week_monday_and_friday(today)
+
+    # fetch presence for week (Mon-Fri)
+    presence_map = _fetch_presence_for_employees(employee_ids, monday, friday)
+
+    # compute today count (today might be within Mon-Fri window)
+    today_count = 0
+    for eid in employee_ids:
+        pm = presence_map.get(eid, {})
+        # presence_map stores per-day 0/1 for the Mon-Fri window; if today in map use that, otherwise fallback DB query for single date
+        if today in pm:
+            if pm[today] > 0:
+                today_count += 1
+        else:
+            # fallback single-day check (try normalized lookup)
+            try:
+                with SessionLocal() as db:
+                    # try exact match first
+                    row = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == eid, AttendanceSummary.date == today).first()
+                    if row and getattr(row, "presence_count", 0) > 0:
+                        today_count += 1
+                        continue
+                    # try digits-only / no-leading-zero match
+                    digits = re.sub(r'\D+', '', eid)
+                    if digits:
+                        cand = digits.lstrip('0') or digits
+                        row2 = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == cand, AttendanceSummary.date == today).first()
+                        if row2 and getattr(row2, "presence_count", 0) > 0:
+                            today_count += 1
+            except Exception:
+                continue
+
+    today_pct = round((today_count / float(total_active)) * 100.0, 2) if total_active > 0 else None
+
+    # compute current status -> leave checks
+    sel["on_leave"] = sel["current_status"].apply(lambda x: _maybe_mark_on_leave(x))
+    leave_count = int(sel["on_leave"].sum())
+
+    # employee type breakdown
+    sel["employee_type_norm"] = sel["employee_type"].fillna("").str.strip().str.lower()
+    type_counts = sel["employee_type_norm"].value_counts().to_dict()
+
+    # Focus on Regular employees for presence checks
+    regular_df = sel[sel["employee_type_norm"].str.contains("regular", na=False)]
+    regular_ids = regular_df["employee_id"].astype(str).str.strip().tolist()
+
+    # compute days present Monday-Friday per regular employee
+    regular_presence: Dict[str, Dict[str, Any]] = {}
+    for eid in regular_ids:
+        week_map = presence_map.get(eid, {})
+        # consider only Mon-Fri keys from week_map (already so)
+        days_present = sum(1 for d, v in week_map.items() if v and (monday <= d <= friday))
+        days_present = int(days_present)
+        regular_presence[eid] = {
+            "days_present": days_present,
+            "on_leave": bool(sel[sel["employee_id"] == eid]["on_leave"].any()),
+            "full_name": sel[sel["employee_id"] == eid]["full_name"].iloc[0] if not sel[sel["employee_id"] == eid].empty else None
+        }
+
+    # counts
+    present_5_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 5)
+    present_3_or_more_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 3)
+    present_less_than_3_count = sum(1 for v in regular_presence.values() if v["days_present"] < 3)
+    present_only_1_count = sum(1 for v in regular_presence.values() if v["days_present"] == 1)
+
+    # lists (limit each to limit_list)
+    present_5_list = []
+    present_3_list = []
+    defaulters_list = []   # those present 1 or <3 depending
+
+    for eid, info in regular_presence.items():
+        entry = {
+            "employee_id": eid,
+            "full_name": info["full_name"],
+            "days_present": info["days_present"],
+            "on_leave": info["on_leave"]
+        }
+        if info["days_present"] >= 5:
+            present_5_list.append(entry)
+        if info["days_present"] >= 3:
+            present_3_list.append(entry)
+        if info["days_present"] < 3:
+            defaulters_list.append(entry)
+
+    # Limit returned lists
+    present_5_list = sorted(present_5_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
+    present_3_list = sorted(present_3_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
+    defaulters_list = sorted(defaulters_list, key=lambda x: (x["days_present"], x["on_leave"], x["full_name"] or ""))[:limit_list]
+
+    # Build response
+    summary = {
+        "filters": {
+            "region": region_filter,
+            "location_city": location_city,
+            "location_state": location_state,
+            "location_description": location_description,
+            "week_monday": monday.isoformat(),
+            "week_friday": friday.isoformat()
+        },
+        "counts": {
+            "total_active_in_sheet": total_active,
+            "today_headcount_from_summary": today_count,
+            "today_headcount_pct_vs_sheet": today_pct,
+            "on_leave_count_in_sheet": leave_count,
+            "employee_type_counts": type_counts
+        },
+        "regular_attendance_summary": {
+            "regular_total": len(regular_ids),
+            "present_5_day_count": present_5_count,
+            "present_3_or_more_count": present_3_or_more_count,
+            "present_less_than_3_count": present_less_than_3_count,
+            "present_only_1_day_count": present_only_1_count
+        }
+    }
+
+    details = {
+        "present_5_days": present_5_list,
+        "present_3_or_more_days": present_3_list,
+        "defaulters_less_than_3_days": defaulters_list
+    }
+
+    report_path = None
+    if export:
+        try:
+            report_name = f"attendance_compare_{(region_filter or 'all')}_{(location_city or 'all')}_{uuid.uuid4().hex[:8]}.xlsx"
+            report_file = OUTPUT_DIR / report_name
+            # write Excel with multiple sheets
+            with pd.ExcelWriter(report_file, engine="openpyxl") as writer:
+                # original selection snapshot
+                sel_df_for_export = sel.copy()
+                # flatten raw_row for convenience: keep as string
+                sel_df_for_export["raw_row_str"] = sel_df_for_export["raw_row"].apply(lambda r: str(r) if not pd.isna(r) else "")
+                sel_df_for_export.to_excel(writer, sheet_name="active_sheet_selection", index=False)
+                # summary / counts as small DataFrame
+                pd.DataFrame([summary["counts"]]).to_excel(writer, sheet_name="summary_counts", index=False)
+                # regular attendance summary
+                pd.DataFrame([summary["regular_attendance_summary"]]).to_excel(writer, sheet_name="regular_summary", index=False)
+                # lists
+                pd.DataFrame(details["present_5_days"]).to_excel(writer, sheet_name="present_5_days", index=False)
+                pd.DataFrame(details["present_3_or_more_days"]).to_excel(writer, sheet_name="present_3_plus", index=False)
+                pd.DataFrame(details["defaulters_less_than_3_days"]).to_excel(writer, sheet_name="defaulters_lt3", index=False)
+            report_path = str(report_file.name)
+        except Exception:
+            logger.exception("Failed to write export report")
+            report_path = None
+
+    out = {
+        "mode": mode,
+        "stats_detail": stats_detail,
+        "summary": summary,
+        "details": details
+    }
+    if report_path:
+        out["report_path"] = report_path
+    return out
+
+
+# small convenience test function (not run at import)
+if __name__ == "__main__":
+    # quick smoke test: compute for APAC Pune
+    res = compare_ccure_vs_sheets(region_filter="APAC", location_city="Pune", export=False, limit_list=50)
+    import json as _json
+    print(_json.dumps(res, indent=2, default=str))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 When Update Above File we Got Below API Responce ...
 http://localhost:8000/ccure/compare_v2?region_filter=APAC&location_city=Pune
 {
