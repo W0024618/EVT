@@ -1,790 +1,339 @@
-# data_compare_service_v2.py
-"""
-Comparison service (v2) with improved prefetching and matching heuristics.
-
-Key changes:
- - Prefetches per-person `details` payloads (if available) and history aggregates once.
- - Uses preloaded per-person detail payloads to map presence to employee IDs.
- - Broader matching heuristics: many field name variants, digits-only, last-n digits, badge fields, conservative name fallback.
-"""
-import sys
-import re
-import uuid
-import logging
-from pathlib import Path
-from datetime import date, datetime, timedelta
-from typing import Optional, Dict, Any, List, Any as AnyType
-
-import pandas as pd
-
-# HTTP client for region histories
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-except Exception:
-    requests = None
-
-# DB imports (same as your project)
-from db import SessionLocal
-from models import AttendanceSummary, ActiveEmployee
-
-# Use settings if present to find DATA_DIR / OUTPUT_DIR and REGION_HISTORY_URLS
-try:
-    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR, REGION_HISTORY_URLS as SETTINGS_REGION_HISTORY_URLS
-    DATA_DIR = Path(SETTINGS_DATA_DIR)
-    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
-    REGION_HISTORY_URLS = SETTINGS_REGION_HISTORY_URLS
-except Exception:
-    DATA_DIR = Path(__file__).resolve().parent / "data"
-    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-    # sensible defaults based on examples you provided; can be overridden via settings.py
-    REGION_HISTORY_URLS = [
-        "http://10.199.22.57:3008/api/occupancy/history",  # APAC (example)
-        "http://10.199.22.57:3006/api/occupancy/history",  # NAMER
-        "http://10.199.22.57:3007/api/occupancy/history",  # EMEA
-        "http://10.199.22.57:4000/api/occupancy/history"   # LACA
-    ]
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-logger = logging.getLogger("data_compare_service_v2")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# local timeouts (tune as needed)
-LOCAL_REGION_TIMEOUT = (5, 10)  # (connect, read)
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def _find_active_employee_file():
-    for ext in (".xlsx", ".xls", ".csv"):
-        p = DATA_DIR / f"active_employee{ext}"
-        if p.exists():
-            return p
-    # try case-insensitive search
-    for p in DATA_DIR.iterdir():
-        if p.is_file() and "active_employee" in p.name.lower():
-            return p
-    return None
-
-def _normalize_key(k):
-    if k is None:
-        return None
-    return str(k).strip()
-
-def _safe_int(v, default=0):
-    try:
-        if v is None or v == "":
-            return default
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return default
-
-def _week_monday_and_friday(ref_date: Optional[date] = None):
-    if ref_date is None:
-        ref_date = date.today()
-    iso = ref_date.isoweekday()
-    monday = ref_date - timedelta(days=(iso - 1))
-    friday = monday + timedelta(days=4)
-    return monday, friday
-
-def _maybe_mark_on_leave(status_str: Optional[str]) -> bool:
-    if not status_str:
-        return False
-    s = str(status_str).strip().lower()
-    for tok in ("leave", "vacation", "on leave", "holiday", "sabbatical", "furlough", "loa"):
-        if tok in s:
-            return True
-    return False
-
-# ----------------------------
-# Core loader: active employees (sheet)
-# ----------------------------
-def load_active_employees_dataframe() -> pd.DataFrame:
-    src = _find_active_employee_file()
-    if not src:
-        raise FileNotFoundError(f"Active employee canonical file not found in {DATA_DIR}")
-    ext = src.suffix.lower()
-    if ext in (".xls", ".xlsx"):
-        df = pd.read_excel(src, sheet_name=0, dtype=str)
-    else:
-        df = pd.read_csv(src, dtype=str)
-    df.columns = [c.strip() for c in df.columns]
-
-    def _first_present(row, candidates):
-        for c in candidates:
-            if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
-                return row[c]
-        return None
-
-    rows = []
-    for _, row in df.iterrows():
-        emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','EmployeeNo','Employee No','Emp No'])
-        full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or (
-            f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
-        )
-        location_city = _first_present(row, ['Location City','Location City ' ,'Location','City','LocationCity'])
-        location_desc = _first_present(row, ['Location Description','Location Description ','LocationDescription'])
-        location_state = _first_present(row, ['Location State / Province','Location State / Province ','Location State','State','Province'])
-        region_code = _first_present(row, ['Region Code','Region','RegionCode'])
-        current_status = _first_present(row, ['Current Status','Status','Employee Status','Employee_Status'])
-        employee_type = _first_present(row, ['Employee Type','Type','Time Type'])
-        rows.append({
-            "employee_id": _normalize_key(emp_id),
-            "full_name": _normalize_key(full_name),
-            "location_city": _normalize_key(location_city),
-            "location_desc": _normalize_key(location_desc),
-            "location_state": _normalize_key(location_state),
-            "region_code": (str(region_code).strip() if region_code is not None else None),
-            "current_status": _normalize_key(current_status),
-            "employee_type": _normalize_key(employee_type),
-            "raw_row": row.to_dict()
-        })
-    ndf = pd.DataFrame(rows)
-    for col in ("employee_id","full_name","location_city","location_desc","location_state","region_code","current_status","employee_type","raw_row"):
-        if col not in ndf:
-            ndf[col] = None
-    ndf = ndf[ndf["employee_id"].notna() & (ndf["employee_id"].str.strip() != "")]
-    ndf.reset_index(drop=True, inplace=True)
-    return ndf
-
-# ----------------------------
-# HTTP Session factory (retries/backoff)
-# ----------------------------
-def _build_requests_session():
-    if requests is None:
-        return None
-    s = requests.Session()
-    allowed = frozenset(['GET', 'HEAD'])
-    try:
-        retry = Retry(
-            total=2,
-            backoff_factor=1,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=allowed
-        )
-    except TypeError:
-        retry = Retry(
-            total=2,
-            backoff_factor=1,
-            status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=allowed
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-# ----------------------------
-# Payload normalization helpers
-# ----------------------------
-def _extract_details_from_payload(payload: AnyType) -> List[Dict[str, Any]]:
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return [p for p in payload if isinstance(p, dict)]
-    if isinstance(payload, dict):
-        for k in ("details", "results", "data", "entries", "list", "people", "items"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        if isinstance(payload.get("summaryByDate"), list):
-            return [x for x in payload.get("summaryByDate") if isinstance(x, dict)]
-        if "date" in payload and isinstance(payload.get("date"), (str,)):
-            # treat single-record summaries as list
-            return [payload]
-    return []
-
-# ----------------------------
-# Prefetch region payloads (both details & history aggregates)
-# ----------------------------
-def _prefetch_region_payloads(start_date: date, end_date: date, timeout=LOCAL_REGION_TIMEOUT) -> Dict[str, List[AnyType]]:
-    """
-    Returns dict with keys:
-      - 'details': list of per-person detail dicts (fast to scan & map to employee ids)
-      - 'history': list of per-date aggregate dicts (useful for averages)
-    Prefetch tries region_clients first, then falls back to direct requests if needed.
-    """
-    details = []
-    history = []
-    # try region_clients if available (it has convenience wrappers)
-    try:
-        import region_clients
-        try:
-            d = region_clients.fetch_all_details(timeout=timeout if isinstance(timeout, (int, float)) else timeout[1])
-            if d:
-                details.extend(d)
-        except Exception:
-            logger.debug("region_clients.fetch_all_details failed (will attempt direct HTTP)", exc_info=True)
-        try:
-            h = region_clients.fetch_all_history(timeout=timeout if isinstance(timeout, (int, float)) else timeout[1])
-            if h:
-                history.extend(h)
-        except Exception:
-            logger.debug("region_clients.fetch_all_history failed (will attempt direct HTTP)", exc_info=True)
-    except Exception:
-        logger.debug("region_clients not importable; will attempt direct HTTP prefetch", exc_info=True)
-
-    # If region_clients didn't return anything, try direct HTTP calls to REGION_HISTORY_URLS
-    if not details and requests is not None:
-        session = _build_requests_session()
-        if session:
-            date_params_options = [
-                ("fromDate", "toDate"),
-                ("from", "to"),
-                ("start", "end"),
-                ("from_date", "to_date"),
-            ]
-            for url in REGION_HISTORY_URLS:
-                if not url:
-                    continue
-                for (k1, k2) in date_params_options + [(None, None)]:
-                    try:
-                        if k1 is None:
-                            resp = session.get(url, timeout=timeout)
-                        else:
-                            params = {k1: start_date.isoformat(), k2: end_date.isoformat()}
-                            resp = session.get(url, params=params, timeout=timeout)
-                    except Exception:
-                        continue
-                    if not resp or resp.status_code != 200:
-                        continue
-                    try:
-                        payload = resp.json()
-                    except Exception:
-                        continue
-                    # attempt to extract person-level details
-                    p_details = _extract_details_from_payload(payload)
-                    if p_details:
-                        details.extend(p_details)
-                    # also collect top-level summary lists (history)
-                    if isinstance(payload, dict):
-                        for k in ("summaryByDate","summary","data","entries","results"):
-                            if k in payload and isinstance(payload[k], list):
-                                history.extend(payload[k])
-                                break
-                    elif isinstance(payload, list):
-                        # could be either details or history; if items look like date aggregates (have 'date' & counts),
-                        # treat as history as well (we keep both)
-                        history.extend(payload)
-                    # break on first successful response from this URL
-                    break
-
-    logger.info("[prefetch] details=%d, history=%d collected", len(details), len(history))
-    return {"details": details, "history": history}
-
-# ----------------------------
-# Region presence fallback scanning (accepts preloaded details)
-# ----------------------------
-def _fetch_presence_from_region_payloads(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None, preloaded: Optional[Dict[str, List[AnyType]]] = None) -> Dict[str, Dict[date,int]]:
-    """
-    Scans preloaded detail payloads (preferred) and returns presence map per employee per date.
-    If preloaded is None or doesn't contain details, attempts to scan HTTP endpoints (less preferred).
-    """
-    presence = {eid: {} for eid in employee_ids}
-    if not employee_ids:
-        return presence
-
-    orig_ids = [str(e).strip() for e in employee_ids]
-    norm_set = set([s for s in orig_ids if s])
-    digits_map = {e: re.sub(r'\D+', '', e) for e in orig_ids}
-
-    scanned_details = 0
-    matched_hits = 0
-
-    # Utility: build name map (last token) for conservative name matching
-    # map last_name_lower -> list of employee ids that have that last token
-    name_map = {}
-    # we will store the original full names from sel after caller provides them; but we can create a minimal map:
-    # the calling code passes names in 'employee_ids' list only, so do conservative name fallback later if necessary.
-
-    def _process_detail(d):
-        nonlocal scanned_details, matched_hits
-        scanned_details += 1
-        try:
-            # timestamp heuristics — many possible keys
-            ts = d.get("LocaleMessageTime") or d.get("SwipeDate") or d.get("SwipeTime") or d.get("timestamp") or d.get("time") or d.get("DateTime") or d.get("date")
-            if not ts:
-                return
-            # normalize timestamp
-            t = None
-            try:
-                if isinstance(ts, (int, float)):
-                    t = datetime.fromtimestamp(int(ts))
-                elif isinstance(ts, str):
-                    if "T" in ts:
-                        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    else:
-                        try:
-                            t = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-                        except Exception:
-                            try:
-                                t = datetime.strptime(ts[:10], "%Y-%m-%d")
-                            except Exception:
-                                t = None
-            except Exception:
-                t = None
-            if t is None:
-                return
-            dt = t.date()
-            if dt < start_date or dt > end_date:
-                return
-
-            if partition_filter:
-                partition_value = (d.get("PartitionNameFriendly") or d.get("PartitionName2") or d.get("PartitionName") or d.get("PrimaryLocation") or d.get("Partition") or "")
-                if not partition_value or partition_filter.strip().lower() not in str(partition_value).strip().lower():
-                    return
-
-            scanned_key = None
-            # candidate keys for employee id
-            for k in ("EmployeeID","employeeId","Employee Id","PersonID","PersonId","personId","person_id","employee_no","EmployeeNo","EmpNo","EmpNo","empid"):
-                raw_emp = d.get(k)
-                if raw_emp and str(raw_emp).strip() != "":
-                    db_key = str(raw_emp).strip()
-                    # direct match
-                    if db_key in norm_set:
-                        scanned_key = db_key
-                        break
-                    # digits-only match
-                    dd = re.sub(r'\D+', '', db_key)
-                    if dd:
-                        cand = dd.lstrip('0') or dd
-                        for orig in orig_ids:
-                            if orig == cand or digits_map.get(orig) == dd or orig.lstrip('0') == db_key:
-                                scanned_key = orig
-                                break
-                    if scanned_key:
-                        break
-
-            # card/badge fallback
-            if scanned_key is None:
-                for k in ("CardNumber","BadgeNumber","Card","badge","badgeNumber","badge_no","card_no"):
-                    card = d.get(k)
-                    if card:
-                        cd = re.sub(r'\D+', '', str(card))
-                        if cd:
-                            cand = cd.lstrip('0') or cd
-                            for orig in orig_ids:
-                                od = digits_map.get(orig, "")
-                                if od and (od == cd or od.lstrip('0') == cand or orig == cand):
-                                    scanned_key = orig
-                                    break
-                        if scanned_key:
-                            break
-
-            # last-n digits heuristic (conservative) if still None: use last 4 digits
-            if scanned_key is None:
-                # try to extract numeric id-like field from payload
-                numeric_fields = []
-                for k in d.keys():
-                    if isinstance(d.get(k), (int, float)) or (isinstance(d.get(k), str) and re.search(r'\d', d.get(k))):
-                        numeric_fields.append(str(d.get(k)))
-                # find last-4 match
-                for nf in numeric_fields:
-                    digits_nf = re.sub(r'\D+', '', nf)
-                    if len(digits_nf) >= 3:
-                        last4 = digits_nf[-4:]
-                        for orig in orig_ids:
-                            od = re.sub(r'\D+', '', orig)
-                            if od.endswith(last4):
-                                scanned_key = orig
-                                break
-                        if scanned_key:
-                            break
-
-            # conservative name fallback: if still None, and payload carries a name-like field and it matches last token of employee id name,
-            # this can be useful in some cases but *may* create false positives. We'll keep this minimal: only match if name token is exact and unique.
-            if scanned_key is None:
-                name_candidates = []
-                for k in ("FullName","Fullname","Name","name","PersonName","personName","displayName"):
-                    n = d.get(k)
-                    if n and isinstance(n, str) and n.strip() != "":
-                        name_candidates.append(n.strip())
-                if name_candidates:
-                    nm = name_candidates[0].strip()
-                    nm_last = nm.split()[-1].lower()
-                    # we don't have sel's names here; the caller can optionally supply a name map. For safety we won't aggressively match here.
-
-            if scanned_key:
-                matched_hits += 1
-                presence.setdefault(scanned_key, {})
-                presence[scanned_key][dt] = 1
-        except Exception:
-            return
-
-    # Use preloaded detail payloads if provided
-    if preloaded and isinstance(preloaded, dict) and preloaded.get("details"):
-        for d in preloaded.get("details") or []:
-            _process_detail(d)
-    else:
-        # fallback: try direct HTTP scanning (less efficient)
-        if requests is None:
-            logger.warning("[region_payload_scan] requests missing and no preloaded payloads")
-        else:
-            session = _build_requests_session()
-            if session is None:
-                logger.warning("[region_payload_scan] could not build HTTP session for fallback scan")
-            else:
-                date_params_options = [
-                    ("fromDate", "toDate"),
-                    ("from", "to"),
-                    ("start", "end"),
-                    ("from_date", "to_date"),
-                ]
-                for url in REGION_HISTORY_URLS:
-                    if not url:
-                        continue
-                    for (k1, k2) in date_params_options + [(None, None)]:
-                        try:
-                            if k1 is None:
-                                resp = session.get(url, timeout=LOCAL_REGION_TIMEOUT)
-                            else:
-                                params = {k1: start_date.isoformat(), k2: end_date.isoformat()}
-                                resp = session.get(url, params=params, timeout=LOCAL_REGION_TIMEOUT)
-                        except Exception:
-                            continue
-                        if not resp or resp.status_code != 200:
-                            continue
-                        try:
-                            payload = resp.json()
-                        except Exception:
-                            continue
-                        # prefer person-level details in payload
-                        ds = _extract_details_from_payload(payload)
-                        if ds:
-                            for d in ds:
-                                _process_detail(d)
-                        # else ignore aggregates for per-person mapping
-
-    logger.info("[region_payload_scan] scanned_details=%d matched_hits=%d", scanned_details, matched_hits)
-
-    # Ensure zeros for all dates
-    cur = start_date
-    while cur <= end_date:
-        for eid in employee_ids:
-            presence.setdefault(eid, {})
-            if cur not in presence[eid]:
-                presence[eid][cur] = 0
-        cur = cur + timedelta(days=1)
-
-    return presence
-
-# ----------------------------
-# Attendance summary queries (combined approach)
-# ----------------------------
-def _fetch_presence_for_employees(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None, preloaded_region_payloads: Optional[Dict[str, List[AnyType]]] = None) -> Dict[str, Dict[date,int]]:
-    if not employee_ids:
-        return {}
-
-    orig_ids = [str(e).strip() for e in employee_ids]
-    norm_id_set = set([s for s in orig_ids if s])
-    result = {eid: {} for eid in orig_ids}
-
-    rows = []
-    chunk_size = 500
-    try:
-        with SessionLocal() as db:
-            for i in range(0, len(orig_ids), chunk_size):
-                chunk = orig_ids[i:i+chunk_size]
-                try:
-                    q = db.query(AttendanceSummary).filter(
-                        AttendanceSummary.date >= start_date,
-                        AttendanceSummary.date <= end_date,
-                        AttendanceSummary.employee_id.in_(chunk)
-                    )
-                    rows_chunk = q.all()
-                    if rows_chunk:
-                        rows.extend(rows_chunk)
-                except Exception:
-                    logger.exception("chunked query failed for _fetch_presence_for_employees (continuing)")
-                    continue
-
-            if not rows:
-                try:
-                    rows = db.query(AttendanceSummary).filter(
-                        AttendanceSummary.date >= start_date,
-                        AttendanceSummary.date <= end_date
-                    ).all()
-                    logger.info("[presence_fetch] fallback broad DB query returned %d rows for %s -> %s", len(rows), start_date, end_date)
-                except Exception:
-                    logger.exception("fallback broad DB query failed in _fetch_presence_for_employees")
-                    rows = []
-    except Exception:
-        logger.exception("DB session error in _fetch_presence_for_employees")
-        rows = []
-
-    # Map DB rows to employee ids using normalization heuristics
-    for r in rows:
-        try:
-            raw_eid = r.employee_id
-            if raw_eid is None:
-                continue
-            db_key = str(raw_eid).strip()
-            match_key = None
-            if db_key in norm_id_set:
-                match_key = db_key
-            else:
-                digits = re.sub(r'\D+', '', db_key)
-                if digits:
-                    cand = digits.lstrip('0') or digits
-                    if cand in norm_id_set:
-                        match_key = cand
-                if match_key is None:
-                    for o in orig_ids:
-                        if o == db_key or o.lstrip('0') == db_key or db_key.lstrip('0') == o:
-                            match_key = o
-                            break
-
-            if not match_key:
-                continue
-
-            d = r.date
-            present = 0
-            try:
-                present = int(r.presence_count or 0)
-            except Exception:
-                present = 1 if (r.presence_count and str(r.presence_count).strip() != "0") else 0
-
-            result.setdefault(match_key, {})
-            prev = result[match_key].get(d, 0)
-            result[match_key][d] = 1 if (prev == 1 or present > 0) else 0
-        except Exception:
-            continue
-
-    # Fill missing dates with zeros
-    cur = start_date
-    while cur <= end_date:
-        for eid in orig_ids:
-            result.setdefault(eid, {})
-            if cur not in result[eid]:
-                result[eid][cur] = 0
-        cur = cur + timedelta(days=1)
-
-    db_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
-    logger.info("[presence_fetch] DB-derived presence found for %d/%d employees", db_positive, len(orig_ids))
-
-    # If DB coverage is low, use region payloads fallback (prefer preloaded payloads)
-    if db_positive == 0 or db_positive < max(10, int(0.1 * len(orig_ids))):
-        try:
-            logger.info("[presence_fetch] DB coverage low (%d/%d) - trying region payload fallback", db_positive, len(orig_ids))
-            region_presence = _fetch_presence_from_region_payloads(orig_ids, start_date, end_date, partition_filter=partition_filter, preloaded=preloaded_region_payloads)
-            for eid in orig_ids:
-                rp = region_presence.get(eid, {})
-                for d, v in rp.items():
-                    if v and result.setdefault(eid, {}).get(d, 0) == 0:
-                        result[eid][d] = 1
-        except Exception:
-            logger.exception("region history fallback failed in _fetch_presence_for_employees")
-
-    final_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
-    logger.info("[presence_fetch] final presence coverage: %d/%d employees have at least one positive day", final_positive, len(orig_ids))
-
-    return result
-
-# ----------------------------
-# Main comparison function
-# ----------------------------
-def compare_ccure_vs_sheets(
-    mode: str = "full",
-    stats_detail: str = "ActiveProfiles",
-    limit_list: int = 200,
-    export: bool = False,
-    region_filter: Optional[str] = None,
-    location_city: Optional[str] = None,
-    location_state: Optional[str] = None,
-    location_description: Optional[str] = None,
-    week_ref_date: Optional[str] = None
-) -> Dict[str, Any]:
-    # compute week window up-front
-    today = date.today()
-    monday, friday = _week_monday_and_friday(date.fromisoformat(week_ref_date)) if week_ref_date else _week_monday_and_friday(today)
-
-    # 1) Prefetch payloads (details + history)
-    preloaded = {}
-    try:
-        preloaded = _prefetch_region_payloads(monday, friday, timeout=LOCAL_REGION_TIMEOUT)
-    except Exception:
-        logger.exception("prefetch_region_payloads failed; continuing without preloaded payloads")
-        preloaded = {}
-
-    # 2) Load sheet
-    try:
-        df = load_active_employees_dataframe()
-    except Exception as e:
-        logger.exception("Failed to load active employees")
-        return {"error": f"active sheet load failed: {e}"}
-
-    rf = region_filter.strip().lower() if region_filter else None
-    lc = location_city.strip().lower() if location_city else None
-    ls = location_state.strip().lower() if location_state else None
-    ld = location_description.strip().lower() if location_description else None
-
-    sel = df.copy()
-    if rf:
-        sel = sel[sel["region_code"].fillna("").str.strip().str.lower() == rf]
-    if lc:
-        sel = sel[sel["location_city"].fillna("").str.strip().str.lower() == lc]
-    if ls:
-        sel = sel[sel["location_state"].fillna("").str.strip().str.lower() == ls]
-    if ld:
-        sel = sel[sel["location_desc"].fillna("").str.strip().str.lower() == ld]
-
-    total_active = len(sel)
-    employee_ids = sel["employee_id"].astype(str).str.strip().tolist()
-
-    # 3) fetch presence (DB first, else preloaded region details)
-    presence_map = _fetch_presence_for_employees(employee_ids, monday, friday, partition_filter=location_city, preloaded_region_payloads=preloaded)
-
-    # compute today count (today within Mon-Fri window or not)
-    today_count = 0
-    for eid in employee_ids:
-        pm = presence_map.get(eid, {})
-        if today in pm and pm[today] > 0:
-            today_count += 1
-        else:
-            # fallback DB single date check
-            try:
-                with SessionLocal() as db:
-                    row = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == eid, AttendanceSummary.date == today).first()
-                    if row and getattr(row, "presence_count", 0) > 0:
-                        today_count += 1
-                        continue
-                    digits = re.sub(r'\D+', '', eid)
-                    if digits:
-                        cand = digits.lstrip('0') or digits
-                        row2 = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == cand, AttendanceSummary.date == today).first()
-                        if row2 and getattr(row2, "presence_count", 0) > 0:
-                            today_count += 1
-            except Exception:
-                continue
-
-    today_pct = round((today_count / float(total_active)) * 100.0, 2) if total_active > 0 else None
-
-    sel["on_leave"] = sel["current_status"].apply(lambda x: _maybe_mark_on_leave(x))
-    leave_count = int(sel["on_leave"].sum())
-    sel["employee_type_norm"] = sel["employee_type"].fillna("").str.strip().str.lower()
-    type_counts = sel["employee_type_norm"].value_counts().to_dict()
-
-    regular_df = sel[sel["employee_type_norm"].str.contains("regular", na=False)]
-    regular_ids = regular_df["employee_id"].astype(str).str.strip().tolist()
-
-    regular_presence = {}
-    for eid in regular_ids:
-        week_map = presence_map.get(eid, {})
-        days_present = sum(1 for d, v in week_map.items() if v and (monday <= d <= friday))
-        days_present = int(days_present)
-        regular_presence[eid] = {
-            "days_present": days_present,
-            "on_leave": bool(sel[sel["employee_id"] == eid]["on_leave"].any()),
-            "full_name": sel[sel["employee_id"] == eid]["full_name"].iloc[0] if not sel[sel["employee_id"] == eid].empty else None
-        }
-
-    present_5_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 5)
-    present_3_or_more_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 3)
-    present_less_than_3_count = sum(1 for v in regular_presence.values() if v["days_present"] < 3)
-    present_only_1_count = sum(1 for v in regular_presence.values() if v["days_present"] == 1)
-
-    present_5_list = []
-    present_3_list = []
-    defaulters_list = []
-
-    for eid, info in regular_presence.items():
-        entry = {
-            "employee_id": eid,
-            "full_name": info["full_name"],
-            "days_present": info["days_present"],
-            "on_leave": info["on_leave"]
-        }
-        if info["days_present"] >= 5:
-            present_5_list.append(entry)
-        if info["days_present"] >= 3:
-            present_3_list.append(entry)
-        if info["days_present"] < 3:
-            defaulters_list.append(entry)
-
-    present_5_list = sorted(present_5_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
-    present_3_list = sorted(present_3_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
-    defaulters_list = sorted(defaulters_list, key=lambda x: (x["days_present"], x["on_leave"], x["full_name"] or ""))[:limit_list]
-
-    summary = {
-        "filters": {
-            "region": region_filter,
-            "location_city": location_city,
-            "location_state": location_state,
-            "location_description": location_description,
-            "week_monday": monday.isoformat(),
-            "week_friday": friday.isoformat()
-        },
-        "counts": {
-            "total_active_in_sheet": total_active,
-            "today_headcount_from_summary": today_count,
-            "today_headcount_pct_vs_sheet": today_pct,
-            "on_leave_count_in_sheet": leave_count,
-            "employee_type_counts": type_counts
-        },
-        "regular_attendance_summary": {
-            "regular_total": len(regular_ids),
-            "present_5_day_count": present_5_count,
-            "present_3_or_more_count": present_3_or_more_count,
-            "present_less_than_3_count": present_less_than_3_count,
-            "present_only_1_day_count": present_only_1_count
-        }
+Once Check all Comparision file carefully and Solve this issue keep both comparision file diffreant diffrant but Solve tthis issue carfully...
+
+Check Console Details 
+alos Check below Each and Every file carefully and Fix the issue .and share me Fuklly Updated file carefully so i can easily swap file each other.
+
+(.venv) PS C:\Users\W0024618\Desktop\global-page> cd backend
+(.venv) PS C:\Users\W0024618\Desktop\global-page\backend> cd attendance-analytics
+(.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> python -m uvicorn app:app --host 0.0.0.0 --port 8000
+INFO:     Started server process [13888]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:55158 - "GET /ccure/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50732 - "GET /ccure/stream HTTP/1.1" 200 OK
+[compute_daily_attendance] no swipes for 2025-09-04
+2025-09-04 11:57:08,041 INFO data_compare_service_v2: [region_cache] fetching region history via region_clients.fetch_all_history()
+2025-09-04 11:57:08,411 INFO data_compare_service_v2: [region_cache] fetching region history via region_clients.fetch_all_history()
+2025-09-04 11:57:28,449 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:3006/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3006): Read timed out. (read timeout=20)       
+2025-09-04 11:57:37,506 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:3008/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3008): Read timed out. (read timeout=20)       
+2025-09-04 11:57:49,063 WARNING region_clients: [region_clients] attempt 2/2 failed for http://10.199.22.57:3006/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3006): Read timed out. (read timeout=20)       
+2025-09-04 11:57:49,063 WARNING region_clients: [region_clients] all 2 attempts failed for http://10.199.22.57:3006/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3006): Read timed out. (read timeout=20)    
+2025-09-04 11:58:09,078 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:3007/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3007): Read timed out. (read timeout=20)       
+2025-09-04 11:58:18,695 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:4000/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=4000): Read timed out. (read timeout=20)       
+2025-09-04 11:58:28,326 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:4000/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=4000): Read timed out. (read timeout=20)       
+2025-09-04 11:58:35,637 WARNING region_clients: [region_clients] attempt 1/2 failed for http://10.199.22.57:3008/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3008): Read timed out. (read timeout=20)       
+2025-09-04 11:58:36,194 INFO data_compare_service_v2: [region_cache] prefetched 67 region history entries
+INFO:     127.0.0.1:61488 - "GET /ccure/verify?raw=true HTTP/1.1" 200 OK
+2025-09-04 11:58:53,199 INFO data_compare_service_v2: [presence_fetch] fallback broad DB query returned 0 rows for 2025-09-01 -> 2025-09-05
+2025-09-04 11:58:53,230 INFO data_compare_service_v2: [presence_fetch] DB-derived presence found for 0/8625 employees
+2025-09-04 11:58:53,230 INFO data_compare_service_v2: [presence_fetch] DB coverage low (0/8625) - trying region occupancy history fallback
+2025-09-04 11:58:53,255 INFO data_compare_service_v2: [region_history] scanned 67 detail rows from preloaded entries; matched 0 presence entries
+2025-09-04 11:58:53,291 INFO data_compare_service_v2: [presence_fetch] final presence coverage: 0/8625 employees have at least one positive day
+2025-09-04 11:58:56,283 WARNING region_clients: [region_clients] attempt 2/2 failed for http://10.199.22.57:3008/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3008): Read timed out. (read timeout=20)       
+2025-09-04 11:58:56,286 WARNING region_clients: [region_clients] all 2 attempts failed for http://10.199.22.57:3008/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3008): Read timed out. (read timeout=20)    
+2025-09-04 11:59:19,983 INFO data_compare_service_v2: [region_cache] prefetched 32 region history entries
+INFO:     127.0.0.1:57894 - "GET /ccure/compare_v2 HTTP/1.1" 200 OK
+2025-09-04 11:59:54,980 INFO data_compare_service_v2: [presence_fetch] fallback broad DB query returned 0 rows for 2025-08-25 -> 2025-08-29
+2025-09-04 11:59:54,984 INFO data_compare_service_v2: [presence_fetch] DB-derived presence found for 0/1132 employees
+2025-09-04 11:59:54,984 INFO data_compare_service_v2: [presence_fetch] DB coverage low (0/1132) - trying region occupancy history fallback
+2025-09-04 11:59:54,990 INFO data_compare_service_v2: [region_history] scanned 32 detail rows from preloaded entries; matched 0 presence entries
+2025-09-04 11:59:55,000 INFO data_compare_service_v2: [presence_fetch] final presence coverage: 0/1132 employees have at least one positive day
+INFO:     127.0.0.1:53018 - "GET /ccure/compare_v2?region_filter=APAC&location_city=Pune&week_ref_date=2025-08-25 HTTP/1.1" 200 OK
+
+
+
+
+
+
+
+Check API Responce..
+
+
+http://localhost:8000/ccure/compare_v2?region_filter=APAC&location_city=Pune&week_ref_date=2025-08-25
+
+
+
+{
+  "mode": "full",
+  "stats_detail": "ActiveProfiles",
+  "summary": {
+    "filters": {
+      "region": "APAC",
+      "location_city": "Pune",
+      "location_state": null,
+      "location_description": null,
+      "week_monday": "2025-08-25",
+      "week_friday": "2025-08-29"
+    },
+    "counts": {
+      "total_active_in_sheet": 1132,
+      "today_headcount_from_summary": 0,
+      "today_headcount_pct_vs_sheet": 0,
+      "on_leave_count_in_sheet": 15,
+      "employee_type_counts": {
+        "regular": 1132
+      }
+    },
+    "regular_attendance_summary": {
+      "regular_total": 1132,
+      "present_5_day_count": 0,
+      "present_3_or_more_count": 0,
+      "present_less_than_3_count": 1132,
+      "present_only_1_day_count": 0
     }
+  },
+  "details": {
+    "present_5_days": [],
+    "present_3_or_more_days": [],
+    "defaulters_less_than_3_days": [
+      {
+        "employee_id": "319473",
+        "full_name": "., Anushka",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "324002",
+        "full_name": "., Diwakar",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323879",
+        "full_name": "., Vikas",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "320818",
+        "full_name": "ANAND, NUPUR",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "317710",
+        "full_name": "Abdul Hafeez, Sameera Begum",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323050",
+        "full_name": "Abey, Jinsy",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "311840",
+        "full_name": "Abhale, Satish",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323873",
+        "full_name": "Abhishek, Mahesh",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "312751",
+        "full_name": "Ablankar, Sujit",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "327185",
+        "full_name": "Adda, Rohith Kumar",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "325046",
+        "full_name": "Adik, Dhananjay",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "326419",
+        "full_name": "Adoni, Sureshkumar",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "309779",
+        "full_name": "Agarwal, Aseem",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "327099",
+        "full_name": "Agarwal, Mihir",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323880",
+        "full_name": "Agarwal, Shivam",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "327034",
+        "full_name": "Aggarwal, Ketan",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323878",
+        "full_name": "Agrawal, Abhijeet",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "322834",
+        "full_name": "Agrawal, Kunal",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "311761",
+        "full_name": "Agrawal, Nidhi",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323027",
+        "full_name": "Agrawal, Nishant",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "326019",
+        "full_name": "Agrawal, Prerna",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "312211",
+        "full_name": "Agrawal, Rupesh",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "325711",
+        "full_name": "Agrawal, Shubham",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "322636",
+        "full_name": "Agrawal, Yash",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "316006",
+        "full_name": "Agrawal, Yogesh",
+        "days_present": 0,
+        "on_leave": false
+      },
 
-    details = {
-        "present_5_days": present_5_list,
-        "present_3_or_more_days": present_3_list,
-        "defaulters_less_than_3_days": defaulters_list
+
+
+
+
+
+
+
+http://localhost:8000/ccure/compare_v2
+
+{
+  "mode": "full",
+  "stats_detail": "ActiveProfiles",
+  "summary": {
+    "filters": {
+      "region": null,
+      "location_city": null,
+      "location_state": null,
+      "location_description": null,
+      "week_monday": "2025-09-01",
+      "week_friday": "2025-09-05"
+    },
+    "counts": {
+      "total_active_in_sheet": 8625,
+      "today_headcount_from_summary": 0,
+      "today_headcount_pct_vs_sheet": 0,
+      "on_leave_count_in_sheet": 294,
+      "employee_type_counts": {
+        "regular": 8448,
+        "fixed term": 146,
+        "temporary": 13,
+        "casual": 12,
+        "intern": 5,
+        "trainee": 1
+      }
+    },
+    "regular_attendance_summary": {
+      "regular_total": 8448,
+      "present_5_day_count": 0,
+      "present_3_or_more_count": 0,
+      "present_less_than_3_count": 8448,
+      "present_only_1_day_count": 0
     }
-
-    report_path = None
-    if export:
-        try:
-            report_name = f"attendance_compare_{(region_filter or 'all')}_{(location_city or 'all')}_{uuid.uuid4().hex[:8]}.xlsx"
-            report_file = OUTPUT_DIR / report_name
-            with pd.ExcelWriter(report_file, engine="openpyxl") as writer:
-                sel_df_for_export = sel.copy()
-                sel_df_for_export["raw_row_str"] = sel_df_for_export["raw_row"].apply(lambda r: str(r) if not pd.isna(r) else "")
-                sel_df_for_export.to_excel(writer, sheet_name="active_sheet_selection", index=False)
-                pd.DataFrame([summary["counts"]]).to_excel(writer, sheet_name="summary_counts", index=False)
-                pd.DataFrame([summary["regular_attendance_summary"]]).to_excel(writer, sheet_name="regular_summary", index=False)
-                pd.DataFrame(details["present_5_days"]).to_excel(writer, sheet_name="present_5_days", index=False)
-                pd.DataFrame(details["present_3_or_more_days"]).to_excel(writer, sheet_name="present_3_plus", index=False)
-                pd.DataFrame(details["defaulters_less_than_3_days"]).to_excel(writer, sheet_name="defaulters_lt3", index=False)
-            report_path = str(report_file.name)
-        except Exception:
-            logger.exception("Failed to write export report")
-            report_path = None
-
-    out = {
-        "mode": mode,
-        "stats_detail": stats_detail,
-        "summary": summary,
-        "details": details
-    }
-    if report_path:
-        out["report_path"] = report_path
-    return out
-
-
-if __name__ == "__main__":
-    res = compare_ccure_vs_sheets(region_filter="APAC", location_city="Pune", export=False, limit_list=50)
-    import json as _json
-    print(_json.dumps(res, indent=2, default=str))
-
-
-
-
-
+  },
+  "details": {
+    "present_5_days": [],
+    "present_3_or_more_days": [],
+    "defaulters_less_than_3_days": [
+      {
+        "employee_id": "319473",
+        "full_name": "., Anushka",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "324002",
+        "full_name": "., Diwakar",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "324422",
+        "full_name": "., LEONARDO Tertuliano Monsani",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "323879",
+        "full_name": "., Vikas",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "322825",
+        "full_name": "AKTER, SULTANA",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "320818",
+        "full_name": "ANAND, NUPUR",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "328795",
+        "full_name": "ARRIOLA BORDON, ALICIA",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
+        "employee_id": "312895",
+        "full_name": "Aassar, Maisa",
+        "days_present": 0,
+        "on_leave": false
+      },
+      {
 
 
 
@@ -1675,6 +1224,694 @@ def ccure_report_download(filename: str):
 
 
 
+#for Active Employee and ACtive Contractor Comparision Report.
+
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\data_compare_service.py
+"""
+Compare CCURE active lists (employees & contractors) with uploaded Active sheets (from disk).
+Provides compare_ccure_vs_sheets(mode='full', stats_detail='ActiveProfiles', limit_list=200, export=False)
+
+When export=True, writes Excel report to OUTPUT_DIR and returns 'report_path'.
+"""
+
+from datetime import datetime
+import os
+import re
+import uuid
+import logging
+import sys
+from pathlib import Path
+import pandas as pd
+
+logger = logging.getLogger("data_compare_service")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Settings fallback (matches app.py pattern)
+try:
+    from settings import OUTPUT_DIR as SETTINGS_OUTPUT_DIR, DATA_DIR as SETTINGS_DATA_DIR, RAW_UPLOAD_DIR as SETTINGS_RAW_UPLOAD_DIR
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    RAW_UPLOAD_DIR = Path(SETTINGS_RAW_UPLOAD_DIR)
+except Exception:
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    RAW_UPLOAD_DIR = DATA_DIR / "raw_uploads"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ccure client helper (optional)
+try:
+    import ccure_client
+except Exception:
+    ccure_client = None
+    logger.warning("ccure_client not importable; CCURE calls will return None")
+
+# ---------- small normalizers (kept local) ----------
+def _normalize_employee_key(x):
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s):
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _normalize_name(s):
+    if s is None:
+        return None
+    try:
+        t = str(s).strip().lower()
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t if t else None
+    except Exception:
+        return None
+
+def _make_w_variant(s):
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss.upper().startswith('W'):
+        return ss
+    return 'W' + ss
+
+def _numeric_variants(s):
+    out = set()
+    if s is None:
+        return out
+    try:
+        s = str(s)
+        clean = re.sub(r'\D', '', s)
+        if clean:
+            out.add(clean)
+            out.add(clean.lstrip('0') or clean)
+            out.add('W' + clean)
+    except Exception:
+        pass
+    return out
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# ---------- CCURE fetch helpers ----------
+def _fetch_ccure_list(detail_name):
+    """
+    Uses ccure_client.fetch_all_stats(detail_name) if available, otherwise tries per-page fetch.
+    Returns list of dicts or [].
+    """
+    if ccure_client is None:
+        logger.warning("ccure_client missing - cannot fetch CCURE lists")
+        return []
+    try:
+        if hasattr(ccure_client, "fetch_all_stats"):
+            res = ccure_client.fetch_all_stats(detail_name, limit=500)
+            return res or []
+    except Exception:
+        logger.exception("fetch_all_stats failed")
+    # fallback to paged fetch if available
+    try:
+        data = []
+        page = 1
+        limit = 500
+        while True:
+            if not hasattr(ccure_client, "fetch_stats_page"):
+                break
+            page_res = ccure_client.fetch_stats_page(detail_name, page=page, limit=limit)
+            if not page_res:
+                break
+            part = page_res.get("data") or []
+            if not part:
+                break
+            data.extend(part)
+            total = int(page_res.get("total") or len(data) or 0)
+            if len(data) >= total:
+                break
+            page += 1
+            if page > 1000:
+                break
+        return data
+    except Exception:
+        logger.exception("per-page fetch failed for %s", detail_name)
+        return []
+
+# ---------- helpers to find/load latest sheet from disk ----------
+def _find_latest_file_for_kind(kind: str):
+    """
+    kind == 'employee' or 'contractor'
+    Prefer canonical file in DATA_DIR: active_<kind>.*,
+    otherwise pick latest in RAW_UPLOAD_DIR that contains the kind token.
+    """
+    # 1) canonical in DATA_DIR
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_{kind}{ext}"
+        if p.exists():
+            return p
+
+    # 2) fallback: find latest raw file with kind token in RAW_UPLOAD_DIR
+    try:
+        files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and kind in p.name.lower() and p.suffix.lower() in (".xlsx", ".xls", ".csv")]
+        if not files:
+            # last fallback: any active_{kind}.* in RAW_UPLOAD_DIR
+            files = [p for p in RAW_UPLOAD_DIR.iterdir() if p.is_file() and f"active_{kind}" in p.name.lower()]
+        if not files:
+            return None
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0]
+    except Exception:
+        return None
+
+def _read_table(path: Path):
+    try:
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path, dtype=str)
+        else:
+            df = pd.read_excel(path, sheet_name=0, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.fillna("")
+    except Exception:
+        logger.exception("Failed to read file %s", path)
+        return pd.DataFrame()
+
+def _first_present_from_row(row, candidates):
+    for c in candidates:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+            return row[c]
+    for k in row.index:
+        for c in candidates:
+            if k.strip().lower() == c.strip().lower():
+                val = row[k]
+                if pd.notna(val) and str(val).strip() != "":
+                    return val
+    return None
+
+# ---------- disk-based loaders to replace DB loaders ----------
+def _load_active_employees_disk():
+    """
+    Return (set of normalized employee_ids, dict mapping id -> row sample, total_rows)
+    Reads the latest employee sheet from data/.
+    """
+    path = _find_latest_file_for_kind("employee")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    id_cols = ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','Employee_Id']
+    name_cols = ['Full Name','FullName','EmpName','Name','First Name','FirstName','Last Name']
+    location_cols = ['Location City','Location','Location Description','City']
+    status_cols = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        emp_id = _first_present_from_row(row, id_cols)
+        if emp_id is None or str(emp_id).strip() == "":
+            continue
+        emp_id = str(emp_id).strip()
+        ids.add(emp_id)
+        full_name = _first_present_from_row(row, name_cols) or ""
+        mapping[emp_id] = {
+            "employee_id": emp_id,
+            "full_name": full_name,
+            "location_city": _first_present_from_row(row, location_cols),
+            "status": _first_present_from_row(row, status_cols),
+            "raw": raw_row
+        }
+    return ids, mapping, len(df)
+
+def _load_active_contractors_disk():
+    """
+    Return (set of candidate contractor ids, mapping, total_rows)
+    Reads latest contractor sheet from data/.
+    """
+    path = _find_latest_file_for_kind("contractor")
+    if not path:
+        return set(), {}, 0
+    df = _read_table(path)
+    ids = set()
+    mapping = {}
+    wsid_cols = ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId','WorkerId']
+    ipass_cols = ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID','IpassID']
+    name_cols = ['Full Name','FullName','Name']
+    vendor_cols = ['Vendor Company Name','Vendor']
+
+    for _, row in df.iterrows():
+        raw_row = row.to_dict()
+        wsid = _first_present_from_row(row, wsid_cols)
+        ipass = _first_present_from_row(row, ipass_cols)
+        full_name = _first_present_from_row(row, name_cols)
+        if wsid:
+            wsid = str(wsid).strip()
+            ids.add(wsid)
+            mapping[wsid] = {"worker_system_id": wsid, "full_name": full_name, "vendor": _first_present_from_row(row, vendor_cols), "raw": raw_row}
+        if ipass:
+            ipass = str(ipass).strip()
+            ids.add(ipass)
+            mapping[ipass] = {"ipass_id": ipass, "full_name": full_name, "vendor": _first_present_from_row(row, vendor_cols), "raw": raw_row}
+            wvar = _make_w_variant(ipass)
+            ids.add(wvar)
+            mapping[wvar] = {"ipass_id": ipass, "w_ipass": wvar, "full_name": full_name, "raw": raw_row}
+        for cand in (wsid, ipass):
+            if cand:
+                for v in _numeric_variants(cand):
+                    ids.add(v)
+                    if v not in mapping:
+                        mapping[v] = {"derived_id": v, "full_name": full_name, "raw": raw_row}
+    return ids, mapping, len(df)
+
+# ---------- helpers to match ccure -> disk lists (same logic as before) ----------
+def _employee_matches_disk(cid, emp_ids_disk, emp_map_disk, ccure_row):
+    if cid in emp_ids_disk:
+        return True
+    for v in _numeric_variants(cid):
+        if v in emp_ids_disk:
+            return True
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in emp_ids_disk:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in emp_ids_disk:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in emp_map_disk.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _contractor_matches_disk(cid, contr_ids_disk, contr_map_disk, ccure_row):
+    if cid in contr_ids_disk:
+        return True
+    for v in _numeric_variants(cid):
+        if v in contr_ids_disk:
+            return True
+    try:
+        ci = _safe_int(cid)
+        if ci is not None:
+            for dbk in contr_ids_disk:
+                if _safe_int(dbk) == ci:
+                    return True
+    except Exception:
+        pass
+    card_cid = _normalize_card_like(cid)
+    if card_cid:
+        for dbk in contr_ids_disk:
+            if _normalize_card_like(dbk) == card_cid:
+                return True
+    try:
+        name = None
+        if isinstance(ccure_row, dict):
+            name = ccure_row.get("EmpName") or ccure_row.get("FullName") or ccure_row.get("Name")
+        normname = _normalize_name(name)
+        if normname:
+            for dbk, dbv in contr_map_disk.items():
+                if _normalize_name(dbv.get("full_name")) == normname:
+                    return True
+    except Exception:
+        pass
+    return False
+
+# ---------- core compare function ----------
+def compare_ccure_vs_sheets(mode="full", stats_detail="ActiveProfiles", limit_list=200, export=False):
+    """
+    Main public function used by /ccure/compare.
+    Reads latest uploaded sheets from disk instead of DB tables.
+    """
+    result = {
+        "ccure_active_employees_count": None,
+        "ccure_active_contractors_count": None,
+        "active_sheet_employee_count": None,
+        "active_sheet_contractor_count": None,
+        "missing_employees_count": None,
+        "missing_contractors_count": None,
+        "missing_employees_sample": [],
+        "missing_contractors_sample": [],
+        "report_path": None
+    }
+
+    # 1) fetch CCURE lists
+    ccure_emps = _fetch_ccure_list("ActiveEmployees")
+    ccure_contrs = _fetch_ccure_list("ActiveContractors")
+
+    result["ccure_active_employees_count"] = len(ccure_emps)
+    result["ccure_active_contractors_count"] = len(ccure_contrs)
+
+    # 2) load uploaded sheets from disk (preferred) — returns (ids_set, mapping, total_rows)
+    emp_ids_disk, emp_map_disk, emp_total_rows = _load_active_employees_disk()
+    contr_ids_disk, contr_map_disk, contr_total_rows = _load_active_contractors_disk()
+
+    result["active_sheet_employee_count"] = int(emp_total_rows)
+    result["active_sheet_contractor_count"] = int(contr_total_rows)
+
+    # 3) build ccure id sets for employees
+    ccure_emp_id_set = set()
+    ccure_emp_rows_by_id = {}
+    for row in ccure_emps:
+        try:
+            eid = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("EmpID") or row.get("Employee Id"))
+            if not eid:
+                eid = _normalize_card_like(row.get("CardNumber") or row.get("iPass ID") or row.get("IPassID") or row.get("Card"))
+            if not eid:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    eid = f"name::{fname}"
+            if eid:
+                ccure_emp_id_set.add(eid)
+                ccure_emp_rows_by_id[eid] = row
+        except Exception:
+            continue
+
+    # 4) employees missing = ccure_emp_id_set - emp_ids_disk (but consider numeric variants, int equality, card-like, name match)
+    expanded_emp_disk_ids = set(emp_ids_disk)
+    for v in list(emp_ids_disk):
+        for nv in _numeric_variants(v):
+            expanded_emp_disk_ids.add(nv)
+
+    missing_emp_ids = []
+    for cid in ccure_emp_id_set:
+        try:
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in emp_map_disk.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_emp_ids.append(cid)
+                continue
+
+            ccure_row = ccure_emp_rows_by_id.get(cid) or {}
+            if _employee_matches_disk(cid, expanded_emp_disk_ids, emp_map_disk, ccure_row):
+                continue
+
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_emp_disk_ids:
+                    found = True
+                    break
+            if not found:
+                missing_emp_ids.append(cid)
+        except Exception:
+            missing_emp_ids.append(cid)
+
+    result["missing_employees_count"] = len(missing_emp_ids)
+    samp_emp = []
+    for mid in missing_emp_ids[:limit_list]:
+        r = ccure_emp_rows_by_id.get(mid) or {}
+
+        # extract manager/profile/status from raw if present
+        manager_name = r.get("Manager_Name") or r.get("ManagerName") or r.get("Manager") or r.get("Manager_WU_ID")
+        profile_disabled = r.get("Profile_Disabled") if "Profile_Disabled" in r else r.get("profile_disabled") if "profile_disabled" in r else r.get("ProfileDisabled") if "ProfileDisabled" in r else None
+        employee_status = r.get("Employee_Status") or r.get("Employee Status") or r.get("Status") or r.get("employee_status")
+
+        # ensure string conversion for boolean-like values
+        if isinstance(profile_disabled, bool):
+            profile_disabled = str(profile_disabled)
+
+        # vendorCompany doesn't apply to employees — keep blank
+        vendor_company = r.get("Vendor Company Name") or r.get("Vendor") or r.get("vendor") or ""
+
+        # build sample row with both old and new key names for compatibility
+        samp_emp.append({
+            "ccure_key": mid,
+            # old keys (kept for compatibility)
+            "EmployeeID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "PersonnelType": r.get("PersonnelType"),
+            # "VendorCompany": vendor_company,
+            "Manager_Name": manager_name,
+            "Profile_Disabled": profile_disabled,
+            "Employee_Status": employee_status,
+            # new/canonical lowerCamel keys requested
+            "employee_Id": r.get("EmployeeID") or r.get("employee_id") or r.get("Employee Id"),
+            "empName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "personnelType": r.get("PersonnelType"),
+            "vendorCompany": vendor_company,
+            "managerName": manager_name,
+            "profileDisabled": profile_disabled,
+            "employeeStatus": employee_status,
+            "raw": r
+        })
+    result["missing_employees_sample"] = samp_emp
+
+    # 5) contractors
+    ccure_contr_id_set = set()
+    ccure_contr_rows_by_id = {}
+    for row in ccure_contrs:
+        try:
+            cand_ids = []
+            e1 = _normalize_employee_key(row.get("EmployeeID") or row.get("employee_id") or row.get("Employee Id"))
+            if e1:
+                cand_ids.append(e1)
+            ip = _normalize_employee_key(row.get("IPassID") or row.get("iPass ID") or row.get("iPass") or row.get("IPASSID"))
+            if ip:
+                cand_ids.append(ip)
+                cand_ids.append(_make_w_variant(ip))
+            cardlike = _normalize_card_like(row.get("CardNumber") or row.get("card_number") or row.get("Badge") or row.get("BadgeNo"))
+            if cardlike:
+                cand_ids.append(cardlike)
+                cand_ids.extend(list(_numeric_variants(cardlike)))
+            if not cand_ids:
+                fname = _normalize_name(row.get("EmpName") or row.get("FullName") or row.get("Name"))
+                if fname:
+                    cand_ids.append(f"name::{fname}")
+            for cid in cand_ids:
+                if cid:
+                    ccure_contr_id_set.add(cid)
+                    ccure_contr_rows_by_id[cid] = row
+            if not cand_ids:
+                key = f"unknown::{uuid.uuid4().hex[:8]}"
+                ccure_contr_id_set.add(key)
+                ccure_contr_rows_by_id[key] = row
+        except Exception:
+            continue
+
+    expanded_contr_disk_ids = set(contr_ids_disk)
+    for v in list(contr_ids_disk):
+        for nv in _numeric_variants(v):
+            expanded_contr_disk_ids.add(nv)
+
+    missing_contr_ids = []
+    for cid in ccure_contr_id_set:
+        try:
+            if str(cid).startswith("name::"):
+                name = cid.split("::", 1)[1]
+                found = False
+                for dbk, dbv in contr_map_disk.items():
+                    n = _normalize_name(dbv.get("full_name"))
+                    if n and n == name:
+                        found = True
+                        break
+                if not found:
+                    missing_contr_ids.append(cid)
+                continue
+
+            ccure_row = ccure_contr_rows_by_id.get(cid) or {}
+            if _contractor_matches_disk(cid, expanded_contr_disk_ids, contr_map_disk, ccure_row):
+                continue
+
+            found = False
+            for v in _numeric_variants(cid):
+                if v in expanded_contr_disk_ids:
+                    found = True
+                    break
+            if not found:
+                missing_contr_ids.append(cid)
+        except Exception:
+            missing_contr_ids.append(cid)
+
+    result["missing_contractors_count"] = len(missing_contr_ids)
+    samp_contr = []
+    for mid in missing_contr_ids[:limit_list]:
+        r = ccure_contr_rows_by_id.get(mid) or {}
+
+        # vendor/company
+        vendor_company = r.get("Vendor Company Name") or r.get("Vendor") or r.get("vendor") or ""
+
+        # personnel, manager, profile, status extraction
+        personnel_type = r.get("PersonnelType") or r.get("Personnel_Type") or r.get("Personnel Type") or None
+        manager_name = r.get("Manager_Name") or r.get("ManagerName") or r.get("Manager") or r.get("Manager_WU_ID")
+        profile_disabled = r.get("Profile_Disabled") if "Profile_Disabled" in r else r.get("profile_disabled") if "profile_disabled" in r else None
+        employee_status = r.get("Employee_Status") or r.get("Employee Status") or r.get("Status") or r.get("employee_status")
+
+        if isinstance(profile_disabled, bool):
+            profile_disabled = str(profile_disabled)
+
+        samp_contr.append({
+            "ccure_key": mid,
+            # old keys kept
+            "Employee_ID": r.get("EmployeeID"),
+            "EmpName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "VendorCompany": vendor_company,
+            "PersonnelType": personnel_type,
+            "Manager_Name": manager_name,
+            "Profile_Disabled": profile_disabled,
+            "Employee_Status": employee_status,
+            # new requested lowerCamel keys
+            "employeeId": r.get("EmployeeID") or r.get("employee_id") or r.get("Employee Id"),
+            "empName": r.get("EmpName") or r.get("FullName") or r.get("Name"),
+            "vendorCompany": vendor_company,
+            "personnelType": personnel_type,
+            "managerName": manager_name,
+            "profileDisabled": profile_disabled,
+            "employeeStatus": employee_status,
+            "raw": r
+        })
+    result["missing_contractors_sample"] = samp_contr
+
+    # 6) optionally export report
+    if export:
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = f"missing_vs_ccure_{ts}.xlsx"
+            fullpath = OUTPUT_DIR / fname
+
+            # Canonical column set requested (lowerCamel)
+            columns = ["ccure_key", "employee_Id", "empName", "personnelType", "managerName", "profileDisabled", "employeeStatus"]
+
+            # Build DataFrames and ensure columns order (fill missing with empty string)
+            if samp_emp:
+                df_emp = pd.DataFrame(samp_emp)
+                # reindex to requested columns; missing columns will be added with NaN
+                df_emp = df_emp.reindex(columns=columns).fillna("")
+            else:
+                df_emp = pd.DataFrame(columns=columns)
+
+            if samp_contr:
+                df_con = pd.DataFrame(samp_contr)
+                df_con = df_con.reindex(columns=columns).fillna("")
+            else:
+                df_con = pd.DataFrame(columns=columns)
+
+            try:
+                with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+            except Exception:
+                # fallback to default engine
+                with pd.ExcelWriter(fullpath) as writer:
+                    df_emp.to_excel(writer, sheet_name="MissingEmployees", index=False)
+                    df_con.to_excel(writer, sheet_name="MissingContractors", index=False)
+                result["report_path"] = fname
+        except Exception:
+            logger.exception("Failed to export report")
+            result["report_path"] = None
+
+    return result
+
+
+
+
+
+
+#export 
+
+def export_uploaded_sheets():
+    """
+    Create a single xlsx workbook with:
+      - Sheet "Employee" -> contents of latest canonical employee sheet (if present)
+      - Sheet "Contractor" -> contents of latest canonical contractor sheet (if present)
+    Writes file into OUTPUT_DIR and returns the filename (not full path).
+    """
+    try:
+        emp_path = _find_latest_file_for_kind("employee")
+        contr_path = _find_latest_file_for_kind("contractor")
+
+        # Ensure OUTPUT_DIR exists
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        fname = f"uploaded_sheets_{ts}.xlsx"
+        fullpath = OUTPUT_DIR / fname
+
+        # Read tables (if present) or create empty dataframe placeholders
+        if emp_path and emp_path.exists():
+            df_emp = _read_table(emp_path)
+        else:
+            df_emp = pd.DataFrame()
+
+        if contr_path and contr_path.exists():
+            df_con = _read_table(contr_path)
+        else:
+            df_con = pd.DataFrame()
+
+        # Write to one workbook (try openpyxl if available)
+        try:
+            with pd.ExcelWriter(fullpath, engine="openpyxl") as writer:
+                df_emp.to_excel(writer, sheet_name="Employee", index=False)
+                df_con.to_excel(writer, sheet_name="Contractor", index=False)
+        except Exception:
+            # fallback to default engine
+            with pd.ExcelWriter(fullpath) as writer:
+                df_emp.to_excel(writer, sheet_name="Employee", index=False)
+                df_con.to_excel(writer, sheet_name="Contractor", index=False)
+
+        return fname
+    except Exception:
+        logger.exception("export_uploaded_sheets failed")
+        return None
+
+
+# Expose public function name expected by app.py
+__all__ =  ["compare_ccure_vs_sheets", "compare_ccure_vs_sheets", "export_uploaded_sheets"]  # keep backwards compatibility
+# End of data_compare_service.py
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2482,2168 +2719,169 @@ if __name__ == "__main__":
 
 
 
-
-
-
-# region_clients.py
-import requests
-from requests.exceptions import RequestException
-from datetime import datetime
-import logging
-import time
-import sys
-
-logger = logging.getLogger("region_clients")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# Edit endpoints if your hosts/ports differ
-endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
-}
-
-history_endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/history",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
-}
-
-DEFAULT_ATTEMPTS = 2
-DEFAULT_BACKOFF = 0.6  # smaller backoff to reduce long sleeps
-
-def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
-    """
-    Perform GET with simple retries. 'timeout' may be a scalar or a (connect, read) tuple.
-    Returns parsed JSON or {'_raw_text': text} or None.
-    """
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            r = requests.get(url, timeout=timeout)
-            r.raise_for_status()
-            try:
-                return r.json()
-            except ValueError:
-                try:
-                    return {"_raw_text": r.text}
-                except Exception:
-                    return None
-        except RequestException as e:
-            last_err = e
-            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
-            if attempt < attempts:
-                time.sleep(backoff * attempt)
-            continue
-    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
-    return None
-
-def fetch_all_regions(timeout=6):
-    results = []
-    for region, url in endpoints.items():
-        try:
-            data = _do_get_with_retries(url, timeout=timeout) or {}
-            realtime = {}
-            if isinstance(data, dict):
-                realtime = data.get("realtime", {}) or {}
-            total = 0
-            for site in realtime.values():
-                try:
-                    total += int(site.get("total", 0))
-                except Exception:
-                    pass
-            # fallback: some live-summary payloads return top-level partitions directly
-            if total == 0 and isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, dict) and "total" in v:
-                        try:
-                            total += int(v.get("total", 0))
-                        except Exception:
-                            pass
-            results.append({"region": region, "count": total})
-        except Exception as e:
-            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
-            results.append({"region": region, "count": None})
-    return results
-
-def fetch_all_details(timeout=6):
-    all_details = []
-    for region, url in endpoints.items():
-        try:
-            data = _do_get_with_retries(url, timeout=timeout) or {}
-            details = []
-            if isinstance(data, dict):
-                details = data.get("details", []) or []
-                if not details:
-                    for k, v in data.items():
-                        if k in ("details", "list", "people", "items") and isinstance(v, list):
-                            details = v
-                            break
-            elif isinstance(data, list):
-                details = data
-            for d in details:
-                try:
-                    d2 = dict(d)
-                    d2["__region"] = region
-                    all_details.append(d2)
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
-            continue
-    return all_details
-
-def fetch_history_for_region(region, timeout=6):
-    url = history_endpoints.get(region)
-    if not url:
-        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
-        return []
-    try:
-        data = _do_get_with_retries(url, timeout=timeout) or {}
-        summary = []
-        if isinstance(data, dict):
-            candidates = []
-            for key in ("summaryByDate", "summary", "data", "entries", "results"):
-                if key in data and isinstance(data.get(key), list):
-                    candidates = data.get(key)
-                    break
-            if not candidates:
-                # maybe the payload itself is a date-summary dict
-                if "date" in data:
-                    candidates = [data]
-            for s in candidates:
-                try:
-                    s2 = dict(s)
-                    s2["__region"] = region
-                    summary.append(s2)
-                except Exception:
-                    continue
-        elif isinstance(data, list):
-            for s in data:
-                try:
-                    s2 = dict(s)
-                    s2["__region"] = region
-                    summary.append(s2)
-                except Exception:
-                    continue
-        return summary
-    except Exception as e:
-        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
-        return []
-
-def fetch_all_history(timeout=6):
-    all_entries = []
-    for region in history_endpoints.keys():
-        try:
-            entries = fetch_history_for_region(region, timeout=timeout)
-            if entries:
-                all_entries.extend(entries)
-        except Exception:
-            logger.exception(f"[region_clients] error aggregating history for {region}")
-            continue
-    return all_entries
-
-
-
-
-
-
-
-
-
-
-
-
-
-Now I have Update all Below File Still We dont get any relavant Comparision Output 
-if Possible can we do like 
-Initailly load only All History API then Load all Excel Sheet data then Compare .
-Beacause some Time History APi take Long time to load data so we got error and dont get any relavant output..
-so check below API Responance and cross validate each other and Solve this issue carefully....
-
-
-http://localhost:8000/ccure/compare_v2
-
-{
-  "mode": "full",
-  "stats_detail": "ActiveProfiles",
-  "summary": {
-    "filters": {
-      "region": null,
-      "location_city": null,
-      "location_state": null,
-      "location_description": null,
-      "week_monday": "2025-09-01",
-      "week_friday": "2025-09-05"
-    },
-    "counts": {
-      "total_active_in_sheet": 8625,
-      "today_headcount_from_summary": 0,
-      "today_headcount_pct_vs_sheet": 0,
-      "on_leave_count_in_sheet": 294,
-      "employee_type_counts": {
-        "regular": 8448,
-        "fixed term": 146,
-        "temporary": 13,
-        "casual": 12,
-        "intern": 5,
-        "trainee": 1
-      }
-    },
-    "regular_attendance_summary": {
-      "regular_total": 8448,
-      "present_5_day_count": 0,
-      "present_3_or_more_count": 0,
-      "present_less_than_3_count": 8448,
-      "present_only_1_day_count": 0
-    }
-  },
-  "details": {
-    "present_5_days": [],
-    "present_3_or_more_days": [],
-    "defaulters_less_than_3_days": [
-      {
-        "employee_id": "319473",
-        "full_name": "., Anushka",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "324002",
-        "full_name": "., Diwakar",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "324422",
-        "full_name": "., LEONARDO Tertuliano Monsani",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323879",
-        "full_name": "., Vikas",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "322825",
-        "full_name": "AKTER, SULTANA",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "320818",
-        "full_name": "ANAND, NUPUR",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "328795",
-        "full_name": "ARRIOLA BORDON, ALICIA",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "312895",
-        "full_name": "Aassar, Maisa",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "321269",
-        "full_name": "Abaca Paez, Agustin Marcelo",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "325862",
-        "full_name": "Abaca, Melisa Ayelen",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "325299",
-        "full_name": "Abadilla, Ma. Erika",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "328996",
-        "full_name": "Abalos, Larry",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "326980",
-        "full_name": "Abancio, Mechel",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "328945",
-        "full_name": "Abang, Emmanuel E.",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "321388",
-        "full_name": "Abanto Reyes, Christian",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "307689",
-        "full_name": "Abarca Torres, Kevin Andrey",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-
-
-
-
-2) http://localhost:8000/ccure/compare_v2?region_filter=APAC&location_city=Pune&week_ref_date=2025-08-25
-
-{
-  "mode": "full",
-  "stats_detail": "ActiveProfiles",
-  "summary": {
-    "filters": {
-      "region": "APAC",
-      "location_city": "Pune",
-      "location_state": null,
-      "location_description": null,
-      "week_monday": "2025-08-25",
-      "week_friday": "2025-08-29"
-    },
-    "counts": {
-      "total_active_in_sheet": 1132,
-      "today_headcount_from_summary": 0,
-      "today_headcount_pct_vs_sheet": 0,
-      "on_leave_count_in_sheet": 15,
-      "employee_type_counts": {
-        "regular": 1132
-      }
-    },
-    "regular_attendance_summary": {
-      "regular_total": 1132,
-      "present_5_day_count": 0,
-      "present_3_or_more_count": 0,
-      "present_less_than_3_count": 1132,
-      "present_only_1_day_count": 0
-    }
-  },
-  "details": {
-    "present_5_days": [],
-    "present_3_or_more_days": [],
-    "defaulters_less_than_3_days": [
-      {
-        "employee_id": "319473",
-        "full_name": "., Anushka",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "324002",
-        "full_name": "., Diwakar",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323879",
-        "full_name": "., Vikas",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "320818",
-        "full_name": "ANAND, NUPUR",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "317710",
-        "full_name": "Abdul Hafeez, Sameera Begum",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323050",
-        "full_name": "Abey, Jinsy",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "311840",
-        "full_name": "Abhale, Satish",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323873",
-        "full_name": "Abhishek, Mahesh",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "312751",
-        "full_name": "Ablankar, Sujit",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "327185",
-        "full_name": "Adda, Rohith Kumar",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "325046",
-        "full_name": "Adik, Dhananjay",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "326419",
-        "full_name": "Adoni, Sureshkumar",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "309779",
-        "full_name": "Agarwal, Aseem",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "327099",
-        "full_name": "Agarwal, Mihir",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323880",
-        "full_name": "Agarwal, Shivam",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "327034",
-        "full_name": "Aggarwal, Ketan",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323878",
-        "full_name": "Agrawal, Abhijeet",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "322834",
-        "full_name": "Agrawal, Kunal",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "311761",
-        "full_name": "Agrawal, Nidhi",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "323027",
-        "full_name": "Agrawal, Nishant",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "326019",
-        "full_name": "Agrawal, Prerna",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "312211",
-        "full_name": "Agrawal, Rupesh",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "325711",
-        "full_name": "Agrawal, Shubham",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "322636",
-        "full_name": "Agrawal, Yash",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "316006",
-        "full_name": "Agrawal, Yogesh",
-        "days_present": 0,
-        "on_leave": false
-      },
-      {
-        "employee_id": "325732",
-        "full_name": "Ahinave, Reshma",
-        "days_present": 0,
-        "on_leave": false
-      },
-
-
-
-
-
-# app.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import shutil
-import uuid
-import json
-import logging
-from pathlib import Path
-from datetime import date, datetime, timedelta
-import re
-import asyncio
-from typing import Optional, Dict, Any
-import sys
-
-# --- DB / models imports (kept for endpoints that still use DB like headcount/attendance fallback) ---
-from db import SessionLocal
-from models import LiveSwipe, AttendanceSummary
-
-# --- settings (optional override) ---
-try:
-    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
-    DATA_DIR = Path(SETTINGS_DATA_DIR)
-    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
-except Exception:
-    DATA_DIR = Path(__file__).resolve().parent / "data"
-    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-
-RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="Attendance Analytics")
-
-logger = logging.getLogger("attendance_app")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# ----------------- GLOBAL TIMEOUTS (UNIFY) -----------------
-REGION_TIMEOUT_SECONDS = 20
-COMPUTE_WAIT_TIMEOUT_SECONDS = 30
-COMPUTE_SYNC_TIMEOUT_SECONDS = 60
-# ----------------------------------------------------------
-
-_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://localhost:3008"
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-_broadcaster_clients = set()
-
-def broadcast_ccure_update(payload: dict):
-    if not _broadcaster_clients:
-        return
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-    for q in list(_broadcaster_clients):
-        try:
-            if loop and loop.is_running():
-                loop.call_soon_threadsafe(q.put_nowait, payload)
-            else:
-                q.put_nowait(payload)
-        except Exception:
-            logger.exception("Failed to push payload to SSE client (will remove client)")
-            try:
-                _broadcaster_clients.discard(q)
-            except Exception:
-                pass
-
-async def _sse_event_generator(client_queue: asyncio.Queue):
-    try:
-        while True:
-            payload = await client_queue.get()
-            try:
-                data = json.dumps(payload, default=str)
-            except Exception:
-                data = json.dumps({"error": "serialization error", "payload": str(payload)})
-            yield f"data: {data}\n\n"
-    finally:
-        try:
-            _broadcaster_clients.discard(client_queue)
-        except Exception:
-            pass
-        return
-
-@app.get("/ccure/stream")
-async def ccure_stream():
-    q = asyncio.Queue()
-    _broadcaster_clients.add(q)
-    generator = _sse_event_generator(q)
-    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
-
-def _guess_region_from_text(txt: str) -> str:
-    if not txt:
-        return "unknown"
-    s = str(txt).strip().lower()
-    s = re.sub(r"[,\-/()]", " ", s)
-    if any(k in s for k in ("pune","quezon city","taguig city","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
-        return "apac"
-    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
-        return "emea"
-    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
-        return "laca"
-    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
-        return "namer"
-    return "unknown"
-
-@app.get("/headcount")
-def api_headcount():
-    try:
-        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
-        with SessionLocal() as db:
-            try:
-                today = date.today()
-                rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
-                if rows:
-                    for r in rows:
-                        try:
-                            partition = None
-                            if r.derived and isinstance(r.derived, dict):
-                                partition = r.derived.get("partition")
-                            loc = partition or "unknown"
-                            region = _guess_region_from_text(loc)
-                            totals[region] = totals.get(region, 0) + 1
-                        except Exception:
-                            totals["unknown"] += 1
-                else:
-                    start = datetime.combine(today, datetime.min.time())
-                    end = datetime.combine(today, datetime.max.time())
-                    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-                    for s in swipes:
-                        loc = s.partition or "unknown"
-                        region = _guess_region_from_text(loc)
-                        totals[region] = totals.get(region, 0) + 1
-            except Exception:
-                logger.exception("Failed to compute headcount regions")
-        out = {
-            "apac": int(totals.get("apac", 0)),
-            "emea": int(totals.get("emea", 0)),
-            "laca": int(totals.get("laca", 0)),
-            "namer": int(totals.get("namer", 0))
-        }
-        return JSONResponse(out)
-    except Exception as exc:
-        logger.exception("api_headcount failed")
-        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
-
-# ---------- Helpers retained (normalize / safe conversions) -------------
-def _normalize_employee_key(x) -> Optional[str]:
-    if x is None:
-        return None
-    try:
-        s = str(x).strip()
-        if s == "" or s.lower() in ("nan", "none", "na", "null"):
-            return None
-        return s
-    except Exception:
-        return None
-
-def _normalize_card_like(s) -> Optional[str]:
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "":
-            return None
-        digits = re.sub(r'\D+', '', ss)
-        if digits == "":
-            return None
-        return digits.lstrip('0') or digits
-    except Exception:
-        return None
-
-def _safe_int(v):
-    try:
-        if v is None:
-            return None
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return None
-
-# ---------- build_ccure_averages (fallback) ------------------------------
-def build_ccure_averages(start_date: Optional[str] = None, end_date: Optional[str] = None):
-    """
-    Fallback averages computation using AttendanceSummary only.
-    Returns a compact shape (live_today, ccure_active, averages, notes).
-    """
-    try:
-        def _parse_date_param(s):
-            if not s:
-                return None
-            try:
-                return datetime.strptime(s, "%Y-%m-%d").date()
-            except Exception:
-                try:
-                    return date.fromisoformat(s)
-                except Exception:
-                    return None
-
-        today = date.today()
-        start_obj = _parse_date_param(start_date) if start_date else (today - timedelta(days=6))
-        end_obj = _parse_date_param(end_date) if end_date else today
-        if start_obj is None or end_obj is None or start_obj > end_obj:
-            start_obj = today - timedelta(days=6)
-            end_obj = today
-
-        with SessionLocal() as db:
-            try:
-                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
-            except Exception:
-                logger.exception("Failed to query AttendanceSummary")
-                att_rows = []
-
-            live_emp = 0
-            live_contr = 0
-            unknown_count = 0
-            seen_keys = set()
-
-            def classify_from_derived(derived):
-                try:
-                    if not derived or not isinstance(derived, dict):
-                        return "contractor"
-                    for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
-                        v = derived.get(k)
-                        if v and "employee" in str(v).strip().lower():
-                            return "employee"
-                    for k in ("Employee_Status","Employee Status","Status"):
-                        v = derived.get(k)
-                        if v and "terminated" in str(v).strip().lower():
-                            return "employee"
-                    return "contractor"
-                except Exception:
-                    return "contractor"
-
-            if att_rows:
-                for a in att_rows:
-                    key = None
-                    try:
-                        key = _normalize_employee_key(a.employee_id)
-                    except Exception:
-                        key = None
-                    if not key:
-                        try:
-                            key = _normalize_card_like(a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None)
-                        except Exception:
-                            key = None
-                    if not key:
-                        unknown_count += 1
-                        continue
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    cls = classify_from_derived(a.derived)
-                    if cls == "employee":
-                        live_emp += 1
-                    elif cls == "contractor":
-                        live_contr += 1
-                    else:
-                        unknown_count += 1
-
-                live_total_reported = live_emp + live_contr + unknown_count
-                live_total_details = len(att_rows)
-            else:
-                live_total_reported = 0
-                live_total_details = 0
-                try:
-                    import region_clients
-                    details = []
-                    try:
-                        details = region_clients.fetch_all_details(timeout=REGION_TIMEOUT_SECONDS) or []
-                    except Exception:
-                        logger.exception("region_clients.fetch_all_details failed in build_ccure_averages()")
-                        details = []
-                    if details:
-                        for d in details:
-                            try:
-                                cls = "contractor"
-                                for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
-                                    v = d.get(k)
-                                    if v and "employee" in str(v).strip().lower():
-                                        cls = "employee"
-                                        break
-                                if cls == "employee":
-                                    live_emp += 1
-                                else:
-                                    live_contr += 1
-                                live_total_details += 1
-                            except Exception:
-                                continue
-                        live_total_reported = live_emp + live_contr
-                    else:
-                        try:
-                            regions = region_clients.fetch_all_regions(timeout=REGION_TIMEOUT_SECONDS) or []
-                            for r in regions:
-                                try:
-                                    c = r.get("count")
-                                    if isinstance(c, (int, float)):
-                                        live_total_reported += int(c)
-                                except Exception:
-                                    continue
-                        except Exception:
-                            logger.exception("region_clients.fetch_all_regions failed in build_ccure_averages()")
-                except Exception:
-                    logger.exception("region_clients not importable in build_ccure_averages()")
-
-            # compute avg range using AttendanceSummary if possible
-            avg_range = None
-            try:
-                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
-                      .filter(AttendanceSummary.date >= start_obj, AttendanceSummary.date <= end_obj).all()
-                by_date = {}
-                for row in q:
-                    d = row[0]
-                    key = (row[1] or "").strip() if row[1] else None
-                    if not key:
-                        continue
-                    if d not in by_date:
-                        by_date[d] = set()
-                    try:
-                        presence_val = getattr(row, 'presence_count', row[2])
-                        if int(presence_val) > 0:
-                            by_date[d].add(key)
-                    except Exception:
-                        by_date[d].add(key)
-                days_count = (end_obj - start_obj).days + 1
-                daily_counts = [len(by_date.get(start_obj + timedelta(days=i), set())) for i in range(days_count)]
-                if days_count and any(daily_counts):
-                    avg_range = int(round(sum(daily_counts) / float(days_count)))
-                else:
-                    avg_range = None
-            except Exception:
-                logger.exception("Failed computing range average from AttendanceSummary")
-                avg_range = None
-
-        # fallback: use region history to compute avg_range if still None
-        if avg_range is None:
-            try:
-                import region_clients
-                entries = region_clients.fetch_all_history(timeout=REGION_TIMEOUT_SECONDS) or []
-                agg = {}
-                for e in entries:
-                    try:
-                        dstr = e.get("date")
-                        if not dstr:
-                            continue
-                        region_obj = e.get("region") if isinstance(e.get("region"), dict) else None
-                        emp = None
-                        con = None
-                        tot = None
-                        if region_obj:
-                            emp = _safe_int(region_obj.get("Employee"))
-                            con = _safe_int(region_obj.get("Contractor"))
-                            tot = _safe_int(region_obj.get("total")) or ((emp or 0) + (con or 0))
-                        else:
-                            emp = _safe_int(e.get("Employee"))
-                            con = _safe_int(e.get("Contractor"))
-                            tot = _safe_int(e.get("total"))
-                        if emp is None and con is None:
-                            continue
-                        if tot is None:
-                            tot = (emp or 0) + (con or 0)
-                        if dstr not in agg:
-                            agg[dstr] = {"total": 0, "count": 0}
-                        agg[dstr]["total"] += tot or 0
-                        agg[dstr]["count"] += 1
-                    except Exception:
-                        continue
-                per_date_totals = []
-                days_count = (end_obj - start_obj).days + 1
-                for i in range(days_count):
-                    dcheck = (start_obj + timedelta(days=i)).isoformat()
-                    if dcheck in agg and agg[dcheck]["count"] > 0:
-                        per_day_avg = float(agg[dcheck]["total"]) / float(agg[dcheck]["count"])
-                        per_date_totals.append(per_day_avg)
-                if per_date_totals:
-                    avg_range = int(round(sum(per_date_totals) / float(len(per_date_totals))))
-            except Exception:
-                logger.exception("Failed computing avg_range from region history in fallback")
-
-        # get ccure stats if available
-        ccure_stats = {}
-        try:
-            import ccure_client
-            if hasattr(ccure_client, "get_global_stats"):
-                ccure_stats = ccure_client.get_global_stats() or {}
-        except Exception:
-            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
-
-        cc_active_emps = None
-        cc_active_contractors = None
-        try:
-            if isinstance(ccure_stats, dict):
-                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
-                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
-                if a is not None and str(a).strip() != "":
-                    cc_active_emps = int(a)
-                if b is not None and str(b).strip() != "":
-                    cc_active_contractors = int(b)
-        except Exception:
-            cc_active_emps = cc_active_contractors = None
-
-        emp_pct = None
-        contr_pct = None
-        overall_pct = None
-        try:
-            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
-                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
-            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
-                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
-            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
-                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
-        except Exception:
-            emp_pct = contr_pct = overall_pct = None
-
-        resp = {
-            "date": today.isoformat(),
-            "notes": f"Computed over range {start_obj.isoformat()} -> {end_obj.isoformat()}" if (start_date or end_date) else None,
-            "live_today": {
-                "employee": live_emp,
-                "contractor": live_contr,
-                "total_reported": live_total_reported,
-                "total_from_details": live_total_details
-            },
-            "ccure_active": {
-                "active_employees": cc_active_emps,
-                "active_contractors": cc_active_contractors,
-                "ccure_active_employees_reported": cc_active_emps,
-                "ccure_active_contractors_reported": cc_active_contractors
-            },
-            "averages": {
-                "employee_pct": emp_pct,
-                "contractor_pct": contr_pct,
-                "overall_pct": overall_pct,
-                "avg_headcount_last_7_days": avg_range,
-                "head_emp_pct_vs_ccure_today": emp_pct,
-                "head_contractor_pct_vs_ccure_today": contr_pct,
-                "headcount_overall_pct_vs_ccure_today": overall_pct,
-                "history_avg_overall_last_7_days": avg_range
-            }
-        }
-
-        return resp
-    except Exception:
-        logger.exception("build_ccure_averages failed")
-        raise
-
-# -------------------------
-# Upload endpoints (store uploads under data/ and data/raw_uploads/ and rotate)
-# -------------------------
-ALLOWED_EXT = (".xls", ".xlsx", ".csv")
-
-def _remove_old_files_for_kind(kind: str):
-    """
-    Remove previous canonical files and previous raw uploads that include kind in filename.
-    """
-    try:
-        # canonical in DATA_DIR
-        for p in DATA_DIR.iterdir():
-            if p.is_file() and f"active_{kind}" in p.name.lower():
-                try:
-                    p.unlink()
-                except Exception:
-                    logger.warning("Could not remove old canonical file %s", p)
-        # remove raw uploads for same kind to keep only latest raw (user requested)
-        for p in RAW_UPLOADS_DIR.iterdir():
-            if p.is_file() and kind in p.name.lower():
-                try:
-                    p.unlink()
-                except Exception:
-                    logger.warning("Could not remove old raw file %s", p)
-    except Exception:
-        logger.exception("error while removing old files for kind=%s", kind)
-
-def _save_upload_and_rotate(upload_file: UploadFile, kind: str) -> dict:
-    """
-    Save the uploaded file as:
-      - data/active_<kind>.<ext>     (canonical)
-      - data/raw_uploads/<timestamp>_<kind>_<origname>  (raw trace)
-    Remove previous files for same kind (both canonical & raw).
-    Returns metadata dict.
-    """
-    fname = Path(upload_file.filename).name
-    ext = Path(fname).suffix.lower()
-    if ext not in ALLOWED_EXT:
-        raise HTTPException(status_code=400, detail="Only .xls .xlsx .csv allowed")
-
-    # rotate old files
-    _remove_old_files_for_kind(kind)
-
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    raw_name = f"{ts}_{kind}_{fname}"
-    raw_path = RAW_UPLOADS_DIR / raw_name
-
-    # Save raw
-    try:
-        with raw_path.open("wb") as out_f:
-            shutil.copyfileobj(upload_file.file, out_f)
-    finally:
-        try:
-            upload_file.file.close()
-        except Exception:
-            pass
-
-    # Write canonical: keep same extension as original (simpler)
-    canonical_path = DATA_DIR / f"active_{kind}{ext}"
-    try:
-        shutil.copy(raw_path, canonical_path)
-    except Exception:
-        logger.exception("Failed to write canonical copy for %s", canonical_path)
-
-    info = {
-        "raw_saved": str(raw_path),
-        "canonical_saved": str(canonical_path),
-        "original_filename": fname,
-        "size_bytes": raw_path.stat().st_size if raw_path.exists() else None
-    }
-    logger.info("Uploaded %s: %s", kind, info)
-    return info
-
-@app.post("/api/upload/active-employees")
-async def upload_active_employees_api(file: UploadFile = File(...)):
-    return await upload_active_employees(file)
-
-@app.post("/api/upload/active-contractors")
-async def upload_active_contractors_api(file: UploadFile = File(...)):
-    return await upload_active_contractors(file)
-
-@app.post("/upload/active-employees")
-async def upload_active_employees(file: UploadFile = File(...)):
-    """
-    Upload Active Employee sheet:
-      - stores raw to data/raw_uploads and canonical to data/active_employee.*
-      - removes previous uploaded employee sheets (raw + canonical)
-      - does NOT write rows into DB
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="no file provided")
-    try:
-        info = _save_upload_and_rotate(file, kind="employee")
-        return JSONResponse({"status": "ok", "detail": info})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("employee upload failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/upload/active-contractors")
-async def upload_active_contractors(file: UploadFile = File(...)):
-    """
-    Upload Active Contractor sheet:
-      - stores raw to data/raw_uploads and canonical to data/active_contractor.*
-      - removes previous uploaded contractor sheets (raw + canonical)
-      - does NOT write rows into DB
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="no file provided")
-    try:
-        info = _save_upload_and_rotate(file, kind="contractor")
-        return JSONResponse({"status": "ok", "detail": info})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("contractor upload failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------- map detailed -> compact (used when compute returns detailed) ----
-def _map_detailed_to_resp(detailed: Dict[str, Any]) -> Dict[str, Any]:
-    live_h = detailed.get("live_headcount", {}) or {}
-    head_h = detailed.get("headcount", {}) or {}
-    ccure_active_obj = detailed.get("ccure_active", {}) or {}
-    averages_obj = detailed.get("averages", {}) or {}
-
-    def to_int(v):
-        try:
-            return None if v is None else int(v)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return None
-
-    live_employee = int(live_h.get("employee") or head_h.get("employee") or 0)
-    live_contractor = int(live_h.get("contractor") or head_h.get("contractor") or 0)
-    total_reported = int(
-        live_h.get("currently_present_total")
-        or head_h.get("total_visited_today")
-        or (live_employee + live_contractor)
-        or 0
-    )
-    total_from_details = int(head_h.get("total_visited_today") or 0)
-
-    mapped_headcount = {
-        "total_visited_today": int(head_h.get("total_visited_today") or 0),
-        "employee": int(head_h.get("employee") or 0),
-        "contractor": int(head_h.get("contractor") or 0),
-        "by_location": head_h.get("by_location") or {}
-    }
-
-    resp = {
-        "date": detailed.get("date"),
-        "notes": detailed.get("notes"),
-        "live_today": {
-            "employee": live_employee,
-            "contractor": live_contractor,
-            "total_reported": total_reported,
-            "total_from_details": total_from_details
-        },
-        "headcount": mapped_headcount,
-        "live_headcount": live_h,
-        "ccure_active": {
-            "active_employees": ccure_active_obj.get("ccure_active_employees_reported")
-                             or ccure_active_obj.get("active_employees"),
-            "active_contractors": ccure_active_obj.get("ccure_active_contractors_reported")
-                               or ccure_active_obj.get("active_contractors"),
-            "ccure_active_employees_reported": ccure_active_obj.get("ccure_active_employees_reported"),
-            "ccure_active_contractors_reported": ccure_active_obj.get("ccure_active_contractors_reported")
-        },
-        "averages": averages_obj
-    }
-    return resp
-
-# ---------- build a verify-compatible summary from mapped payload -----------
-def _build_verify_like_summary_from_mapped(mapped: Dict[str, Any], include_raw: bool = False) -> Dict[str, Any]:
-    def to_int(v):
-        try:
-            return None if v is None else int(v)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return None
-
-    cc = mapped.get("ccure_active", {}) or {}
-    head = mapped.get("headcount", {}) or {}
-    live_head = mapped.get("live_headcount", {}) or {}
-    averages = mapped.get("averages", {}) or {}
-
-    cc_emp = to_int(cc.get("ccure_active_employees_reported") or cc.get("active_employees"))
-    cc_con = to_int(cc.get("ccure_active_contractors_reported") or cc.get("active_contractors"))
-
-    head_total = to_int(head.get("total_visited_today") or mapped.get("live_today", {}).get("total_from_details"))
-    head_emp = to_int(head.get("employee") or mapped.get("live_today", {}).get("employee"))
-    head_con = to_int(head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
-
-    live_total = to_int(live_head.get("currently_present_total") or mapped.get("live_today", {}).get("total_reported"))
-    live_emp = to_int(live_head.get("employee") or mapped.get("live_today", {}).get("employee"))
-    live_con = to_int(live_head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
-
-    history_emp_avg = averages.get("history_avg_employee_last_7_days")
-    history_con_avg = averages.get("history_avg_contractor_last_7_days")
-    history_overall_avg = averages.get("history_avg_overall_last_7_days")
-
-    def pct(n, d):
-        try:
-            if n is None or d is None:
-                return None
-            if float(d) == 0:
-                return None
-            return round((float(n) / float(d)) * 100.0, 2)
-        except Exception:
-            return None
-
-    summary = {
-        "date": mapped.get("date"),
-        "ccure_reported": {
-            "employees": cc_emp,
-            "contractors": cc_con,
-            "total_reported": (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None
-        },
-        "headcount_attendance_summary": {
-            "total_visited_today": head_total,
-            "employee": head_emp,
-            "contractor": head_con,
-        },
-        "live_headcount_region_clients": {
-            "currently_present_total": live_total,
-            "employee": live_emp,
-            "contractor": live_con,
-        },
-        "percentages_vs_ccure": {
-            "head_employee_pct_vs_ccure_today": pct(head_emp, cc_emp),
-            "head_contractor_pct_vs_ccure_today": pct(head_con, cc_con),
-            "head_overall_pct_vs_ccure_today": pct(head_total, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None),
-            "live_employee_pct_vs_ccure_today": pct(live_emp, cc_emp),
-            "live_contractor_pct_vs_ccure_today": pct(live_con, cc_con),
-            "live_overall_pct_vs_ccure_today": pct(live_total, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None),
-            "history_employee_pct_vs_ccure": pct(history_emp_avg, cc_emp),
-            "history_contractor_pct_vs_ccure": pct(history_con_avg, cc_con),
-            "history_overall_pct_vs_ccure": pct(history_overall_avg, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None)
-        },
-        "averages": {
-            "history_avg_employee_last_7_days": history_emp_avg,
-            "history_avg_contractor_last_7_days": history_con_avg,
-            "history_avg_overall_last_7_days": history_overall_avg,
-            "avg_headcount_last_7_days_db": averages.get("avg_headcount_last_7_days") or averages.get("avg_headcount_last_7_days_db"),
-            "avg_headcount_per_site_last_7_days": averages.get("avg_headcount_per_site_last_7_days"),
-            "employee_pct": averages.get("employee_pct"),
-            "contractor_pct": averages.get("contractor_pct"),
-            "overall_pct": averages.get("overall_pct"),
-            **({k: v for k, v in averages.items() if k not in (
-                "history_avg_employee_last_7_days",
-                "history_avg_contractor_last_7_days",
-                "history_avg_overall_last_7_days",
-                "avg_headcount_last_7_days",
-                "avg_headcount_last_7_days_db",
-                "avg_headcount_per_site_last_7_days",
-                "employee_pct","contractor_pct","overall_pct"
-            )})
-        },
-        "notes": mapped.get("notes")
-    }
-
-    summary["headcount_details"] = {
-        "total_visited_today": head_total,
-        "employee": head_emp,
-        "contractor": head_con,
-        "by_location": head.get("by_location") if isinstance(head.get("by_location"), dict) else {}
-    }
-    summary["live_headcount_details"] = {
-        "currently_present_total": live_total,
-        "employee": live_emp,
-        "contractor": live_con,
-        "by_location": live_head.get("by_location") if isinstance(live_head.get("by_location"), dict) else {}
-    }
-
-    summary["ccure_active"] = {
-        "active_employees": cc.get("active_employees") or cc.get("ccure_active_employees_reported"),
-        "active_contractors": cc.get("active_contractors") or cc.get("ccure_active_contractors_reported"),
-        "ccure_active_employees_reported": cc.get("ccure_active_employees_reported"),
-        "ccure_active_contractors_reported": cc.get("ccure_active_contractors_reported")
-    }
-
-    return summary
-
-# ---------- /ccure/verify (already present in your original) -----
-@app.get("/ccure/verify")
-def ccure_verify(
-    raw: bool = Query(False, description="if true, include the raw compute payload for debugging"),
-    start_date: Optional[str] = Query(None, description="YYYY-MM-DD start date (inclusive)"),
-    end_date: Optional[str] = Query(None, description="YYYY-MM-DD end date (inclusive)")
-):
-    """
-    Synchronous verification endpoint. Prefer compute_visit_averages() (synchronous call).
-    If compute raises or fails, fall back to build_ccure_averages() so output shape remains consistent.
-    """
-    try:
-        detailed = None
-        try:
-            from ccure_compare_service import compute_visit_averages
-            detailed = compute_visit_averages(start_date, end_date, timeout=REGION_TIMEOUT_SECONDS)
-        except Exception:
-            logger.exception("compute_visit_averages() failed inside /ccure/verify; falling back")
-            detailed = None
-
-        if isinstance(detailed, dict):
-            mapped = _map_detailed_to_resp(detailed)
-            summary = _build_verify_like_summary_from_mapped(mapped, include_raw=raw)
-            if raw and isinstance(detailed, dict):
-                summary["raw"] = detailed
-            return JSONResponse(summary)
-        else:
-            fallback = build_ccure_averages(start_date, end_date)
-            mapped_fallback = {
-                "date": fallback.get("date"),
-                "notes": fallback.get("notes"),
-                "live_today": fallback.get("live_today", {}),
-                "headcount": {
-                    "total_visited_today": fallback.get("live_today", {}).get("total_from_details") or fallback.get("live_today", {}).get("total_reported"),
-                    "employee": fallback.get("live_today", {}).get("employee"),
-                    "contractor": fallback.get("live_today", {}).get("contractor"),
-                    "by_location": {}
-                },
-                "live_headcount": {
-                    "currently_present_total": fallback.get("live_today", {}).get("total_reported"),
-                    "employee": fallback.get("live_today", {}).get("employee"),
-                    "contractor": fallback.get("live_today", {}).get("contractor"),
-                    "by_location": {}
-                },
-                "ccure_active": fallback.get("ccure_active", {}),
-                "averages": fallback.get("averages", {})
-            }
-
-            summary = _build_verify_like_summary_from_mapped(mapped_fallback, include_raw=raw)
-            if raw:
-                summary["raw"] = mapped_fallback
-       
-            return JSONResponse(summary)
-    except Exception as e:
-        logger.exception("ccure_verify failed")
-        raise HTTPException(status_code=500, detail=f"ccure verify error: {e}")
-
-# ---------- /ccure/compare -> uses data_compare_service.compare_ccure_vs_sheets ----------
-@app.get("/ccure/compare")
-def ccure_compare(
-    mode: str = Query("full", description="full or stats"),
-    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
-    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
-    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
-):
-    try:
-        from data_compare_service import compare_ccure_vs_sheets
-    except Exception as e:
-        logger.exception("data_compare_service import failed")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
-    if not isinstance(res, dict):
-        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
-    return JSONResponse(res)
-
-@app.get("/ccure/export_uploaded")
-def ccure_export_uploaded():
-    """
-    Export the currently uploaded canonical sheets into one workbook.
-    Returns JSON: { status: "ok", report_path: "<filename>" }
-    Downloadable at /ccure/report/{filename}
-    """
-    try:
-        from data_compare_service import export_uploaded_sheets
-    except Exception as e:
-        logger.exception("data_compare_service import failed for export_uploaded")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    fname = export_uploaded_sheets()
-    if not fname:
-        raise HTTPException(status_code=500, detail="failed to export uploaded sheets")
-    return JSONResponse({"status": "ok", "report_path": fname})
-
-@app.get("/ccure/compare_v2")
-def ccure_compare_v2(
-    mode: str = Query("full"),
-    stats_detail: str = Query("ActiveProfiles"),
-    limit_list: int = Query(200, ge=1, le=5000),
-    export: bool = Query(False),
-    region_filter: Optional[str] = Query(None, description="Region code e.g. APAC"),
-    location_city: Optional[str] = Query(None, description="Location city e.g. Pune"),
-    location_state: Optional[str] = Query(None, description="Location state/province"),
-    location_description: Optional[str] = Query(None, description="Location Description"),
-    week_ref_date: Optional[str] = Query(None, description="YYYY-MM-DD for week (Mon-Fri)")
-):
-    try:
-        from data_compare_service_v2 import compare_ccure_vs_sheets
-    except Exception as e:
-        logger.exception("data_compare_service_v2 import failed")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    res = compare_ccure_vs_sheets(
-        mode=mode,
-        stats_detail=stats_detail,
-        limit_list=limit_list,
-        export=export,
-        region_filter=region_filter,
-        location_city=location_city,
-        location_state=location_state,
-        location_description=location_description,
-        week_ref_date=week_ref_date
-    )
-    if not isinstance(res, dict):
-        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
-    return JSONResponse(res)
-
-@app.get("/ccure/report/{filename}")
-def ccure_report_download(filename: str):
-    try:
-        safe_name = Path(filename).name
-        full = OUTPUT_DIR / safe_name
-        if not full.exists() or not full.is_file():
-            raise HTTPException(status_code=404, detail="Report not found")
-        return FileResponse(str(full),
-                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            filename=safe_name)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to serve report")
-        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
-
-# End of app.py
-
-
-
-
-
-# data_compare_service_v2.py
-"""
-New comparison service (v2) - improved presence fetching using:
-  - AttendanceSummary DB (chunked IN queries + broad range)
-  - Fallback: occupancy history endpoints (region services) to derive presence by EmployeeID/CardNumber
-  - Respects filters (region/location/partition) when possible
-  - Robust HTTP client with retries/backoff and conservative logging to avoid spamming tracebacks
-"""
-import sys
-import re
-import uuid
-import logging
-from pathlib import Path
-from datetime import date, datetime, timedelta
-from typing import Optional, Dict, Any, List
-
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\ingest_excel.py
 import pandas as pd
+from datetime import datetime
+from sqlalchemy.exc import IntegrityError
+from db import SessionLocal, engine
+from models import Base, ActiveEmployee, ActiveContractor
+from settings import UPLOAD_DIR
+import uuid, os
 
-# HTTP client for region histories
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-except Exception:
-    requests = None
+# --- database setup: do NOT run create_all at import time ---
+def init_db():
+    """
+    Create DB tables if they do not exist.
+    Call this manually only when you want to initialize/repair the DB:
+      python -c "from ingest_excel import init_db; init_db()"
+    """
+    from db import engine
+    from models import Base
+    Base.metadata.create_all(bind=engine)
 
-# DB imports (same as your project)
-from db import SessionLocal
-from models import AttendanceSummary, ActiveEmployee
-
-# Use settings if present to find DATA_DIR / OUTPUT_DIR and REGION_HISTORY_URLS
-try:
-    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR, REGION_HISTORY_URLS as SETTINGS_REGION_HISTORY_URLS
-    DATA_DIR = Path(SETTINGS_DATA_DIR)
-    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
-    REGION_HISTORY_URLS = SETTINGS_REGION_HISTORY_URLS
-except Exception:
-    DATA_DIR = Path(__file__).resolve().parent / "data"
-    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-    # sensible defaults based on examples you provided; can be overridden via settings.py
-    REGION_HISTORY_URLS = [
-        "http://10.199.22.57:3008/api/occupancy/history",  # APAC (example)
-        "http://10.199.22.57:3006/api/occupancy/history",  # NAMER
-        "http://10.199.22.57:3007/api/occupancy/history",  # EMEA
-        "http://10.199.22.57:4000/api/occupancy/history"   # LACA
-    ]
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-logger = logging.getLogger("data_compare_service_v2")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def _find_active_employee_file():
-    for ext in (".xlsx", ".xls", ".csv"):
-        p = DATA_DIR / f"active_employee{ext}"
-        if p.exists():
-            return p
-    # try case-insensitive search
-    for p in DATA_DIR.iterdir():
-        if p.is_file() and "active_employee" in p.name.lower():
-            return p
+def _first_present(row, candidates):
+    for c in candidates:
+        v = row.get(c)
+        if v is not None and str(v).strip() != "":
+            return v
     return None
 
-def _normalize_key(k):
-    if k is None:
-        return None
-    return str(k).strip()
-
-def _safe_int(v, default=0):
-    try:
-        if v is None or v == "":
-            return default
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return default
-
-def _week_monday_and_friday(ref_date: Optional[date] = None):
-    if ref_date is None:
-        ref_date = date.today()
-    # ISO weekday: Monday=1
-    iso = ref_date.isoweekday()
-    monday = ref_date - timedelta(days=(iso - 1))
-    friday = monday + timedelta(days=4)
-    return monday, friday
-
-def _maybe_mark_on_leave(status_str: Optional[str]) -> bool:
-    if not status_str:
-        return False
-    s = str(status_str).strip().lower()
-    for tok in ("leave", "vacation", "on leave", "holiday", "sabbatical", "furlough", "loa"):
-        if tok in s:
-            return True
-    return False
-
-# ----------------------------
-# Core loader: active employees (sheet)
-# ----------------------------
-def load_active_employees_dataframe() -> pd.DataFrame:
-    """
-    Loads canonical active_employee spreadsheet into a normalized DataFrame.
-    """
-    src = _find_active_employee_file()
-    if not src:
-        raise FileNotFoundError(f"Active employee canonical file not found in {DATA_DIR}")
-    ext = src.suffix.lower()
-    if ext in (".xls", ".xlsx"):
-        df = pd.read_excel(src, sheet_name=0, dtype=str)
-    else:
-        df = pd.read_csv(src, dtype=str)
-
-    # normalize column names (strip)
+def ingest_employee_excel(path, uploaded_by="system"):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
     df.columns = [c.strip() for c in df.columns]
-
-    def _first_present(row, candidates):
-        for c in candidates:
-            if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
-                return row[c]
-        return None
-
-    rows = []
-    for _, row in df.iterrows():
-        emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id'])
-        full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or (
-            f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
-        )
-        location_city = _first_present(row, ['Location City','Location City ' ,'Location','City','LocationCity'])
-        location_desc = _first_present(row, ['Location Description','Location Description ','LocationDescription'])
-        location_state = _first_present(row, ['Location State / Province','Location State / Province ','Location State','State','Province'])
-        region_code = _first_present(row, ['Region Code','Region','RegionCode'])
-        current_status = _first_present(row, ['Current Status','Status','Employee Status','Employee_Status'])
-        employee_type = _first_present(row, ['Employee Type','Type','Time Type'])
-        rows.append({
-            "employee_id": _normalize_key(emp_id),
-            "full_name": _normalize_key(full_name),
-            "location_city": _normalize_key(location_city),
-            "location_desc": _normalize_key(location_desc),
-            "location_state": _normalize_key(location_state),
-            "region_code": (str(region_code).strip() if region_code is not None else None),
-            "current_status": _normalize_key(current_status),
-            "employee_type": _normalize_key(employee_type),
-            "raw_row": row.to_dict()
-        })
-    ndf = pd.DataFrame(rows)
-    for col in ("employee_id","full_name","location_city","location_desc","location_state","region_code","current_status","employee_type","raw_row"):
-        if col not in ndf:
-            ndf[col] = None
-    ndf = ndf[ndf["employee_id"].notna() & (ndf["employee_id"].str.strip() != "")]
-    ndf.reset_index(drop=True, inplace=True)
-    return ndf
-
-# ----------------------------
-# HTTP Session factory (retries/backoff)
-# ----------------------------
-def _build_requests_session():
-    if requests is None:
-        return None
-    s = requests.Session()
-    # Retry: handle urllib3 versions differences for method whitelist naming
-    allowed = frozenset(['GET', 'HEAD'])
-    try:
-        retry = Retry(
-            total=2,
-            backoff_factor=1,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=allowed
-        )
-    except TypeError:
-        # older urllib3
-        retry = Retry(
-            total=2,
-            backoff_factor=1,
-            status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=allowed
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-# ----------------------------
-# Region occupancy history fallback
-# ----------------------------
-def _extract_details_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Normalize payload into a list of detail dicts if possible.
-    Accepts:
-      - list of dicts
-      - dict with keys: details, results, data, entries, summaryByDate, list, people, items
-      - single dict representing one detail
-    """
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return [p for p in payload if isinstance(p, dict)]
-    if isinstance(payload, dict):
-        # common keys that hold lists of detail rows
-        for k in ("details", "results", "data", "entries", "list", "people", "items"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        # sometimes payload is {"summaryByDate": [...]}
-        if isinstance(payload.get("summaryByDate"), list):
-            return [x for x in payload.get("summaryByDate") if isinstance(x, dict)]
-        # if it's a single record containing date field, treat as single detail
-        if "date" in payload and isinstance(payload.get("date"), (str,)):
-            return [payload]
-    return []
-
-def _fetch_presence_from_region_histories(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None) -> Dict[str, Dict[date,int]]:
-    """
-    Query configured region occupancy history endpoints for the date range and build presence map.
-
-    Improvements:
-      - Uses a requests.Session with retries/backoff
-      - Attempts common date-range query params first to limit payloads
-      - Handles timeouts gracefully (warning-level logs), continues with other endpoints
-      - Accepts varying payload shapes
-    """
-    presence = {eid: {} for eid in employee_ids}
-    if requests is None:
-        logger.warning("[region_history] requests library not available — skipping region history fallback")
-        return presence
-
-    session = _build_requests_session()
-    if session is None:
-        logger.warning("[region_history] failed to create HTTP session — skipping region history fallback")
-        return presence
-
-    orig_ids = [str(e).strip() for e in employee_ids]
-    norm_set = set([s for s in orig_ids if s])
-    digits_map = {e: re.sub(r'\D+', '', e) for e in orig_ids}
-
-    scanned_details = 0
-    matched_hits = 0
-
-    # common param keys many services accept; we will try each combination and stop at first success
-    date_params_options = [
-        ("fromDate", "toDate"),
-        ("from", "to"),
-        ("start", "end"),
-        ("from_date", "to_date"),
-    ]
-    # default read/connect timeout tuple (connect, read) - tuned to avoid very long blocking
-    timeout = (3, 6)
-
-    for url in REGION_HISTORY_URLS:
-        if not url:
-            continue
-
-        tried_variants = []
-        success_payload = None
-
-        # ensure concatenation uses lists
-        for (k1, k2) in date_params_options + [(None, None)]:
-            if k1 is None:
-                attempt_label = "bare"
-            else:
-                attempt_label = f"{k1}={start_date.isoformat()}&{k2}={end_date.isoformat()}"
-            tried_variants.append(attempt_label)
-
+    # robust mapping keys
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id'])
+            if emp_id:
+                emp_id = str(emp_id).strip()
+            if not emp_id:
+                # skip rows without an employee id
+                continue
+            full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+            # robust current_status detection
+            status_candidates = ['Current Status','Status','Employee Status','Employee_Status','Status (Current)','CurrentStatus']
+            current_status = _first_present(row, status_candidates)
+            email = _first_present(row, ["Employee's Email",'Email','Email Address'])
+            location_city = _first_present(row, ['Location City','Location','Location Description','City'])
+            rec = ActiveEmployee(
+                employee_id=emp_id,
+                full_name=full_name,
+                email=email,
+                location_city=location_city,
+                location_desc=row.get('Location Description'),
+                current_status=current_status,
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
             try:
-                if k1 is None:
-                    resp = session.get(url, timeout=timeout)
-                else:
-                    params = {k1: start_date.isoformat(), k2: end_date.isoformat()}
-                    resp = session.get(url, params=params, timeout=timeout)
-            except requests.exceptions.ReadTimeout:
-                logger.warning("[region_history] read timeout for %s (tried %s) — skipping this attempt", url, attempt_label)
-                continue
-            except requests.exceptions.ConnectTimeout:
-                logger.warning("[region_history] connect timeout for %s (tried %s) — skipping this attempt", url, attempt_label)
-                continue
-            except requests.exceptions.RequestException as e:
-                # don't include full exception trace for transient network issues
-                logger.warning("[region_history] request error for %s (tried %s): %s", url, attempt_label, str(e))
-                continue
-
-            if resp is None:
-                continue
-            if resp.status_code != 200:
-                logger.debug("[region_history] non-200 from %s (tried %s): %d", url, attempt_label, resp.status_code)
-                continue
-
-            # parse JSON safely; if not JSON, try to salvage minimal info
-            try:
-                payload = resp.json()
+                db.merge(rec)  # upsert
+                db.commit()
+            except IntegrityError:
+                db.rollback()
             except Exception:
-                # try to fallback to plain text if JSON not present
-                logger.warning("[region_history] invalid json from %s (tried %s) — trying next variant/endpoint", url, attempt_label)
+                db.rollback()
+
+def ingest_contractor_excel(path):
+    df = pd.read_excel(path, sheet_name=0, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    with SessionLocal() as db:
+        for _, row in df.iterrows():
+            wsid = _first_present(row, ['Worker System Id','Worker System ID','Worker ID','WorkerSystemId'])
+            if wsid:
+                wsid = str(wsid).strip()
+            if not wsid:
                 continue
-
-            success_payload = payload
-            break
-
-        if success_payload is None:
-            logger.warning("[region_history] no usable payload from %s after trying variants: %s", url, ", ".join(tried_variants))
-            continue
-
-        details = _extract_details_from_payload(success_payload)
-        if not details:
-            # If the payload contained a top-level 'details' string in a different shape, keep an empty list
-            details = []
-        scanned_details += len(details)
-
-        for d in details:
+            ipass = _first_present(row, ['iPass ID','"W" iPass ID','IPassID','iPassID','Ipass ID'])
+            full_name = _first_present(row, ['Full Name','FullName','Name'])
+            rec = ActiveContractor(
+                worker_system_id=wsid,
+                ipass_id=ipass,
+                full_name=full_name,
+                vendor=_first_present(row, ['Vendor Company Name','Vendor']),
+                location=_first_present(row, ['Worker Location','Location']),
+                status=_first_present(row, ['Status','Current Status']),
+                raw_row=row.to_dict(),
+                uploaded_at=datetime.utcnow()
+            )
             try:
-                # timestamp heuristics
-                ts = d.get("LocaleMessageTime") or d.get("SwipeDate") or d.get("SwipeTime") or d.get("timestamp") or d.get("time")
-                if not ts:
-                    # sometimes the detail is a dict with 'date' field representing day
-                    ts = d.get("date")
-                if not ts:
-                    continue
-
-                # normalize timestamp into datetime
-                t = None
-                try:
-                    if isinstance(ts, (int, float)):
-                        # epoch seconds
-                        t = datetime.fromtimestamp(int(ts))
-                    elif isinstance(ts, str):
-                        if "T" in ts:
-                            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        else:
-                            # try common date-only pattern
-                            try:
-                                t = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-                            except Exception:
-                                try:
-                                    t = datetime.strptime(ts[:10], "%Y-%m-%d")
-                                except Exception:
-                                    t = None
-                except Exception:
-                    t = None
-
-                if t is None:
-                    continue
-                dt = t.date()
-                if dt < start_date or dt > end_date:
-                    continue
-
-                # partition / location filter
-                partition_value = (d.get("PartitionNameFriendly") or d.get("PartitionName2") or d.get("PartitionName") or d.get("PrimaryLocation") or d.get("Partition") or "")
-                if partition_filter:
-                    if not partition_value:
-                        continue
-                    if partition_filter.strip().lower() not in str(partition_value).strip().lower():
-                        continue
-
-                scanned_key = None
-
-                # 1) try EmployeeID-like fields
-                raw_emp = d.get("EmployeeID") or d.get("PersonID") or d.get("Employee Id") or d.get("employeeId") or None
-                if raw_emp and str(raw_emp).strip() != "":
-                    db_key = str(raw_emp).strip()
-                    if db_key in norm_set:
-                        scanned_key = db_key
-                    else:
-                        dd = re.sub(r'\D+', '', db_key)
-                        if dd:
-                            cand = dd.lstrip('0') or dd
-                            for orig in orig_ids:
-                                if orig == cand or digits_map.get(orig) == dd or orig.lstrip('0') == db_key:
-                                    scanned_key = orig
-                                    break
-
-                # 2) card/badge fallback
-                if scanned_key is None:
-                    card = d.get("CardNumber") or d.get("BadgeNumber") or d.get("Card") or d.get("badge")
-                    if card:
-                        cd = re.sub(r'\D+', '', str(card))
-                        if cd:
-                            cand = cd.lstrip('0') or cd
-                            for orig in orig_ids:
-                                od = digits_map.get(orig, "")
-                                if od and (od == cd or od.lstrip('0') == cand or orig == cand):
-                                    scanned_key = orig
-                                    break
-
-                if scanned_key:
-                    matched_hits += 1
-                    presence.setdefault(scanned_key, {})
-                    presence[scanned_key][dt] = 1
-
+                db.merge(rec)
+                db.commit()
+            except IntegrityError:
+                db.rollback()
             except Exception:
-                # don't raise on single-row parse issues
-                continue
-
-    logger.info("[region_history] scanned %d detail rows across %d endpoints; matched %d presence entries",
-                scanned_details, len(REGION_HISTORY_URLS), matched_hits)
-
-    # ensure entries exist for each date in range
-    cur = start_date
-    while cur <= end_date:
-        for eid in employee_ids:
-            presence.setdefault(eid, {})
-            if cur not in presence[eid]:
-                presence[eid][cur] = 0
-        cur = cur + timedelta(days=1)
-
-    return presence
-
-# ----------------------------
-# Attendance summary queries (combined approach)
-# ----------------------------
-def _fetch_presence_for_employees(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None) -> Dict[str, Dict[date,int]]:
-    """
-    Fetch presence for employee_ids using:
-      1) chunked DB IN queries (fast)
-      2) fallback: broad DB query and Python normalization
-      3) fallback: region occupancy history endpoints if DB couldn't provide matches
-    """
-    if not employee_ids:
-        return {}
-
-    orig_ids = [str(e).strip() for e in employee_ids]
-    norm_id_set = set([s for s in orig_ids if s])
-    result = {eid: {} for eid in orig_ids}
-
-    rows = []
-    chunk_size = 500
-    try:
-        with SessionLocal() as db:
-            # chunked IN queries first
-            for i in range(0, len(orig_ids), chunk_size):
-                chunk = orig_ids[i:i+chunk_size]
-                try:
-                    q = db.query(AttendanceSummary).filter(
-                        AttendanceSummary.date >= start_date,
-                        AttendanceSummary.date <= end_date,
-                        AttendanceSummary.employee_id.in_(chunk)
-                    )
-                    rows_chunk = q.all()
-                    if rows_chunk:
-                        rows.extend(rows_chunk)
-                except Exception:
-                    logger.exception("chunked query failed for _fetch_presence_for_employees (continuing)")
-                    continue
-
-            # if no rows found at all, do broad query
-            if not rows:
-                try:
-                    rows = db.query(AttendanceSummary).filter(
-                        AttendanceSummary.date >= start_date,
-                        AttendanceSummary.date <= end_date
-                    ).all()
-                    logger.info("[presence_fetch] fallback broad DB query returned %d rows for %s -> %s", len(rows), start_date, end_date)
-                except Exception:
-                    logger.exception("fallback broad DB query failed in _fetch_presence_for_employees")
-                    rows = []
-    except Exception:
-        logger.exception("DB session error in _fetch_presence_for_employees")
-        rows = []
-
-    # Map DB rows to employee ids using normalization heuristics
-    for r in rows:
-        try:
-            raw_eid = r.employee_id
-            if raw_eid is None:
-                continue
-            db_key = str(raw_eid).strip()
-            match_key = None
-
-            # direct match
-            if db_key in norm_id_set:
-                match_key = db_key
-            else:
-                # digits-only match
-                digits = re.sub(r'\D+', '', db_key)
-                if digits:
-                    cand = digits.lstrip('0') or digits
-                    if cand in norm_id_set:
-                        match_key = cand
-
-                # reverse comparisons (strip leading zeros of orig ids)
-                if match_key is None:
-                    for o in orig_ids:
-                        if o == db_key or o.lstrip('0') == db_key or db_key.lstrip('0') == o:
-                            match_key = o
-                            break
-
-            if not match_key:
-                continue
-
-            d = r.date
-            present = 0
-            try:
-                present = int(r.presence_count or 0)
-            except Exception:
-                present = 1 if (r.presence_count and str(r.presence_count).strip() != "0") else 0
-
-            result.setdefault(match_key, {})
-            prev = result[match_key].get(d, 0)
-            result[match_key][d] = 1 if (prev == 1 or present > 0) else 0
-        except Exception:
-            continue
-
-    # Fill missing dates with zeros for now
-    cur = start_date
-    while cur <= end_date:
-        for eid in orig_ids:
-            result.setdefault(eid, {})
-            if cur not in result[eid]:
-                result[eid][cur] = 0
-        cur = cur + timedelta(days=1)
-
-    # Count how many employees have any positive presence from DB
-    db_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
-    logger.info("[presence_fetch] DB-derived presence found for %d/%d employees", db_positive, len(orig_ids))
-
-    # If DB provided no positives (or very few), use region history fallback to improve coverage
-    if db_positive == 0 or db_positive < max(10, int(0.1 * len(orig_ids))):
-        try:
-            logger.info("[presence_fetch] DB coverage low (%d/%d) - trying region occupancy history fallback", db_positive, len(orig_ids))
-            region_presence = _fetch_presence_from_region_histories(orig_ids, start_date, end_date, partition_filter=partition_filter)
-            # merge region_presence into result (any positive overwrites zero)
-            for eid in orig_ids:
-                rp = region_presence.get(eid, {})
-                for d, v in rp.items():
-                    if v and result.setdefault(eid, {}).get(d, 0) == 0:
-                        result[eid][d] = 1
-        except Exception:
-            logger.exception("region history fallback failed in _fetch_presence_for_employees")
-
-    # Final logging: how many employees have any presence
-    final_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
-    logger.info("[presence_fetch] final presence coverage: %d/%d employees have at least one positive day", final_positive, len(orig_ids))
-
-    return result
-
-# ----------------------------
-# Main comparison function
-# ----------------------------
-def compare_ccure_vs_sheets(
-    mode: str = "full",
-    stats_detail: str = "ActiveProfiles",
-    limit_list: int = 200,
-    export: bool = False,
-    # extra optional filters (if present, will be applied)
-    region_filter: Optional[str] = None,        # e.g. "APAC"
-    location_city: Optional[str] = None,       # e.g. "Pune"
-    location_state: Optional[str] = None,
-    location_description: Optional[str] = None,
-    week_ref_date: Optional[str] = None        # "YYYY-MM-DD" - week to evaluate (Mon-Fri)
-) -> Dict[str, Any]:
-    """
-    Main compare function - returns structured summary + details.
-    """
-    try:
-        df = load_active_employees_dataframe()
-    except Exception as e:
-        logger.exception("Failed to load active employees")
-        return {"error": f"active sheet load failed: {e}"}
-
-    # normalize filters
-    rf = region_filter.strip().lower() if region_filter else None
-    lc = location_city.strip().lower() if location_city else None
-    ls = location_state.strip().lower() if location_state else None
-    ld = location_description.strip().lower() if location_description else None
-
-    # apply filters
-    sel = df.copy()
-    if rf:
-        sel = sel[sel["region_code"].fillna("").str.strip().str.lower() == rf]
-    if lc:
-        sel = sel[sel["location_city"].fillna("").str.strip().str.lower() == lc]
-    if ls:
-        sel = sel[sel["location_state"].fillna("").str.strip().str.lower() == ls]
-    if ld:
-        sel = sel[sel["location_desc"].fillna("").str.strip().str.lower() == ld]
-
-    total_active = len(sel)
-    employee_ids = sel["employee_id"].astype(str).str.strip().tolist()
-
-    # week calculation
-    today = date.today()
-    monday, friday = _week_monday_and_friday(date.fromisoformat(week_ref_date)) if week_ref_date else _week_monday_and_friday(today)
-
-    # fetch presence map (DB first, then region history fallback if needed)
-    presence_map = _fetch_presence_for_employees(employee_ids, monday, friday, partition_filter=location_city)
-
-    # compute today count (today within Mon-Fri window or not)
-    today_count = 0
-    for eid in employee_ids:
-        pm = presence_map.get(eid, {})
-        if today in pm:
-            if pm[today] > 0:
-                today_count += 1
-        else:
-            # fallback direct DB single date check (robust normalized attempts)
-            try:
-                with SessionLocal() as db:
-                    row = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == eid, AttendanceSummary.date == today).first()
-                    if row and getattr(row, "presence_count", 0) > 0:
-                        today_count += 1
-                        continue
-                    # try digits normalization
-                    digits = re.sub(r'\D+', '', eid)
-                    if digits:
-                        cand = digits.lstrip('0') or digits
-                        row2 = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == cand, AttendanceSummary.date == today).first()
-                        if row2 and getattr(row2, "presence_count", 0) > 0:
-                            today_count += 1
-            except Exception:
-                continue
-
-    today_pct = round((today_count / float(total_active)) * 100.0, 2) if total_active > 0 else None
-
-    # leave and type counts
-    sel["on_leave"] = sel["current_status"].apply(lambda x: _maybe_mark_on_leave(x))
-    leave_count = int(sel["on_leave"].sum())
-    sel["employee_type_norm"] = sel["employee_type"].fillna("").str.strip().str.lower()
-    type_counts = sel["employee_type_norm"].value_counts().to_dict()
-
-    # regular employees
-    regular_df = sel[sel["employee_type_norm"].str.contains("regular", na=False)]
-    regular_ids = regular_df["employee_id"].astype(str).str.strip().tolist()
-
-    regular_presence = {}
-    for eid in regular_ids:
-        week_map = presence_map.get(eid, {})
-        days_present = sum(1 for d, v in week_map.items() if v and (monday <= d <= friday))
-        days_present = int(days_present)
-        regular_presence[eid] = {
-            "days_present": days_present,
-            "on_leave": bool(sel[sel["employee_id"] == eid]["on_leave"].any()),
-            "full_name": sel[sel["employee_id"] == eid]["full_name"].iloc[0] if not sel[sel["employee_id"] == eid].empty else None
-        }
-
-    present_5_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 5)
-    present_3_or_more_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 3)
-    present_less_than_3_count = sum(1 for v in regular_presence.values() if v["days_present"] < 3)
-    present_only_1_count = sum(1 for v in regular_presence.values() if v["days_present"] == 1)
-
-    present_5_list = []
-    present_3_list = []
-    defaulters_list = []
-
-    for eid, info in regular_presence.items():
-        entry = {
-            "employee_id": eid,
-            "full_name": info["full_name"],
-            "days_present": info["days_present"],
-            "on_leave": info["on_leave"]
-        }
-        if info["days_present"] >= 5:
-            present_5_list.append(entry)
-        if info["days_present"] >= 3:
-            present_3_list.append(entry)
-        if info["days_present"] < 3:
-            defaulters_list.append(entry)
-
-    present_5_list = sorted(present_5_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
-    present_3_list = sorted(present_3_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
-    defaulters_list = sorted(defaulters_list, key=lambda x: (x["days_present"], x["on_leave"], x["full_name"] or ""))[:limit_list]
-
-    summary = {
-        "filters": {
-            "region": region_filter,
-            "location_city": location_city,
-            "location_state": location_state,
-            "location_description": location_description,
-            "week_monday": monday.isoformat(),
-            "week_friday": friday.isoformat()
-        },
-        "counts": {
-            "total_active_in_sheet": total_active,
-            "today_headcount_from_summary": today_count,
-            "today_headcount_pct_vs_sheet": today_pct,
-            "on_leave_count_in_sheet": leave_count,
-            "employee_type_counts": type_counts
-        },
-        "regular_attendance_summary": {
-            "regular_total": len(regular_ids),
-            "present_5_day_count": present_5_count,
-            "present_3_or_more_count": present_3_or_more_count,
-            "present_less_than_3_count": present_less_than_3_count,
-            "present_only_1_day_count": present_only_1_count
-        }
-    }
-
-    details = {
-        "present_5_days": present_5_list,
-        "present_3_or_more_days": present_3_list,
-        "defaulters_less_than_3_days": defaulters_list
-    }
-
-    report_path = None
-    if export:
-        try:
-            report_name = f"attendance_compare_{(region_filter or 'all')}_{(location_city or 'all')}_{uuid.uuid4().hex[:8]}.xlsx"
-            report_file = OUTPUT_DIR / report_name
-            with pd.ExcelWriter(report_file, engine="openpyxl") as writer:
-                sel_df_for_export = sel.copy()
-                sel_df_for_export["raw_row_str"] = sel_df_for_export["raw_row"].apply(lambda r: str(r) if not pd.isna(r) else "")
-                sel_df_for_export.to_excel(writer, sheet_name="active_sheet_selection", index=False)
-                pd.DataFrame([summary["counts"]]).to_excel(writer, sheet_name="summary_counts", index=False)
-                pd.DataFrame([summary["regular_attendance_summary"]]).to_excel(writer, sheet_name="regular_summary", index=False)
-                pd.DataFrame(details["present_5_days"]).to_excel(writer, sheet_name="present_5_days", index=False)
-                pd.DataFrame(details["present_3_or_more_days"]).to_excel(writer, sheet_name="present_3_plus", index=False)
-                pd.DataFrame(details["defaulters_less_than_3_days"]).to_excel(writer, sheet_name="defaulters_lt3", index=False)
-            report_path = str(report_file.name)
-        except Exception:
-            logger.exception("Failed to write export report")
-            report_path = None
-
-    out = {
-        "mode": mode,
-        "stats_detail": stats_detail,
-        "summary": summary,
-        "details": details
-    }
-    if report_path:
-        out["report_path"] = report_path
-    return out
-
+                db.rollback()
 
 if __name__ == "__main__":
-    # quick smoke test (adjust filters as needed)
-    res = compare_ccure_vs_sheets(region_filter="APAC", location_city="Pune", export=False, limit_list=50)
-    import json as _json
-    print(_json.dumps(res, indent=2, default=str))
+    # ingestion convenience: read all uploaded files
+    for f in os.listdir(UPLOAD_DIR):
+        p = UPLOAD_DIR / f
+        if 'contractor' in f.lower() or 'contractor' in str(p).lower():
+            ingest_contractor_excel(p)
+        else:
+            ingest_employee_excel(p)
+    print("Ingestion completed.")
 
 
 
+
+
+
+
+
+
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\models.py
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, Date
+from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship
+from db import Base
+
+class ActiveEmployee(Base):
+    __tablename__ = "active_employees"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True, unique=True, nullable=False)
+    full_name = Column(String, index=True)
+    email = Column(String)
+    location_city = Column(String, index=True)
+    location_desc = Column(String)
+    current_status = Column(String)
+    raw_row = Column(JSON)  # store original row for reference
+    uploaded_at = Column(DateTime)
+
+class ActiveContractor(Base):
+    __tablename__ = "active_contractors"
+    id = Column(Integer, primary_key=True)
+    worker_system_id = Column(String, index=True, unique=True, nullable=False)
+    ipass_id = Column(String, index=True)
+    full_name = Column(String, index=True)
+    vendor = Column(String)
+    location = Column(String)
+    status = Column(String)
+    raw_row = Column(JSON)
+    uploaded_at = Column(DateTime)
+
+class LiveSwipe(Base):
+    __tablename__ = "live_swipes"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, index=True)
+    employee_id = Column(String, index=True, nullable=True)
+    card_number = Column(String, index=True, nullable=True)
+    full_name = Column(String)
+    partition = Column(String, index=True)
+    floor = Column(String)
+    door = Column(String)
+    region = Column(String, index=True)
+    raw = Column(JSON)
+
+class AttendanceSummary(Base):
+    __tablename__ = "attendance_summary"
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(String, index=True)
+    date = Column(Date, index=True)
+    presence_count = Column(Integer)
+    first_seen = Column(DateTime)
+    last_seen = Column(DateTime)
+    derived = Column(JSON)  # extra stats
 
 
 
@@ -4814,9 +3052,6 @@ def fetch_all_history(timeout=6):
             logger.exception(f"[region_clients] error aggregating history for {region}")
             continue
     return all_entries
-
-
-
 
 
 
