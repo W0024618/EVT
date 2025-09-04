@@ -1,3 +1,1161 @@
+# data_compare_service_v2.py
+"""
+Comparison service (v2) with broadened matching heuristics and safer prefetch/cache.
+Improved: deeper scalar iteration, robust timestamp parsing, clearer logging and example matches.
+Drop-in replacement for your existing data_compare_service_v2.py
+"""
+
+import sys
+import re
+import uuid
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
+import pandas as pd
+
+# HTTP client for region histories
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+except Exception:
+    requests = None
+
+# DB imports (same as your project)
+from db import SessionLocal
+from models import AttendanceSummary
+
+# Settings / defaults
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR, REGION_HISTORY_URLS as SETTINGS_REGION_HISTORY_URLS
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+    REGION_HISTORY_URLS = SETTINGS_REGION_HISTORY_URLS
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+    REGION_HISTORY_URLS = [
+        "http://10.199.22.57:3008/api/occupancy/history",  # APAC
+        "http://10.199.22.57:3006/api/occupancy/history",  # NAMER
+        "http://10.199.22.57:3007/api/occupancy/history",  # EMEA
+        "http://10.199.22.57:4000/api/occupancy/history"   # LACA
+    ]
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("data_compare_service_v2")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# In-memory cache for prefetched region history entries
+REGION_HISTORY_CACHE = None
+REGION_HISTORY_CACHE_FETCHED_AT = None
+REGION_HISTORY_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+# Matching config
+ID_FIELD_CANDIDATES = [
+    "EmployeeID","employeeId","Employee Id","EmpID","Emp Id","EmpNo","EmployeeNo","Employee_Number",
+    "PersonID","PersonId","personId","person_id","employee_id","id","Id","employeeNumber","EmployeeNumber",
+    "worker_system_id","wsid","WorkerID","Worker System Id","workerId","WorkerSystemId"
+]
+CARD_FIELD_CANDIDATES = [
+    "CardNumber","Card","cardNumber","card_number","BadgeNumber","BadgeNo","Badge","badgeNumber","badge_no",
+    "iPassID","IPassID","iPass","i_pass_id","CardNo","card_no","card","IPASSID","IPass"
+]
+NAME_FIELD_CANDIDATES = [
+    "FullName","Full Name","EmpName","Name","full_name","displayName","personName","PersonName"
+]
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _find_active_employee_file():
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_employee{ext}"
+        if p.exists():
+            return p
+    for p in DATA_DIR.iterdir():
+        if p.is_file() and "active_employee" in p.name.lower():
+            return p
+    return None
+
+def _normalize_key(k):
+    if k is None:
+        return None
+    try:
+        s = str(k).strip()
+        return s if s != "" else None
+    except Exception:
+        return None
+
+def _digits_only(s):
+    if s is None:
+        return ""
+    return re.sub(r'\D+', '', str(s))
+
+def _safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+def _week_monday_and_friday(ref_date: Optional[date] = None):
+    if ref_date is None:
+        ref_date = date.today()
+    iso = ref_date.isoweekday()
+    monday = ref_date - timedelta(days=(iso - 1))
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+def _maybe_mark_on_leave(status_str: Optional[str]) -> bool:
+    if not status_str:
+        return False
+    s = str(status_str).strip().lower()
+    for tok in ("leave", "vacation", "on leave", "holiday", "sabbatical", "furlough", "loa"):
+        if tok in s:
+            return True
+    return False
+
+# ----------------------------
+# Load active sheet
+# ----------------------------
+def load_active_employees_dataframe() -> pd.DataFrame:
+    src = _find_active_employee_file()
+    if not src:
+        raise FileNotFoundError(f"Active employee canonical file not found in {DATA_DIR}")
+    ext = src.suffix.lower()
+    if ext in (".xls", ".xlsx"):
+        df = pd.read_excel(src, sheet_name=0, dtype=str)
+    else:
+        df = pd.read_csv(src, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+
+    def _first_present(row, candidates):
+        for c in candidates:
+            if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+                return row[c]
+        return None
+
+    rows = []
+    for _, row in df.iterrows():
+        emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','EmployeeNo','Employee No'])
+        if emp_id is None:
+            continue
+        full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or (
+            f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+        )
+        location_city = _first_present(row, ['Location City','Location','City'])
+        location_desc = _first_present(row, ['Location Description','LocationDescription'])
+        location_state = _first_present(row, ['Location State / Province','Location State','State','Province'])
+        region_code = _first_present(row, ['Region Code','Region','RegionCode'])
+        current_status = _first_present(row, ['Current Status','Status','Employee Status'])
+        employee_type = _first_present(row, ['Employee Type','Type','Time Type'])
+        rows.append({
+            "employee_id": _normalize_key(emp_id),
+            "full_name": _normalize_key(full_name),
+            "location_city": _normalize_key(location_city),
+            "location_desc": _normalize_key(location_desc),
+            "location_state": _normalize_key(location_state),
+            "region_code": (str(region_code).strip() if region_code is not None else None),
+            "current_status": _normalize_key(current_status),
+            "employee_type": _normalize_key(employee_type),
+            "raw_row": row.to_dict()
+        })
+    ndf = pd.DataFrame(rows)
+    for col in ("employee_id","full_name","location_city","location_desc","location_state","region_code","current_status","employee_type","raw_row"):
+        if col not in ndf:
+            ndf[col] = None
+    ndf = ndf[ndf["employee_id"].notna() & (ndf["employee_id"].str.strip() != "")]
+    ndf.reset_index(drop=True, inplace=True)
+    return ndf
+
+# ----------------------------
+# HTTP Session factory (retries/backoff)
+# ----------------------------
+def _build_requests_session():
+    if requests is None:
+        return None
+    s = requests.Session()
+    allowed = frozenset(['GET', 'HEAD'])
+    try:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=allowed
+        )
+    except TypeError:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=allowed
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+# ----------------------------
+# Prefetch / cache helpers
+# ----------------------------
+def prefetch_region_history(timeout: int = 10, force: bool = False):
+    """
+    Fetch region history entries (cached). Returns list of raw entries.
+    """
+    global REGION_HISTORY_CACHE, REGION_HISTORY_CACHE_FETCHED_AT
+    try:
+        now = datetime.utcnow()
+        if not force and REGION_HISTORY_CACHE is not None and REGION_HISTORY_CACHE_FETCHED_AT:
+            elapsed = (now - REGION_HISTORY_CACHE_FETCHED_AT).total_seconds()
+            if elapsed < REGION_HISTORY_CACHE_TTL_SECONDS:
+                logger.info("[region_cache] Using cached region history (age %.1fs)", elapsed)
+                return REGION_HISTORY_CACHE
+
+        entries = []
+        # Prefer region_clients when available
+        try:
+            import region_clients
+            logger.info("[region_cache] fetching region history via region_clients.fetch_all_history()")
+            try:
+                got = region_clients.fetch_all_history(timeout=timeout)
+            except TypeError:
+                got = region_clients.fetch_all_history()
+            entries = got or []
+        except Exception:
+            entries = []
+
+        # If empty, try direct requests to configured URLs
+        if not entries and requests is not None:
+            logger.info("[region_cache] fetching region history directly from endpoints")
+            session = _build_requests_session() or requests
+            for url in REGION_HISTORY_URLS:
+                if not url:
+                    continue
+                try:
+                    resp = session.get(url, timeout=(3, max(5, timeout)))
+                    if not resp or resp.status_code != 200:
+                        continue
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        continue
+                    # flatten possible lists
+                    if isinstance(payload, list):
+                        for p in payload:
+                            if isinstance(p, dict):
+                                p['_source_url'] = url
+                                entries.append(p)
+                    elif isinstance(payload, dict):
+                        found_list = False
+                        for k in ("results","summaryByDate","details","data","entries","list","people","items"):
+                            if k in payload and isinstance(payload[k], list):
+                                for p in payload[k]:
+                                    if isinstance(p, dict):
+                                        p['_source_url'] = url
+                                        entries.append(p)
+                                found_list = True
+                                break
+                        if not found_list:
+                            payload['_source_url'] = url
+                            entries.append(payload)
+                except requests.exceptions.RequestException as e:
+                    logger.warning("[region_cache] fetch failed for %s: %s", url, str(e))
+                    continue
+
+        REGION_HISTORY_CACHE = entries or []
+        REGION_HISTORY_CACHE_FETCHED_AT = datetime.utcnow()
+        logger.info("[region_cache] prefetched %d region history entries", len(REGION_HISTORY_CACHE))
+        return REGION_HISTORY_CACHE
+    except Exception:
+        logger.exception("[region_cache] prefetch failed")
+        REGION_HISTORY_CACHE = REGION_HISTORY_CACHE or []
+        REGION_HISTORY_CACHE_FETCHED_AT = datetime.utcnow()
+        return REGION_HISTORY_CACHE
+
+# ----------------------------
+# Payload helpers (deep search)
+# ----------------------------
+def _iter_scalars_in_obj(obj, parent_key=""):
+    """
+    Yield all scalar key->value pairs inside nested dict/list structures as (key_path, value).
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_key = f"{parent_key}.{k}" if parent_key else str(k)
+            if isinstance(v, (dict, list)):
+                yield from _iter_scalars_in_obj(v, parent_key=new_key)
+            else:
+                yield new_key, v
+    elif isinstance(obj, list):
+        for idx, it in enumerate(obj):
+            new_key = f"{parent_key}[{idx}]" if parent_key else f"[{idx}]"
+            if isinstance(it, (dict, list)):
+                yield from _iter_scalars_in_obj(it, parent_key=new_key)
+            else:
+                yield new_key, it
+
+def _extract_details_from_payload(payload):
+    """
+    Normalize to list of dict rows that look like detail records.
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [p for p in payload if isinstance(p, dict)]
+    if isinstance(payload, dict):
+        for k in ("details","results","data","entries","list","people","items"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+        # single-record-like payload (date-summary) -> return as single element to allow higher-level scanner to inspect fields
+        if any(k in payload for k in ("date","Employee","Contractor","total","day")) and len(payload.keys()) <= 40:
+            return [payload]
+    return []
+
+# ----------------------------
+# ID matching helpers
+# ----------------------------
+def _match_candidate_to_employees(candidate_raw, orig_ids_set, orig_ids_list, digits_map):
+    """
+    Try many heuristics to map candidate_raw to one of the orig_ids_list.
+    Returns matched_orig_id or None.
+    """
+    if candidate_raw is None:
+        return None
+    cand_str = str(candidate_raw).strip()
+    if not cand_str:
+        return None
+
+    # direct exact match
+    if cand_str in orig_ids_set:
+        return cand_str
+
+    # direct case-insensitive match
+    for o in orig_ids_list:
+        if isinstance(o, str) and cand_str.lower() == o.lower():
+            return o
+
+    # numeric transformations
+    cand_digits = _digits_only(cand_str)
+    if cand_digits:
+        cand_nolead = cand_digits.lstrip('0') or cand_digits
+        # direct digits match to original ids
+        for o in orig_ids_list:
+            if not isinstance(o, str):
+                continue
+            if o == cand_digits or o == cand_nolead:
+                return o
+            od = _digits_only(o)
+            if od == cand_digits or od == cand_nolead:
+                return o
+        # numeric equality by int
+        try:
+            ci = int(cand_nolead)
+            for o in orig_ids_list:
+                try:
+                    od = _digits_only(o)
+                    if not od:
+                        continue
+                    oi = int(od.lstrip('0') or od)
+                    if oi == ci:
+                        return o
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # last-n digits heuristics (conservative)
+        if len(cand_digits) >= 3:
+            for n in (6, 4):
+                suf = cand_digits[-n:]
+                if not suf:
+                    continue
+                for o in orig_ids_list:
+                    od = _digits_only(o)
+                    if od and od.endswith(suf):
+                        return o
+
+    # strip common prefixes and retry
+    up = cand_str.upper()
+    for pref in ("W", "IPASS", "IPASSID", "IPass"):
+        if up.startswith(pref):
+            stripped = cand_str[len(pref):]
+            m = _match_candidate_to_employees(stripped, orig_ids_set, orig_ids_list, digits_map)
+            if m:
+                return m
+
+    # fallback: find numeric substrings inside string and try mapping
+    for match in re.finditer(r'(\d{3,})', cand_str):
+        ssub = match.group(1)
+        m = _match_candidate_to_employees(ssub, orig_ids_set, orig_ids_list, digits_map)
+        if m:
+            return m
+
+    return None
+
+# ----------------------------
+# Region history scanning -> build presence map
+# ----------------------------
+def _fetch_presence_from_region_histories(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None, preloaded_entries: Optional[List[dict]] = None):
+    """
+    Scans preloaded_entries (or global cache) and returns presence mapping: {employee_id -> {date: 0/1}}
+    """
+    presence = {eid: {} for eid in employee_ids}
+    if not employee_ids:
+        return presence
+
+    if preloaded_entries is None:
+        global REGION_HISTORY_CACHE
+        preloaded_entries = REGION_HISTORY_CACHE or []
+
+    if not preloaded_entries:
+        logger.info("[region_history] no preloaded region history entries to scan")
+    else:
+        orig_ids_list = [str(e).strip() for e in employee_ids]
+        orig_ids_set = set(orig_ids_list)
+        digits_map = {e: _digits_only(e) for e in orig_ids_list}
+
+        scanned = 0
+        matched = 0
+        examples_matched = []
+
+        for entry in preloaded_entries:
+            detail_rows = []
+            if isinstance(entry, dict):
+                # prefer explicit lists
+                for key in ("details","people","items","list","results","entries","data"):
+                    if key in entry and isinstance(entry.get(key), list):
+                        detail_rows = [r for r in entry.get(key) if isinstance(r, dict)]
+                        break
+                if not detail_rows:
+                    # treat entry itself as a candidate detail row if it has plausible fields (timestamp or id-like)
+                    candidate_keys = set(ID_FIELD_CANDIDATES + CARD_FIELD_CANDIDATES + ["date","timestamp","time","SwipeDate","LocaleMessageTime","day"])
+                    if any(k in entry for k in candidate_keys):
+                        detail_rows = [entry]
+                    else:
+                        # try extract via helper (covers nested payload shapes)
+                        detail_rows = _extract_details_from_payload(entry) or []
+            else:
+                continue
+
+            scanned += len(detail_rows)
+            for d in detail_rows:
+                try:
+                    # find a timestamp / date for row
+                    ts = None
+                    # common keys first
+                    for tkey in ("LocaleMessageTime","LocaleMessageDateTime","SwipeDate","SwipeTime","timestamp","time","DateTime","date","swipeDate","day"):
+                        if tkey in d and d.get(tkey):
+                            ts = d.get(tkey)
+                            break
+
+                    # fallback: scan scalar values in row for iso-like date
+                    if ts is None:
+                        for k, v in _iter_scalars_in_obj(d):
+                            if v is None:
+                                continue
+                            try:
+                                s = str(v)
+                            except Exception:
+                                continue
+                            # quick heuristic
+                            if re.search(r'\d{4}-\d{2}-\d{2}', s) or re.search(r'\d{2}/\d{2}/\d{4}', s):
+                                ts = s
+                                break
+
+                    if ts is None:
+                        # skip row (no date info)
+                        continue
+
+                    # parse timestamp into date (robust)
+                    t = None
+                    if isinstance(ts, (int, float)):
+                        try:
+                            t = datetime.fromtimestamp(int(ts))
+                        except Exception:
+                            try:
+                                t = datetime.utcfromtimestamp(int(ts) / 1000.0)
+                            except Exception:
+                                t = None
+                    elif isinstance(ts, str):
+                        s = ts.strip()
+                        if s == "":
+                            t = None
+                        else:
+                            parsed = None
+                            # try dateutil if available (best)
+                            try:
+                                from dateutil import parser as _parser
+                                parsed = _parser.parse(s)
+                            except Exception:
+                                parsed = None
+                            if parsed:
+                                try:
+                                    if parsed.tzinfo is not None:
+                                        parsed = parsed.astimezone(tz=None).replace(tzinfo=None)
+                                except Exception:
+                                    pass
+                                t = parsed
+                            else:
+                                # try common formats
+                                fmts = [
+                                    "%Y-%m-%dT%H:%M:%S.%fZ",
+                                    "%Y-%m-%dT%H:%M:%S.%f",
+                                    "%Y-%m-%dT%H:%M:%S",
+                                    "%Y-%m-%d %H:%M:%S",
+                                    "%Y-%m-%d",
+                                    "%d/%m/%Y %H:%M:%S",
+                                    "%d/%m/%Y"
+                                ]
+                                for f in fmts:
+                                    try:
+                                        t = datetime.strptime(s, f)
+                                        break
+                                    except Exception:
+                                        t = None
+                    if t is None:
+                        continue
+
+                    dt = t.date()
+                    if dt < start_date or dt > end_date:
+                        continue
+
+                    # partition filter (if provided)
+                    if partition_filter:
+                        part_values = []
+                        for k in ("PartitionNameFriendly","PartitionName","PrimaryLocation","partition","location","Partition","Location","Site","PartitionName1","PartitionName2"):
+                            v = d.get(k)
+                            if v:
+                                part_values.append(str(v))
+                        if part_values:
+                            ok = any(part_filter_match(part, partition_filter) for part in part_values)
+                            if not ok:
+                                continue
+                        else:
+                            # no partition info -> skip when filter exists
+                            continue
+
+                    # attempt to match explicit id keys first
+                    matched_key = None
+                    for k in ID_FIELD_CANDIDATES:
+                        if k in d and d.get(k) is not None and str(d.get(k)).strip() != "":
+                            m = _match_candidate_to_employees(d.get(k), orig_ids_set, orig_ids_list, digits_map)
+                            if m:
+                                matched_key = m
+                                break
+
+                    # try card fields
+                    if not matched_key:
+                        for k in CARD_FIELD_CANDIDATES:
+                            if k in d and d.get(k) is not None and str(d.get(k)).strip() != "":
+                                m = _match_candidate_to_employees(d.get(k), orig_ids_set, orig_ids_list, digits_map)
+                                if m:
+                                    matched_key = m
+                                    break
+
+                    # deep-scan scalars for numeric substrings and name fields
+                    if not matched_key:
+                        for key_path, val in _iter_scalars_in_obj(d):
+                            if val is None:
+                                continue
+                            sval = str(val)
+                            # numeric substring preference
+                            if re.search(r'\d{3,}', sval):
+                                m = _match_candidate_to_employees(sval, orig_ids_set, orig_ids_list, digits_map)
+                                if m:
+                                    matched_key = m
+                                    break
+                        # check name fields that may contain last name -> (left disabled by default; can be enabled later)
+                        # (conservative) if matched_key still None we skip name mapping to avoid false positives
+
+                    if matched_key:
+                        matched += 1
+                        # coerce matched_key to exact string from orig list
+                        matched_key = next((o for o in orig_ids_list if str(o).strip() == str(matched_key).strip()), str(matched_key).strip())
+                        presence.setdefault(matched_key, {})
+                        presence[matched_key][dt] = 1
+                        if len(examples_matched) < 10:
+                            examples_matched.append({"matched": matched_key, "date": dt.isoformat(), "sample_row_keys": list(d.keys())[:8]})
+                except Exception:
+                    continue
+
+        logger.info("[region_history] scanned %d detail rows from preloaded entries; matched %d presence entries", scanned, matched)
+        if examples_matched:
+            logger.debug("[region_history] example matches (up to 10): %s", examples_matched)
+
+    # fill zeros for any missing date
+    cur = start_date
+    while cur <= end_date:
+        for eid in employee_ids:
+            presence.setdefault(eid, {})
+            if cur not in presence[eid]:
+                presence[eid][cur] = 0
+        cur = cur + timedelta(days=1)
+
+    return presence
+
+def part_filter_match(src_val, partition_filter):
+    try:
+        if not src_val:
+            return False
+        return partition_filter.strip().lower() in str(src_val).strip().lower()
+    except Exception:
+        return False
+
+# ----------------------------
+# DB / combined fetch
+# ----------------------------
+def _fetch_presence_for_employees(employee_ids: List[str], start_date: date, end_date: date, partition_filter: Optional[str] = None):
+    """
+    1) chunked DB IN queries (AttendanceSummary)
+    2) fallback broad DB query
+    3) fallback region history cache scan (prefetch_region_history)
+    """
+    if not employee_ids:
+        return {}
+
+    orig_ids = [str(e).strip() for e in employee_ids]
+    norm_id_set = set([s for s in orig_ids if s])
+    result = {eid: {} for eid in orig_ids}
+
+    # 1) chunked DB fetch
+    rows = []
+    chunk_size = 500
+    try:
+        with SessionLocal() as db:
+            for i in range(0, len(orig_ids), chunk_size):
+                chunk = orig_ids[i:i+chunk_size]
+                try:
+                    q = db.query(AttendanceSummary).filter(
+                        AttendanceSummary.date >= start_date,
+                        AttendanceSummary.date <= end_date,
+                        AttendanceSummary.employee_id.in_(chunk)
+                    )
+                    rows_chunk = q.all()
+                    if rows_chunk:
+                        rows.extend(rows_chunk)
+                except Exception:
+                    logger.exception("chunked query failed (continuing)")
+                    continue
+
+            # fallback broad query if none found
+            if not rows:
+                try:
+                    rows = db.query(AttendanceSummary).filter(
+                        AttendanceSummary.date >= start_date,
+                        AttendanceSummary.date <= end_date
+                    ).all()
+                    logger.info("[presence_fetch] fallback broad DB query returned %d rows for %s -> %s", len(rows), start_date, end_date)
+                except Exception:
+                    logger.exception("fallback broad DB query failed")
+                    rows = []
+    except Exception:
+        logger.exception("DB session error in _fetch_presence_for_employees")
+        rows = []
+
+    # map DB rows to provided employee ids
+    for r in rows:
+        try:
+            raw = r.employee_id
+            if raw is None:
+                continue
+            db_key = str(raw).strip()
+            match_key = None
+            if db_key in norm_id_set:
+                match_key = db_key
+            else:
+                digits = _digits_only(db_key)
+                if digits:
+                    cand = digits.lstrip('0') or digits
+                    if cand in norm_id_set:
+                        match_key = cand
+                if match_key is None:
+                    for o in orig_ids:
+                        if o == db_key or o.lstrip('0') == db_key or db_key.lstrip('0') == o:
+                            match_key = o
+                            break
+            if not match_key:
+                continue
+            d = r.date
+            present = 0
+            try:
+                present = int(r.presence_count or 0)
+            except Exception:
+                present = 1 if (r.presence_count and str(r.presence_count).strip() != "0") else 0
+            result.setdefault(match_key, {})
+            prev = result[match_key].get(d, 0)
+            result[match_key][d] = 1 if (prev == 1 or present > 0) else 0
+        except Exception:
+            continue
+
+    # fill zeros
+    cur = start_date
+    while cur <= end_date:
+        for eid in orig_ids:
+            result.setdefault(eid, {})
+            if cur not in result[eid]:
+                result[eid][cur] = 0
+        cur = cur + timedelta(days=1)
+
+    db_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
+    logger.info("[presence_fetch] DB-derived presence found for %d/%d employees", db_positive, len(orig_ids))
+
+    # fallback to region history if needed
+    if db_positive == 0 or db_positive < max(10, int(0.1 * len(orig_ids))):
+        try:
+            logger.info("[presence_fetch] DB coverage low (%d/%d) - trying region occupancy history fallback", db_positive, len(orig_ids))
+            # ensure cache is populated
+            prefetch_region_history()
+            region_presence = _fetch_presence_from_region_histories(orig_ids, start_date, end_date, partition_filter=partition_filter)
+            for eid in orig_ids:
+                rp = region_presence.get(eid, {})
+                for d, v in rp.items():
+                    if v and result.setdefault(eid, {}).get(d, 0) == 0:
+                        result[eid][d] = 1
+        except Exception:
+            logger.exception("region history fallback failed")
+
+    final_positive = sum(1 for eid in orig_ids if any(v == 1 for v in result.get(eid, {}).values()))
+    logger.info("[presence_fetch] final presence coverage: %d/%d employees have at least one positive day", final_positive, len(orig_ids))
+    return result
+
+# ----------------------------
+# Main compare function (public)
+# ----------------------------
+def compare_ccure_vs_sheets(
+    mode: str = "full",
+    stats_detail: str = "ActiveProfiles",
+    limit_list: int = 200,
+    export: bool = False,
+    region_filter: Optional[str] = None,
+    location_city: Optional[str] = None,
+    location_state: Optional[str] = None,
+    location_description: Optional[str] = None,
+    week_ref_date: Optional[str] = None
+):
+    # compute week window
+    if week_ref_date:
+        monday, friday = _week_monday_and_friday(date.fromisoformat(week_ref_date))
+    else:
+        monday, friday = _week_monday_and_friday(date.today())
+
+    try:
+        df = load_active_employees_dataframe()
+    except Exception as e:
+        logger.exception("Failed to load active employees sheet")
+        return {"error": f"active sheet load failed: {e}"}
+
+    rf = region_filter.strip().lower() if region_filter else None
+    lc = location_city.strip().lower() if location_city else None
+    ls = location_state.strip().lower() if location_state else None
+    ld = location_description.strip().lower() if location_description else None
+
+    sel = df.copy()
+    if rf:
+        sel = sel[sel["region_code"].fillna("").str.strip().str.lower() == rf]
+    if lc:
+        sel = sel[sel["location_city"].fillna("").str.strip().str.lower() == lc]
+    if ls:
+        sel = sel[sel["location_state"].fillna("").str.strip().str.lower() == ls]
+    if ld:
+        sel = sel[sel["location_desc"].fillna("").str.strip().str.lower() == ld]
+
+    total_active = len(sel)
+    employee_ids = sel["employee_id"].astype(str).str.strip().tolist()
+
+    presence_map = _fetch_presence_for_employees(employee_ids, monday, friday, partition_filter=location_city)
+
+    # compute today count
+    today = date.today()
+    today_count = 0
+    for eid in employee_ids:
+        pm = presence_map.get(eid, {})
+        if pm.get(today, 0) > 0:
+            today_count += 1
+        else:
+            # fallback DB check
+            try:
+                with SessionLocal() as db:
+                    row = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == eid, AttendanceSummary.date == today).first()
+                    if row and getattr(row, "presence_count", 0) > 0:
+                        today_count += 1
+                        continue
+                    digits = _digits_only(eid)
+                    if digits:
+                        cand = digits.lstrip('0') or digits
+                        row2 = db.query(AttendanceSummary).filter(AttendanceSummary.employee_id == cand, AttendanceSummary.date == today).first()
+                        if row2 and getattr(row2, "presence_count", 0) > 0:
+                            today_count += 1
+            except Exception:
+                continue
+
+    today_pct = round((today_count / float(total_active)) * 100.0, 2) if total_active > 0 else None
+
+    sel["on_leave"] = sel["current_status"].apply(lambda x: _maybe_mark_on_leave(x))
+    leave_count = int(sel["on_leave"].sum())
+    sel["employee_type_norm"] = sel["employee_type"].fillna("").str.strip().str.lower()
+    type_counts = sel["employee_type_norm"].value_counts().to_dict()
+
+    regular_df = sel[sel["employee_type_norm"].str.contains("regular", na=False)]
+    regular_ids = regular_df["employee_id"].astype(str).str.strip().tolist()
+
+    regular_presence = {}
+    for eid in regular_ids:
+        week_map = presence_map.get(eid, {})
+        days_present = sum(1 for d, v in week_map.items() if v and (monday <= d <= friday))
+        days_present = int(days_present)
+        regular_presence[eid] = {
+            "days_present": days_present,
+            "on_leave": bool(sel[sel["employee_id"] == eid]["on_leave"].any()),
+            "full_name": sel[sel["employee_id"] == eid]["full_name"].iloc[0] if not sel[sel["employee_id"] == eid].empty else None
+        }
+
+    present_5_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 5)
+    present_3_or_more_count = sum(1 for v in regular_presence.values() if v["days_present"] >= 3)
+    present_less_than_3_count = sum(1 for v in regular_presence.values() if v["days_present"] < 3)
+    present_only_1_count = sum(1 for v in regular_presence.values() if v["days_present"] == 1)
+
+    present_5_list = []
+    present_3_list = []
+    defaulters_list = []
+
+    for eid, info in regular_presence.items():
+        entry = {
+            "employee_id": eid,
+            "full_name": info["full_name"],
+            "days_present": info["days_present"],
+            "on_leave": info["on_leave"]
+        }
+        if info["days_present"] >= 5:
+            present_5_list.append(entry)
+        if info["days_present"] >= 3:
+            present_3_list.append(entry)
+        if info["days_present"] < 3:
+            defaulters_list.append(entry)
+
+    present_5_list = sorted(present_5_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
+    present_3_list = sorted(present_3_list, key=lambda x: (-x["days_present"], x["full_name"] or ""))[:limit_list]
+    defaulters_list = sorted(defaulters_list, key=lambda x: (x["days_present"], x["on_leave"], x["full_name"] or ""))[:limit_list]
+
+    summary = {
+        "filters": {
+            "region": region_filter,
+            "location_city": location_city,
+            "location_state": location_state,
+            "location_description": location_description,
+            "week_monday": monday.isoformat(),
+            "week_friday": friday.isoformat()
+        },
+        "counts": {
+            "total_active_in_sheet": total_active,
+            "today_headcount_from_summary": today_count,
+            "today_headcount_pct_vs_sheet": today_pct,
+            "on_leave_count_in_sheet": leave_count,
+            "employee_type_counts": type_counts
+        },
+        "regular_attendance_summary": {
+            "regular_total": len(regular_ids),
+            "present_5_day_count": present_5_count,
+            "present_3_or_more_count": present_3_or_more_count,
+            "present_less_than_3_count": present_less_than_3_count,
+            "present_only_1_day_count": present_only_1_count
+        }
+    }
+
+    details = {
+        "present_5_days": present_5_list,
+        "present_3_or_more_days": present_3_list,
+        "defaulters_less_than_3_days": defaulters_list
+    }
+
+    report_path = None
+    if export:
+        try:
+            report_name = f"attendance_compare_{(region_filter or 'all')}_{(location_city or 'all')}_{uuid.uuid4().hex[:8]}.xlsx"
+            report_file = OUTPUT_DIR / report_name
+            with pd.ExcelWriter(report_file, engine="openpyxl") as writer:
+                sel_df_for_export = sel.copy()
+                sel_df_for_export["raw_row_str"] = sel_df_for_export["raw_row"].apply(lambda r: str(r) if r is not None else "")
+                sel_df_for_export.to_excel(writer, sheet_name="active_sheet_selection", index=False)
+                pd.DataFrame([summary["counts"]]).to_excel(writer, sheet_name="summary_counts", index=False)
+                pd.DataFrame([summary["regular_attendance_summary"]]).to_excel(writer, sheet_name="regular_summary", index=False)
+                pd.DataFrame(details["present_5_days"]).to_excel(writer, sheet_name="present_5_days", index=False)
+                pd.DataFrame(details["present_3_or_more_days"]).to_excel(writer, sheet_name="present_3_plus", index=False)
+                pd.DataFrame(details["defaulters_less_than_3_days"]).to_excel(writer, sheet_name="defaulters_lt3", index=False)
+            report_path = str(report_file.name)
+        except Exception:
+            logger.exception("Failed to write export report")
+            report_path = None
+
+    out = {
+        "mode": mode,
+        "stats_detail": stats_detail,
+        "summary": summary,
+        "details": details
+    }
+    if report_path:
+        out["report_path"] = report_path
+    return out
+
+
+if __name__ == "__main__":
+    res = compare_ccure_vs_sheets(region_filter="APAC", location_city="Pune", export=False, limit_list=20)
+    import json as _json
+    print(_json.dumps(res, indent=2, default=str))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# region_clients.py
+"""
+HTTP helpers for region occupancy endpoints.
+Returns:
+ - fetch_all_regions() -> list of {"region": <name>, "count": <int>}
+ - fetch_all_details(timeout=...) -> list of person-detail dicts (where available)
+ - fetch_all_history(timeout=...) -> list of date-or-detail dicts (history endpoints)
+
+Drop-in replacement for your region_clients.py.
+"""
+
+import requests
+from requests.exceptions import RequestException
+from datetime import datetime
+import logging
+import time
+import sys
+
+logger = logging.getLogger("region_clients")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# endpoints (edit if your hosts differ)
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+history_endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/history",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
+}
+
+DEFAULT_ATTEMPTS = 3
+DEFAULT_BACKOFF = 0.6
+
+def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # use connect,read timeouts tuple for clarity
+            r = requests.get(url, timeout=(3, max(5, timeout)))
+            r.raise_for_status()
+            try:
+                return r.json()
+            except ValueError:
+                try:
+                    return {"_raw_text": r.text}
+                except Exception:
+                    return None
+        except RequestException as e:
+            last_err = e
+            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
+    return None
+
+def fetch_all_regions(timeout=6):
+    results = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            realtime = {}
+            if isinstance(data, dict):
+                realtime = data.get("realtime", {}) or {}
+            total = 0
+            for site in realtime.values():
+                try:
+                    total += int(site.get("total", 0))
+                except Exception:
+                    pass
+            if total == 0 and isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict) and "total" in v:
+                        try:
+                            total += int(v.get("total", 0))
+                        except Exception:
+                            pass
+            results.append({"region": region, "count": total})
+        except Exception as e:
+            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
+            results.append({"region": region, "count": None})
+    return results
+
+def _extract_list_candidates(data):
+    """
+    Helper to find lists that may contain detail rows inside a payload.
+    """
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for k in ("details","people","list","items","results","data","entries"):
+            if k in data and isinstance(data[k], list):
+                return [x for x in data[k] if isinstance(x, dict)]
+        # top-level dict might be single row; return empty here (caller will inspect)
+        return []
+    return []
+
+def fetch_all_details(timeout=6):
+    """
+    Attempt to fetch person-level detail records from live-summary endpoints.
+    Returns a list of dicts (flattened detail rows). Regions that don't provide details will be skipped.
+    """
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            details = _extract_list_candidates(data)
+            # also attempt to find nested partitions that contain details
+            if not details and isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, dict):
+                        candidates = _extract_list_candidates(v)
+                        if candidates:
+                            details.extend(candidates)
+            for d in details:
+                try:
+                    d2 = dict(d)
+                    d2["_region"] = region
+                    d2["_source_url"] = url
+                    all_details.append(d2)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
+            continue
+
+    # try history endpoints as second chance (they sometimes include per-person rows)
+    if not all_details:
+        for region, url in history_endpoints.items():
+            try:
+                data = _do_get_with_retries(url, timeout=timeout) or {}
+                details = _extract_list_candidates(data)
+                for d in details:
+                    try:
+                        d2 = dict(d)
+                        d2["_region"] = region
+                        d2["_source_url"] = url
+                        all_details.append(d2)
+                    except Exception:
+                        continue
+            except Exception:
+                logger.debug(f"[region_clients] history details fetch for {region} failed", exc_info=True)
+                continue
+
+    logger.info("[region_clients] fetched %d detail rows across endpoints", len(all_details))
+    return all_details
+
+def fetch_history_for_region(region, timeout=6):
+    url = history_endpoints.get(region)
+    if not url:
+        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
+        return []
+    try:
+        data = _do_get_with_retries(url, timeout=timeout) or {}
+        summary = []
+        if isinstance(data, dict):
+            # try common key names
+            for key in ("summaryByDate","summary","data","entries","results","details","items"):
+                if key in data and isinstance(data.get(key), list):
+                    for s in data.get(key):
+                        if isinstance(s, dict):
+                            s2 = dict(s)
+                            s2["_region"] = region
+                            s2["_source_url"] = url
+                            summary.append(s2)
+                    break
+            else:
+                # maybe single dict date-summary
+                if "date" in data or "day" in data:
+                    s2 = dict(data)
+                    s2["_region"] = region
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        elif isinstance(data, list):
+            for s in data:
+                if isinstance(s, dict):
+                    s2 = dict(s)
+                    s2["_region"] = region
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        return summary
+    except Exception as e:
+        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
+        return []
+
+def fetch_all_history(timeout=6):
+    all_entries = []
+    for region in history_endpoints.keys():
+        try:
+            entries = fetch_history_for_region(region, timeout=timeout)
+            if entries:
+                all_entries.extend(entries)
+        except Exception:
+            logger.exception(f"[region_clients] error aggregating history for {region}")
+            continue
+    logger.info("[region_clients] fetched %d history entries", len(all_entries))
+    return all_entries
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check API Respone . We are not getting expected output debug below file line by line and fix the issue ..
 
 http://localhost:8000/ccure/compare_v2?region_filter=APAC&location_city=Pune&week_ref_date=2025-08-25
