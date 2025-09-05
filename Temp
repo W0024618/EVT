@@ -1,3 +1,270 @@
+"""
+duration_report.py
+
+Purpose:
+  - Connects to ACVSUJournal MSSQL databases for APAC, EMEA, LACA, NAMER regions (credentials provided by user)
+  - Extracts CardAdmitted swipe events for a specified date and computes daily duration per employee
+    using first swipe (min) and last swipe (max) timestamps for that date.
+  - Writes per-region CSV duration reports and returns pandas DataFrames for further use.
+  - Contains clear TODO hooks to later improve shift-aware logic.
+
+Notes & Usage:
+  - Place this file in:
+      C:/Users/W0024618/Desktop/global-page/backend/attendance-analytics
+    (or any other folder).
+
+  - Requires Python packages: pyodbc, pandas, python-dateutil
+    Install (example):
+      pip install pyodbc pandas python-dateutil
+
+  - ODBC driver: adjust DRIVER in the connection string depending on the host environment.
+    Example uses 'ODBC Driver 17 for SQL Server' by default.
+    If you use a different driver (e.g. 18), change the DRIVER value.
+
+  - Example CLI usage:
+      python duration_report.py --date 2025-07-21 --regions apac,namer --outdir ./out_reports
+
+  - The script by default picks "today" in Asia/Kolkata timezone if --date is omitted.
+
+Security:
+  - This script contains credentials as provided by the user. In production, consider moving credentials
+    to environment variables or a secure vault.
+
+TODO (future improvements):
+  - Shift-aware logic: handle cases where employees have predefined shift windows spanning midnight,
+    and decide which swipes belong to which shift.
+  - Handle badge-in-only or badge-out-only cases (e.g., tele-getting or push-button exits)
+  - More advanced deduplication of multiple swipes in short windows.
+
+"""
+
+import argparse
+import logging
+import os
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+
+import pandas as pd
+
+# Optional: import pyodbc only when connecting (allows importing this module even without driver)
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# --------------------- Configuration ---------------------
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        # partitions to include (from provided query)
+        "partitions": [
+            "APAC.Default", "CN.Beijing", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+        ]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        # For NAMER we'll filter by ObjectName2 patterns (HQ, Austin, Miami, NYC)
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+
+# --------------------- SQL Builder ---------------------
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1],
+    t1.[ObjectName2],
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[PersonnelTypeID],
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType
+FROM [{db}].[dbo].[ACVSUJournalLog] AS t1
+INNER JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+;
+"""
+
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    return GENERIC_SQL_TEMPLATE.format(db=rc["database"], date=date_str, region_filter=region_filter)
+
+
+# --------------------- DB Utilities ---------------------
+def get_connection(region_key: str):
+    """Create and return a pyodbc connection for the region configuration."""
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """Fetch CardAdmitted swipes for the given region and target_date."""
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        cols = ["ObjectName1", "ObjectName2", "EmployeeID", "PersonnelTypeID", "PersonnelTypeName",
+                "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "MessageType"]
+        return pd.DataFrame(columns=cols)
+
+    conn = get_connection(region_key)
+    try:
+        df = pd.read_sql(sql, conn)
+    finally:
+        conn.close()
+    if "LocaleMessageTime" in df.columns:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"])
+    return df
+
+
+# --------------------- Duration Calculation ---------------------
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute first and last swipe per employee per day and duration."""
+    if swipes_df.empty:
+        return pd.DataFrame(columns=[
+            "EmployeeID", "Date", "FirstSwipe", "LastSwipe", "DurationSeconds", "Duration", "CountSwipes",
+            "PersonnelTypeName", "PartitionName2"
+        ])
+
+    df = swipes_df.copy()
+    df = df[df["EmployeeID"].notna()].copy()
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    group_cols = ["EmployeeID", "Date"]
+    agg = df.groupby(group_cols).agg(
+        FirstSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="min"),
+        LastSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="max"),
+        CountSwipes=pd.NamedAgg(column="LocaleMessageTime", aggfunc="count"),
+        PersonnelTypeName=pd.NamedAgg(column="PersonnelTypeName", aggfunc="first"),
+        PartitionName2=pd.NamedAgg(column="PartitionName2", aggfunc="first")
+    ).reset_index()
+
+    agg["DurationSeconds"] = (agg["LastSwipe"] - agg["FirstSwipe"]).dt.total_seconds()
+    agg["DurationSeconds"] = agg["DurationSeconds"].clip(lower=0)
+    agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))))
+    return agg
+
+
+# --------------------- Main Runner ---------------------
+def run_for_date(target_date: date, regions: list, outdir: str) -> dict:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        swipes = fetch_swipes_for_region(r, target_date)
+        durations = compute_daily_durations(swipes)
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        durations.to_csv(csv_path, index=False)
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        results[r] = durations
+    return results
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir)
+
+    for r, df in results.items():
+        logging.info("Region %s: %d employees with computed durations", r, len(df))
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 When I run API we got got error
 
 http://localhost:8000/duration
