@@ -1,3 +1,348 @@
+@app.get("/duration")
+async def api_duration(
+    date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
+    regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
+    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune). Case-insensitive, matches PartitionName2 or ObjectName2"),
+    outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
+    sample_rows: int = Query(10, ge=0, le=100, description="How many sample rows to include per region in response")
+):
+    try:
+        # parse date
+        if date_param:
+            try:
+                target_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        else:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("Asia/Kolkata")
+            target_date = datetime.now(tz).date()
+
+        # parse regions
+        if regions:
+            regions_list = [r.strip().lower() for r in regions.split(",") if r.strip()]
+        else:
+            regions_list = ["apac", "emea", "laca", "namer"]
+
+        # determine outdir
+        if outdir:
+            outdir_path = Path(outdir)
+        else:
+            outdir_path = OUTPUT_DIR / "duration_reports"
+        outdir_path.mkdir(parents=True, exist_ok=True)
+
+        # lazy import of duration_report
+        try:
+            import duration_report
+        except Exception as e:
+            logger.exception("Failed importing duration_report module")
+            raise HTTPException(status_code=500, detail=f"duration module import failed: {e}")
+
+        # run blocking compute in thread with timeout
+        loop = asyncio.get_running_loop()
+        # pass `city` filter as 4th arg (may be None)
+        task = loop.run_in_executor(None, duration_report.run_for_date, target_date, regions_list, str(outdir_path), city)
+        try:
+            results = await asyncio.wait_for(task, timeout=COMPUTE_WAIT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Duration computation timed out")
+        except Exception as e:
+            logger.exception("Duration run_for_date failed")
+            raise HTTPException(status_code=500, detail=f"duration run failed: {e}")
+
+        # helper to convert non-serializable values
+        def _to_json_safe(v):
+            try:
+                if pd.isna(v):
+                    return None
+            except Exception:
+                pass
+            if isinstance(v, (datetime, date)):
+                return v.isoformat()
+            if hasattr(v, "isoformat") and not isinstance(v, str):
+                try:
+                    return v.isoformat()
+                except Exception:
+                    pass
+            if isinstance(v, (int, float, bool)):
+                return v
+            return v
+
+        resp = {"date": target_date.isoformat(), "regions": {}}
+        for r, region_obj in results.items():
+            try:
+                # Expect region_obj to be dict with keys "swipes" and "durations"
+                swipes_df = None
+                durations_df = None
+                if isinstance(region_obj, dict):
+                    swipes_df = region_obj.get("swipes")
+                    durations_df = region_obj.get("durations")
+                else:
+                    # backward compatibility: region_obj may be a DataFrame (durations)
+                    durations_df = region_obj
+
+                # rows = number of aggregated persons (durations) as before
+                rows = int(len(durations_df)) if durations_df is not None else 0
+                swipe_rows = int(len(swipes_df)) if swipes_df is not None else 0
+
+                durations_sample = []
+                swipe_sample = []
+
+                if rows > 0 and sample_rows > 0:
+                    head = durations_df.head(sample_rows).copy()
+                    for col in head.columns:
+                        head[col] = head[col].apply(lambda v: _to_json_safe(v))
+                    # ensure numeric DurationSeconds
+                    if "DurationSeconds" in head.columns:
+                        head["DurationSeconds"] = head["DurationSeconds"].apply(lambda v: None if v is None else float(v))
+                    durations_sample = head.to_dict(orient="records")
+
+                if swipe_rows > 0 and sample_rows > 0:
+                    sh = swipes_df.head(sample_rows).copy()
+                    for col in sh.columns:
+                        sh[col] = sh[col].apply(lambda v: _to_json_safe(v))
+                    # ensure LocaleMessageTime serialized
+                    if "LocaleMessageTime" in sh.columns:
+                        sh["LocaleMessageTime"] = sh["LocaleMessageTime"].apply(lambda v: None if v is None else _to_json_safe(v))
+                    swipe_sample = sh.to_dict(orient="records")
+
+                # CSV paths: durations & swipes
+                csv_name = f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+                csv_full = outdir_path / csv_name
+                csv_path = str(csv_full.resolve()) if csv_full.exists() else None
+                csv_url = None
+
+                swipe_csv_name = f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+                swipe_csv_full = outdir_path / swipe_csv_name
+                swipe_csv_path = str(swipe_csv_full.resolve()) if swipe_csv_full.exists() else None
+                swipe_csv_url = None
+
+                try:
+                    out_abs = outdir_path.resolve()
+                    out_root = OUTPUT_DIR.resolve()
+                    if str(out_abs).startswith(str(out_root)):
+                        rel = out_abs.relative_to(out_root)
+                        csv_url = f"/ccure/report/{(rel / csv_name).as_posix()}"
+                        swipe_csv_url = f"/ccure/report/{(rel / swipe_csv_name).as_posix()}"
+                except Exception:
+                    csv_url = swipe_csv_url = None
+
+                resp["regions"][r] = {
+                    "rows": rows,
+                    "swipe_rows": swipe_rows,
+                    "durations_sample": durations_sample,
+                    "swipe_sample": swipe_sample,
+                    "csv_path": csv_path,
+                    "csv_url": csv_url,
+                    "swipe_csv_path": swipe_csv_path,
+                    "swipe_csv_url": swipe_csv_url
+                }
+            except Exception:
+                logger.exception("Failed to serialize duration result for region %s", r)
+                resp["regions"][r] = {"rows": 0, "swipe_rows": 0, "durations_sample": [], "swipe_sample": [], "csv_path": None, "csv_url": None}
+
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("api_duration failed")
+        raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
+
+
+
+
+
+
+
+
+SELECT
+    t1.[ObjectName1] AS DoorName,
+    t1.[ObjectName2],
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[Text12] AS CardNumber,
+    t2.[Text1] AS EmployeeName,
+    t2.[PersonnelTypeID],
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType
+FROM [{db}].[dbo].[ACVSUJournalLog] AS t1
+INNER JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+;
+
+
+
+
+
+
+
+
+
+
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute first and last swipe per person per day and duration.
+    - preserves and uses EmployeeIdentity (GUID) as primary dedupe key
+    - falls back to EmployeeID|CardNumber|EmployeeName when GUID missing
+    - returns DataFrame with columns:
+      person_uid, EmployeeIdentity, EmployeeID, EmployeeName, CardNumber,
+      Date, FirstSwipe, LastSwipe, FirstDoor, LastDoor, CountSwipes,
+      DurationSeconds, Duration, PersonnelTypeName, PartitionName2
+    """
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=[
+            "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+            "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+            "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
+        ])
+
+    df = swipes_df.copy()
+
+    # Ensure expected columns available
+    for col in ("EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "ObjectName1"):
+        if col not in df.columns:
+            df[col] = None
+
+    # parse datetime
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # drop exact duplicate swipe records (same person, same timestamp, same door/card)
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "ObjectName1"]
+    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+
+    # date column (local date already applied in SQL)
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        # fallback combine
+        pieces = [str(row.get("EmployeeID") or "").strip(), str(row.get("CardNumber") or "").strip(), str(row.get("EmployeeName") or "").strip()]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    # drop rows where person uid could not be built
+    df = df[df["person_uid"].notna()]
+
+    # group by person_uid + date and compute aggregates (use first/last swipe to get doors and names)
+    def agg_for_group(g):
+        g_sorted = g.sort_values("LocaleMessageTime")
+        first = g_sorted.iloc[0]
+        last = g_sorted.iloc[-1]
+        return pd.Series({
+            "person_uid": first["person_uid"],
+            "EmployeeIdentity": first.get("EmployeeIdentity"),
+            "EmployeeID": first.get("EmployeeID"),
+            "EmployeeName": first.get("EmployeeName"),
+            "CardNumber": first.get("CardNumber"),
+            "Date": first["Date"],
+            "FirstSwipe": first["LocaleMessageTime"],
+            "LastSwipe": last["LocaleMessageTime"],
+            "FirstDoor": first.get("ObjectName1"),
+            "LastDoor": last.get("ObjectName1"),
+            "CountSwipes": int(len(g_sorted)),
+            "PersonnelTypeName": first.get("PersonnelTypeName"),
+            "PartitionName2": first.get("PartitionName2")
+        })
+
+    grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    # compute duration fields
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # Reorder columns for clarity
+    cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
+    ]
+    return grouped[cols]
+
+
+
+
+
+
+
+
+def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        swipes = fetch_swipes_for_region(r, target_date)
+
+        # optional city filter: match PartitionName2 or ObjectName2 (case-insensitive)
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask = (
+                swipes.get("PartitionName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
+                | swipes.get("ObjectName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
+            )
+            swipes = swipes[mask].copy()
+
+        # compute durations (de-duplicated, per-person)
+        durations = compute_daily_durations(swipes)
+
+        # save CSVs
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+    return results
+
+
+
+
+
+
+
+
+Quick test examples
+	•	All durations & swipes (today):
+GET http://localhost:8000/duration
+	•	Only APAC durations & swipes for 2025-09-05:
+GET http://localhost:8000/duration?date=2025-09-05&regions=apac
+	•	Only Pune (city) across all regions:
+GET http://localhost:8000/duration?date=2025-09-05&city=pune
+	•	APAC + Pune:
+GET http://localhost:8000/duration?date=2025-09-05&regions=apac&city=pune
+
+
+
+
+
+
+
+
+
+
+
+
 Good Now We Got API Responce like Below so Update API responce as Per City Location wise as well Region wise 
 ex- if i want to find out duration only for Pune  .. 
 if i want to find out dirstion only APAC .
