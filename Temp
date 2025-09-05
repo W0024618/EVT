@@ -1,783 +1,133 @@
-@app.get("/duration")
-async def api_duration(
-    date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
-    regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
-    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune). Case-insensitive, matches PartitionName2 or ObjectName2"),
-    outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
-    sample_rows: int = Query(10, ge=0, le=100, description="How many sample rows to include per region in response")
-):
-    try:
-        # parse date
-        if date_param:
-            try:
-                target_date = datetime.strptime(date_param, "%Y-%m-%d").date()
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-        else:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo("Asia/Kolkata")
-            target_date = datetime.now(tz).date()
-
-        # parse regions
-        if regions:
-            regions_list = [r.strip().lower() for r in regions.split(",") if r.strip()]
-        else:
-            regions_list = ["apac", "emea", "laca", "namer"]
-
-        # determine outdir
-        if outdir:
-            outdir_path = Path(outdir)
-        else:
-            outdir_path = OUTPUT_DIR / "duration_reports"
-        outdir_path.mkdir(parents=True, exist_ok=True)
-
-        # lazy import of duration_report
-        try:
-            import duration_report
-        except Exception as e:
-            logger.exception("Failed importing duration_report module")
-            raise HTTPException(status_code=500, detail=f"duration module import failed: {e}")
-
-        # run blocking compute in thread with timeout
-        loop = asyncio.get_running_loop()
-        # pass `city` filter as 4th arg (may be None)
-        task = loop.run_in_executor(None, duration_report.run_for_date, target_date, regions_list, str(outdir_path), city)
-        try:
-            results = await asyncio.wait_for(task, timeout=COMPUTE_WAIT_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="Duration computation timed out")
-        except Exception as e:
-            logger.exception("Duration run_for_date failed")
-            raise HTTPException(status_code=500, detail=f"duration run failed: {e}")
-
-        # helper to convert non-serializable values
-        def _to_json_safe(v):
-            try:
-                if pd.isna(v):
-                    return None
-            except Exception:
-                pass
-            if isinstance(v, (datetime, date)):
-                return v.isoformat()
-            if hasattr(v, "isoformat") and not isinstance(v, str):
-                try:
-                    return v.isoformat()
-                except Exception:
-                    pass
-            if isinstance(v, (int, float, bool)):
-                return v
-            return v
-
-        resp = {"date": target_date.isoformat(), "regions": {}}
-        for r, region_obj in results.items():
-            try:
-                # Expect region_obj to be dict with keys "swipes" and "durations"
-                swipes_df = None
-                durations_df = None
-                if isinstance(region_obj, dict):
-                    swipes_df = region_obj.get("swipes")
-                    durations_df = region_obj.get("durations")
-                else:
-                    # backward compatibility: region_obj may be a DataFrame (durations)
-                    durations_df = region_obj
-
-                # rows = number of aggregated persons (durations) as before
-                rows = int(len(durations_df)) if durations_df is not None else 0
-                swipe_rows = int(len(swipes_df)) if swipes_df is not None else 0
-
-                durations_sample = []
-                swipe_sample = []
-
-                if rows > 0 and sample_rows > 0:
-                    head = durations_df.head(sample_rows).copy()
-                    for col in head.columns:
-                        head[col] = head[col].apply(lambda v: _to_json_safe(v))
-                    # ensure numeric DurationSeconds
-                    if "DurationSeconds" in head.columns:
-                        head["DurationSeconds"] = head["DurationSeconds"].apply(lambda v: None if v is None else float(v))
-                    durations_sample = head.to_dict(orient="records")
-
-                if swipe_rows > 0 and sample_rows > 0:
-                    sh = swipes_df.head(sample_rows).copy()
-                    for col in sh.columns:
-                        sh[col] = sh[col].apply(lambda v: _to_json_safe(v))
-                    # ensure LocaleMessageTime serialized
-                    if "LocaleMessageTime" in sh.columns:
-                        sh["LocaleMessageTime"] = sh["LocaleMessageTime"].apply(lambda v: None if v is None else _to_json_safe(v))
-                    swipe_sample = sh.to_dict(orient="records")
-
-                # CSV paths: durations & swipes
-                csv_name = f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-                csv_full = outdir_path / csv_name
-                csv_path = str(csv_full.resolve()) if csv_full.exists() else None
-                csv_url = None
-
-                swipe_csv_name = f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
-                swipe_csv_full = outdir_path / swipe_csv_name
-                swipe_csv_path = str(swipe_csv_full.resolve()) if swipe_csv_full.exists() else None
-                swipe_csv_url = None
-
-                try:
-                    out_abs = outdir_path.resolve()
-                    out_root = OUTPUT_DIR.resolve()
-                    if str(out_abs).startswith(str(out_root)):
-                        rel = out_abs.relative_to(out_root)
-                        csv_url = f"/ccure/report/{(rel / csv_name).as_posix()}"
-                        swipe_csv_url = f"/ccure/report/{(rel / swipe_csv_name).as_posix()}"
-                except Exception:
-                    csv_url = swipe_csv_url = None
-
-                resp["regions"][r] = {
-                    "rows": rows,
-                    "swipe_rows": swipe_rows,
-                    "durations_sample": durations_sample,
-                    "swipe_sample": swipe_sample,
-                    "csv_path": csv_path,
-                    "csv_url": csv_url,
-                    "swipe_csv_path": swipe_csv_path,
-                    "swipe_csv_url": swipe_csv_url
-                }
-            except Exception:
-                logger.exception("Failed to serialize duration result for region %s", r)
-                resp["regions"][r] = {"rows": 0, "swipe_rows": 0, "durations_sample": [], "swipe_sample": [], "csv_path": None, "csv_url": None}
-
-        return JSONResponse(resp)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("api_duration failed")
-        raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
-
-
-
-
-
-
-
-
-SELECT
-    t1.[ObjectName1] AS DoorName,
-    t1.[ObjectName2],
-    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
-    t2.[Text12] AS CardNumber,
-    t2.[Text1] AS EmployeeName,
-    t2.[PersonnelTypeID],
-    t3.[Name] AS PersonnelTypeName,
-    t1.ObjectIdentity1 AS EmployeeIdentity,
-    t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-    t1.MessageType
-FROM [{db}].[dbo].[ACVSUJournalLog] AS t1
-INNER JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-WHERE t1.MessageType = 'CardAdmitted'
-  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
-  {region_filter}
-;
-
-
-
-
-
-
-
-
-
-
-def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute first and last swipe per person per day and duration.
-    - preserves and uses EmployeeIdentity (GUID) as primary dedupe key
-    - falls back to EmployeeID|CardNumber|EmployeeName when GUID missing
-    - returns DataFrame with columns:
-      person_uid, EmployeeIdentity, EmployeeID, EmployeeName, CardNumber,
-      Date, FirstSwipe, LastSwipe, FirstDoor, LastDoor, CountSwipes,
-      DurationSeconds, Duration, PersonnelTypeName, PartitionName2
-    """
-    if swipes_df is None or swipes_df.empty:
-        return pd.DataFrame(columns=[
-            "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
-            "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
-            "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
-        ])
-
-    df = swipes_df.copy()
-
-    # Ensure expected columns available
-    for col in ("EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "ObjectName1"):
-        if col not in df.columns:
-            df[col] = None
-
-    # parse datetime
-    if df["LocaleMessageTime"].dtype == object:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-
-    # drop exact duplicate swipe records (same person, same timestamp, same door/card)
-    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "ObjectName1"]
-    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
-
-    # date column (local date already applied in SQL)
-    df["Date"] = df["LocaleMessageTime"].dt.date
-
-    def make_person_uid(row):
-        eid = row.get("EmployeeIdentity")
-        if pd.notna(eid) and str(eid).strip() != "":
-            return str(eid).strip()
-        # fallback combine
-        pieces = [str(row.get("EmployeeID") or "").strip(), str(row.get("CardNumber") or "").strip(), str(row.get("EmployeeName") or "").strip()]
-        joined = "|".join([p for p in pieces if p])
-        return joined or None
-
-    df["person_uid"] = df.apply(make_person_uid, axis=1)
-    # drop rows where person uid could not be built
-    df = df[df["person_uid"].notna()]
-
-    # group by person_uid + date and compute aggregates (use first/last swipe to get doors and names)
-    def agg_for_group(g):
-        g_sorted = g.sort_values("LocaleMessageTime")
-        first = g_sorted.iloc[0]
-        last = g_sorted.iloc[-1]
-        return pd.Series({
-            "person_uid": first["person_uid"],
-            "EmployeeIdentity": first.get("EmployeeIdentity"),
-            "EmployeeID": first.get("EmployeeID"),
-            "EmployeeName": first.get("EmployeeName"),
-            "CardNumber": first.get("CardNumber"),
-            "Date": first["Date"],
-            "FirstSwipe": first["LocaleMessageTime"],
-            "LastSwipe": last["LocaleMessageTime"],
-            "FirstDoor": first.get("ObjectName1"),
-            "LastDoor": last.get("ObjectName1"),
-            "CountSwipes": int(len(g_sorted)),
-            "PersonnelTypeName": first.get("PersonnelTypeName"),
-            "PartitionName2": first.get("PartitionName2")
-        })
-
-    grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-
-    # compute duration fields
-    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
-    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
-
-    # Reorder columns for clarity
-    cols = [
-        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
-        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
-        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
-    ]
-    return grouped[cols]
-
-
-
-
-
-
-
-
-def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
-    outdir_path = Path(outdir)
-    outdir_path.mkdir(parents=True, exist_ok=True)
-
-    results = {}
-    for r in regions:
-        r = r.lower()
-        if r not in REGION_CONFIG:
-            logging.warning("Unknown region '%s' - skipping", r)
-            continue
-        logging.info("Fetching swipes for region %s on %s", r, target_date)
-        swipes = fetch_swipes_for_region(r, target_date)
-
-        # optional city filter: match PartitionName2 or ObjectName2 (case-insensitive)
-        if city and not swipes.empty:
-            city_l = str(city).strip().lower()
-            mask = (
-                swipes.get("PartitionName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
-                | swipes.get("ObjectName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
-            )
-            swipes = swipes[mask].copy()
-
-        # compute durations (de-duplicated, per-person)
-        durations = compute_daily_durations(swipes)
-
-        # save CSVs
-        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
-        try:
-            durations.to_csv(csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing durations CSV for %s", r)
-        try:
-            swipes.to_csv(swipes_csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing swipes CSV for %s", r)
-
-        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
-        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
-        results[r] = {"swipes": swipes, "durations": durations}
-    return results
-
-
-
-
-
-
-
-
-Quick test examples
-	•	All durations & swipes (today):
-GET http://localhost:8000/duration
-	•	Only APAC durations & swipes for 2025-09-05:
-GET http://localhost:8000/duration?date=2025-09-05&regions=apac
-	•	Only Pune (city) across all regions:
-GET http://localhost:8000/duration?date=2025-09-05&city=pune
-	•	APAC + Pune:
-GET http://localhost:8000/duration?date=2025-09-05&regions=apac&city=pune
-
-
-
-
-
-
-
-
-
-
-
-
-Good Now We Got API Responce like Below so Update API responce as Per City Location wise as well Region wise 
-ex- if i want to find out duration only for Pune  .. 
-if i want to find out dirstion only APAC .
-so Update API end Point and 
-
-
-In below API respone We need Each swipe Record if Employe swipe thier badge in 10 time then display their 10 swipe Also 
-Remove Duplicate using Personel GUID also double check with name , EMployee ID , card number also
-Add Employee Name in API responce , Door Name , Card Number in API responce carefdully.
 http://localhost:8000/duration?date=2025-09-05
+{"detail":"duration module import failed: name 'Optional' is not defined"}
 
+
+http://localhost:8000/duration?date=2025-09-05&regions=apac
+{"detail":"duration module import failed: name 'Optional' is not defined"}
+
+
+http://localhost:8000/duration
 {
-  "date": "2025-09-05",
-  "regions": {
-    "apac": {
-      "rows": 462,
-      "sample": [
-        {
-          "EmployeeID": "",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:01:05",
-          "LastSwipe": "2025-09-05T17:29:51",
-          "CountSwipes": 3101,
-          "PersonnelTypeName": "Property Management",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 62926,
-          "Duration": "17:28:46"
-        },
-        {
-          "EmployeeID": "236337",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T07:59:43",
-          "LastSwipe": "2025-09-05T13:22:18",
-          "CountSwipes": 20,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "APAC.Default",
-          "DurationSeconds": 19355,
-          "Duration": "5:22:35"
-        },
-        {
-          "EmployeeID": "236459",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T12:51:12",
-          "LastSwipe": "2025-09-05T13:17:09",
-          "CountSwipes": 10,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "APAC.Default",
-          "DurationSeconds": 1557,
-          "Duration": "0:25:57"
-        },
-        {
-          "EmployeeID": "237809",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T01:02:22",
-          "LastSwipe": "2025-09-05T16:38:42",
-          "CountSwipes": 11,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 56180,
-          "Duration": "15:36:20"
-        },
-        {
-          "EmployeeID": "237825",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T03:35:52",
-          "LastSwipe": "2025-09-05T05:15:50",
-          "CountSwipes": 3,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 5998,
-          "Duration": "1:39:58"
-        },
-        {
-          "EmployeeID": "238713",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:18:48",
-          "LastSwipe": "2025-09-05T02:10:39",
-          "CountSwipes": 5,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 6711,
-          "Duration": "1:51:51"
-        },
-        {
-          "EmployeeID": "238770",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:11:03",
-          "LastSwipe": "2025-09-05T13:58:37",
-          "CountSwipes": 14,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 49654,
-          "Duration": "13:47:34"
-        },
-        {
-          "EmployeeID": "238870",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T09:34:02",
-          "LastSwipe": "2025-09-05T10:29:58",
-          "CountSwipes": 11,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "APAC.Default",
-          "DurationSeconds": 3356,
-          "Duration": "0:55:56"
-        },
-        {
-          "EmployeeID": "239208",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T12:38:39",
-          "LastSwipe": "2025-09-05T15:00:31",
-          "CountSwipes": 3,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 8512,
-          "Duration": "2:21:52"
-        },
-        {
-          "EmployeeID": "239360",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:44:09",
-          "LastSwipe": "2025-09-05T05:47:07",
-          "CountSwipes": 10,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "PH.Manila",
-          "DurationSeconds": 18178,
-          "Duration": "5:02:58"
-        }
-      ],
-      "csv_path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\output\\duration_reports\\apac_duration_20250905.csv",
-      "csv_url": "/ccure/report/duration_reports/apac_duration_20250905.csv"
-    },
-    "emea": {
-      "rows": 352,
-      "sample": [
-        {
-          "EmployeeID": "",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T05:42:38",
-          "LastSwipe": "2025-09-05T12:21:00",
-          "CountSwipes": 50,
-          "PersonnelTypeName": "Temp Badge",
-          "PartitionName2": "LT.Vilnius",
-          "DurationSeconds": 23902,
-          "Duration": "6:38:22"
-        },
-        {
-          "EmployeeID": "174907",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T09:04:38",
-          "LastSwipe": "2025-09-05T11:06:31",
-          "CountSwipes": 5,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "AUT.Vienna",
-          "DurationSeconds": 7313,
-          "Duration": "2:01:53"
-        },
-        {
-          "EmployeeID": "175878",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T12:14:41",
-          "LastSwipe": "2025-09-05T12:14:41",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "RU.Moscow",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "186464",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T09:49:28",
-          "LastSwipe": "2025-09-05T09:49:28",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "UK.London",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "193823",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T13:41:06",
-          "LastSwipe": "2025-09-05T13:41:06",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "RU.Moscow",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "195824",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T11:32:10",
-          "LastSwipe": "2025-09-05T11:32:10",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "DU.Abu Dhab",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "196742",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T10:43:10",
-          "LastSwipe": "2025-09-05T10:43:20",
-          "CountSwipes": 2,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "AUT.Vienna",
-          "DurationSeconds": 10,
-          "Duration": "0:00:10"
-        },
-        {
-          "EmployeeID": "205556",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T09:32:15",
-          "LastSwipe": "2025-09-05T09:32:15",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "IE.Dublin",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "236155",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T11:05:28",
-          "LastSwipe": "2025-09-05T11:05:28",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "RU.Moscow",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "238911",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T09:26:29",
-          "LastSwipe": "2025-09-05T12:26:09",
-          "CountSwipes": 11,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "LT.Vilnius",
-          "DurationSeconds": 10780,
-          "Duration": "2:59:40"
-        }
-      ],
-      "csv_path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\output\\duration_reports\\emea_duration_20250905.csv",
-      "csv_url": "/ccure/report/duration_reports/emea_duration_20250905.csv"
-    },
-    "laca": {
-      "rows": 15,
-      "sample": [
-        {
-          "EmployeeID": "",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T05:44:51",
-          "LastSwipe": "2025-09-05T06:00:57",
-          "CountSwipes": 2,
-          "PersonnelTypeName": "Visitor",
-          "PartitionName2": "AR.Cordoba",
-          "DurationSeconds": 966,
-          "Duration": "0:16:06"
-        },
-        {
-          "EmployeeID": "315037",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T01:57:21",
-          "LastSwipe": "2025-09-05T01:57:21",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Employee",
-          "PartitionName2": "CR.Costa Rica Partition",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "73432593",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T01:17:15",
-          "LastSwipe": "2025-09-05T02:01:13",
-          "CountSwipes": 2,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "CR.Costa Rica Partition",
-          "DurationSeconds": 2638,
-          "Duration": "0:43:58"
-        },
-        {
-          "EmployeeID": "C668376",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T05:43:46",
-          "LastSwipe": "2025-09-05T05:43:46",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "BR.Sao Paulo",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        },
-        {
-          "EmployeeID": "W0013046",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:37:30",
-          "LastSwipe": "2025-09-05T03:06:07",
-          "CountSwipes": 13,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "CR.Costa Rica Partition",
-          "DurationSeconds": 8917,
-          "Duration": "2:28:37"
-        },
-        {
-          "EmployeeID": "W0017751",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:08:09",
-          "LastSwipe": "2025-09-05T01:58:00",
-          "CountSwipes": 6,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "CR.Costa Rica Partition",
-          "DurationSeconds": 6591,
-          "Duration": "1:49:51"
-        },
-        {
-          "EmployeeID": "W0018199",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T05:10:55",
-          "LastSwipe": "2025-09-05T06:23:33",
-          "CountSwipes": 21,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "AR.Cordoba",
-          "DurationSeconds": 4358,
-          "Duration": "1:12:38"
-        },
-        {
-          "EmployeeID": "W0022873",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:07:36",
-          "LastSwipe": "2025-09-05T03:18:24",
-          "CountSwipes": 34,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "CR.Costa Rica Partition",
-          "DurationSeconds": 11448,
-          "Duration": "3:10:48"
-        },
-        {
-          "EmployeeID": "W0023748",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T06:10:28",
-          "LastSwipe": "2025-09-05T06:11:15",
-          "CountSwipes": 2,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "AR.Cordoba",
-          "DurationSeconds": 47,
-          "Duration": "0:00:47"
-        },
-        {
-          "EmployeeID": "W0024741",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T06:10:06",
-          "LastSwipe": "2025-09-05T06:11:18",
-          "CountSwipes": 3,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "AR.Cordoba",
-          "DurationSeconds": 72,
-          "Duration": "0:01:12"
-        }
-      ],
-      "csv_path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\output\\duration_reports\\laca_duration_20250905.csv",
-      "csv_url": "/ccure/report/duration_reports/laca_duration_20250905.csv"
-    },
-    "namer": {
-      "rows": 5,
-      "sample": [
-        {
-          "EmployeeID": "",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T02:21:57",
-          "LastSwipe": "2025-09-05T03:29:51",
-          "CountSwipes": 6,
-          "PersonnelTypeName": "Temp Badge",
-          "PartitionName2": "US.CO.OBS",
-          "DurationSeconds": 4074,
-          "Duration": "1:07:54"
-        },
-        {
-          "EmployeeID": "W0022449",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:06:04",
-          "LastSwipe": "2025-09-05T02:34:11",
-          "CountSwipes": 18,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "US.CO.OBS",
-          "DurationSeconds": 8887,
-          "Duration": "2:28:07"
-        },
-        {
-          "EmployeeID": "W0022451",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:03:02",
-          "LastSwipe": "2025-09-05T02:34:22",
-          "CountSwipes": 10,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "US.CO.OBS",
-          "DurationSeconds": 9080,
-          "Duration": "2:31:20"
-        },
-        {
-          "EmployeeID": "W0026151",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T01:15:09",
-          "LastSwipe": "2025-09-05T01:43:31",
-          "CountSwipes": 25,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "US.CO.OBS",
-          "DurationSeconds": 1702,
-          "Duration": "0:28:22"
-        },
-        {
-          "EmployeeID": "W0026176",
-          "Date": "2025-09-05",
-          "FirstSwipe": "2025-09-05T00:49:50",
-          "LastSwipe": "2025-09-05T00:49:50",
-          "CountSwipes": 1,
-          "PersonnelTypeName": "Contractor",
-          "PartitionName2": "US.CO.OBS",
-          "DurationSeconds": 0,
-          "Duration": "0:00:00"
-        }
-      ],
-      "csv_path": "C:\\Users\\W0024618\\Desktop\\global-page\\backend\\attendance-analytics\\output\\duration_reports\\namer_duration_20250905.csv",
-      "csv_url": "/ccure/report/duration_reports/namer_duration_20250905.csv"
-    }
-  }
+  "detail": "duration module import failed: name 'Optional' is not defined"
 }
 
 
 
+http://localhost:8000/duration?date=2025-09-05&city=pune
+{"detail":"duration module import failed: name 'Optional' is not defined"}
 
 
-Check below All file carefdully and fix the issue carefully...
+
+i Have test all API but we got this error read below file carefully and Fix the error carefully..
+
+(.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> python -m uvicorn app:app --host 0.0.0.0 --port 8000
+INFO:     Started server process [38640]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2025-09-05 16:10:52,925 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:51718 - "GET /duration?date=2025-09-05 HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:53251 - "GET /ccure/stream HTTP/1.1" 200 OK
+[compute_daily_attendance] no swipes for 2025-09-05
+INFO:     127.0.0.1:58324 - "GET /ccure/stream HTTP/1.1" 200 OK
+[compute_daily_attendance] no swipes for 2025-09-05
+2025-09-05 16:11:18,951 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05 HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:19,132 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05 HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:19,313 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05 HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:21,026 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05&regions=apac HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:21,209 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05&regions=apac HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:22,731 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:22,909 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:26,667 INFO region_clients: [region_clients] fetched 659 detail rows across endpoints
+2025-09-05 16:11:27,373 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05&city=pune HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:27,547 ERROR attendance_app: Failed importing duration_report module
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py", line 1941, in api_duration    
+    import duration_report
+  File "C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py", line 569, in <module>
+    def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
+                                                                          ^^^^^^^^
+NameError: name 'Optional' is not defined
+INFO:     127.0.0.1:59526 - "GET /duration?date=2025-09-05&city=pune HTTP/1.1" 500 Internal Server Error
+2025-09-05 16:11:27,760 INFO region_clients: [region_clients] fetched 660 detail rows across endpoints
+2025-09-05 16:11:46,690 WARNING region_clients: [region_clients] attempt 1/3 failed for http://10.199.22.57:3006/api/occupancy/history: HTTPConnectionPool(host='10.199.22.57', port=3006): Read timed out. (read timeout=20)       
+2025-09-05 16:12:21,611 INFO region_clients: [region_clients] fetched 68 history entries
+INFO:     127.0.0.1:54430 - "GET /ccure/verify?raw=true HTTP/1.1" 200 OK
+2025-09-05 16:12:42,168 INFO region_clients: [region_clients] fetched 68 history entries
+INFO:     127.0.0.1:54683 - "GET /ccure/verify?raw=true HTTP/1.1" 200 OK
+
+
 
 
 
@@ -1714,11 +1064,11 @@ def ccure_report_download(filename: str):
 #   sample_rows — optional number of sample rows to return per region
 #
 
-
 @app.get("/duration")
 async def api_duration(
     date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
     regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
+    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune). Case-insensitive, matches PartitionName2 or ObjectName2"),
     outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
     sample_rows: int = Query(10, ge=0, le=100, description="How many sample rows to include per region in response")
 ):
@@ -1747,7 +1097,7 @@ async def api_duration(
             outdir_path = OUTPUT_DIR / "duration_reports"
         outdir_path.mkdir(parents=True, exist_ok=True)
 
-        # lazy import of duration_report to avoid startup failure if dependencies missing
+        # lazy import of duration_report
         try:
             import duration_report
         except Exception as e:
@@ -1756,7 +1106,8 @@ async def api_duration(
 
         # run blocking compute in thread with timeout
         loop = asyncio.get_running_loop()
-        task = loop.run_in_executor(None, duration_report.run_for_date, target_date, regions_list, str(outdir_path))
+        # pass `city` filter as 4th arg (may be None)
+        task = loop.run_in_executor(None, duration_report.run_for_date, target_date, regions_list, str(outdir_path), city)
         try:
             results = await asyncio.wait_for(task, timeout=COMPUTE_WAIT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
@@ -1771,69 +1122,90 @@ async def api_duration(
                 if pd.isna(v):
                     return None
             except Exception:
-                # if pd isn't applicable for this type, continue
                 pass
             if isinstance(v, (datetime, date)):
                 return v.isoformat()
-            # pandas Timestamp (sometimes not subclass of datetime) - has isoformat
             if hasattr(v, "isoformat") and not isinstance(v, str):
                 try:
                     return v.isoformat()
                 except Exception:
                     pass
-            # leave numbers as-is
             if isinstance(v, (int, float, bool)):
                 return v
-            # strings, dicts, lists are already JSON serializable; return as-is
             return v
 
-        # summarize results into JSON-serializable structure
         resp = {"date": target_date.isoformat(), "regions": {}}
-        for r, df in results.items():
+        for r, region_obj in results.items():
             try:
-                if df is None:
-                    resp["regions"][r] = {"rows": 0, "sample": [], "csv_path": None, "csv_url": None}
-                    continue
+                # Expect region_obj to be dict with keys "swipes" and "durations"
+                swipes_df = None
+                durations_df = None
+                if isinstance(region_obj, dict):
+                    swipes_df = region_obj.get("swipes")
+                    durations_df = region_obj.get("durations")
+                else:
+                    # backward compatibility: region_obj may be a DataFrame (durations)
+                    durations_df = region_obj
 
-                rows = int(len(df))
-                sample = []
+                # rows = number of aggregated persons (durations) as before
+                rows = int(len(durations_df)) if durations_df is not None else 0
+                swipe_rows = int(len(swipes_df)) if swipes_df is not None else 0
+
+                durations_sample = []
+                swipe_sample = []
+
                 if rows > 0 and sample_rows > 0:
-                    head = df.head(sample_rows).copy()
-
-                    # Convert every column value in the sample to JSON-safe value
+                    head = durations_df.head(sample_rows).copy()
                     for col in head.columns:
-                        # apply conversion per-cell
                         head[col] = head[col].apply(lambda v: _to_json_safe(v))
-
-                    # ensure DurationSeconds as numeric (float) or None
+                    # ensure numeric DurationSeconds
                     if "DurationSeconds" in head.columns:
                         head["DurationSeconds"] = head["DurationSeconds"].apply(lambda v: None if v is None else float(v))
+                    durations_sample = head.to_dict(orient="records")
 
-                    sample = head.to_dict(orient="records")
+                if swipe_rows > 0 and sample_rows > 0:
+                    sh = swipes_df.head(sample_rows).copy()
+                    for col in sh.columns:
+                        sh[col] = sh[col].apply(lambda v: _to_json_safe(v))
+                    # ensure LocaleMessageTime serialized
+                    if "LocaleMessageTime" in sh.columns:
+                        sh["LocaleMessageTime"] = sh["LocaleMessageTime"].apply(lambda v: None if v is None else _to_json_safe(v))
+                    swipe_sample = sh.to_dict(orient="records")
 
-                # CSV path
+                # CSV paths: durations & swipes
                 csv_name = f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
                 csv_full = outdir_path / csv_name
                 csv_path = str(csv_full.resolve()) if csv_full.exists() else None
                 csv_url = None
+
+                swipe_csv_name = f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+                swipe_csv_full = outdir_path / swipe_csv_name
+                swipe_csv_path = str(swipe_csv_full.resolve()) if swipe_csv_full.exists() else None
+                swipe_csv_url = None
+
                 try:
                     out_abs = outdir_path.resolve()
                     out_root = OUTPUT_DIR.resolve()
                     if str(out_abs).startswith(str(out_root)):
                         rel = out_abs.relative_to(out_root)
                         csv_url = f"/ccure/report/{(rel / csv_name).as_posix()}"
+                        swipe_csv_url = f"/ccure/report/{(rel / swipe_csv_name).as_posix()}"
                 except Exception:
-                    csv_url = None
+                    csv_url = swipe_csv_url = None
 
                 resp["regions"][r] = {
                     "rows": rows,
-                    "sample": sample,
+                    "swipe_rows": swipe_rows,
+                    "durations_sample": durations_sample,
+                    "swipe_sample": swipe_sample,
                     "csv_path": csv_path,
-                    "csv_url": csv_url
+                    "csv_url": csv_url,
+                    "swipe_csv_path": swipe_csv_path,
+                    "swipe_csv_url": swipe_csv_url
                 }
             except Exception:
                 logger.exception("Failed to serialize duration result for region %s", r)
-                resp["regions"][r] = {"rows": 0, "sample": [], "csv_path": None, "csv_url": None}
+                resp["regions"][r] = {"rows": 0, "swipe_rows": 0, "durations_sample": [], "swipe_sample": [], "csv_path": None, "csv_url": None}
 
         return JSONResponse(resp)
     except HTTPException:
@@ -1841,305 +1213,6 @@ async def api_duration(
     except Exception as exc:
         logger.exception("api_duration failed")
         raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
-
-
-
-
-
-
-
-
-
-
-
-# #C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py
-
-# """
-# duration_report.py
-
-# Purpose:
-#   - Connects to ACVSUJournal MSSQL databases for APAC, EMEA, LACA, NAMER regions (credentials provided by user)
-#   - Extracts CardAdmitted swipe events for a specified date and computes daily duration per employee
-#     using first swipe (min) and last swipe (max) timestamps for that date.
-#   - Writes per-region CSV duration reports and returns pandas DataFrames for further use.
-#   - Contains clear TODO hooks to later improve shift-aware logic.
-
-# Notes & Usage:
-#   - Place this file in:
-#       C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics
-#     (or any other folder).
-
-#   - Requires Python packages: pyodbc, pandas, python-dateutil
-#     Install (example):
-#       pip install pyodbc pandas python-dateutil
-
-#   - ODBC driver: adjust DRIVER in the connection string depending on the host environment.
-#     Example uses 'ODBC Driver 17 for SQL Server' by default.
-#     If you use a different driver (e.g. 18), change the DRIVER value.
-
-#   - Example CLI usage:
-#       python duration_report.py --date 2025-07-21 --regions apac,namer --outdir ./out_reports
-
-#   - The script by default picks "today" in Asia/Kolkata timezone if --date is omitted.
-
-# Security:
-#   - This script contains credentials as provided by the user. In production, consider moving credentials
-#     to environment variables or a secure vault.
-
-# TODO (future improvements):
-#   - Shift-aware logic: handle cases where employees have predefined shift windows spanning midnight,
-#     and decide which swipes belong to which shift.
-#   - Handle badge-in-only or badge-out-only cases (e.g., tele-getting or push-button exits)
-#   - More advanced deduplication of multiple swipes in short windows.
-
-# """
-
-# import argparse
-# import logging
-# import os
-# from datetime import datetime, timedelta, date
-# from zoneinfo import ZoneInfo
-# from pathlib import Path
-
-# import pandas as pd
-
-# # Optional: import pyodbc only when connecting (allows importing this module even without driver)
-# try:
-#     import pyodbc
-# except Exception:
-#     pyodbc = None
-
-# # --------------------- Configuration ---------------------
-# ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-
-# REGION_CONFIG = {
-#     "apac": {
-#         "user": "GSOC_Test",
-#         "password": "Westernccure@2025",
-#         "server": "SRVWUPNQ0986V",
-#         "database": "ACVSUJournal_00010029",
-#         # partitions to include (from provided query)
-#         "partitions": [
-#             "APAC.Default", "CN.Beijing", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
-#         ]
-#     },
-#     "emea": {
-#         "user": "GSOC_Test",
-#         "password": "Westernccure@2025",
-#         "server": "SRVWUFRA0986V",
-#         "database": "ACVSUJournal_00011028",  # note: user provided 00011028 in credentials block
-#         "partitions": [
-#             "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
-#             "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
-#         ]
-#     },
-#     "laca": {
-#         "user": "GSOC_Test",
-#         "password": "Westernccure@2025",
-#         "server": "SRVWUSJO0986V",
-#         "database": "ACVSUJournal_00010029",
-#         "partitions": [
-#             "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
-#             "PA.Panama City", "PE.Lima"
-#         ]
-#     },
-#     "namer": {
-#         "user": "GSOC_Test",
-#         "password": "Westernccure@2025",
-#         "server": "SRVWUDEN0891V",
-#         "database": "ACVSUJournal_00010029",
-#         # For NAMER we'll filter by ObjectName2 patterns (HQ, Austin, Miami, NYC)
-#         "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
-#     }
-# }
-
-
-# # --------------------- SQL Builder ---------------------
-# GENERIC_SQL_TEMPLATE = r"""
-# SELECT
-#     t1.[ObjectName1],
-#     t1.[ObjectName2],
-#     CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
-#     t2.[PersonnelTypeID],
-#     t3.[Name] AS PersonnelTypeName,
-#     t1.ObjectIdentity1 AS EmployeeIdentity,
-#     t1.PartitionName2,
-#     DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-#     t1.MessageType
-# FROM [{db}].[dbo].[ACVSUJournalLog] AS t1
-# INNER JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-# INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-# WHERE t1.MessageType = 'CardAdmitted'
-#   AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
-#   {region_filter}
-# ;
-# """
-
-
-# def build_region_query(region_key: str, target_date: date) -> str:
-#     rc = REGION_CONFIG[region_key]
-#     date_str = target_date.strftime("%Y-%m-%d")
-#     region_filter = ""
-
-#     if region_key in ("apac", "emea", "laca"):
-#         partitions = rc.get("partitions", [])
-#         # build partition IN clause
-#         parts_sql = ", ".join(f"'{p}'" for p in partitions)
-#         region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
-#     elif region_key == "namer":
-#         likes = rc.get("logical_like", [])
-#         # build OR of LIKE patterns on ObjectName2
-#         like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
-#         region_filter = f"AND ({like_sql})"
-#     else:
-#         # no filter
-#         region_filter = ""
-
-#     return GENERIC_SQL_TEMPLATE.format(db=rc["database"], date=date_str, region_filter=region_filter)
-
-
-# # --------------------- DB Utilities ---------------------
-# def get_connection(region_key: str):
-#     """Create and return a pyodbc connection for the region configuration.
-#     Caller must ensure pyodbc is installed and the ODBC driver exists on the host.
-#     """
-#     if pyodbc is None:
-#         raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
-
-#     rc = REGION_CONFIG[region_key]
-#     conn_str = (
-#         f"DRIVER={{{ODBC_DRIVER}}};"
-#         f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
-#         "TrustServerCertificate=Yes;"
-#     )
-#     return pyodbc.connect(conn_str, autocommit=True)
-
-
-# def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
-#     """Fetch CardAdmitted swipes for the given region and target_date.
-#     Returns a pandas DataFrame with columns including EmployeeID and LocaleMessageTime (UTC->locale adjusted).
-#     """
-#     sql = build_region_query(region_key, target_date)
-#     logging.info("Built SQL for region %s, date %s", region_key, target_date)
-#     if pyodbc is None:
-#         # Return an empty DataFrame skeleton so the script can be inspected without DB driver installed.
-#         logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
-#         cols = ["ObjectName1", "ObjectName2", "EmployeeID", "PersonnelTypeID", "PersonnelTypeName",
-#                 "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "MessageType"]
-#         return pd.DataFrame(columns=cols)
-
-#     conn = get_connection(region_key)
-#     try:
-#         df = pd.read_sql(sql, conn)
-#     finally:
-#         conn.close()
-#     # Ensure LocaleMessageTime is datetime
-#     if "LocaleMessageTime" in df.columns:
-#         df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"])
-#     return df
-
-
-# # --------------------- Duration Calculation ---------------------
-# def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
-#     """Given swipe events DataFrame, compute first and last swipe per employee per day and duration.
-#     Returns DataFrame with columns: EmployeeID, Date, FirstSwipe, LastSwipe, DurationSeconds, Duration (HH:MM:SS), CountSwipes
-#     """
-#     if swipes_df.empty:
-#         return pd.DataFrame(columns=[
-#             "EmployeeID", "Date", "FirstSwipe", "LastSwipe", "DurationSeconds", "Duration", "CountSwipes",
-#             "PersonnelTypeName", "PartitionName2"
-#         ])
-
-#     df = swipes_df.copy()
-
-#     # Normalize employee id and remove rows without EmployeeID
-#     df = df[df["EmployeeID"].notna()].copy()
-#     # Create date column (local date already applied in SQL)
-#     df["Date"] = df["LocaleMessageTime"].dt.date
-
-#     # Group by EmployeeID + Date (use EmployeeIdentity if you prefer)
-#     group_cols = ["EmployeeID", "Date"]
-#     agg = df.groupby(group_cols).agg(
-#         FirstSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="min"),
-#         LastSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="max"),
-#         CountSwipes=pd.NamedAgg(column="LocaleMessageTime", aggfunc="count"),
-#         PersonnelTypeName=pd.NamedAgg(column="PersonnelTypeName", aggfunc="first"),
-#         PartitionName2=pd.NamedAgg(column="PartitionName2", aggfunc="first")
-#     ).reset_index()
-
-#     agg["DurationSeconds"] = (agg["LastSwipe"] - agg["FirstSwipe"]).dt.total_seconds()
-#     # Negative durations (if any) will be clipped to 0
-#     agg["DurationSeconds"] = agg["DurationSeconds"].clip(lower=0)
-
-#     # Human readable HH:MM:SS
-#     agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))))
-#     return agg
-
-
-# # --------------------- Main Runner ---------------------
-# def run_for_date(target_date: date, regions: list, outdir: str) -> dict:
-#     """
-#     Run duration reports for the requested regions on target_date.
-#     Returns a dict of region->DataFrame (duration report).
-#     """
-#     outdir_path = Path(outdir)
-#     outdir_path.mkdir(parents=True, exist_ok=True)
-
-#     results = {}
-#     for r in regions:
-#         r = r.lower()
-#         if r not in REGION_CONFIG:
-#             logging.warning("Unknown region '%s' - skipping", r)
-#             continue
-#         logging.info("Fetching swipes for region %s on %s", r, target_date)
-#         swipes = fetch_swipes_for_region(r, target_date)
-#         durations = compute_daily_durations(swipes)
-#         csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-#         durations.to_csv(csv_path, index=False)
-#         logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
-#         results[r] = durations
-#     return results
-
-
-# def parse_args():
-#     p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
-#     p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
-#     p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
-#                    default="apac,emea,laca,namer")
-#     p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
-#     return p.parse_args()
-
-
-# if __name__ == "__main__":
-#     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-#     args = parse_args()
-
-#     # Default date in Asia/Kolkata timezone
-#     if args.date:
-#         target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-#     else:
-#         tz = ZoneInfo("Asia/Kolkata")
-#         target_date = datetime.now(tz).date()
-
-#     regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
-#     outdir = args.outdir
-
-#     logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
-#     results = run_for_date(target_date, regions, outdir)
-
-#     # Print a short summary
-#     for r, df in results.items():
-#         logging.info("Region %s: %d employees with computed durations", r, len(df))
-#     logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2254,10 +1327,13 @@ REGION_CONFIG = {
 
 # --------------------- SQL Builder ---------------------
 GENERIC_SQL_TEMPLATE = r"""
+
 SELECT
-    t1.[ObjectName1],
+    t1.[ObjectName1] AS DoorName,
     t1.[ObjectName2],
     CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[Text12] AS CardNumber,
+    t2.[Text1] AS EmployeeName,
     t2.[PersonnelTypeID],
     t3.[Name] AS PersonnelTypeName,
     t1.ObjectIdentity1 AS EmployeeIdentity,
@@ -2329,35 +1405,95 @@ def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
 
 
 # --------------------- Duration Calculation ---------------------
+
+
 def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute first and last swipe per employee per day and duration."""
-    if swipes_df.empty:
+    """Compute first and last swipe per person per day and duration.
+    - preserves and uses EmployeeIdentity (GUID) as primary dedupe key
+    - falls back to EmployeeID|CardNumber|EmployeeName when GUID missing
+    - returns DataFrame with columns:
+      person_uid, EmployeeIdentity, EmployeeID, EmployeeName, CardNumber,
+      Date, FirstSwipe, LastSwipe, FirstDoor, LastDoor, CountSwipes,
+      DurationSeconds, Duration, PersonnelTypeName, PartitionName2
+    """
+    if swipes_df is None or swipes_df.empty:
         return pd.DataFrame(columns=[
-            "EmployeeID", "Date", "FirstSwipe", "LastSwipe", "DurationSeconds", "Duration", "CountSwipes",
-            "PersonnelTypeName", "PartitionName2"
+            "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+            "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+            "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
         ])
 
     df = swipes_df.copy()
-    df = df[df["EmployeeID"].notna()].copy()
+
+    # Ensure expected columns available
+    for col in ("EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "ObjectName1"):
+        if col not in df.columns:
+            df[col] = None
+
+    # parse datetime
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # drop exact duplicate swipe records (same person, same timestamp, same door/card)
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "ObjectName1"]
+    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+
+    # date column (local date already applied in SQL)
     df["Date"] = df["LocaleMessageTime"].dt.date
 
-    group_cols = ["EmployeeID", "Date"]
-    agg = df.groupby(group_cols).agg(
-        FirstSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="min"),
-        LastSwipe=pd.NamedAgg(column="LocaleMessageTime", aggfunc="max"),
-        CountSwipes=pd.NamedAgg(column="LocaleMessageTime", aggfunc="count"),
-        PersonnelTypeName=pd.NamedAgg(column="PersonnelTypeName", aggfunc="first"),
-        PartitionName2=pd.NamedAgg(column="PartitionName2", aggfunc="first")
-    ).reset_index()
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        # fallback combine
+        pieces = [str(row.get("EmployeeID") or "").strip(), str(row.get("CardNumber") or "").strip(), str(row.get("EmployeeName") or "").strip()]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
 
-    agg["DurationSeconds"] = (agg["LastSwipe"] - agg["FirstSwipe"]).dt.total_seconds()
-    agg["DurationSeconds"] = agg["DurationSeconds"].clip(lower=0)
-    agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))))
-    return agg
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    # drop rows where person uid could not be built
+    df = df[df["person_uid"].notna()]
+
+    # group by person_uid + date and compute aggregates (use first/last swipe to get doors and names)
+    def agg_for_group(g):
+        g_sorted = g.sort_values("LocaleMessageTime")
+        first = g_sorted.iloc[0]
+        last = g_sorted.iloc[-1]
+        return pd.Series({
+            "person_uid": first["person_uid"],
+            "EmployeeIdentity": first.get("EmployeeIdentity"),
+            "EmployeeID": first.get("EmployeeID"),
+            "EmployeeName": first.get("EmployeeName"),
+            "CardNumber": first.get("CardNumber"),
+            "Date": first["Date"],
+            "FirstSwipe": first["LocaleMessageTime"],
+            "LastSwipe": last["LocaleMessageTime"],
+            "FirstDoor": first.get("ObjectName1"),
+            "LastDoor": last.get("ObjectName1"),
+            "CountSwipes": int(len(g_sorted)),
+            "PersonnelTypeName": first.get("PersonnelTypeName"),
+            "PartitionName2": first.get("PartitionName2")
+        })
+
+    grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    # compute duration fields
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # Reorder columns for clarity
+    cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2"
+    ]
+    return grouped[cols]
 
 
 # --------------------- Main Runner ---------------------
-def run_for_date(target_date: date, regions: list, outdir: str) -> dict:
+
+
+def run_for_date(target_date: date, regions: list, outdir: str, city: Optional[str] = None) -> dict:
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
 
@@ -2369,12 +1505,37 @@ def run_for_date(target_date: date, regions: list, outdir: str) -> dict:
             continue
         logging.info("Fetching swipes for region %s on %s", r, target_date)
         swipes = fetch_swipes_for_region(r, target_date)
+
+        # optional city filter: match PartitionName2 or ObjectName2 (case-insensitive)
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask = (
+                swipes.get("PartitionName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
+                | swipes.get("ObjectName2", swipes.columns[:0]).fillna("").astype(str).str.lower().str.contains(city_l, na=False)
+            )
+            swipes = swipes[mask].copy()
+
+        # compute durations (de-duplicated, per-person)
         durations = compute_daily_durations(swipes)
+
+        # save CSVs
         csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-        durations.to_csv(csv_path, index=False)
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
         logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
-        results[r] = durations
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
     return results
+
+
 
 
 def parse_args():
@@ -2405,6 +1566,10 @@ if __name__ == "__main__":
     for r, df in results.items():
         logging.info("Region %s: %d employees with computed durations", r, len(df))
     logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
 
 
 
