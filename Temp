@@ -1,3 +1,488 @@
+"""
+duration_report.py
+
+Updated: supports querying multiple monthly ACVSUJournal databases (current + previous N).
+"""
+import argparse
+import logging
+import os
+import re
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+
+# Optional: import pyodbc only when connecting (allows importing this module even without driver)
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# --------------------- Configuration ---------------------
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        # Optional: use last_n_databases to include previous months
+        "last_n_databases": 2,
+        "partitions": [
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+        ]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "last_n_databases": 2,
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+# --------------------- SQL Builder ---------------------
+# Removed trailing semicolon so multiple SELECTs can be UNIONed safely
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,                       -- Person name from ACVS
+    t1.[ObjectName2] AS Door,                               -- Door / reader name
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+
+def _split_db_name(dbname: str):
+    """
+    Split dbname into (prefix, numeric_suffix_str) if numeric suffix exists,
+    otherwise return (dbname, None).
+    Example: 'ACVSUJournal_00010029' -> ('ACVSUJournal_', '00010029')
+    """
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    """
+    From a base db name with numeric suffix, return list of last_n db names descending.
+    If base has no numeric suffix, just return [db_base].
+    """
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    """
+    Return a candidate list of DB names for this region configuration.
+    Priority:
+    1. If rc contains explicit 'databases': use that list (as provided).
+    2. Otherwise, if rc contains 'database' and rc['last_n_databases'] > 1, expand last_n_databases.
+    3. Otherwise return [rc['database']].
+    """
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    """
+    Attempt to open a connection to the server's master database to check DB existence.
+    Returns connection or None if pyodbc missing / connection fails.
+    """
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    """
+    Filter candidate DB names by checking sys.databases on the server (via master).
+    If master connection fails, return the candidates (best-effort).
+    """
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        # Use parameterized query to avoid quoting issues
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates  # if none found, fallback to candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    # Determine candidate DBs (either explicit list or expanded from base + last_n_databases)
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        # fallback to single configured database
+        candidates = [rc.get("database")]
+
+    # Validate candidate DB names by checking server sys.databases (if possible)
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    # Build union SQL across valid DBs
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    # If for some reason union_parts is empty, return a query for the configured db (may error upstream)
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    # Join with UNION ALL to preserve duplicates across DBs if any
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+
+# --------------------- DB Utilities ---------------------
+def get_connection(region_key: str):
+    """Create and return a pyodbc connection for the region configuration."""
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Fetch CardAdmitted swipes for the given region and target_date.
+    Returns a pandas DataFrame with normalized column names:
+      ['EmployeeName','Door','EmployeeID','CardNumber','PersonnelTypeName','EmployeeIdentity',
+       'PartitionName2','LocaleMessageTime','MessageType','Direction','CompanyName','PrimaryLocation']
+    If pyodbc is not available, returns an empty skeleton DataFrame with those columns.
+    """
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
+        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
+    ]
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    # Connect using configured database (connection DB doesn't have to be the databases we query because
+    # queries reference fully-qualified [db].dbo.Table)
+    conn = get_connection(region_key)
+    try:
+        df = pd.read_sql(sql, conn)
+    finally:
+        conn.close()
+
+    # Ensure expected columns exist
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # Parse datetime
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    return df[cols]
+
+
+# --------------------- Duration Calculation ---------------------
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    df = df[df["person_uid"].notna()].copy()
+
+    def agg_for_group(g):
+        g_sorted = g.sort_values("LocaleMessageTime")
+        first = g_sorted.iloc[0]
+        last = g_sorted.iloc[-1]
+        first_dir = first.get("Direction")
+        last_dir = last.get("Direction")
+
+        return pd.Series({
+            "person_uid": first["person_uid"],
+            "EmployeeIdentity": first.get("EmployeeIdentity"),
+            "EmployeeID": first.get("EmployeeID"),
+            "EmployeeName": first.get("EmployeeName"),
+            "CardNumber": first.get("CardNumber"),
+            "Date": first["Date"],
+            "FirstSwipe": first["LocaleMessageTime"],
+            "LastSwipe": last["LocaleMessageTime"],
+            "FirstDoor": first.get("Door"),
+            "LastDoor": last.get("Door"),
+            "CountSwipes": int(len(g_sorted)),
+            "PersonnelTypeName": first.get("PersonnelTypeName"),
+            "PartitionName2": first.get("PartitionName2"),
+            "CompanyName": first.get("CompanyName"),
+            "PrimaryLocation": first.get("PrimaryLocation"),
+            "FirstDirection": first_dir,
+            "LastDirection": last_dir
+        })
+
+    grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    return grouped[out_cols]
+
+
+# --------------------- Main Runner ---------------------
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+            else:
+                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+
+    return results
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir, city=args.city)
+
+    for r, obj in results.items():
+        dur = obj.get("durations")
+        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Good , 
 Now Check Below Details carefully...
 
