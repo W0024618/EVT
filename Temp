@@ -1,619 +1,10 @@
-# duration_report.py
-"""
-duration_report.py  — optimized for faster repeated API requests:
- - parallel region fetch (ThreadPoolExecutor, limited workers)
- - CSV caching (reuse recent CSVs to avoid DB hits during dev / repeated UI runs)
- - use SQLAlchemy engine for pd.read_sql when available to avoid pandas warning
- - replaced groupby.apply with groupby.agg for faster aggregation
-"""
-import argparse
-import logging
-import os
-import re
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-import concurrent.futures
-import time
+I have Update all above upadte in both file still it take more time how we can improve theor performance ..
 
-import pandas as pd
+debug file line by line and check where data is block and fix this issue 
 
-# Optional: import pyodbc only when connecting (allows importing this module even without driver)
-try:
-    import pyodbc
-except Exception:
-    pyodbc = None
 
-# Optional: SQLAlchemy engine (faster pd.read_sql with engine, silences pandas warning)
-try:
-    from sqlalchemy import create_engine
-    SQLALCHEMY_AVAILABLE = True
-except Exception:
-    create_engine = None
-    SQLALCHEMY_AVAILABLE = False
 
-ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-
-# (KEEP YOUR REGION_CONFIG — unchanged)
-REGION_CONFIG = {
-    "apac": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUPNQ0986V",
-        "database": "ACVSUJournal_00010029",
-        "last_n_databases": 2,
-        "partitions": [
-            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
-        ]
-    },
-    "emea": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUFRA0986V",
-        "database": "ACVSUJournal_00011028",
-        "last_n_databases": 2,
-        "partitions": [
-            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
-            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
-        ]
-    },
-    "laca": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUSJO0986V",
-        "database": "ACVSUJournal_00010029",
-        "last_n_databases": 2,
-        "partitions": [
-            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
-            "PA.Panama City", "PE.Lima"
-        ]
-    },
-    "namer": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUDEN0891V",
-        "database": "ACVSUJournal_00010029",
-        "last_n_databases": 2,
-        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
-    }
-}
-
-GENERIC_SQL_TEMPLATE = r"""
-SELECT
-    t1.[ObjectName1] AS EmployeeName,
-    t1.[ObjectName2] AS Door,
-    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
-    COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
-      sc.value,
-      t2.[Text12]
-    ) AS CardNumber,
-    t3.[Name] AS PersonnelTypeName,
-    t1.ObjectIdentity1 AS EmployeeIdentity,
-    t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-    t1.MessageType,
-    t5d.value AS Direction,
-    t2.Text4 AS CompanyName,
-    t2.Text5 AS PrimaryLocation
-FROM [{db}].dbo.ACVSUJournalLog AS t1
-INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
-  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
-  ON t1.XmlGUID = t_xml.GUID
-LEFT JOIN (
-  SELECT GUID, value
-  FROM [{db}].dbo.ACVSUJournalLogxmlShred
-  WHERE Name IN ('Card','CHUID')
-) AS sc
-  ON t1.XmlGUID = sc.GUID
-WHERE t1.MessageType = 'CardAdmitted'
-  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
-  {region_filter}
-"""
-
-# Helper functions (unchanged logic)
-def _split_db_name(dbname: str):
-    m = re.match(r"^(.*?)(\d+)$", dbname)
-    if not m:
-        return dbname, None
-    return m.group(1), m.group(2)
-
-def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
-    prefix, digits = _split_db_name(db_base)
-    if digits is None:
-        return [db_base]
-    width = len(digits)
-    try:
-        cur = int(digits)
-    except Exception:
-        return [db_base]
-    out = []
-    for i in range(last_n):
-        num = cur - i
-        if num < 0:
-            break
-        out.append(f"{prefix}{str(num).zfill(width)}")
-    return out
-
-def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
-    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
-        return rc["databases"]
-    base_db = rc.get("database")
-    if not base_db:
-        return []
-    last_n = int(rc.get("last_n_databases", 1) or 1)
-    if last_n <= 1:
-        return [base_db]
-    return _expand_databases_from_base(base_db, last_n)
-
-def _connect_master(rc: Dict[str, Any]):
-    if pyodbc is None:
-        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
-        return None
-    try:
-        conn_str = (
-            f"DRIVER={{{ODBC_DRIVER}}};"
-            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
-            "TrustServerCertificate=Yes;"
-        )
-        return pyodbc.connect(conn_str, autocommit=True)
-    except Exception:
-        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
-        return None
-
-def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
-    if not candidates:
-        return []
-    master_conn = _connect_master(rc)
-    if master_conn is None:
-        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
-        return candidates
-    try:
-        exists = []
-        cursor = master_conn.cursor()
-        for db in candidates:
-            try:
-                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
-                row = cursor.fetchone()
-                if row and row[0] and int(row[0]) > 0:
-                    exists.append(db)
-            except Exception:
-                logging.exception("Error checking existence for database %s", db)
-        cursor.close()
-        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
-        return exists if exists else candidates
-    finally:
-        try:
-            master_conn.close()
-        except Exception:
-            pass
-
-def build_region_query(region_key: str, target_date: date) -> str:
-    rc = REGION_CONFIG[region_key]
-    date_str = target_date.strftime("%Y-%m-%d")
-    region_filter = ""
-
-    if region_key in ("apac", "emea", "laca"):
-        partitions = rc.get("partitions", [])
-        parts_sql = ", ".join(f"'{p}'" for p in partitions)
-        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
-    elif region_key == "namer":
-        likes = rc.get("logical_like", [])
-        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
-        region_filter = f"AND ({like_sql})"
-    else:
-        region_filter = ""
-
-    candidates = _get_candidate_databases(rc)
-    if not candidates:
-        candidates = [rc.get("database")]
-
-    valid_dbs = _filter_existing_databases(rc, candidates)
-
-    union_parts = []
-    for dbname in valid_dbs:
-        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
-
-    if not union_parts:
-        dbname = rc.get("database")
-        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
-
-    sql = "\nUNION ALL\n".join(union_parts)
-    return sql
-
-# DB connection helper (same as before)
-def get_connection(region_key: str):
-    if pyodbc is None:
-        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
-
-    rc = REGION_CONFIG[region_key]
-    conn_str = (
-        f"DRIVER={{{ODBC_DRIVER}}};"
-        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
-        "TrustServerCertificate=Yes;"
-    )
-    return pyodbc.connect(conn_str, autocommit=True)
-
-def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
-    """
-    Fetch swipes for a single region/date. Uses SQLAlchemy engine if available (faster),
-    otherwise falls back to pyodbc connection and pd.read_sql.
-    """
-    sql = build_region_query(region_key, target_date)
-    logging.info("Built SQL for region %s, date %s", region_key, target_date)
-    cols = [
-        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
-        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
-    ]
-    if pyodbc is None:
-        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
-        return pd.DataFrame(columns=cols)
-
-    # Try SQLAlchemy engine path first (silences pandas DBAPI warning and may be faster)
-    rc = REGION_CONFIG[region_key]
-    if SQLALCHEMY_AVAILABLE:
-        try:
-            # Build a secure engine string (ODBC uri)
-            # Example: mssql+pyodbc://user:pass@server/database?driver=ODBC+Driver+17+for+SQL+Server
-            driver = ODBC_DRIVER.replace(" ", "+")
-            username = rc['user']
-            password = rc['password']
-            server = rc['server']
-            database = rc['database']
-            engine_url = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver={driver};TrustServerCertificate=Yes"
-            engine = create_engine(engine_url, fast_executemany=True)
-            df = pd.read_sql(sql, engine)
-            engine.dispose()
-        except Exception:
-            logging.exception("SQLAlchemy path failed, falling back to raw pyodbc for region %s", region_key)
-            conn = get_connection(region_key)
-            try:
-                df = pd.read_sql(sql, conn)
-            finally:
-                conn.close()
-    else:
-        conn = get_connection(region_key)
-        try:
-            df = pd.read_sql(sql, conn)
-        finally:
-            conn.close()
-
-    # Ensure columns exist
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-
-    # make sure timestamp coercion happens
-    try:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-    except Exception:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
-
-    return df[cols]
-
-def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Faster aggregation using groupby.agg instead of groupby.apply.
-    Returns the same columns as before.
-    """
-    out_cols = [
-        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
-        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
-        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
-        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
-    ]
-
-    if swipes_df is None or swipes_df.empty:
-        return pd.DataFrame(columns=out_cols)
-
-    df = swipes_df.copy()
-
-    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
-                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
-    for col in expected:
-        if col not in df.columns:
-            df[col] = None
-
-    if df["LocaleMessageTime"].dtype == object:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-
-    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
-    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
-
-    df["Date"] = df["LocaleMessageTime"].dt.date
-
-    def make_person_uid(row):
-        eid = row.get("EmployeeIdentity")
-        if pd.notna(eid) and str(eid).strip() != "":
-            return str(eid).strip()
-        pieces = [
-            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
-            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
-            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
-        ]
-        joined = "|".join([p for p in pieces if p])
-        return joined or None
-
-    df["person_uid"] = df.apply(make_person_uid, axis=1)
-    df = df[df["person_uid"].notna()].copy()
-
-    # Sort, then use groupby.agg (faster than apply)
-    df = df.sort_values("LocaleMessageTime")
-
-    grouped = df.groupby(["person_uid", "Date"], sort=False)
-
-    agg = grouped.agg(
-        EmployeeIdentity=("EmployeeIdentity", "first"),
-        EmployeeID=("EmployeeID", "first"),
-        EmployeeName=("EmployeeName", "first"),
-        CardNumber=("CardNumber", "first"),
-        FirstSwipe=("LocaleMessageTime", "first"),
-        LastSwipe=("LocaleMessageTime", "last"),
-        FirstDoor=("Door", "first"),
-        LastDoor=("Door", "last"),
-        CountSwipes=("LocaleMessageTime", "count"),
-        PersonnelTypeName=("PersonnelTypeName", "first"),
-        PartitionName2=("PartitionName2", "first"),
-        CompanyName=("CompanyName", "first"),
-        PrimaryLocation=("PrimaryLocation", "first"),
-        FirstDirection=("Direction", "first"),
-        LastDirection=("Direction", "last")
-    ).reset_index()
-
-    # compute durations
-    try:
-        agg["DurationSeconds"] = (pd.to_datetime(agg["LastSwipe"]) - pd.to_datetime(agg["FirstSwipe"])).dt.total_seconds().clip(lower=0)
-    except Exception:
-        # fallback if conversion fails
-        agg["DurationSeconds"] = 0
-        for i, row in agg.iterrows():
-            try:
-                first = pd.to_datetime(row["FirstSwipe"])
-                last = pd.to_datetime(row["LastSwipe"])
-                agg.at[i, "DurationSeconds"] = max(0, int((last - first).total_seconds()))
-            except Exception:
-                agg.at[i, "DurationSeconds"] = 0
-
-    agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
-    agg = agg.rename(columns={"person_uid": "person_uid"})
-
-    # ensure all columns
-    result = pd.DataFrame(columns=out_cols)
-    for col in out_cols:
-        if col in agg.columns:
-            result[col] = agg[col]
-        else:
-            result[col] = None
-
-    # Fill Date as date type
-    if "Date" in result.columns:
-        result["Date"] = pd.to_datetime(result["Date"]).dt.date
-
-    return result[out_cols]
-
-def categorize_seconds(s: Optional[int]) -> str:
-    try:
-        if s is None or s <= 0:
-            return "0-30m"
-        s = int(s)
-        if s <= 1800:
-            return "0-30m"
-        if s <= 7200:
-            return "30m-2h"
-        if s <= 21600:
-            return "2h-6h"
-        if s < 28800:
-            return "6h-8h"
-        return "8h+"
-    except Exception:
-        return "0-30m"
-
-# New: helper to load from csv if present + recent
-def _is_recent(path: Path, max_age_seconds: int = 300) -> bool:
-    try:
-        if not path.exists():
-            return False
-        m = path.stat().st_mtime
-        return (time.time() - m) <= max_age_seconds
-    except Exception:
-        return False
-
-def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Fetch durations for multiple regions in parallel (bounded ThreadPool).
-    Uses on-disk CSV cache when available and recent to drastically speed up repeated UI calls.
-    Returns { region_key: {"swipes": DataFrame, "durations": DataFrame}, ... }
-    """
-    outdir_path = Path(outdir)
-    outdir_path.mkdir(parents=True, exist_ok=True)
-
-    results: Dict[str, Any] = {}
-
-    # Cap concurrency to avoid hammering DB server
-    max_workers = min(4, max(1, len(regions)))  # tune this number as needed
-    logging.info("Running run_for_date for %s regions=%s (workers=%d)", target_date, regions, max_workers)
-
-    def fetch_region(rkey: str):
-        r = rkey.lower()
-        if r not in REGION_CONFIG:
-            logging.warning("Unknown region '%s' - skipping", r)
-            return (r, {"swipes": pd.DataFrame(), "durations": pd.DataFrame()})
-
-        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
-
-        # If cache exists and recent, load it
-        if _is_recent(csv_path, max_age_seconds=300) and _is_recent(swipes_csv_path, max_age_seconds=300):
-            try:
-                logging.info("Loading cached CSVs for region %s date %s", r, target_date)
-                durations = pd.read_csv(csv_path, parse_dates=["FirstSwipe", "LastSwipe"], infer_datetime_format=True)
-                swipes = pd.read_csv(swipes_csv_path, parse_dates=["LocaleMessageTime"], infer_datetime_format=True)
-                # convert Date column to date if present
-                if "Date" in durations.columns:
-                    try:
-                        durations["Date"] = pd.to_datetime(durations["Date"]).dt.date
-                    except Exception:
-                        pass
-                return (r, {"swipes": swipes, "durations": durations})
-            except Exception:
-                logging.exception("Failed loading cached CSVs for %s — will re-fetch", r)
-
-        logging.info("Fetching swipes from DB for region %s date %s", r, target_date)
-        try:
-            swipes = fetch_swipes_for_region(r, target_date)
-        except Exception:
-            logging.exception("Failed fetching swipes for region %s", r)
-            swipes = pd.DataFrame()
-
-        # apply city filter if required
-        if city and not swipes.empty:
-            city_l = str(city).strip().lower()
-            mask_parts = []
-            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
-                if col in swipes.columns:
-                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
-            if mask_parts:
-                combined_mask = mask_parts[0]
-                for m in mask_parts[1:]:
-                    combined_mask = combined_mask | m
-                swipes = swipes[combined_mask].copy()
-            else:
-                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
-
-        try:
-            durations = compute_daily_durations(swipes)
-        except Exception:
-            logging.exception("Failed computing durations for region %s", r)
-            durations = pd.DataFrame()
-
-        # try to save CSVs (best-effort)
-        try:
-            durations.to_csv(csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing durations CSV for %s", r)
-        try:
-            swipes.to_csv(swipes_csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing swipes CSV for %s", r)
-
-        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, str(csv_path), len(durations))
-        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, str(swipes_csv_path), len(swipes))
-        return (r, {"swipes": swipes, "durations": durations})
-
-    # run parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_region = {ex.submit(fetch_region, r): r for r in regions}
-        for fut in concurrent.futures.as_completed(future_to_region):
-            rkey = future_to_region[fut]
-            try:
-                r, val = fut.result()
-                results[r] = val
-            except Exception:
-                logging.exception("Region task failed for %s", rkey)
-                results[rkey] = {"swipes": pd.DataFrame(), "durations": pd.DataFrame()}
-
-    return results
-
-# CLI runner (unchanged)
-def parse_args():
-    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
-    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
-    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
-                   default="apac,emea,laca,namer")
-    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
-    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
-    return p.parse_args()
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args = parse_args()
-
-    if args.date:
-        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-    else:
-        tz = ZoneInfo("Asia/Kolkata")
-        target_date = datetime.now(tz).date()
-
-    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
-    outdir = args.outdir
-
-    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
-    results = run_for_date(target_date, regions, outdir, city=args.city)
-
-    for r, obj in results.items():
-        dur = obj.get("durations")
-        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
-    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
-
-
-
-
-
-
-
-
-
-# near top of app.py
-COMPUTE_WAIT_TIMEOUT_SECONDS = 180  # was 30; allow longer compute time while DB queries run
-
-
-
-
-
-
-
-
-
-alos check console details and fix this issue carefully..
-
-(.venv) PS C:\Users\W0024618\Desktop\global-page> cd backend
-(.venv) PS C:\Users\W0024618\Desktop\global-page\backend> cd attendance-analytics                                 
-(.venv) PS C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics> python -m uvicorn app:app --host 0.0.0.0 --port 8000
-INFO:     Started server process [20908]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:52694 - "GET /ccure/stream HTTP/1.1" 200 OK
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:727: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
-  df = pd.read_sql(sql, conn)
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\duration_report.py:810: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
-  grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-
-
-
-
-
-C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
-
+#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
 # app.py (top portion) - minor cleanup (remove duplicate import)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
@@ -627,6 +18,7 @@ from datetime import date, datetime, timedelta
 import re
 import asyncio
 from typing import Optional, Dict, Any
+COMPUTE_WAIT_TIMEOUT_SECONDS = 180  # was 30; allow longer compute time while DB queries run
 
 # NEW: pandas import required for /duration serialization
 import pandas as pd
@@ -2043,12 +1435,20 @@ async def api_duration(
 
 
 
+
+
+
+
+
+
+
 # duration_report.py
 """
-duration_report.py
-
-Updated: supports querying multiple monthly ACVSUJournal databases (current + previous N).
-Fixes: category counting only for present days (so dominant category is correct).
+duration_report.py  — optimized for faster repeated API requests:
+ - parallel region fetch (ThreadPoolExecutor, limited workers)
+ - CSV caching (reuse recent CSVs to avoid DB hits during dev / repeated UI runs)
+ - use SQLAlchemy engine for pd.read_sql when available to avoid pandas warning
+ - replaced groupby.apply with groupby.agg for faster aggregation
 """
 import argparse
 import logging
@@ -2058,6 +1458,8 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import concurrent.futures
+import time
 
 import pandas as pd
 
@@ -2067,9 +1469,17 @@ try:
 except Exception:
     pyodbc = None
 
+# Optional: SQLAlchemy engine (faster pd.read_sql with engine, silences pandas warning)
+try:
+    from sqlalchemy import create_engine
+    SQLALCHEMY_AVAILABLE = True
+except Exception:
+    create_engine = None
+    SQLALCHEMY_AVAILABLE = False
+
 ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
 
-# (REGION_CONFIG unchanged - omitted here for brevity in inline view; keep your config)
+# (KEEP YOUR REGION_CONFIG — unchanged)
 REGION_CONFIG = {
     "apac": {
         "user": "GSOC_Test",
@@ -2113,7 +1523,6 @@ REGION_CONFIG = {
     }
 }
 
-# GENERIC_SQL_TEMPLATE and DB helper functions remain unchanged.
 GENERIC_SQL_TEMPLATE = r"""
 SELECT
     t1.[ObjectName1] AS EmployeeName,
@@ -2151,7 +1560,7 @@ WHERE t1.MessageType = 'CardAdmitted'
   {region_filter}
 """
 
-# helper functions (split name, expand DB list, connect master, filter existing dbs)
+# Helper functions (unchanged logic)
 def _split_db_name(dbname: str):
     m = re.match(r"^(.*?)(\d+)$", dbname)
     if not m:
@@ -2275,6 +1684,10 @@ def get_connection(region_key: str):
     return pyodbc.connect(conn_str, autocommit=True)
 
 def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Fetch swipes for a single region/date. Uses SQLAlchemy engine if available (faster),
+    otherwise falls back to pyodbc connection and pd.read_sql.
+    """
     sql = build_region_query(region_key, target_date)
     logging.info("Built SQL for region %s, date %s", region_key, target_date)
     cols = [
@@ -2285,16 +1698,41 @@ def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
         logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
         return pd.DataFrame(columns=cols)
 
-    conn = get_connection(region_key)
-    try:
-        df = pd.read_sql(sql, conn)
-    finally:
-        conn.close()
+    # Try SQLAlchemy engine path first (silences pandas DBAPI warning and may be faster)
+    rc = REGION_CONFIG[region_key]
+    if SQLALCHEMY_AVAILABLE:
+        try:
+            # Build a secure engine string (ODBC uri)
+            # Example: mssql+pyodbc://user:pass@server/database?driver=ODBC+Driver+17+for+SQL+Server
+            driver = ODBC_DRIVER.replace(" ", "+")
+            username = rc['user']
+            password = rc['password']
+            server = rc['server']
+            database = rc['database']
+            engine_url = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver={driver};TrustServerCertificate=Yes"
+            engine = create_engine(engine_url, fast_executemany=True)
+            df = pd.read_sql(sql, engine)
+            engine.dispose()
+        except Exception:
+            logging.exception("SQLAlchemy path failed, falling back to raw pyodbc for region %s", region_key)
+            conn = get_connection(region_key)
+            try:
+                df = pd.read_sql(sql, conn)
+            finally:
+                conn.close()
+    else:
+        conn = get_connection(region_key)
+        try:
+            df = pd.read_sql(sql, conn)
+        finally:
+            conn.close()
 
+    # Ensure columns exist
     for c in cols:
         if c not in df.columns:
             df[c] = None
 
+    # make sure timestamp coercion happens
     try:
         df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
     except Exception:
@@ -2303,6 +1741,10 @@ def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
     return df[cols]
 
 def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Faster aggregation using groupby.agg instead of groupby.apply.
+    Returns the same columns as before.
+    """
     out_cols = [
         "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
         "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
@@ -2314,6 +1756,7 @@ def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=out_cols)
 
     df = swipes_df.copy()
+
     expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
                 "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
     for col in expected:
@@ -2343,51 +1786,61 @@ def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
     df["person_uid"] = df.apply(make_person_uid, axis=1)
     df = df[df["person_uid"].notna()].copy()
 
-    def agg_for_group(g):
-        g_sorted = g.sort_values("LocaleMessageTime")
-        first = g_sorted.iloc[0]
-        last = g_sorted.iloc[-1]
-        first_dir = first.get("Direction")
-        last_dir = last.get("Direction")
+    # Sort, then use groupby.agg (faster than apply)
+    df = df.sort_values("LocaleMessageTime")
 
-        return pd.Series({
-            "person_uid": first["person_uid"],
-            "EmployeeIdentity": first.get("EmployeeIdentity"),
-            "EmployeeID": first.get("EmployeeID"),
-            "EmployeeName": first.get("EmployeeName"),
-            "CardNumber": first.get("CardNumber"),
-            "Date": first["Date"],
-            "FirstSwipe": first["LocaleMessageTime"],
-            "LastSwipe": last["LocaleMessageTime"],
-            "FirstDoor": first.get("Door"),
-            "LastDoor": last.get("Door"),
-            "CountSwipes": int(len(g_sorted)),
-            "PersonnelTypeName": first.get("PersonnelTypeName"),
-            "PartitionName2": first.get("PartitionName2"),
-            "CompanyName": first.get("CompanyName"),
-            "PrimaryLocation": first.get("PrimaryLocation"),
-            "FirstDirection": first_dir,
-            "LastDirection": last_dir
-        })
+    grouped = df.groupby(["person_uid", "Date"], sort=False)
 
-    grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+    agg = grouped.agg(
+        EmployeeIdentity=("EmployeeIdentity", "first"),
+        EmployeeID=("EmployeeID", "first"),
+        EmployeeName=("EmployeeName", "first"),
+        CardNumber=("CardNumber", "first"),
+        FirstSwipe=("LocaleMessageTime", "first"),
+        LastSwipe=("LocaleMessageTime", "last"),
+        FirstDoor=("Door", "first"),
+        LastDoor=("Door", "last"),
+        CountSwipes=("LocaleMessageTime", "count"),
+        PersonnelTypeName=("PersonnelTypeName", "first"),
+        PartitionName2=("PartitionName2", "first"),
+        CompanyName=("CompanyName", "first"),
+        PrimaryLocation=("PrimaryLocation", "first"),
+        FirstDirection=("Direction", "first"),
+        LastDirection=("Direction", "last")
+    ).reset_index()
 
-    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
-    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+    # compute durations
+    try:
+        agg["DurationSeconds"] = (pd.to_datetime(agg["LastSwipe"]) - pd.to_datetime(agg["FirstSwipe"])).dt.total_seconds().clip(lower=0)
+    except Exception:
+        # fallback if conversion fails
+        agg["DurationSeconds"] = 0
+        for i, row in agg.iterrows():
+            try:
+                first = pd.to_datetime(row["FirstSwipe"])
+                last = pd.to_datetime(row["LastSwipe"])
+                agg.at[i, "DurationSeconds"] = max(0, int((last - first).total_seconds()))
+            except Exception:
+                agg.at[i, "DurationSeconds"] = 0
 
-    return grouped[out_cols]
+    agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+    agg = agg.rename(columns={"person_uid": "person_uid"})
+
+    # ensure all columns
+    result = pd.DataFrame(columns=out_cols)
+    for col in out_cols:
+        if col in agg.columns:
+            result[col] = agg[col]
+        else:
+            result[col] = None
+
+    # Fill Date as date type
+    if "Date" in result.columns:
+        result["Date"] = pd.to_datetime(result["Date"]).dt.date
+
+    return result[out_cols]
 
 def categorize_seconds(s: Optional[int]) -> str:
-    """
-    Category labels (used when secs present > 0):
-      - "0-30m"      -> 0 .. 1800 (inclusive)
-      - "30m-2h"     -> 1801 .. 7200
-      - "2h-6h"      -> 7201 .. 21600
-      - "6h-8h"      -> 21601 .. 28800
-      - "8h+"        -> >= 28800
-    Note: this helper alone will still return "0-30m" for s None/0, but in counting code we
-    only increment when s is present and >0.
-    """
     try:
         if s is None or s <= 0:
             return "0-30m"
@@ -2404,23 +1857,64 @@ def categorize_seconds(s: Optional[int]) -> str:
     except Exception:
         return "0-30m"
 
+# New: helper to load from csv if present + recent
+def _is_recent(path: Path, max_age_seconds: int = 300) -> bool:
+    try:
+        if not path.exists():
+            return False
+        m = path.stat().st_mtime
+        return (time.time() - m) <= max_age_seconds
+    except Exception:
+        return False
+
 def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Fetch durations for multiple regions in parallel (bounded ThreadPool).
+    Uses on-disk CSV cache when available and recent to drastically speed up repeated UI calls.
+    Returns { region_key: {"swipes": DataFrame, "durations": DataFrame}, ... }
+    """
     outdir_path = Path(outdir)
     outdir_path.mkdir(parents=True, exist_ok=True)
 
     results: Dict[str, Any] = {}
-    for r in regions:
-        r = r.lower()
+
+    # Cap concurrency to avoid hammering DB server
+    max_workers = min(4, max(1, len(regions)))  # tune this number as needed
+    logging.info("Running run_for_date for %s regions=%s (workers=%d)", target_date, regions, max_workers)
+
+    def fetch_region(rkey: str):
+        r = rkey.lower()
         if r not in REGION_CONFIG:
             logging.warning("Unknown region '%s' - skipping", r)
-            continue
-        logging.info("Fetching swipes for region %s on %s", r, target_date)
+            return (r, {"swipes": pd.DataFrame(), "durations": pd.DataFrame()})
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+
+        # If cache exists and recent, load it
+        if _is_recent(csv_path, max_age_seconds=300) and _is_recent(swipes_csv_path, max_age_seconds=300):
+            try:
+                logging.info("Loading cached CSVs for region %s date %s", r, target_date)
+                durations = pd.read_csv(csv_path, parse_dates=["FirstSwipe", "LastSwipe"], infer_datetime_format=True)
+                swipes = pd.read_csv(swipes_csv_path, parse_dates=["LocaleMessageTime"], infer_datetime_format=True)
+                # convert Date column to date if present
+                if "Date" in durations.columns:
+                    try:
+                        durations["Date"] = pd.to_datetime(durations["Date"]).dt.date
+                    except Exception:
+                        pass
+                return (r, {"swipes": swipes, "durations": durations})
+            except Exception:
+                logging.exception("Failed loading cached CSVs for %s — will re-fetch", r)
+
+        logging.info("Fetching swipes from DB for region %s date %s", r, target_date)
         try:
             swipes = fetch_swipes_for_region(r, target_date)
         except Exception:
             logging.exception("Failed fetching swipes for region %s", r)
             swipes = pd.DataFrame()
 
+        # apply city filter if required
         if city and not swipes.empty:
             city_l = str(city).strip().lower()
             mask_parts = []
@@ -2441,8 +1935,7 @@ def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optio
             logging.exception("Failed computing durations for region %s", r)
             durations = pd.DataFrame()
 
-        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        # try to save CSVs (best-effort)
         try:
             durations.to_csv(csv_path, index=False)
         except Exception:
@@ -2452,9 +1945,21 @@ def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optio
         except Exception:
             logging.exception("Failed writing swipes CSV for %s", r)
 
-        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
-        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
-        results[r] = {"swipes": swipes, "durations": durations}
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, str(csv_path), len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, str(swipes_csv_path), len(swipes))
+        return (r, {"swipes": swipes, "durations": durations})
+
+    # run parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_region = {ex.submit(fetch_region, r): r for r in regions}
+        for fut in concurrent.futures.as_completed(future_to_region):
+            rkey = future_to_region[fut]
+            try:
+                r, val = fut.result()
+                results[r] = val
+            except Exception:
+                logging.exception("Region task failed for %s", rkey)
+                results[rkey] = {"swipes": pd.DataFrame(), "durations": pd.DataFrame()}
 
     return results
 
@@ -2492,738 +1997,6 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
-
-// frontend/src/pages/DurationPage.jsx
-import React, { useState, useMemo } from "react";
-import axios from "axios";
-import {
-  Box,
-  Grid,
-  Paper,
-  Typography,
-  TextField,
-  Button,
-  Table,
-  TableHead,
-  TableRow,
-  TableCell,
-  TableBody,
-  TableContainer,
-  CircularProgress,
-  IconButton,
-  Tooltip,
-  Card,
-  CardContent,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  Divider,
-} from "@mui/material";
-import DateRangeIcon from "@mui/icons-material/DateRange";
-import SearchIcon from "@mui/icons-material/Search";
-import DownloadIcon from "@mui/icons-material/CloudDownload";
-import ClearIcon from "@mui/icons-material/Clear";
-import VisibilityIcon from "@mui/icons-material/Visibility";
-
-const API_BASE = import.meta.env.VITE_API_BASE || import.meta.env.REACT_APP_API_BASE || "http://localhost:8000";
-
-const REGIONS = [
-  { value: "apac", label: "APAC" },
-  { value: "emea", label: "EMEA" },
-  { value: "laca", label: "LACA" },
-  { value: "namer", label: "NAMER" },
-];
-
-function secondsToHMS(s) {
-  if (s == null) return "";
-  const sec = Number(s);
-  if (!Number.isFinite(sec)) return "";
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const r = Math.floor(sec % 60);
-  return `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-}
-
-function isoToDDMMYYYY(iso) {
-  if (!iso) return iso;
-  const dt = new Date(iso.includes("T") ? iso : `${iso}T00:00:00Z`);
-  if (Number.isNaN(dt.getTime())) return iso;
-  const dd = String(dt.getUTCDate()).padStart(2, "0");
-  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
-  const yyyy = dt.getUTCFullYear();
-  return `${dd}-${mm}-${yyyy}`;
-}
-
-function isoToLongDateNoCommas(iso) {
-  // produce a header string without internal commas to avoid CSV splitting
-  if (!iso) return iso;
-  const dt = new Date(iso.includes("T") ? iso : `${iso}T00:00:00Z`);
-  if (Number.isNaN(dt.getTime())) return iso;
-  const weekday = dt.toLocaleDateString(undefined, { weekday: "short" }); // Mon/Tue...
-  const day = String(dt.getUTCDate()).padStart(2, "0");
-  const month = String(dt.getUTCMonth() + 1).padStart(2, "0");
-  const year = dt.getUTCFullYear();
-  return `${weekday} ${day}-${month}-${year}`; // no commas
-}
-
-export default function DurationPage() {
-  const [region, setRegion] = useState("apac");
-  const [city, setCity] = useState("");
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-  const [singleDate, setSingleDate] = useState("");
-  const [useRange, setUseRange] = useState(true);
-
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const [searchEmployeeId, setSearchEmployeeId] = useState("");
-  const [searchEmployeeName, setSearchEmployeeName] = useState("");
-  const [searchCardNumber, setSearchCardNumber] = useState("");
-
-  const [swipeDialogOpen, setSwipeDialogOpen] = useState(false);
-  const [selectedEmployee, setSelectedEmployee] = useState(null);
-  const [selectedSwipes, setSelectedSwipes] = useState([]);
-
-  // --- fetch durations ---
-  const fetchDurations = async () => {
-    setError("");
-    setLoading(true);
-    setData(null);
-
-    try {
-      const params = {};
-      if (useRange && startDate && endDate) {
-        params.start_date = startDate;
-        params.end_date = endDate;
-      } else if (!useRange && singleDate) {
-        params.date = singleDate;
-      } else {
-        if (singleDate) params.date = singleDate;
-      }
-
-      if (region) params.regions = region;
-      if (city) params.city = city;
-
-      const res = await axios.get(`${API_BASE}/duration`, { params, timeout: 12000000 });
-      setData(res.data);
-    } catch (err) {
-      console.error(err);
-      setError(err?.response?.data?.detail || err.message || "Failed to fetch duration data");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const regionObj = useMemo(() => {
-    if (!data || !region) return null;
-    return data.regions?.[region] || null;
-  }, [data, region]);
-
-  // helpers to compute week starts from regionObj.dates
-  const computeWeekStarts = (datesIso) => {
-    if (!datesIso || datesIso.length === 0) return [];
-    const dateObjs = datesIso.map(d => new Date(d + "T00:00:00Z"));
-    const weekStartSet = new Set();
-    dateObjs.forEach(dt => {
-      const day = dt.getUTCDay(); // 0 Sun..6 Sat
-      const diff = (day + 6) % 7; // days since Monday
-      const monday = new Date(dt);
-      monday.setUTCDate(dt.getUTCDate() - diff);
-      weekStartSet.add(monday.toISOString().slice(0,10));
-    });
-    return Array.from(weekStartSet).sort();
-  };
-
-  // --- CSV exports ---
-
-  const quote = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`;
-
-  const exportSummaryCsv = () => {
-    if (!regionObj) return;
-    const dates = regionObj.dates || [];
-    const rows = regionObj.employees || [];
-
-    const header = ["EmployeeID", "EmployeeName", "TotalSecondsPresentInRange", "DominantCategory", "ComplianceSummary", ...dates.map(d => d)];
-    const csvRows = [header.map(h => quote(h)).join(",")];
-
-    rows.forEach((r) => {
-      const complianceText = r.compliance?.month_summary || "";
-      const complianceCell = `'${complianceText}`; // force text in Excel
-      const row = [
-        quote(r.EmployeeID || ""),
-        quote(r.EmployeeName || ""),
-        r.total_seconds_present_in_range ?? "",
-        quote(r.duration_categories?.dominant_category || ""),
-        quote(complianceCell),
-        ...dates.map(d => quote(r.durations?.[d] ?? ""))
-      ];
-      csvRows.push(row.join(","));
-    });
-
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const filename = `duration_summary_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-
-
-
-
-
-
- const exportReportCsv = () => {
-    if (!regionObj) return;
-    const datesIso = regionObj.dates || [];
-    const weekStarts = computeWeekStarts(datesIso);
-
-    // base header
-    const baseHeader = [
-      "Sr.No", "EmployeeID", "EmployeeName", "CardNumber", "PersonnelType", "PartitionName2", "TotalSecondsPresentInRange"
-    ];
-
-    // per-day headers (Mon..Sun for each week) - use a no-comma format
-    const perDayHeaders = [];
-    weekStarts.forEach(ws => {
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(ws + "T00:00:00Z");
-        d.setUTCDate(d.getUTCDate() + i);
-        const iso = d.toISOString().slice(0,10);
-        perDayHeaders.push(isoToLongDateNoCommas(iso));
-      }
-    });
-
-    // per-week compliance headers
-    const perWeekHeaders = weekStarts.map(ws => `Week compliance ${ws}`);
-
-    const header = [...baseHeader, ...perDayHeaders, ...perWeekHeaders, "DominantCategory", "ComplianceSummary"];
-    const csvRows = [header.map(h => quote(h)).join(",")];
-
-    const rows = regionObj.employees || [];
-    rows.forEach((r, idx) => {
-      const srNo = idx + 1;
-      const employeeId = r.EmployeeID ?? "";
-      const employeeName = r.EmployeeName ?? "";
-      const cardNumber = r.CardNumber ?? "";
-      const personnelType = r.PersonnelType ?? r.PersonnelTypeName ?? "";
-      const partition = r.PartitionName2 ?? "";
-      const totalSeconds = r.total_seconds_present_in_range ?? "";
-
-      // per-day durations (string) or "0" when absent
-      const perDayVals = [];
-      weekStarts.forEach(ws => {
-        for (let i = 0; i < 7; i++) {
-          const d = new Date(ws + "T00:00:00Z");
-          d.setUTCDate(d.getUTCDate() + i);
-          const iso = d.toISOString().slice(0,10);
-
-          // prefer API-provided week map if present
-          const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-          let outVal = "0";
-
-          if (wk && wk.dates && Object.prototype.hasOwnProperty.call(wk.dates, iso)) {
-            const secs = wk.dates[iso];
-            if (secs !== null && secs !== undefined) {
-              // prefer already formatted string if available
-              outVal = (r.durations && r.durations[iso]) ? r.durations[iso] : secondsToHMS(secs);
-            } else {
-              outVal = "0";
-            }
-          } else if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && r.durations[iso]) {
-            outVal = r.durations[iso];
-          } else if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso) && r.durations_seconds[iso]) {
-            outVal = secondsToHMS(r.durations_seconds[iso]);
-          } else {
-            outVal = "0";
-          }
-
-          perDayVals.push(outVal);
-        }
-      });
-
-      // per-week compliance Yes/No
-      const perWeekVals = weekStarts.map(ws => {
-        const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-        return wk && wk.compliant ? "Yes" : "No";
-      });
-
-      const complianceText = r.compliance?.month_summary || "";
-      const complianceCell = `'${complianceText}`;
-
-      const row = [
-        `${srNo}`,
-        quote(employeeId),
-        quote(employeeName),
-        quote(cardNumber),
-        quote(personnelType),
-        quote(partition),
-        `${totalSeconds}`,
-        ...perDayVals.map(v => quote(v)),
-        ...perWeekVals.map(v => quote(v)),
-        quote(r.duration_categories?.dominant_category || ""),
-        quote(complianceCell)
-      ];
-
-      csvRows.push(row.join(","));
-    });
-
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const filename = `duration_report_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-
-
-
-
-  const exportSwipesCsv = () => {
-    if (!regionObj) return;
-    const swipesByDate = regionObj.swipes_by_date || {};
-    const rows = [];
-    Object.entries(swipesByDate).forEach(([d, arr]) => {
-      arr.forEach(s => {
-        rows.push({
-          Date: d,
-          LocaleMessageTime: s.LocaleMessageTime || "",
-          Swipe_Time: s.Swipe_Time || "",
-          EmployeeID: s.EmployeeID || "",
-          PersonGUID: s.PersonGUID || "",
-          ObjectName1: s.ObjectName1 || "",
-          Door: s.Door || "",
-          PersonnelType: s.PersonnelType || "",
-          CardNumber: s.CardNumber || "",
-          PrimaryLocation: s.PrimaryLocation || s.Text5 || "",
-          PartitionName2: s.PartitionName2 || "",
-          AdmitCode: s.AdmitCode || "",
-          Direction: s.Direction || "",
-          CompanyName: s.CompanyName || ""
-        });
-      });
-    });
-
-    if (rows.length === 0) {
-      alert("No swipe rows available for current selection to export.");
-      return;
-    }
-
-    const headers = [
-      "Date",
-      "LocaleMessageTime",
-      "Swipe_Time",
-      "EmployeeID",
-      "PersonGUID",
-      "ObjectName1",
-      "Door",
-      "PersonnelType",
-      "CardNumber",
-      "PrimaryLocation",
-      "PartitionName2",
-      "AdmitCode",
-      "Direction",
-      "CompanyName"
-    ];
-    const csvRows = [headers.map(h => quote(h)).join(",")];
-    rows.forEach(r => {
-      const line = headers.map(h => quote(r[h] ?? "")).join(",");
-      csvRows.push(line);
-    });
-
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const filename = `swipes_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-  // --- Render helpers ---
-  const getFilteredRows = () => {
-    if (!regionObj) return [];
-    const rows = regionObj.employees || [];
-    return rows.filter(r => {
-      const matchesEmployeeId = !searchEmployeeId || String(r.EmployeeID || "").toLowerCase().includes(searchEmployeeId.toLowerCase());
-      const matchesName = !searchEmployeeName || String(r.EmployeeName || "").toLowerCase().includes(searchEmployeeName.toLowerCase());
-      const matchesCard = !searchCardNumber || String(r.CardNumber || "").toLowerCase().includes(searchCardNumber.toLowerCase());
-      return matchesEmployeeId && matchesName && matchesCard;
-    });
-  };
-
-  const openSwipeDialogFor = (emp) => {
-    setSelectedEmployee(emp);
-    const swipesByDate = regionObj?.swipes_by_date || {};
-    const matches = [];
-    Object.entries(swipesByDate).forEach(([d, arr]) => {
-      arr.forEach(s => {
-        const matchByEmployeeId = emp.EmployeeID && s.EmployeeID && String(s.EmployeeID) === String(emp.EmployeeID);
-        const matchByCard = emp.CardNumber && s.CardNumber && String(s.CardNumber) === String(emp.CardNumber);
-        const matchByPersonGuid = emp.person_uid && s.PersonGUID && String(s.PersonGUID) === String(emp.person_uid);
-        if (matchByEmployeeId || matchByCard || matchByPersonGuid) {
-          matches.push({ ...s, Date: d });
-        }
-      });
-    });
-    matches.sort((a,b) => {
-      const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
-      const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
-      return ta - tb;
-    });
-
-    setSelectedSwipes(matches);
-    setSwipeDialogOpen(true);
-  };
-
-  const renderTable = () => {
-    if (!regionObj) return <Typography>No data for selected region.</Typography>;
-
-    const dates = regionObj.dates || [];
-    const rows = getFilteredRows();
-
-    const weekStarts = computeWeekStarts(dates);
-
-    return (
-      <TableContainer component={Paper} sx={{ mt: 2, width: "100%", overflowX: "auto" }}>
-        <Table size="small" stickyHeader>
-          <TableHead>
-            <TableRow>
-              <TableCell><b>Sr.No</b></TableCell>
-              <TableCell><b>EmployeeID</b></TableCell>
-              <TableCell><b>EmployeeName</b></TableCell>
-              <TableCell><b>CardNumber</b></TableCell>
-              <TableCell><b>PersonnelType</b></TableCell>
-              <TableCell><b>PartitionName2</b></TableCell>
-              <TableCell align="right"><b>Total (hh:mm:ss)</b></TableCell>
-              {dates.map((d) => (
-                <TableCell key={d} align="center"><b>{isoToDDMMYYYY(d)}</b></TableCell>
-              ))}
-              {/* add week-level compliance columns */}
-              {weekStarts.map(ws => (
-                <TableCell key={ws} align="center"><b>{`Week ${ws} compliant`}</b></TableCell>
-              ))}
-              <TableCell align="center"><b>Dominant Category</b></TableCell>
-              <TableCell align="center"><b>Compliance (weeks met/total)</b></TableCell>
-              <TableCell align="center"><b>View</b></TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {rows.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={9 + (regionObj.dates || []).length + weekStarts.length} align="center">No employees in the response.</TableCell>
-              </TableRow>
-            ) : (
-              rows.map((r, idx) => (
-                <TableRow key={r.person_uid || `${r.EmployeeID}-${r.EmployeeName}`}>
-                  <TableCell>{idx + 1}</TableCell>
-                  <TableCell>{r.EmployeeID || "-"}</TableCell>
-                  <TableCell>{r.EmployeeName || "-"}</TableCell>
-                  <TableCell>{r.CardNumber || "-"}</TableCell>
-                  <TableCell>{r.PersonnelType || r.PersonnelTypeName || "-"}</TableCell>
-                  <TableCell>{r.PartitionName2 || "-"}</TableCell>
-                  <TableCell align="right">{secondsToHMS(r.total_seconds_present_in_range)}</TableCell>
-                  {dates.map((d) => (
-                    <TableCell key={d} align="center">{r.durations?.[d] ?? "-"}</TableCell>
-                  ))}
-                  {weekStarts.map(ws => {
-                    const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-                    return <TableCell key={ws} align="center">{wk && wk.compliant ? "Yes" : "No"}</TableCell>;
-                  })}
-                  <TableCell align="center">
-                    {r.duration_categories?.dominant_category || "-"}
-                    {r.duration_categories?.red_flag > 0 ? " ⚠️" : ""}
-                  </TableCell>
-                  <TableCell align="center">{r.compliance?.month_summary || "-"}</TableCell>
-                  <TableCell align="center">
-                    <Tooltip title="View swipe records for this employee">
-                      <IconButton size="small" onClick={() => openSwipeDialogFor(r)}>
-                        <VisibilityIcon />
-                      </IconButton>
-                    </Tooltip>
-                  </TableCell>
-                </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
-    );
-  };
-
-  // --- JSX UI (top controls) ---
-  return (
-    <Box sx={{ p: 3, width: "100%", maxWidth: "100vw", boxSizing: "border-box" }}>
-      <Typography variant="h5" gutterBottom>
-        Duration Reports (with Compliance & Category)
-      </Typography>
-
-      <Grid container spacing={2}>
-        <Grid item xs={12}>
-          <Card>
-            <CardContent>
-              <Grid container spacing={2} alignItems="center">
-                <Grid item xs={12} md={2}>
-                  <TextField
-                    select
-                    fullWidth
-                    label="Region"
-                    value={region}
-                    onChange={(e) => setRegion(e.target.value)}
-                  >
-                    {REGIONS.map((r) => (
-                      <option key={r.value} value={r.value}>{r.label}</option>
-                    ))}
-                  </TextField>
-                </Grid>
-
-                <Grid item xs={12} md={3}>
-                  <TextField
-                    fullWidth
-                    label="City / Partition (optional)"
-                    placeholder="e.g. CR.Costa Rica Partition"
-                    value={city}
-                    onChange={(e) => setCity(e.target.value)}
-                  />
-                </Grid>
-
-                <Grid item xs={12} md={5} sx={{ display: "flex", gap: 1, justifyContent: "flex-end" }}>
-                  <Button
-                    startIcon={<DateRangeIcon />}
-                    variant={useRange ? "contained" : "outlined"}
-                    onClick={() => setUseRange(true)}
-                  >
-                    Range
-                  </Button>
-                  <Button
-                    startIcon={<DateRangeIcon />}
-                    variant={!useRange ? "contained" : "outlined"}
-                    onClick={() => setUseRange(false)}
-                  >
-                    Single Day
-                  </Button>
-                </Grid>
-
-                {useRange ? (
-                  <>
-                    <Grid item xs={12} md={3}>
-                      <TextField
-                        label="Start date"
-                        type="date"
-                        fullWidth
-                        InputLabelProps={{ shrink: true }}
-                        value={startDate}
-                        onChange={(e) => setStartDate(e.target.value)}
-                      />
-                    </Grid>
-                    <Grid item xs={12} md={3}>
-                      <TextField
-                        label="End date"
-                        type="date"
-                        fullWidth
-                        InputLabelProps={{ shrink: true }}
-                        value={endDate}
-                        onChange={(e) => setEndDate(e.target.value)}
-                      />
-                    </Grid>
-                  </>
-                ) : (
-                  <Grid item xs={12} md={3}>
-                    <TextField
-                      label="Date"
-                      type="date"
-                      fullWidth
-                      InputLabelProps={{ shrink: true }}
-                      value={singleDate}
-                      onChange={(e) => setSingleDate(e.target.value)}
-                    />
-                  </Grid>
-                )}
-
-                <Grid item xs={12} md={6} sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                  <Button
-                    variant="contained"
-                    startIcon={<SearchIcon />}
-                    onClick={fetchDurations}
-                    disabled={loading}
-                  >
-                    {loading ? "Loading..." : "Run"}
-                  </Button>
-
-                  <Button
-                    variant="outlined"
-                    startIcon={<ClearIcon />}
-                    onClick={() => {
-                      setStartDate("");
-                      setEndDate("");
-                      setSingleDate("");
-                      setCity("");
-                      setData(null);
-                      setError("");
-                    }}
-                  >
-                    Clear
-                  </Button>
-
-                  <Tooltip title="Export Summary CSV (per-person)">
-                    <span>
-                      <IconButton onClick={exportSummaryCsv} disabled={!regionObj || (regionObj.employees || []).length === 0}>
-                        <DownloadIcon />
-                      </IconButton>
-                    </span>
-                  </Tooltip>
-
-                  <Tooltip title="Export full report (Sr.No, ... Compliance)">
-                    <span>
-                      <Button variant="contained" onClick={exportReportCsv} disabled={!regionObj || (regionObj.employees || []).length === 0}>
-                        Export Report
-                      </Button>
-                    </span>
-                  </Tooltip>
-
-                  <Tooltip title="Export raw swipes for this region/date range">
-                    <span>
-                      <Button variant="outlined" onClick={exportSwipesCsv} disabled={!regionObj || Object.keys(regionObj.swipes_by_date || {}).length === 0}>
-                        Export Swipes
-                      </Button>
-                    </span>
-                  </Tooltip>
-                </Grid>
-
-                <Grid item xs={12} md={4}>
-                  <TextField
-                    fullWidth
-                    label="Search Employee ID"
-                    value={searchEmployeeId}
-                    onChange={(e) => setSearchEmployeeId(e.target.value)}
-                    size="small"
-                  />
-                </Grid>
-                <Grid item xs={12} md={4}>
-                  <TextField
-                    fullWidth
-                    label="Search Employee Name"
-                    value={searchEmployeeName}
-                    onChange={(e) => setSearchEmployeeName(e.target.value)}
-                    size="small"
-                  />
-                </Grid>
-                <Grid item xs={12} md={4}>
-                  <TextField
-                    fullWidth
-                    label="Search Card Number"
-                    value={searchCardNumber}
-                    onChange={(e) => setSearchCardNumber(e.target.value)}
-                    size="small"
-                  />
-                </Grid>
-
-              </Grid>
-            </CardContent>
-          </Card>
-        </Grid>
-
-        <Grid item xs={12}>
-          <Paper sx={{ p: 2 }}>
-            <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <Typography variant="subtitle1">
-                {data ? `Showing ${region.toUpperCase()} — ${data.start_date} → ${data.end_date}` : "No results yet"}
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                Tip: use the CSV export for offline analysis
-              </Typography>
-            </Box>
-
-            {loading && (
-              <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
-                <CircularProgress />
-              </Box>
-            )}
-
-            {error && (
-              <Typography color="error" sx={{ mt: 2 }}>
-                {error}
-              </Typography>
-            )}
-
-            {!loading && !error && (
-              <Box sx={{ mt: 2 }}>
-                {renderTable()}
-              </Box>
-            )}
-          </Paper>
-        </Grid>
-      </Grid>
-
-      {/* Swipe dialog */}
-      <Dialog open={swipeDialogOpen} onClose={() => setSwipeDialogOpen(false)} fullWidth maxWidth="xl">
-        <DialogTitle>
-          Swipe records for: {selectedEmployee ? `${selectedEmployee.EmployeeID || ""} — ${selectedEmployee.EmployeeName || ""}` : ""}
-        </DialogTitle>
-        <DialogContent dividers>
-          {selectedSwipes.length === 0 ? (
-            <Typography>No swipe records found for this employee in the selected range.</Typography>
-          ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell><b>Date</b></TableCell>
-                  <TableCell><b>Time (local)</b></TableCell>
-                  <TableCell><b>Door</b></TableCell>
-                  <TableCell><b>Direction</b></TableCell>
-                  <TableCell><b>CardNumber</b></TableCell>
-                  <TableCell><b>PersonnelType</b></TableCell>
-                  <TableCell><b>Partition</b></TableCell>
-                  <TableCell><b>PrimaryLocation</b></TableCell>
-                  <TableCell><b>Company</b></TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {selectedSwipes.map((s, i) => (
-                  <TableRow key={i}>
-                    <TableCell>{s.Date}</TableCell>
-                    <TableCell>{s.Swipe_Time ?? (s.LocaleMessageTime ? new Date(s.LocaleMessageTime).toLocaleString() : "-")}</TableCell>
-                    <TableCell>{s.Door || s.ObjectName1 || "-"}</TableCell>
-                    <TableCell>{s.Direction || "-"}</TableCell>
-                    <TableCell>{s.CardNumber || "-"}</TableCell>
-                    <TableCell>{s.PersonnelType || "-"}</TableCell>
-                    <TableCell>{s.PartitionName2 || "-"}</TableCell>
-                    <TableCell>{s.PrimaryLocation || s.Text5 || "-"}</TableCell>
-                    <TableCell>{s.CompanyName || "-"}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </DialogContent>
-        <Divider />
-        <Box sx={{ p: 1, display: "flex", justifyContent: "flex-end" }}>
-          <Button onClick={() => setSwipeDialogOpen(false)}>Close</Button>
-        </Box>
-      </Dialog>
-    </Box>
-  );
-}
 
 
 
