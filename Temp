@@ -1,3 +1,1337 @@
+# app.py (full, updated /duration endpoint with compliance & categories)
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+from typing import Optional, Dict, Any, List, Tuple
+
+# NEW: pandas import required for /duration serialization
+import pandas as pd
+
+# --- DB / models imports (kept for endpoints that still use DB like headcount/attendance fallback) ---
+from db import SessionLocal
+from models import LiveSwipe, AttendanceSummary
+
+# --- settings (optional override) ---
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+import sys  # ensure logging stream available
+RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# ----------------- GLOBAL TIMEOUTS (UNIFY) -----------------
+REGION_TIMEOUT_SECONDS = 20
+COMPUTE_WAIT_TIMEOUT_SECONDS = 30
+COMPUTE_SYNC_TIMEOUT_SECONDS = 60
+# ----------------------------------------------------------
+
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+_broadcaster_clients = set()
+
+def broadcast_ccure_update(payload: dict):
+    if not _broadcaster_clients:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    for q in list(_broadcaster_clients):
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to push payload to SSE client (will remove client)")
+            try:
+                _broadcaster_clients.discard(q)
+            except Exception:
+                pass
+
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    try:
+        while True:
+            payload = await client_queue.get()
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            yield f"data: {data}\n\n"
+    finally:
+        try:
+            _broadcaster_clients.discard(client_queue)
+        except Exception:
+            pass
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    generator = _sse_event_generator(q)
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
+
+def _guess_region_from_text(txt: str) -> str:
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    if any(k in s for k in ("pune","quezon city","taguig city","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+@app.get("/headcount")
+def api_headcount():
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        with SessionLocal() as db:
+            try:
+                today = date.today()
+                rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+                if rows:
+                    for r in rows:
+                        try:
+                            partition = None
+                            if r.derived and isinstance(r.derived, dict):
+                                partition = r.derived.get("partition")
+                            loc = partition or "unknown"
+                            region = _guess_region_from_text(loc)
+                            totals[region] = totals.get(region, 0) + 1
+                        except Exception:
+                            totals["unknown"] += 1
+                else:
+                    start = datetime.combine(today, datetime.min.time())
+                    end = datetime.combine(today, datetime.max.time())
+                    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+                    for s in swipes:
+                        loc = s.partition or "unknown"
+                        region = _guess_region_from_text(loc)
+                        totals[region] = totals.get(region, 0) + 1
+            except Exception:
+                logger.exception("Failed to compute headcount regions")
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# ---------- Helpers retained (normalize / safe conversions) -------------
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# ---------- build_ccure_averages (fallback) ------------------------------
+def build_ccure_averages(start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """
+    Fallback averages computation using AttendanceSummary only.
+    Returns a compact shape (live_today, ccure_active, averages, notes).
+    """
+    try:
+        def _parse_date_param(s):
+            if not s:
+                return None
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date()
+            except Exception:
+                try:
+                    return date.fromisoformat(s)
+                except Exception:
+                    return None
+
+        today = date.today()
+        start_obj = _parse_date_param(start_date) if start_date else (today - timedelta(days=6))
+        end_obj = _parse_date_param(end_date) if end_date else today
+        if start_obj is None or end_obj is None or start_obj > end_obj:
+            start_obj = today - timedelta(days=6)
+            end_obj = today
+
+        with SessionLocal() as db:
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+
+            def classify_from_derived(derived):
+                try:
+                    if not derived or not isinstance(derived, dict):
+                        return "contractor"
+                    for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                        v = derived.get(k)
+                        if v and "employee" in str(v).strip().lower():
+                            return "employee"
+                    for k in ("Employee_Status","Employee Status","Status"):
+                        v = derived.get(k)
+                        if v and "terminated" in str(v).strip().lower():
+                            return "employee"
+                    return "contractor"
+                except Exception:
+                    return "contractor"
+
+            if att_rows:
+                for a in att_rows:
+                    key = None
+                    try:
+                        key = _normalize_employee_key(a.employee_id)
+                    except Exception:
+                        key = None
+                    if not key:
+                        try:
+                            key = _normalize_card_like(a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None)
+                        except Exception:
+                            key = None
+                    if not key:
+                        unknown_count += 1
+                        continue
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    cls = classify_from_derived(a.derived)
+                    if cls == "employee":
+                        live_emp += 1
+                    elif cls == "contractor":
+                        live_contr += 1
+                    else:
+                        unknown_count += 1
+
+                live_total_reported = live_emp + live_contr + unknown_count
+                live_total_details = len(att_rows)
+            else:
+                live_total_reported = 0
+                live_total_details = 0
+                try:
+                    import region_clients
+                    details = []
+                    try:
+                        details = region_clients.fetch_all_details(timeout=REGION_TIMEOUT_SECONDS) or []
+                    except Exception:
+                        logger.exception("region_clients.fetch_all_details failed in build_ccure_averages()")
+                        details = []
+                    if details:
+                        for d in details:
+                            try:
+                                cls = "contractor"
+                                for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                                    v = d.get(k)
+                                    if v and "employee" in str(v).strip().lower():
+                                        cls = "employee"
+                                        break
+                                if cls == "employee":
+                                    live_emp += 1
+                                else:
+                                    live_contr += 1
+                                live_total_details += 1
+                            except Exception:
+                                continue
+                        live_total_reported = live_emp + live_contr
+                    else:
+                        try:
+                            regions = region_clients.fetch_all_regions(timeout=REGION_TIMEOUT_SECONDS) or []
+                            for r in regions:
+                                try:
+                                    c = r.get("count")
+                                    if isinstance(c, (int, float)):
+                                        live_total_reported += int(c)
+                                except Exception:
+                                    continue
+                        except Exception:
+                            logger.exception("region_clients.fetch_all_regions failed in build_ccure_averages()")
+                except Exception:
+                    logger.exception("region_clients not importable in build_ccure_averages()")
+
+            # compute avg range using AttendanceSummary if possible
+            avg_range = None
+            try:
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_obj, AttendanceSummary.date <= end_obj).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                days_count = (end_obj - start_obj).days + 1
+                daily_counts = [len(by_date.get(start_obj + timedelta(days=i), set())) for i in range(days_count)]
+                if days_count and any(daily_counts):
+                    avg_range = int(round(sum(daily_counts) / float(days_count)))
+                else:
+                    avg_range = None
+            except Exception:
+                logger.exception("Failed computing range average from AttendanceSummary")
+                avg_range = None
+
+        # fallback: use region history to compute avg_range if still None
+        if avg_range is None:
+            try:
+                import region_clients
+                entries = region_clients.fetch_all_history(timeout=REGION_TIMEOUT_SECONDS) or []
+                agg = {}
+                for e in entries:
+                    try:
+                        dstr = e.get("date")
+                        if not dstr:
+                            continue
+                        region_obj = e.get("region") if isinstance(e.get("region"), dict) else None
+                        emp = None
+                        con = None
+                        tot = None
+                        if region_obj:
+                            emp = _safe_int(region_obj.get("Employee"))
+                            con = _safe_int(region_obj.get("Contractor"))
+                            tot = _safe_int(region_obj.get("total")) or ((emp or 0) + (con or 0))
+                        else:
+                            emp = _safe_int(e.get("Employee"))
+                            con = _safe_int(e.get("Contractor"))
+                            tot = _safe_int(e.get("total"))
+                        if emp is None and con is None:
+                            continue
+                        if tot is None:
+                            tot = (emp or 0) + (con or 0)
+                        if dstr not in agg:
+                            agg[dstr] = {"total": 0, "count": 0}
+                        agg[dstr]["total"] += tot or 0
+                        agg[dstr]["count"] += 1
+                    except Exception:
+                        continue
+                per_date_totals = []
+                days_count = (end_obj - start_obj).days + 1
+                for i in range(days_count):
+                    dcheck = (start_obj + timedelta(days=i)).isoformat()
+                    if dcheck in agg and agg[dcheck]["count"] > 0:
+                        per_day_avg = float(agg[dcheck]["total"]) / float(agg[dcheck]["count"])
+                        per_date_totals.append(per_day_avg)
+                if per_date_totals:
+                    avg_range = int(round(sum(per_date_totals) / float(len(per_date_totals))))
+            except Exception:
+                logger.exception("Failed computing avg_range from region history in fallback")
+
+        # get ccure stats if available
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": f"Computed over range {start_obj.isoformat()} -> {end_obj.isoformat()}" if (start_date or end_date) else None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg_range,
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg_range
+            }
+        }
+
+        return resp
+    except Exception:
+        logger.exception("build_ccure_averages failed")
+        raise
+
+# -------------------------
+# Upload endpoints (store uploads under data/ and data/raw_uploads/ and rotate)
+# -------------------------
+ALLOWED_EXT = (".xls", ".xlsx", ".csv")
+
+def _remove_old_files_for_kind(kind: str):
+    """
+    Remove previous canonical files and previous raw uploads that include kind in filename.
+    """
+    try:
+        # canonical in DATA_DIR
+        for p in DATA_DIR.iterdir():
+            if p.is_file() and f"active_{kind}" in p.name.lower():
+                try:
+                    p.unlink()
+                except Exception:
+                    logger.warning("Could not remove old canonical file %s", p)
+        # remove raw uploads for same kind to keep only latest raw (user requested)
+        for p in RAW_UPLOADS_DIR.iterdir():
+            if p.is_file() and kind in p.name.lower():
+                try:
+                    p.unlink()
+                except Exception:
+                    logger.warning("Could not remove old raw file %s", p)
+    except Exception:
+        logger.exception("error while removing old files for kind=%s", kind)
+
+def _save_upload_and_rotate(upload_file: UploadFile, kind: str) -> dict:
+    """
+    Save the uploaded file as:
+      - data/active_<kind>.<ext>     (canonical)
+      - data/raw_uploads/<timestamp>_<kind>_<origname>  (raw trace)
+    Remove previous files for same kind (both canonical & raw).
+    Returns metadata dict.
+    """
+    fname = Path(upload_file.filename).name
+    ext = Path(fname).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail="Only .xls .xlsx .csv allowed")
+
+    # rotate old files
+    _remove_old_files_for_kind(kind)
+
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    raw_name = f"{ts}_{kind}_{fname}"
+    raw_path = RAW_UPLOADS_DIR / raw_name
+
+    # Save raw
+    try:
+        with raw_path.open("wb") as out_f:
+            shutil.copyfileobj(upload_file.file, out_f)
+    finally:
+        try:
+            upload_file.file.close()
+        except Exception:
+            pass
+
+    # Write canonical: keep same extension as original (simpler)
+    canonical_path = DATA_DIR / f"active_{kind}{ext}"
+    try:
+        shutil.copy(raw_path, canonical_path)
+    except Exception:
+        logger.exception("Failed to write canonical copy for %s", canonical_path)
+
+    info = {
+        "raw_saved": str(raw_path),
+        "canonical_saved": str(canonical_path),
+        "original_filename": fname,
+        "size_bytes": raw_path.stat().st_size if raw_path.exists() else None
+    }
+    logger.info("Uploaded %s: %s", kind, info)
+    return info
+
+@app.post("/api/upload/active-employees")
+async def upload_active_employees_api(file: UploadFile = File(...)):
+    return await upload_active_employees(file)
+
+@app.post("/api/upload/active-contractors")
+async def upload_active_contractors_api(file: UploadFile = File(...)):
+    return await upload_active_contractors(file)
+
+@app.post("/upload/active-employees")
+async def upload_active_employees(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="no file provided")
+    try:
+        info = _save_upload_and_rotate(file, kind="employee")
+        return JSONResponse({"status": "ok", "detail": info})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("employee upload failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload/active-contractors")
+async def upload_active_contractors(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="no file provided")
+    try:
+        info = _save_upload_and_rotate(file, kind="contractor")
+        return JSONResponse({"status": "ok", "detail": info})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("contractor upload failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- map detailed -> resp and summaries (unchanged) -----------
+def _map_detailed_to_resp(detailed: Dict[str, Any]) -> Dict[str, Any]:
+    # unchanged mapping (kept identical to previous)
+    live_h = detailed.get("live_headcount", {}) or {}
+    head_h = detailed.get("headcount", {}) or {}
+    ccure_active_obj = detailed.get("ccure_active", {}) or {}
+    averages_obj = detailed.get("averages", {}) or {}
+
+    def to_int(v):
+        try:
+            return None if v is None else int(v)
+        except Exception:
+            try:
+                return int(float(v))
+            except Exception:
+                return None
+
+    live_employee = int(live_h.get("employee") or head_h.get("employee") or 0)
+    live_contractor = int(live_h.get("contractor") or head_h.get("contractor") or 0)
+    total_reported = int(
+        live_h.get("currently_present_total")
+        or head_h.get("total_visited_today")
+        or (live_employee + live_contractor)
+        or 0
+    )
+    total_from_details = int(head_h.get("total_visited_today") or 0)
+
+    mapped_headcount = {
+        "total_visited_today": int(head_h.get("total_visited_today") or 0),
+        "employee": int(head_h.get("employee") or 0),
+        "contractor": int(head_h.get("contractor") or 0),
+        "by_location": head_h.get("by_location") or {}
+    }
+
+    resp = {
+        "date": detailed.get("date"),
+        "notes": detailed.get("notes"),
+        "live_today": {
+            "employee": live_employee,
+            "contractor": live_contractor,
+            "total_reported": total_reported,
+            "total_from_details": total_from_details
+        },
+        "headcount": mapped_headcount,
+        "live_headcount": live_h,
+        "ccure_active": {
+            "active_employees": ccure_active_obj.get("ccure_active_employees_reported")
+                             or ccure_active_obj.get("active_employees"),
+            "active_contractors": ccure_active_obj.get("ccure_active_contractors_reported")
+                               or ccure_active_obj.get("active_contractors"),
+            "ccure_active_employees_reported": ccure_active_obj.get("ccure_active_employees_reported"),
+            "ccure_active_contractors_reported": ccure_active_obj.get("ccure_active_contractors_reported")
+        },
+        "averages": averages_obj
+    }
+    return resp
+
+# ---------- build a verify-compatible summary from mapped payload -----------
+def _build_verify_like_summary_from_mapped(mapped: Dict[str, Any], include_raw: bool = False) -> Dict[str, Any]:
+    def to_int(v):
+        try:
+            return None if v is None else int(v)
+        except Exception:
+            try:
+                return int(float(v))
+            except Exception:
+                return None
+
+    cc = mapped.get("ccure_active", {}) or {}
+    head = mapped.get("headcount", {}) or {}
+    live_head = mapped.get("live_headcount", {}) or {}
+    averages = mapped.get("averages", {}) or {}
+
+    cc_emp = to_int(cc.get("ccure_active_employees_reported") or cc.get("active_employees"))
+    cc_con = to_int(cc.get("ccure_active_contractors_reported") or cc.get("active_contractors"))
+
+    head_total = to_int(head.get("total_visited_today") or mapped.get("live_today", {}).get("total_from_details"))
+    head_emp = to_int(head.get("employee") or mapped.get("live_today", {}).get("employee"))
+    head_con = to_int(head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
+
+    live_total = to_int(live_head.get("currently_present_total") or mapped.get("live_today", {}).get("total_reported"))
+    live_emp = to_int(live_head.get("employee") or mapped.get("live_today", {}).get("employee"))
+    live_con = to_int(live_head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
+
+    history_emp_avg = averages.get("history_avg_employee_last_7_days")
+    history_con_avg = averages.get("history_avg_contractor_last_7_days")
+    history_overall_avg = averages.get("history_avg_overall_last_7_days")
+
+    def pct(n, d):
+        try:
+            if n is None or d is None:
+                return None
+            if float(d) == 0:
+                return None
+            return round((float(n) / float(d)) * 100.0, 2)
+        except Exception:
+            return None
+
+    summary = {
+        "date": mapped.get("date"),
+        "notes": mapped.get("notes"),
+        "live_today": {
+            "employee": live_employee,
+            "contractor": live_contractor,
+            "total_reported": total_reported,
+            "total_from_details": total_from_details
+        },
+        "headcount": mapped.get("headcount", {}),
+        "live_headcount": mapped.get("live_headcount", {}),
+        "ccure_active": mapped.get("ccure_active", {}),
+        "averages": mapped.get("averages", {})
+    }
+    # maintain older structure used by UI
+    summary["headcount_details"] = {
+        "total_visited_today": head_total,
+        "employee": head_emp,
+        "contractor": head_con,
+        "by_location": head.get("by_location") if isinstance(head.get("by_location"), dict) else {}
+    }
+    summary["live_headcount_details"] = {
+        "currently_present_total": live_total,
+        "employee": live_emp,
+        "contractor": live_con,
+        "by_location": live_head.get("by_location") if isinstance(live_head.get("by_location"), dict) else {}
+    }
+
+    return summary
+
+# ---------- /ccure/verify (already present in your original) -----
+@app.get("/ccure/verify")
+def ccure_verify(
+    raw: bool = Query(False, description="if true, include the raw compute payload for debugging"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD start date (inclusive)"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD end date (inclusive)")
+):
+    """
+    Synchronous verification endpoint. Prefer compute_visit_averages() (synchronous call).
+    If compute raises or fails, fall back to build_ccure_averages() so output shape remains consistent.
+    """
+    try:
+        detailed = None
+        try:
+            from ccure_compare_service import compute_visit_averages
+            detailed = compute_visit_averages(start_date, end_date, timeout=REGION_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception("compute_visit_averages() failed inside /ccure/verify; falling back")
+            detailed = None
+
+        if isinstance(detailed, dict):
+            mapped = _map_detailed_to_resp(detailed)
+            summary = _build_verify_like_summary_from_mapped(mapped, include_raw=raw)
+            if raw and isinstance(detailed, dict):
+                summary["raw"] = detailed
+            return JSONResponse(summary)
+        else:
+            fallback = build_ccure_averages(start_date, end_date)
+            mapped_fallback = {
+                "date": fallback.get("date"),
+                "notes": fallback.get("notes"),
+                "live_today": fallback.get("live_today", {}),
+                "headcount": {
+                    "total_visited_today": fallback.get("live_today", {}).get("total_from_details") or fallback.get("live_today", {}).get("total_reported"),
+                    "employee": fallback.get("live_today", {}).get("employee"),
+                    "contractor": fallback.get("live_today", {}).get("contractor"),
+                    "by_location": {}
+                },
+                "live_headcount": {
+                    "currently_present_total": fallback.get("live_today", {}).get("total_reported"),
+                    "employee": fallback.get("live_today", {}).get("employee"),
+                    "contractor": fallback.get("live_today", {}).get("contractor"),
+                    "by_location": {}
+                },
+                "ccure_active": fallback.get("ccure_active", {}),
+                "averages": fallback.get("averages", {})
+            }
+
+            summary = _build_verify_like_summary_from_mapped(mapped_fallback, include_raw=raw)
+            if raw:
+                summary["raw"] = mapped_fallback
+       
+            return JSONResponse(summary)
+    except Exception as e:
+        logger.exception("ccure_verify failed")
+        raise HTTPException(status_code=500, detail=f"ccure verify error: {e}")
+
+# ---------- /ccure/compare -> uses data_compare_service.compare_ccure_vs_sheets ----------
+@app.get("/ccure/compare")
+def ccure_compare(
+    mode: str = Query("full", description="full or stats"),
+    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
+    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
+    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
+):
+    try:
+        from data_compare_service import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("data_compare_service import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+
+    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+@app.get("/ccure/export_uploaded")
+def ccure_export_uploaded():
+    try:
+        from data_compare_service import export_uploaded_sheets
+    except Exception as e:
+        logger.exception("data_compare_service import failed for export_uploaded")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+
+    fname = export_uploaded_sheets()
+    if not fname:
+        raise HTTPException(status_code=500, detail="failed to export uploaded sheets")
+    return JSONResponse({"status": "ok", "report_path": fname})
+
+@app.get("/ccure/compare_v2")
+def ccure_compare_v2(
+    mode: str = Query("full"),
+    stats_detail: str = Query("ActiveProfiles"),
+    limit_list: int = Query(200, ge=1, le=5000),
+    export: bool = Query(False),
+    region_filter: Optional[str] = Query(None, description="Region code e.g. APAC"),
+    location_city: Optional[str] = Query(None, description="Location city e.g. Pune"),
+    location_state: Optional[str] = Query(None, description="Location state/province"),
+    location_description: Optional[str] = Query(None, description="Location Description"),
+    week_ref_date: Optional[str] = Query(None, description="YYYY-MM-DD for week (Mon-Fri)")
+):
+    try:
+        from data_compare_service_v2 import compare_ccure_vs_sheets
+    except Exception as e:
+        logger.exception("data_compare_service_v2 import failed")
+        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
+
+    res = compare_ccure_vs_sheets(
+        mode=mode,
+        stats_detail=stats_detail,
+        limit_list=limit_list,
+        export=export,
+        region_filter=region_filter,
+        location_city=location_city,
+        location_state=location_state,
+        location_description=location_description,
+        week_ref_date=week_ref_date
+    )
+    if not isinstance(res, dict):
+        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
+    return JSONResponse(res)
+
+@app.get("/ccure/report/{filename}")
+def ccure_report_download(filename: str):
+    try:
+        safe_name = Path(filename).name
+        full = OUTPUT_DIR / safe_name
+        if not full.exists() or not full.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(str(full),
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            filename=safe_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to serve report")
+        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
+
+# ---------------------------
+# NEW helper functions for /duration compliance & categories
+# ---------------------------
+
+# Category thresholds in seconds
+_CAT_THRESHOLDS = [
+    ("cat_0_30m", 0, 30 * 60),
+    ("cat_30m_2h", 30 * 60 + 1, 2 * 3600),
+    ("cat_2h_6h", 2 * 3600 + 1, 6 * 3600),
+    ("cat_6h_8h", 6 * 3600 + 1, 8 * 3600),
+    ("cat_8h_plus", 8 * 3600, None),  # >= 8h
+]
+
+def _which_category(seconds: Optional[int]) -> str:
+    if seconds is None:
+        # treat as 0 minute presence (no duration) -> cat_0_30m
+        return "cat_0_30m"
+    try:
+        s = int(seconds)
+    except Exception:
+        return "cat_0_30m"
+    for name, lo, hi in _CAT_THRESHOLDS:
+        if hi is None:
+            if s >= lo:
+                return name
+        else:
+            if s >= lo and s <= hi:
+                return name
+    # fallback
+    return "cat_2h_6h"
+
+def _infer_expected_days_from_row(row: dict, default: int = 5) -> int:
+    """
+    Try to infer whether this person is 3-day or 5-day required.
+    Heuristic: look for '3day', '3-day', 'part-time-3', '3d' tokens in PersonnelType/PartitionName2/CompanyName/EmployeeName.
+    Default: 5
+    """
+    try:
+        keys = ["PersonnelType", "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "EmployeeName"]
+        combined = " ".join([(str(row.get(k) or "")).lower() for k in keys])
+        combined = re.sub(r"[^\w\s\-]", " ", combined)
+        if any(t in combined for t in ("3day", "3-day", "3 day", "part-time-3", "3d", "three day")):
+            return 3
+        # explicit markers for 5-day rarely needed, default to 5
+        return default
+    except Exception:
+        return default
+
+def _week_key_and_range_for_date(d: date) -> Tuple[str, date, date]:
+    """
+    Return (week_key, week_start_date, week_end_date) where week_start is Monday.
+    week_key is like '2025-W36'
+    """
+    iso = d.isocalendar()
+    year = iso[0]
+    weeknum = iso[1]
+    week_key = f"{year}-W{weeknum:02d}"
+    week_start = d - timedelta(days=d.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)
+    return week_key, week_start, week_end
+
+def _compute_compliance_for_weeks(dates_iso: List[str], emp_durations_seconds: Dict[str, Optional[int]], expected_days: int) -> Tuple[Dict[str, Any], str]:
+    """
+    dates_iso: list of ISO date strings covered in the report
+    emp_durations_seconds: map date_iso->seconds (may be None or 0)
+    expected_days: 3 or 5
+    Returns:
+      - compliance_by_week: { week_key: { week_start, week_end, present_days, days_with_8h, expected_days, compliant } }
+      - overall_summary string like '3/5' (weeks_met / total_weeks)
+    """
+    # group dates into weeks
+    week_groups: Dict[str, List[str]] = {}
+    week_ranges: Dict[str, Tuple[str,str]] = {}
+    for iso in dates_iso:
+        try:
+            d = date.fromisoformat(iso)
+        except Exception:
+            try:
+                d = datetime.fromisoformat(iso).date()
+            except Exception:
+                continue
+        wk, wk_start, wk_end = _week_key_and_range_for_date(d)
+        week_groups.setdefault(wk, []).append(iso)
+        week_ranges[wk] = (wk_start.isoformat(), wk_end.isoformat())
+
+    compliance_by_week = {}
+    weeks_met = 0
+    total_weeks = len(week_groups)
+    for wk, iso_list in sorted(week_groups.items()):
+        present_days = 0
+        days_with_8h = 0
+        for iso in iso_list:
+            secs = emp_durations_seconds.get(iso)
+            if secs is None:
+                # treat None as 0 (not present)
+                continue
+            try:
+                s = int(secs)
+            except Exception:
+                s = 0
+            if s > 0:
+                present_days += 1
+            if s >= 8 * 3600:
+                days_with_8h += 1
+
+        # rules:
+        #  - if expected_days == 3:
+        #      - require present_days >= 3 AND all present days >= 8h -> compliant
+        #  - if expected_days == 5:
+        #      - require present_days >= 3 (at least some presence) and days_with_8h >= 3 -> compliant
+        #  - otherwise fallback: require days_with_8h >= 3
+        compliant = False
+        if expected_days == 3:
+            if present_days >= 3 and days_with_8h >= present_days and present_days > 0:
+                compliant = True
+        elif expected_days == 5:
+            if present_days >= 3 and days_with_8h >= 3:
+                compliant = True
+        else:
+            if days_with_8h >= 3:
+                compliant = True
+
+        if compliant:
+            weeks_met += 1
+
+        compliance_by_week[wk] = {
+            "week_start": week_ranges[wk][0],
+            "week_end": week_ranges[wk][1],
+            "present_days": present_days,
+            "days_with_8h": days_with_8h,
+            "expected_days": expected_days,
+            "compliant": compliant
+        }
+
+    summary = f"{weeks_met}/{total_weeks}" if total_weeks > 0 else "0/0"
+    return compliance_by_week, summary
+
+# ---------------------------
+# NEW: Duration API endpoint (enhanced with compliance and categories)
+# ---------------------------
+@app.get("/duration")
+async def api_duration(
+    date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
+    start_date: Optional[str] = Query(None, description="Start date for a range (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date for a range (YYYY-MM-DD)"),
+    regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
+    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune). Case-insensitive, matches PartitionName2/PrimaryLocation/Door/EmployeeName"),
+    outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
+    sample_rows: int = Query(10, ge=0, le=100, description="How many sample rows to include per region in response")
+):
+    """
+    Returns per-region duration aggregates and swipe-level details (extended with compliance & category analysis).
+    - response.regions[region].dates -> list of ISO dates covered
+    - response.regions[region].employees -> list of persons with:
+        person_uid, EmployeeID, EmployeeName, CardNumber, FirstSwipe, LastSwipe, FirstDoor, LastDoor,
+        PersonnelType, PartitionName2, CompanyName, PrimaryLocation, FirstDirection, LastDirection,
+        durations (map date->HH:MM:SS), durations_seconds (map date->seconds), total_seconds_present_in_range
+      PLUS:
+        compliance_by_week -> per-week compliance info
+        compliance_summary -> 'weeks_met/total_weeks'
+        categories -> {dominant_category, category_counts}
+    """
+    try:
+        # --- parse region list
+        if regions:
+            regions_list = [r.strip().lower() for r in regions.split(",") if r.strip()]
+        else:
+            regions_list = ["apac", "emea", "laca", "namer"]
+
+        # --- parse output dir
+        if outdir:
+            outdir_path = Path(outdir)
+        else:
+            outdir_path = OUTPUT_DIR / "duration_reports"
+        outdir_path.mkdir(parents=True, exist_ok=True)
+
+        # --- determine date(s)
+        def _parse_date(s: str) -> date:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date()
+            except Exception:
+                return date.fromisoformat(s)
+
+        if start_date and end_date:
+            try:
+                start_obj = _parse_date(start_date)
+                end_obj = _parse_date(end_date)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid start_date or end_date format. Use YYYY-MM-DD.")
+            if start_obj > end_obj:
+                raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+            # safety: limit max days to avoid overloading
+            max_days = 31
+            days_count = (end_obj - start_obj).days + 1
+            if days_count > max_days:
+                raise HTTPException(status_code=400, detail=f"Date range too large (> {max_days} days). Please request a smaller range.")
+            date_list = [start_obj + timedelta(days=i) for i in range(days_count)]
+            range_mode = True
+        else:
+            # single-date: prefer explicit `date` query param, otherwise today's Asia/Kolkata
+            if date_param:
+                try:
+                    target_date = _parse_date(date_param)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+            else:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo("Asia/Kolkata")
+                target_date = datetime.now(tz).date()
+            date_list = [target_date]
+            start_obj = end_obj = date_list[0]
+            range_mode = False
+
+        # --- import duration_report lazily
+        try:
+            import duration_report
+        except Exception as e:
+            logger.exception("Failed importing duration_report module")
+            raise HTTPException(status_code=500, detail=f"duration module import failed: {e}")
+
+        loop = asyncio.get_running_loop()
+
+        # Helper serializer (safe conversion for pandas / numpy types)
+        def _to_json_safe(v):
+            try:
+                if pd.isna(v):
+                    return None
+            except Exception:
+                pass
+            if isinstance(v, (datetime, date)):
+                return v.isoformat()
+            if hasattr(v, "isoformat") and not isinstance(v, str):
+                try:
+                    return v.isoformat()
+                except Exception:
+                    pass
+            # numpy.int64 etc are int-like
+            try:
+                if isinstance(v, (int, float, bool)):
+                    return v
+            except Exception:
+                pass
+            # fallback to string
+            try:
+                return str(v)
+            except Exception:
+                return None
+
+        # For each date, call run_for_date and collect results
+        per_date_results = {}  # iso_date -> results dict returned by duration_report.run_for_date
+        for single_date in date_list:
+            try:
+                task = loop.run_in_executor(None, duration_report.run_for_date, single_date, regions_list, str(outdir_path), city)
+                per_date_results[single_date.isoformat()] = await asyncio.wait_for(task, timeout=COMPUTE_WAIT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail=f"Duration computation timed out for date {single_date.isoformat()}")
+            except Exception as e:
+                logger.exception("duration run_for_date failed for date %s", single_date)
+                raise HTTPException(status_code=500, detail=f"duration run failed for {single_date.isoformat()}: {e}")
+
+        # Aggregate results per region and per employee across dates
+        resp: Dict[str, Any] = {
+            "start_date": start_obj.isoformat(),
+            "end_date": end_obj.isoformat(),
+            "regions": {}
+        }
+
+        for r in regions_list:
+            try:
+                dates_iso = [d.isoformat() for d in date_list]
+
+                # employee_map keyed by person_uid (prefer) else by EmployeeID|EmployeeName
+                employees_map: Dict[str, Dict[str, Any]] = {}
+                swipes_by_date: Dict[str, list] = {}
+                date_rows = {}
+
+                for iso_d, day_res in per_date_results.items():
+                    # day_res is a dict: region -> {"swipes": df, "durations": df} OR region -> df
+                    region_obj = day_res.get(r) if isinstance(day_res, dict) else None
+                    durations_df = None
+                    swipes_df = None
+                    if isinstance(region_obj, dict):
+                        swipes_df = region_obj.get("swipes")
+                        durations_df = region_obj.get("durations")
+                    elif isinstance(region_obj, pd.DataFrame):
+                        durations_df = region_obj
+
+                    # counts
+                    rows_count = int(len(durations_df)) if isinstance(durations_df, pd.DataFrame) else 0
+                    swipe_count = int(len(swipes_df)) if isinstance(swipes_df, pd.DataFrame) else 0
+                    date_rows[iso_d] = {"rows": rows_count, "swipe_rows": swipe_count}
+
+                    # collect swipe rows for this date (if present) into JSON-able dicts
+                    if isinstance(swipes_df, pd.DataFrame) and not swipes_df.empty:
+                        swipe_records = []
+                        # ensure expected columns exist
+                        for c in ["LocaleMessageTime", "EmployeeName", "Door", "EmployeeID", "CardNumber", "PartitionName2", "PersonnelTypeName", "CompanyName", "PrimaryLocation", "Direction", "EmployeeIdentity", "MessageType", "Text5"]:
+                            if c not in swipes_df.columns:
+                                swipes_df[c] = None
+                        for _, srow in swipes_df.iterrows():
+                            dt = srow.get("LocaleMessageTime")
+                            iso_ts = None
+                            if pd.notna(dt):
+                                try:
+                                    iso_ts = pd.to_datetime(dt).isoformat()
+                                except Exception:
+                                    try:
+                                        iso_ts = datetime.fromtimestamp(float(dt)).isoformat()
+                                    except Exception:
+                                        iso_ts = str(dt)
+                            swipe_records.append({
+                                "LocaleMessageTime": iso_ts,
+                                "Dateonly": iso_d,
+                                "Swipe_Time": (pd.to_datetime(srow.get("LocaleMessageTime")).time().isoformat() if pd.notna(srow.get("LocaleMessageTime")) else None),
+                                "EmployeeID": _to_json_safe(srow.get("EmployeeID")),
+                                "PersonGUID": _to_json_safe(srow.get("EmployeeIdentity") or srow.get("EmployeeIdentity")),
+                                "ObjectName1": _to_json_safe(srow.get("EmployeeName")),
+                                "Door": _to_json_safe(srow.get("Door")),
+                                "PersonnelType": _to_json_safe(srow.get("PersonnelTypeName") or srow.get("PersonnelType")),
+                                "CardNumber": _to_json_safe(srow.get("CardNumber")),
+                                "Text5": _to_json_safe(srow.get("PrimaryLocation") or srow.get("Text5")),
+                                "PartitionName2": _to_json_safe(srow.get("PartitionName2")),
+                                "AdmitCode": _to_json_safe(srow.get("AdmitCode") or srow.get("MessageType")),
+                                "Direction": _to_json_safe(srow.get("Direction")),
+                                "CompanyName": _to_json_safe(srow.get("CompanyName")),
+                                "PrimaryLocation": _to_json_safe(srow.get("PrimaryLocation") or srow.get("Text5")),
+                            })
+                        swipes_by_date[iso_d] = swipe_records
+                    else:
+                        # ensure an empty list present for this date to keep shape stable
+                        swipes_by_date.setdefault(iso_d, [])
+
+                    # If we have durations_df with per-person aggregated rows, use it to build employees map
+                    if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
+                        # ensure useful columns present (the compute_daily_durations from duration_report provides many)
+                        # expected possible columns: person_uid, EmployeeID, EmployeeName, CardNumber, Date,
+                        # FirstSwipe, LastSwipe, FirstDoor, LastDoor, Duration, DurationSeconds,
+                        # PersonnelTypeName, PartitionName2, CompanyName, PrimaryLocation, FirstDirection, LastDirection
+                        for col in ["person_uid", "EmployeeID", "EmployeeName", "CardNumber", "Date",
+                                    "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor",
+                                    "Duration", "DurationSeconds", "PersonnelTypeName", "PartitionName2",
+                                    "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"]:
+                            if col not in durations_df.columns:
+                                durations_df[col] = None
+
+                        for _, drow in durations_df.iterrows():
+                            person_uid = drow.get("person_uid")
+                            if pd.isna(person_uid) or person_uid is None or str(person_uid).strip() == "":
+                                # fallback key
+                                person_uid = f"{_to_json_safe(drow.get('EmployeeID'))}|{_to_json_safe(drow.get('EmployeeName'))}"
+                            # initialize employee entry if missing
+                            if person_uid not in employees_map:
+                                employees_map[person_uid] = {
+                                    "person_uid": person_uid,
+                                    "EmployeeID": _to_json_safe(drow.get("EmployeeID")),
+                                    "EmployeeName": _to_json_safe(drow.get("EmployeeName")),
+                                    "CardNumber": _to_json_safe(drow.get("CardNumber")),
+                                    "durations": {d: None for d in dates_iso},
+                                    "durations_seconds": {d: None for d in dates_iso},
+                                    "total_seconds_present_in_range": 0,
+                                    # include first/last aggregates (will be updated if multiple dates present)
+                                    "FirstSwipe": None,
+                                    "LastSwipe": None,
+                                    "FirstDoor": _to_json_safe(drow.get("FirstDoor")),
+                                    "LastDoor": _to_json_safe(drow.get("LastDoor")),
+                                    "PersonnelType": _to_json_safe(drow.get("PersonnelTypeName") or drow.get("PersonnelType")),
+                                    "PartitionName2": _to_json_safe(drow.get("PartitionName2")),
+                                    "CompanyName": _to_json_safe(drow.get("CompanyName")),
+                                    "PrimaryLocation": _to_json_safe(drow.get("PrimaryLocation")),
+                                    "FirstDirection": _to_json_safe(drow.get("FirstDirection")),
+                                    "LastDirection": _to_json_safe(drow.get("LastDirection")),
+                                }
+
+                            # populate this date for this person
+                            dur_str = None if pd.isna(drow.get("Duration")) else str(drow.get("Duration"))
+                            dur_secs = None
+                            try:
+                                v = drow.get("DurationSeconds")
+                                if pd.notna(v):
+                                    dur_secs = int(float(v))
+                            except Exception:
+                                dur_secs = None
+
+                            employees_map[person_uid]["durations"][iso_d] = dur_str
+                            employees_map[person_uid]["durations_seconds"][iso_d] = dur_secs
+                            if dur_secs is not None:
+                                employees_map[person_uid]["total_seconds_present_in_range"] += dur_secs
+
+                            # update FirstSwipe/LastSwipe across dates (keep earliest FirstSwipe and latest LastSwipe)
+                            try:
+                                fs = drow.get("FirstSwipe")
+                                ls = drow.get("LastSwipe")
+                                # normalize to datetime if possible
+                                if pd.notna(fs):
+                                    fs_dt = pd.to_datetime(fs)
+                                    cur_fs = employees_map[person_uid].get("FirstSwipe")
+                                    if cur_fs is None:
+                                        employees_map[person_uid]["FirstSwipe"] = _to_json_safe(fs_dt)
+                                    else:
+                                        # keep earliest
+                                        try:
+                                            if pd.to_datetime(cur_fs) > fs_dt:
+                                                employees_map[person_uid]["FirstSwipe"] = _to_json_safe(fs_dt)
+                                        except Exception:
+                                            employees_map[person_uid]["FirstSwipe"] = _to_json_safe(fs_dt)
+                                if pd.notna(ls):
+                                    ls_dt = pd.to_datetime(ls)
+                                    cur_ls = employees_map[person_uid].get("LastSwipe")
+                                    if cur_ls is None:
+                                        employees_map[person_uid]["LastSwipe"] = _to_json_safe(ls_dt)
+                                    else:
+                                        # keep latest
+                                        try:
+                                            if pd.to_datetime(cur_ls) < ls_dt:
+                                                employees_map[person_uid]["LastSwipe"] = _to_json_safe(ls_dt)
+                                        except Exception:
+                                            employees_map[person_uid]["LastSwipe"] = _to_json_safe(ls_dt)
+                            except Exception:
+                                pass
+
+                # convert employees_map to list and sort
+                emp_list = list(employees_map.values())
+                emp_list.sort(key=lambda x: ((x.get("EmployeeName") or "") or "").lower())
+
+                # --- NEW: compute compliance & categories for each employee
+                for emp in emp_list:
+                    try:
+                        # infer expected days (3 or 5) via heuristic
+                        expected_days = _infer_expected_days_from_row(emp, default=5)
+                        emp["expected_days"] = expected_days
+
+                        # compute per-week compliance
+                        comp_by_week, comp_summary = _compute_compliance_for_weeks(dates_iso, emp.get("durations_seconds", {}), expected_days)
+                        emp["compliance_by_week"] = comp_by_week
+                        emp["compliance_summary"] = comp_summary
+
+                        # compute categories counts across dates
+                        cat_counts = {name: 0 for name, _, _ in _CAT_THRESHOLDS}
+                        for iso in dates_iso:
+                            secs = emp.get("durations_seconds", {}).get(iso)
+                            # treat None or 0 as cat_0_30m
+                            cat = _which_category(secs)
+                            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                        emp["category_counts"] = cat_counts
+
+                        # dominant category (max count), tie-break by ordering in _CAT_THRESHOLDS
+                        dominant = None
+                        dominant_count = 0
+                        for name, _, _ in _CAT_THRESHOLDS:
+                            c = cat_counts.get(name, 0)
+                            if c > dominant_count:
+                                dominant = name
+                                dominant_count = c
+                        emp["dominant_category"] = dominant
+                        emp["dominant_category_count"] = dominant_count
+
+                    except Exception:
+                        logger.exception("Failed computing compliance/categories for employee %s", emp.get("person_uid"))
+
+                durations_sample = emp_list[:sample_rows] if sample_rows and sample_rows > 0 else []
+
+                resp["regions"][r] = {
+                    "dates": dates_iso,
+                    "employees": emp_list,
+                    "durations_sample": durations_sample,
+                    "date_rows": date_rows,
+                    "swipes_by_date": swipes_by_date
+                }
+            except Exception:
+                logger.exception("Failed to aggregate range results for region %s", r)
+                resp["regions"][r] = {"dates": [d.isoformat() for d in date_list], "employees": [], "durations_sample": [], "date_rows": {}, "swipes_by_date": {}}
+
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("api_duration (range) failed")
+        raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
+
+# End of file
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ---------- START: ENRICH EMPLOYEE RECORDS WITH COMPLIANCE & CATEGORIES ----------
 # (Place this after `emp_list = list(employees_map.values())`)
 
