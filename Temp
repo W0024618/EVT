@@ -1,1 +1,281 @@
+# ---------- START: ENRICH EMPLOYEE RECORDS WITH COMPLIANCE & CATEGORIES ----------
+# (Place this after `emp_list = list(employees_map.values())`)
+
+# helper: load required-days mapping from uploaded active_employee sheet if present
+def _load_required_days_map():
+    """
+    Tries to read DATA_DIR/active_employee.* and build a mapping keyed by normalized EmployeeID or CardNumber.
+    Looks for columns named like RequiredDays, RequiredDaysPerWeek, Required_Days (case-insensitive).
+    Returns dict: key -> int required_days
+    """
+    mapping = {}
+    try:
+        import glob
+        files = list(DATA_DIR.glob("active_employee.*"))
+        if not files:
+            return mapping
+        for f in files:
+            try:
+                # read either excel or csv depending on extension
+                if f.suffix.lower() in (".xls", ".xlsx"):
+                    df_emp = pd.read_excel(f)
+                else:
+                    df_emp = pd.read_csv(f)
+                # normalize columns
+                cols = {c.strip().lower(): c for c in df_emp.columns}
+                # find candidate id/card columns
+                id_cols = next((cols[c] for c in cols if c in ("employeeid", "employee_id", "empid", "emp_id", "cardnumber", "card_number", "card no", "card")), None)
+                req_cols = next((cols[c] for c in cols if c in ("requireddays", "requireddaysperweek", "required_days_per_week", "required_days")), None)
+                if req_cols is None:
+                    # try fuzzy
+                    for k in cols:
+                        if "required" in k and "day" in k:
+                            req_cols = cols[k]
+                            break
+                if id_cols is None or req_cols is None:
+                    continue
+                # build mapping
+                for _, row in df_emp.iterrows():
+                    try:
+                        key = _normalize_employee_key(row.get(id_cols)) or _normalize_card_like(row.get(id_cols))
+                        if not key:
+                            continue
+                        req = row.get(req_cols)
+                        if pd.isna(req):
+                            continue
+                        try:
+                            req_i = int(req)
+                        except Exception:
+                            try:
+                                req_i = int(float(req))
+                            except Exception:
+                                continue
+                        mapping[str(key).strip()] = req_i
+                    except Exception:
+                        continue
+                # if we got a mapping, break since first canonical active_employee is enough
+                if mapping:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return mapping
+
+required_days_map = _load_required_days_map()
+default_required_days = 3  # change here if you want default to 5
+
+# Helper: bucketize duration seconds
+def _bucket_name_for_seconds(s):
+    try:
+        if s is None:
+            return "0-30m"
+        s = int(s)
+        if s <= 1800:
+            return "0-30m"
+        if s <= 7200:
+            return "30m-2h"
+        if s <= 21600:
+            return "2-6h"
+        if s <= 28800:
+            return "6-8h"
+        return "8h+"
+    except Exception:
+        return "0-30m"
+
+# Enrich each employee record
+for emp in emp_list:
+    try:
+        # get per-date seconds mapping
+        dur_secs_map = emp.get("durations_seconds") or {}
+        # compute present days and days >= 8h
+        present_days = 0
+        days_ge_8h = 0
+        category_counts = {"0-30m": 0, "30m-2h": 0, "2-6h": 0, "6-8h": 0, "8h+": 0}
+        for d in dates_iso:
+            s_val = dur_secs_map.get(d)
+            if s_val is None:
+                # treat None as not present
+                continue
+            try:
+                s_int = int(s_val)
+            except Exception:
+                continue
+            if s_int > 0:
+                present_days += 1
+            if s_int >= 28800:
+                days_ge_8h += 1
+            b = _bucket_name_for_seconds(s_int)
+            category_counts[b] = category_counts.get(b, 0) + 1
+
+        # resolve required days for this employee via mapping keys (EmployeeID or CardNumber)
+        required_days = None
+        try:
+            emp_id_key = str(emp.get("EmployeeID") or "").strip()
+            card_key = str(emp.get("CardNumber") or "").strip()
+            if emp_id_key and emp_id_key in required_days_map:
+                required_days = int(required_days_map[emp_id_key])
+            elif card_key and card_key in required_days_map:
+                required_days = int(required_days_map[card_key])
+        except Exception:
+            required_days = None
+        if required_days is None:
+            required_days = default_required_days
+
+        # compliance rule: meet if days_ge_8h >= 3 (per your examples)
+        compliance_met = (days_ge_8h >= 3)
+
+        # weekly summary: for multi-week ranges compute per-week compliance and summarize as X/Y
+        weekly_map = {}
+        for i, iso_d in enumerate(dates_iso):
+            try:
+                d_obj = datetime.fromisoformat(iso_d).date()
+            except Exception:
+                d_obj = date.fromisoformat(iso_d)
+            iso_year, iso_week, _ = d_obj.isocalendar()
+            wk_key = f"{iso_year}-{iso_week}"
+            if wk_key not in weekly_map:
+                weekly_map[wk_key] = {"days_ge_8h": 0, "days_present": 0, "dates": []}
+            s_val = dur_secs_map.get(iso_d)
+            if s_val is not None:
+                try:
+                    s_int = int(s_val)
+                except Exception:
+                    s_int = 0
+                if s_int > 0:
+                    weekly_map[wk_key]["days_present"] += 1
+                if s_int >= 28800:
+                    weekly_map[wk_key]["days_ge_8h"] += 1
+            weekly_map[wk_key]["dates"].append(iso_d)
+
+        met_weeks = 0
+        total_weeks = len(weekly_map) if weekly_map else 0
+        for wk, info in weekly_map.items():
+            if info.get("days_ge_8h", 0) >= 3:
+                met_weeks += 1
+        weekly_compliance_summary = f"{met_weeks}/{total_weeks}" if total_weeks else None
+
+        # most common category
+        most_common_category = None
+        try:
+            most_common_category = max(category_counts.items(), key=lambda x: x[1])[0] if category_counts else None
+        except Exception:
+            most_common_category = None
+
+        # attach computed fields to employee dict (frontend will pick these up)
+        emp["present_days"] = present_days
+        emp["days_ge_8h"] = days_ge_8h
+        emp["compliance_required_days"] = required_days
+        emp["compliance_met"] = compliance_met
+        emp["weekly_compliance_summary"] = weekly_compliance_summary
+        emp["category_counts"] = category_counts
+        emp["most_common_category"] = most_common_category
+    except Exception:
+        logger.exception("Failed computing compliance/category for employee %s", emp.get("person_uid"))
+
+# ---------- END: ENRICH EMPLOYEE RECORDS WITH COMPLIANCE & CATEGORIES ----------
+
+
+
+
+
+
+
+
+
+
+
+function isoToWeekdayDate(iso) {
+  if (!iso) return iso;
+  // treat iso as UTC midnight if no time present
+  const dt = new Date(iso.includes("T") ? iso : `${iso}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return iso;
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const weekday = days[dt.getUTCDay()];
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = dt.getUTCFullYear();
+  return `${weekday} - ${dd}-${mm}-${yyyy}`;
+}
+
+
+
+
+
+
+
+
+
+<TableRow>
+  <TableCell><b>Sr.No</b></TableCell>
+  <TableCell><b>EmployeeID</b></TableCell>
+  <TableCell><b>EmployeeName</b></TableCell>
+  <TableCell><b>CardNumber</b></TableCell>
+  <TableCell><b>PersonnelType</b></TableCell>
+  <TableCell><b>PartitionName2</b></TableCell>
+  <TableCell align="right"><b>Total (hh:mm:ss)</b></TableCell>
+  <TableCell align="center"><b>Compliance</b></TableCell>
+  <TableCell align="center"><b>Category</b></TableCell>
+  {dates.map((d) => (
+    <TableCell key={d} align="center"><b>{isoToWeekdayDate(d)}</b></TableCell>
+  ))}
+  <TableCell align="center"><b>View</b></TableCell>
+</TableRow>
+
+
+
+
+
+
+
+
+
+
+
+
+<TableCell align="center">{r.compliance_met ? "Yes" : "No"}</TableCell>
+<TableCell align="center">{r.most_common_category || "-"}</TableCell>
+
+
+
+
+const header = [
+  "Sr.No",
+  "EmployeeID",
+  "EmployeeName",
+  "CardNumber",
+  "PersonnelType",
+  "PartitionName2",
+  "TotalSecondsPresentInRange",
+  "Compliance",
+  "Category",
+  ...datesFormatted,
+];
+
+
+
+
+
+const complianceVal = r.compliance_met ? "Yes" : "No";
+const categoryVal = r.most_common_category || "";
+const escaped = [
+  `${srNo}`,
+  `"${String(employeeId).replace(/"/g, '""')}"`,
+  `"${String(employeeName).replace(/"/g, '""')}"`,
+  `"${String(cardNumber).replace(/"/g, '""')}"`,
+  `"${String(personnelType).replace(/"/g, '""')}"`,
+  `"${String(partition).replace(/"/g, '""')}"`,
+  `${totalSeconds}`,
+  `"${String(complianceVal).replace(/"/g, '""')}"`,
+  `"${String(categoryVal).replace(/"/g, '""')}"`,
+  ...perDateVals.map(v => `"${String(v).replace(/"/g, '""')}"`)
+];
+
+
+
+
+
+
+
+
 
