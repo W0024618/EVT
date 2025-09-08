@@ -1,3 +1,177 @@
+emp_list = list(employees_map.values())
+emp_list.sort(key=lambda x: ((x.get("EmployeeName") or "") or "").lower())
+
+
+
+
+
+
+
+
+# --- after emp_list sorted, insert this block ---
+
+# SHIFT-FIX constants
+SHIFT_GAP_SECONDS = 6 * 3600        # gap > 6 hours -> new session
+SHIFT_MIN_FIX_SECONDS = 4 * 3600    # only attempt fix if a day duration < 4h
+SHIFT_MAX_FIX_SECONDS = 20 * 3600   # or if a day duration > 20h
+
+# Build a helper to parse swipe timestamps safely
+def _parse_swipe_ts(swipe_rec):
+    ts = swipe_rec.get("LocaleMessageTime")
+    if not ts:
+        return None
+    try:
+        return pd.to_datetime(ts)
+    except Exception:
+        try:
+            # fallback
+            return datetime.fromisoformat(str(ts))
+        except Exception:
+            return None
+
+# For faster matching, build swipes_by_person from swipes_by_date (ordered by time)
+swipes_by_person = {}
+# swipes_by_date is already built earlier in the API loop and maps iso_date -> list of swipe dicts
+for iso_d in dates_iso:
+    for s in swipes_by_date.get(iso_d, []):
+        # identify person by person_uid or EmployeeID/CardNumber fallback
+        # use the same matching fields as elsewhere
+        pids = []
+        if s.get("PersonGUID"):
+            pids.append(str(s.get("PersonGUID")))
+        if s.get("EmployeeID") is not None:
+            pids.append(str(s.get("EmployeeID")))
+        if s.get("CardNumber") is not None:
+            pids.append(str(s.get("CardNumber")))
+        # store record under each id (so matching later will be robust)
+        for pid in pids:
+            swipes_by_person.setdefault(pid, []).append(s)
+
+# Normalize: sort each person's swipe list by timestamp
+for pid, arr in swipes_by_person.items():
+    arr_ts = []
+    for s in arr:
+        ts = _parse_swipe_ts(s)
+        if ts is not None:
+            arr_ts.append((ts, s))
+    arr_ts.sort(key=lambda x: x[0])
+    swipes_by_person[pid] = [s for _, s in arr_ts]
+
+# Helper to decide if we should attempt shift-fix for this employee:
+def _needs_shift_fix(emp):
+    for v in (emp.get("durations_seconds") or {}).values():
+        if v is None:
+            continue
+        if v < SHIFT_MIN_FIX_SECONDS or v > SHIFT_MAX_FIX_SECONDS:
+            return True
+    return False
+
+# Now perform session reconstruction per employee when needed
+for emp in emp_list:
+    try:
+        # collect candidate swipe lists by attempting keys in order:
+        # prefer person_uid, then EmployeeID, then CardNumber
+        person_keys = []
+        if emp.get("person_uid"):
+            person_keys.append(str(emp["person_uid"]))
+        if emp.get("EmployeeID") is not None:
+            person_keys.append(str(emp["EmployeeID"]))
+        if emp.get("CardNumber") is not None:
+            person_keys.append(str(emp["CardNumber"]))
+
+        # merge all swipe records for the candidate keys into a single chronological list
+        all_swipes = []
+        for k in person_keys:
+            lst = swipes_by_person.get(k) or []
+            for s in lst:
+                ts = _parse_swipe_ts(s)
+                if ts is not None:
+                    all_swipes.append((ts, s))
+        if not all_swipes:
+            continue
+        all_swipes.sort(key=lambda x: x[0])
+        swipe_times = [ts for ts, _ in all_swipes]
+
+        # only attempt shift reconstruction if some day looks problematic
+        if not _needs_shift_fix(emp):
+            continue
+
+        # Build sessions: consecutive swipes with gaps <= SHIFT_GAP_SECONDS belong to the same session
+        sessions = []
+        cur_start = swipe_times[0]
+        cur_last = swipe_times[0]
+        for ts in swipe_times[1:]:
+            gap = (ts - cur_last).total_seconds()
+            if gap > SHIFT_GAP_SECONDS:
+                # close current session
+                sessions.append((cur_start, cur_last))
+                cur_start = ts
+                cur_last = ts
+            else:
+                cur_last = ts
+        sessions.append((cur_start, cur_last))
+
+        # Rebuild per-date durations_seconds and durations strings for the requested date range:
+        # Start with zeros/None for all dates
+        new_durations_seconds = {d: None for d in dates_iso}
+        # We'll accumulate sessions into the date-of-session-start
+        for s_start, s_end in sessions:
+            session_secs = max(0, int((s_end - s_start).total_seconds()))
+            session_date_iso = s_start.date().isoformat()
+            if session_date_iso not in new_durations_seconds:
+                # session start outside requested date range -> ignore (or if you prefer,
+                # you could attribute to start date only if within +/-1 day - keeping simple here)
+                continue
+            prev = new_durations_seconds.get(session_date_iso)
+            if prev is None:
+                new_durations_seconds[session_date_iso] = session_secs
+            else:
+                new_durations_seconds[session_date_iso] = prev + session_secs
+
+        # For dates that had per-day aggregated durations previously but were not covered by sessions,
+        # keep those existing values (so we don't lose single-day non-overlapping info)
+        for d in dates_iso:
+            if new_durations_seconds.get(d) is None and emp.get("durations_seconds", {}).get(d) is not None:
+                new_durations_seconds[d] = emp["durations_seconds"][d]
+
+        # Convert seconds to string format like 'H:MM:SS' (like you already produce)
+        new_durations_str = {}
+        for d, secs in new_durations_seconds.items():
+            if secs is None:
+                new_durations_str[d] = None
+            else:
+                # use timedelta string formatting to stay consistent with existing code
+                try:
+                    new_durations_str[d] = str(timedelta(seconds=int(secs)))
+                except Exception:
+                    new_durations_str[d] = None
+
+        # Recompute total_seconds_present_in_range
+        total = 0
+        for v in new_durations_seconds.values():
+            if v is not None:
+                total += int(v)
+
+        # Apply updates back to emp
+        emp["durations_seconds"] = new_durations_seconds
+        emp["durations"] = new_durations_str
+        emp["total_seconds_present_in_range"] = total
+
+    except Exception:
+        logger.exception("shift-fix reconstruction failed for employee %s", emp.get("person_uid") or emp.get("EmployeeID"))
+
+# --- end of SHIFT-FIX block ---
+
+
+
+
+
+
+
+
+
+
+
 Now We have One issue for Employee Whos Working in shift ...
 so there Duration willl display wrong like there Duration meets like ...
 0:56:17	   21:22:30	
