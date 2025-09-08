@@ -1,3 +1,1208 @@
+# app.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+from typing import Optional, Dict, Any
+from zoneinfo import ZoneInfo
+
+# COMPUTE timeouts
+REGION_TIMEOUT_SECONDS = 20
+COMPUTE_WAIT_TIMEOUT_SECONDS = 180
+COMPUTE_SYNC_TIMEOUT_SECONDS = 60
+
+# pandas used for serialization helpers
+import pandas as pd
+
+# --- DB / models imports (unchanged) ---
+from db import SessionLocal
+from models import LiveSwipe, AttendanceSummary
+
+# --- settings (optional override) ---
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+import sys
+RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+_broadcaster_clients = set()
+
+# ... keep your existing endpoints (unchanged) until /duration ...
+# For brevity in this file we keep earlier endpoints the same (headcount, uploads, etc).
+# The file continues directly to the /duration endpoint (optimized below).
+
+
+def _to_json_safe_value(v):
+    """Convert common values to JSON-serializable forms used in responses."""
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if hasattr(v, "isoformat") and not isinstance(v, str):
+        try:
+            return v.isoformat()
+        except Exception:
+            pass
+    try:
+        if isinstance(v, (int, float, bool)):
+            return v
+    except Exception:
+        pass
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+
+@app.get("/duration")
+async def api_duration(
+    date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
+    start_date: Optional[str] = Query(None, description="Start date for a range (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date for a range (YYYY-MM-DD)"),
+    regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
+    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune)"),
+    outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
+    sample_rows: int = Query(10, ge=0, le=200, description="How many sample rows to include per region in response"),
+    compliance_target: int = Query(3, ge=1, le=7, description="Compliance target days (e.g. 3 or 5). Default 3"),
+    enable_shift_fix: bool = Query(False, description="Enable the expensive shift-fix session reconstruction (default false)")
+):
+    """
+    Returns per-region duration aggregates and swipe-level details with weekly compliance & duration category splits.
+
+    Performance notes:
+      - By default, shift-fix reconstruction is disabled (very expensive).
+      - The endpoint uses duration_report.run_for_date which does parallel fetch & caching.
+      - This endpoint performs vectorized transforms (pivot/agg) instead of Python iterrows where possible.
+    """
+    try:
+        # parse regions / outdir
+        if regions:
+            regions_list = [r.strip().lower() for r in regions.split(",") if r.strip()]
+        else:
+            regions_list = ["apac", "emea", "laca", "namer"]
+
+        if outdir:
+            outdir_path = Path(outdir)
+        else:
+            outdir_path = OUTPUT_DIR / "duration_reports"
+        outdir_path.mkdir(parents=True, exist_ok=True)
+
+        def _parse_date(s: str) -> date:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date()
+            except Exception:
+                return date.fromisoformat(s)
+
+        if start_date and end_date:
+            start_obj = _parse_date(start_date)
+            end_obj = _parse_date(end_date)
+            if start_obj > end_obj:
+                raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+            max_days = 92
+            days_count = (end_obj - start_obj).days + 1
+            if days_count > max_days:
+                raise HTTPException(status_code=400, detail=f"Date range too large (> {max_days} days). Please request a smaller range.")
+            date_list = [start_obj + timedelta(days=i) for i in range(days_count)]
+            range_mode = True
+        else:
+            if date_param:
+                target_date = _parse_date(date_param)
+            else:
+                tz = ZoneInfo("Asia/Kolkata")
+                target_date = datetime.now(tz).date()
+            date_list = [target_date]
+            start_obj = end_obj = date_list[0]
+            range_mode = False
+
+        try:
+            import duration_report
+        except Exception as e:
+            logger.exception("Failed importing duration_report module")
+            raise HTTPException(status_code=500, detail=f"duration module import failed: {e}")
+
+        loop = asyncio.get_running_loop()
+
+        per_date_results = {}
+        # call duration_report.run_for_date in executor for each date (still parallel inside that function)
+        for single_date in date_list:
+            logger.info("Starting duration computations for date %s", single_date.isoformat())
+            try:
+                task = loop.run_in_executor(None, duration_report.run_for_date, single_date, regions_list, str(outdir_path), city, enable_shift_fix)
+                per_date_results[single_date.isoformat()] = await asyncio.wait_for(task, timeout=COMPUTE_WAIT_TIMEOUT_SECONDS)
+                logger.info("Completed duration computations for date %s", single_date.isoformat())
+            except asyncio.TimeoutError:
+                logger.exception("Duration computation timed out for date %s", single_date.isoformat())
+                raise HTTPException(status_code=504, detail=f"Duration computation timed out for date {single_date.isoformat()}")
+            except Exception as e:
+                logger.exception("duration run_for_date failed for date %s", single_date.isoformat())
+                raise HTTPException(status_code=500, detail=f"duration run failed for {single_date.isoformat()}: {e}")
+
+        # prepare response structure
+        dates_iso = [d.isoformat() for d in date_list]
+        date_objs = [d for d in date_list]
+        week_starts = sorted({(d - timedelta(days=d.weekday())) for d in date_objs})
+
+        resp: Dict[str, Any] = {
+            "start_date": start_obj.isoformat(),
+            "end_date": end_obj.isoformat(),
+            "regions": {}
+        }
+
+        # Loop per region and use vectorized transforms to build the payload
+        for r in regions_list:
+            t0_region = datetime.utcnow()
+            try:
+                # Collect durations and swipes across dates into concatenated dataframes
+                durations_dfs = []
+                swipes_dfs = []
+                date_rows = {}
+                for iso_d, day_res in per_date_results.items():
+                    region_obj = day_res.get(r) if isinstance(day_res, dict) else None
+                    durations_df = None
+                    swipes_df = None
+                    if isinstance(region_obj, dict):
+                        swipes_df = region_obj.get("swipes")
+                        durations_df = region_obj.get("durations")
+                    elif isinstance(region_obj, pd.DataFrame):
+                        durations_df = region_obj
+
+                    if isinstance(durations_df, pd.DataFrame):
+                        durations_dfs.append(durations_df.copy())
+                        rows_count = int(len(durations_df))
+                    else:
+                        rows_count = 0
+                    if isinstance(swipes_df, pd.DataFrame):
+                        swipes_dfs.append(swipes_df.copy())
+                        swipe_count = int(len(swipes_df))
+                    else:
+                        swipe_count = 0
+                    date_rows[iso_d] = {"rows": rows_count, "swipe_rows": swipe_count}
+
+                if durations_dfs:
+                    all_durations = pd.concat(durations_dfs, ignore_index=True, sort=False)
+                else:
+                    all_durations = pd.DataFrame()
+
+                if swipes_dfs:
+                    all_swipes = pd.concat(swipes_dfs, ignore_index=True, sort=False)
+                else:
+                    all_swipes = pd.DataFrame()
+
+                # Ensure Date is a date object
+                if not all_durations.empty and "Date" in all_durations.columns:
+                    try:
+                        all_durations["Date"] = pd.to_datetime(all_durations["Date"], errors="coerce").dt.date
+                    except Exception:
+                        pass
+
+                # Build swipes_by_date quickly via groupby -> to_dict
+                swipes_by_date: Dict[str, list] = {}
+                if not all_swipes.empty:
+                    # ensure required columns exist
+                    for c in ["LocaleMessageTime", "EmployeeName", "Door", "EmployeeID", "CardNumber", "PartitionName2",
+                              "PersonnelTypeName", "CompanyName", "PrimaryLocation", "Direction", "EmployeeIdentity", "MessageType", "Text5"]:
+                        if c not in all_swipes.columns:
+                            all_swipes[c] = None
+
+                    # compute Dateonly as ISO date string (safe fallback)
+                    def _dateonly_from_ts(x):
+                        try:
+                            if pd.isna(x):
+                                return None
+                            return pd.to_datetime(x).date().isoformat()
+                        except Exception:
+                            return None
+
+                    all_swipes["Dateonly"] = all_swipes["LocaleMessageTime"].apply(_dateonly_from_ts)
+                    grouped = all_swipes.groupby("Dateonly", sort=False)
+                    for dname, g in grouped:
+                        if not dname:
+                            dname = "unknown"
+                        # convert each row to dict but with safe conversion of timestamps
+                        recs = []
+                        for rec in g.to_dict(orient="records"):
+                            dt = rec.get("LocaleMessageTime")
+                            iso_ts = None
+                            try:
+                                if pd.notna(dt):
+                                    iso_ts = pd.to_datetime(dt).isoformat()
+                                else:
+                                    iso_ts = None
+                            except Exception:
+                                iso_ts = str(dt) if dt is not None else None
+                            recs.append({
+                                "LocaleMessageTime": iso_ts,
+                                "Dateonly": dname,
+                                "Swipe_Time": (pd.to_datetime(dt).time().isoformat() if dt is not None and not pd.isna(dt) else None),
+                                "EmployeeID": _to_json_safe_value(rec.get("EmployeeID")),
+                                "PersonGUID": _to_json_safe_value(rec.get("EmployeeIdentity") or rec.get("EmployeeIdentity")),
+                                "ObjectName1": _to_json_safe_value(rec.get("EmployeeName")),
+                                "Door": _to_json_safe_value(rec.get("Door")),
+                                "PersonnelType": _to_json_safe_value(rec.get("PersonnelTypeName") or rec.get("PersonnelType")),
+                                "CardNumber": _to_json_safe_value(rec.get("CardNumber")),
+                                "Text5": _to_json_safe_value(rec.get("PrimaryLocation") or rec.get("Text5")),
+                                "PartitionName2": _to_json_safe_value(rec.get("PartitionName2")),
+                                "AdmitCode": _to_json_safe_value(rec.get("AdmitCode") or rec.get("MessageType")),
+                                "Direction": _to_json_safe_value(rec.get("Direction")),
+                                "CompanyName": _to_json_safe_value(rec.get("CompanyName")),
+                                "PrimaryLocation": _to_json_safe_value(rec.get("PrimaryLocation") or rec.get("Text5")),
+                            })
+                        swipes_by_date[dname] = recs
+                else:
+                    # ensure keys for requested dates exist
+                    for d in dates_iso:
+                        swipes_by_date.setdefault(d, [])
+
+                # Build employees pivot from all_durations (vectorized)
+                emp_list = []
+                if not all_durations.empty:
+                    # ensure required columns exist
+                    for col in ["person_uid", "EmployeeID", "EmployeeName", "CardNumber", "Date", "DurationSeconds", "Duration",
+                                "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation",
+                                "FirstDirection", "LastDirection"]:
+                        if col not in all_durations.columns:
+                            all_durations[col] = None
+
+                    # normalize Date to iso strings for stable pivot columns
+                    all_durations["_DateISO"] = pd.to_datetime(all_durations["Date"], errors="coerce").dt.date.astype("object")
+                    # pivot seconds and strings
+                    pivot_secs = all_durations.pivot_table(index="person_uid", columns="_DateISO", values="DurationSeconds", aggfunc="sum")
+                    pivot_str = all_durations.pivot_table(index="person_uid", columns="_DateISO", values="Duration", aggfunc="first")
+
+                    # meta info per person (first)
+                    meta = all_durations.groupby("person_uid", sort=False).agg({
+                        "EmployeeID": "first",
+                        "EmployeeName": "first",
+                        "CardNumber": "first",
+                        "FirstSwipe": "min",
+                        "LastSwipe": "max",
+                        "FirstDoor": "first",
+                        "LastDoor": "last",
+                        "PersonnelTypeName": "first",
+                        "PartitionName2": "first",
+                        "CompanyName": "first",
+                        "PrimaryLocation": "first",
+                        "FirstDirection": "first",
+                        "LastDirection": "last"
+                    }).reset_index()
+
+                    # Merge meta with pivot data
+                    pivot_secs = pivot_secs.reset_index()
+                    merged = meta.merge(pivot_secs, on="person_uid", how="left")
+                    # For readable durations as strings, discover available date columns and fetch from pivot_str if present
+                    date_columns = sorted(list({c for c in pivot_secs.columns if c != "person_uid"}), key=lambda x: str(x))
+                    # Build the employee dicts
+                    for _, row in merged.iterrows():
+                        puid = row["person_uid"]
+                        person = {
+                            "person_uid": puid,
+                            "EmployeeID": _to_json_safe_value(row.get("EmployeeID")),
+                            "EmployeeName": _to_json_safe_value(row.get("EmployeeName")),
+                            "CardNumber": _to_json_safe_value(row.get("CardNumber")),
+                            "durations": {d.isoformat() if hasattr(d, "isoformat") else str(d): None for d in date_objs},
+                            "durations_seconds": {d.isoformat() if hasattr(d, "isoformat") else str(d): None for d in date_objs},
+                            "total_seconds_present_in_range": 0,
+                            "FirstSwipe": _to_json_safe_value(row.get("FirstSwipe")),
+                            "LastSwipe": _to_json_safe_value(row.get("LastSwipe")),
+                            "FirstDoor": _to_json_safe_value(row.get("FirstDoor")),
+                            "LastDoor": _to_json_safe_value(row.get("LastDoor")),
+                            "PersonnelType": _to_json_safe_value(row.get("PersonnelTypeName")),
+                            "PartitionName2": _to_json_safe_value(row.get("PartitionName2")),
+                            "CompanyName": _to_json_safe_value(row.get("CompanyName")),
+                            "PrimaryLocation": _to_json_safe_value(row.get("PrimaryLocation")),
+                            "FirstDirection": _to_json_safe_value(row.get("FirstDirection")),
+                            "LastDirection": _to_json_safe_value(row.get("LastDirection"))
+                        }
+                        # fill per-date secs and strings
+                        total = 0
+                        for d in date_objs:
+                            key = d
+                            # pivot_secs columns are python date objects; attempt to read them safely
+                            secs_val = None
+                            try:
+                                secs_val = row.get(key)
+                            except Exception:
+                                try:
+                                    secs_val = row.get(pd.to_datetime(key).date())
+                                except Exception:
+                                    secs_val = None
+                            # fallback: check pivot_str
+                            dur_str = None
+                            try:
+                                if key in pivot_str.columns:
+                                    dur_str = pivot_str.loc[pivot_str["person_uid"] == puid, key]
+                            except Exception:
+                                dur_str = None
+
+                            if pd.notna(secs_val):
+                                try:
+                                    secs_int = int(float(secs_val))
+                                    person["durations_seconds"][d.isoformat()] = secs_int
+                                    # prefer string if pivot_str has it
+                                    try:
+                                        s = str(pivot_str.at[puid, key]) if (puid in pivot_str.index and key in pivot_str.columns) else None
+                                    except Exception:
+                                        s = None
+                                    if s is not None and s != "nan":
+                                        person["durations"][d.isoformat()] = s
+                                    else:
+                                        # fallback convert seconds to hh:mm:ss
+                                        person["durations"][d.isoformat()] = str(timedelta(seconds=secs_int))
+                                    total += secs_int
+                                except Exception:
+                                    person["durations_seconds"][d.isoformat()] = None
+                                    person["durations"][d.isoformat()] = None
+                            else:
+                                # no seconds recorded
+                                person["durations_seconds"][d.isoformat()] = None
+                                person["durations"][d.isoformat()] = None
+
+                        person["total_seconds_present_in_range"] = total
+                        # remove internal swipe fields (they're included but kept)
+                        for _k in ("FirstSwipe", "LastSwipe"):
+                            if _k in person and person[_k] is None:
+                                person.pop(_k, None)
+                        emp_list.append(person)
+                else:
+                    emp_list = []
+
+                # small sort by name to keep output consistent
+                emp_list.sort(key=lambda x: ((x.get("EmployeeName") or "") or "").lower())
+
+                # SHIFT-FIX: optional heavy operation (left off by default)
+                if enable_shift_fix and emp_list and swipes_by_date:
+                    try:
+                        # run a relatively efficient shift-fix that uses per-person swipe ordering (still pythonic, but on reduced set)
+                        # we keep this intentionally simple and safe; it's expensive so disabled by default.
+                        logger.info("Shift-fix enabled: running session reconstruction (this may be slow)...")
+                        # Build swipes_by_person map
+                        swipes_by_person = {}
+                        for dkey, arr in swipes_by_date.items():
+                            for s in arr:
+                                pids = []
+                                if s.get("PersonGUID"):
+                                    pids.append(str(s.get("PersonGUID")))
+                                if s.get("EmployeeID"):
+                                    pids.append(str(s.get("EmployeeID")))
+                                if s.get("CardNumber"):
+                                    pids.append(str(s.get("CardNumber")))
+                                for pid in pids:
+                                    swipes_by_person.setdefault(pid, []).append(s)
+                        # sort each list
+                        for pid, arr in swipes_by_person.items():
+                            arr.sort(key=lambda s: s.get("LocaleMessageTime") or "")
+                        # naive reconstruction per employee (only for those flagged)
+                        SHIFT_GAP_SECONDS = 6 * 3600
+                        SHIFT_MIN_FIX_SECONDS = 4 * 3600
+                        SHIFT_MAX_FIX_SECONDS = 20 * 3600
+                        for emp in emp_list:
+                            # decide quickly whether to attempt fix by scanning durations_seconds
+                            bad = False
+                            for v in emp.get("durations_seconds", {}).values():
+                                if v is None:
+                                    continue
+                                if v < SHIFT_MIN_FIX_SECONDS or v > SHIFT_MAX_FIX_SECONDS:
+                                    bad = True
+                                    break
+                            if not bad:
+                                continue
+                            # gather all swipes for this person
+                            keys = []
+                            if emp.get("person_uid"):
+                                keys.append(str(emp["person_uid"]))
+                            if emp.get("EmployeeID"):
+                                keys.append(str(emp["EmployeeID"]))
+                            if emp.get("CardNumber"):
+                                keys.append(str(emp["CardNumber"]))
+                            all_sw = []
+                            for k in keys:
+                                for s in swipes_by_person.get(k, []):
+                                    ts = s.get("LocaleMessageTime")
+                                    try:
+                                        tsv = pd.to_datetime(ts)
+                                    except Exception:
+                                        try:
+                                            tsv = datetime.fromisoformat(str(ts))
+                                        except Exception:
+                                            tsv = None
+                                    if tsv is not None:
+                                        all_sw.append((tsv, s))
+                            if not all_sw:
+                                continue
+                            all_sw.sort(key=lambda x: x[0])
+                            # build sessions
+                            sessions = []
+                            cur_start = all_sw[0][0]
+                            cur_last = all_sw[0][0]
+                            for ts, _ in all_sw[1:]:
+                                gap = (ts - cur_last).total_seconds()
+                                if gap > SHIFT_GAP_SECONDS:
+                                    sessions.append((cur_start, cur_last))
+                                    cur_start = ts
+                                    cur_last = ts
+                                else:
+                                    cur_last = ts
+                            sessions.append((cur_start, cur_last))
+                            # accumulate per-day
+                            new_secs = {d.isoformat(): None for d in date_objs}
+                            for sstart, send in sessions:
+                                secs = max(0, int((send - sstart).total_seconds()))
+                                diso = sstart.date().isoformat()
+                                if diso in new_secs and new_secs[diso] is None:
+                                    new_secs[diso] = secs
+                                elif diso in new_secs:
+                                    new_secs[diso] = (new_secs[diso] or 0) + secs
+                            # preserve untouched days
+                            for d in date_objs:
+                                di = d.isoformat()
+                                if new_secs.get(di) is None and emp.get("durations_seconds", {}).get(di) is not None:
+                                    new_secs[di] = emp["durations_seconds"][di]
+                            # recompute strings & total
+                            new_str = {}
+                            total = 0
+                            for di, secs in new_secs.items():
+                                if secs is None:
+                                    new_str[di] = None
+                                else:
+                                    new_str[di] = str(timedelta(seconds=int(secs)))
+                                    total += int(secs)
+                            emp["durations_seconds"] = new_secs
+                            emp["durations"] = new_str
+                            emp["total_seconds_present_in_range"] = total
+
+                    except Exception:
+                        logger.exception("Shift-fix phase failed; continuing without full fix")
+
+                # compute per-employee weekly compliance and categories (vectorized-ish)
+                for emp in emp_list:
+                    weeks_info = {}
+                    weeks_met = 0
+                    weeks_total = 0
+                    cat_counts = {"0-30m": 0, "30m-2h": 0, "2h-6h": 0, "6h-8h": 0, "8h+": 0}
+                    cat_dates = {k: [] for k in cat_counts.keys()}
+
+                    for ws in week_starts:
+                        week_start_iso = ws.isoformat()
+                        week_dates = [(ws + timedelta(days=i)).isoformat() for i in range(7)]
+                        relevant_dates = [d for d in week_dates if d in dates_iso]
+                        if not relevant_dates:
+                            continue
+
+                        days_present = 0
+                        days_ge8 = 0
+                        per_date_durations = {}
+                        per_date_compliance = {}
+
+                        for d in relevant_dates:
+                            secs = emp["durations_seconds"].get(d)
+                            per_date_durations[d] = secs
+                            if secs is not None and secs > 0:
+                                days_present += 1
+                            is_ge8 = (secs is not None and secs >= 28800)
+                            if is_ge8:
+                                days_ge8 += 1
+                            per_date_compliance[d] = True if is_ge8 else False
+
+                            if secs is not None and secs > 0:
+                                cat = duration_report.categorize_seconds(secs) if hasattr(duration_report, 'categorize_seconds') else "0-30m"
+                                if cat in cat_counts:
+                                    cat_counts[cat] += 1
+                                    cat_dates[cat].append(d)
+
+                        ct = int(compliance_target or 3)
+                        compliant = False
+                        if days_present >= ct:
+                            if ct == 3:
+                                if days_present == 3:
+                                    compliant = (days_ge8 == days_present)
+                                else:
+                                    compliant = False
+
+                        weeks_info[week_start_iso] = {
+                            "week_start": week_start_iso,
+                            "dates": per_date_durations,
+                            "dates_compliance": per_date_compliance,
+                            "days_present": days_present,
+                            "days_ge8": days_ge8,
+                            "compliant": compliant
+                        }
+                        weeks_total += 1
+                        if compliant:
+                            weeks_met += 1
+
+                    # dominant category
+                    dominant_category = None
+                    max_count = -1
+                    for k, v in cat_counts.items():
+                        if v > max_count:
+                            max_count = v
+                            dominant_category = k
+
+                    # cleanup internal fields
+                    for _k in ("FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor"):
+                        if _k in emp:
+                            try:
+                                del emp[_k]
+                            except Exception:
+                                pass
+
+                    emp["compliance"] = {
+                        "weeks": weeks_info,
+                        "weeks_met": weeks_met,
+                        "weeks_total": weeks_total,
+                        "month_summary": f"{weeks_met}/{weeks_total}" if weeks_total > 0 else "0/0",
+                        "compliance_target": int(compliance_target or 3)
+                    }
+                    emp["duration_categories"] = {
+                        "counts": cat_counts,
+                        "dominant_category": dominant_category,
+                        "category_dates": cat_dates,
+                        "red_flag": cat_counts.get("2h-6h", 0)
+                    }
+
+                durations_sample = emp_list[:sample_rows] if sample_rows and sample_rows > 0 else []
+
+                resp["regions"][r] = {
+                    "dates": dates_iso,
+                    "employees": emp_list,
+                    "durations_sample": durations_sample,
+                    "date_rows": date_rows,
+                    "swipes_by_date": swipes_by_date
+                }
+
+                t1_region = datetime.utcnow()
+                logger.info("Aggregated region %s in %.2f seconds", r, (t1_region - t0_region).total_seconds())
+
+            except Exception:
+                logger.exception("Failed to aggregate range results for region %s", r)
+                resp["regions"][r] = {"dates": [d.isoformat() for d in date_list], "employees": [], "durations_sample": [], "date_rows": {}, "swipes_by_date": {}}
+
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("api_duration (range) failed")
+        raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
+
+
+
+
+
+
+
+
+
+
+
+# duration_report.py
+"""
+duration_report.py  — optimized:
+ - vectorized person_uid generation (no apply)
+ - groupby.agg for durations computation (no groupby.apply)
+ - parallel region fetch + CSV cache retained
+ - optional shift-fix argument to enable/disable expensive reconstruction
+"""
+import argparse
+import logging
+import os
+import re
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import concurrent.futures
+import time
+
+import pandas as pd
+import numpy as np
+
+# Optional: import pyodbc only when connecting
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# Optional: SQLAlchemy engine (if installed)
+try:
+    from sqlalchemy import create_engine
+    SQLALCHEMY_AVAILABLE = True
+except Exception:
+    create_engine = None
+    SQLALCHEMY_AVAILABLE = False
+
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+        ]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "last_n_databases": 2,
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+
+# Helpers: DB discovery/connect (unchanged)
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
+        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
+    ]
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    rc = REGION_CONFIG[region_key]
+    if SQLALCHEMY_AVAILABLE:
+        try:
+            driver = ODBC_DRIVER.replace(" ", "+")
+            username = rc['user']
+            password = rc['password']
+            server = rc['server']
+            database = rc['database']
+            engine_url = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver={driver};TrustServerCertificate=Yes"
+            engine = create_engine(engine_url, fast_executemany=True)
+            df = pd.read_sql(sql, engine)
+            engine.dispose()
+        except Exception:
+            logging.exception("SQLAlchemy path failed, fallback to pyodbc for region %s", region_key)
+            conn = get_connection(region_key)
+            try:
+                df = pd.read_sql(sql, conn)
+            finally:
+                conn.close()
+    else:
+        conn = get_connection(region_key)
+        try:
+            df = pd.read_sql(sql, conn)
+        finally:
+            conn.close()
+
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    return df[cols]
+
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    # ensure timestamp dtype
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # drop duplicates on key fields
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    try:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+    except Exception:
+        df = df.copy()
+
+    # Date column as date
+    df["Date"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce").dt.date
+
+    # --- VECTORIZE person_uid creation (avoid apply) ---
+    eid_series = df["EmployeeIdentity"].fillna("").astype(str).str.strip()
+    has_eid = eid_series.ne("")
+    # combine EmployeeID|CardNumber|EmployeeName
+    eid_like = df["EmployeeID"].fillna("").astype(str).str.strip()
+    card_like = df["CardNumber"].fillna("").astype(str).str.strip()
+    name_like = df["EmployeeName"].fillna("").astype(str).str.strip()
+    combined = eid_like + "|" + card_like + "|" + name_like
+    # clean up repeated pipes and leading/trailing pipes
+    combined = combined.str.replace(r"\|{2,}", "|", regex=True).str.strip("|")
+    # produce person_uid vector
+    person_uid = pd.Series(index=df.index, dtype=object)
+    person_uid.loc[has_eid] = eid_series.loc[has_eid]
+    person_uid.loc[~has_eid] = combined.loc[~has_eid].replace("", None)
+
+    df["person_uid"] = person_uid
+    df = df[df["person_uid"].notna()].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # sort by timestamp for stable first/last selection
+    df = df.sort_values("LocaleMessageTime")
+
+    # group and aggregate via agg (fast)
+    grouped = df.groupby(["person_uid", "Date"], sort=False)
+    agg = grouped.agg(
+        EmployeeIdentity=("EmployeeIdentity", "first"),
+        EmployeeID=("EmployeeID", "first"),
+        EmployeeName=("EmployeeName", "first"),
+        CardNumber=("CardNumber", "first"),
+        FirstSwipe=("LocaleMessageTime", "first"),
+        LastSwipe=("LocaleMessageTime", "last"),
+        FirstDoor=("Door", "first"),
+        LastDoor=("Door", "last"),
+        CountSwipes=("LocaleMessageTime", "count"),
+        PersonnelTypeName=("PersonnelTypeName", "first"),
+        PartitionName2=("PartitionName2", "first"),
+        CompanyName=("CompanyName", "first"),
+        PrimaryLocation=("PrimaryLocation", "first"),
+        FirstDirection=("Direction", "first"),
+        LastDirection=("Direction", "last")
+    ).reset_index()
+
+    # compute durations vectorized
+    try:
+        agg["DurationSeconds"] = (pd.to_datetime(agg["LastSwipe"]) - pd.to_datetime(agg["FirstSwipe"])).dt.total_seconds().clip(lower=0)
+    except Exception:
+        agg["DurationSeconds"] = 0
+        for i, row in agg.iterrows():
+            try:
+                first = pd.to_datetime(row["FirstSwipe"])
+                last = pd.to_datetime(row["LastSwipe"])
+                agg.at[i, "DurationSeconds"] = max(0, int((last - first).total_seconds()))
+            except Exception:
+                agg.at[i, "DurationSeconds"] = 0
+
+    agg["Duration"] = agg["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s != "" else None)
+
+    # ensure all out columns
+    res = pd.DataFrame()
+    for col in out_cols:
+        if col in agg.columns:
+            res[col] = agg[col]
+        else:
+            res[col] = None
+
+    # cast Date back to date
+    if "Date" in res.columns:
+        res["Date"] = pd.to_datetime(res["Date"], errors="coerce").dt.date
+
+    return res[out_cols]
+
+
+def categorize_seconds(s: Optional[int]) -> str:
+    try:
+        if s is None or s <= 0:
+            return "0-30m"
+        s = int(s)
+        if s <= 1800:
+            return "0-30m"
+        if s <= 7200:
+            return "30m-2h"
+        if s <= 21600:
+            return "2h-6h"
+        if s < 28800:
+            return "6h-8h"
+        return "8h+"
+    except Exception:
+        return "0-30m"
+
+
+# CSV cache helper
+def _is_recent(path: Path, max_age_seconds: int = 300) -> bool:
+    try:
+        if not path.exists():
+            return False
+        m = path.stat().st_mtime
+        return (time.time() - m) <= max_age_seconds
+    except Exception:
+        return False
+
+
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None, enable_shift_fix: bool = False) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+
+    max_workers = min(4, max(1, len(regions)))
+    logging.info("run_for_date: date=%s regions=%s workers=%d", target_date, regions, max_workers)
+
+    def fetch_region(rkey: str):
+        r = rkey.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            return (r, {"swipes": pd.DataFrame(), "durations": pd.DataFrame()})
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+
+        # load cached if very recent
+        if _is_recent(csv_path, max_age_seconds=300) and _is_recent(swipes_csv_path, max_age_seconds=300):
+            try:
+                logging.info("Loading cached CSVs for region %s date %s", r, target_date)
+                durations = pd.read_csv(csv_path, parse_dates=["FirstSwipe", "LastSwipe"], infer_datetime_format=True)
+                swipes = pd.read_csv(swipes_csv_path, parse_dates=["LocaleMessageTime"], infer_datetime_format=True)
+                if "Date" in durations.columns:
+                    try:
+                        durations["Date"] = pd.to_datetime(durations["Date"]).dt.date
+                    except Exception:
+                        pass
+                return (r, {"swipes": swipes, "durations": durations})
+            except Exception:
+                logging.exception("Failed loading cached CSVs for %s — will re-fetch", r)
+
+        logging.info("Fetching swipes from DB for region %s date %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+            else:
+                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        # save CSVs best-effort
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, str(csv_path), len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, str(swipes_csv_path), len(swipes))
+        return (r, {"swipes": swipes, "durations": durations})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_region = {ex.submit(fetch_region, r): r for r in regions}
+        for fut in concurrent.futures.as_completed(future_to_region):
+            rkey = future_to_region[fut]
+            try:
+                r, val = fut.result()
+                results[r] = val
+            except Exception:
+                logging.exception("Region task failed for %s", rkey)
+                results[rkey] = {"swipes": pd.DataFrame(), "durations": pd.DataFrame()}
+
+    return results
+
+
+# CLI runner (unchanged)
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
+    p.add_argument("--enable-shift-fix", action="store_true", help="Enable expensive shift-fix reconstruction")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir, city=args.city, enable_shift_fix=args.enable_shift_fix)
+
+    for r, obj in results.items():
+        dur = obj.get("durations")
+        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
+
+
+
+
+
+curl 'http://localhost:8000/duration?regions=apac&date=2025-09-01'
+
+pip install sqlalchemy pyodbc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I have Update all above upadte in both file still it take more time how we can improve theor performance ..
 
 debug file line by line and check where data is block and fix this issue 
