@@ -1,3 +1,365 @@
+@app.get("/duration")
+async def api_duration(
+    date_param: Optional[str] = Query(None, alias="date", description="Target date YYYY-MM-DD. Defaults to today in Asia/Kolkata"),
+    start_date: Optional[str] = Query(None, description="Start date for a range (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date for a range (YYYY-MM-DD)"),
+    regions: Optional[str] = Query(None, description="Comma-separated list: apac,emea,laca,namer. Default: all"),
+    city: Optional[str] = Query(None, description="Optional city/location filter (e.g. Pune). Case-insensitive"),
+    outdir: Optional[str] = Query(None, description="Output directory for CSVs. Defaults to OUTPUT_DIR/duration_reports"),
+    sample_rows: int = Query(10, ge=0, le=200, description="How many sample rows to include per region in response"),
+    compliance_target: int = Query(3, ge=1, le=7, description="Compliance target days (e.g. 3 or 5). Default 3")
+):
+    """
+    Returns per-region duration aggregates and swipe-level details with weekly compliance & duration category splits.
+    This endpoint is defensive: if duration_report or DB is slow/unavailable, returns partial results with diagnostic messages.
+    """
+    try:
+        # parse regions / outdir
+        if regions:
+            regions_list = [r.strip().lower() for r in regions.split(",") if r.strip()]
+        else:
+            regions_list = ["apac", "emea", "laca", "namer"]
+
+        if outdir:
+            outdir_path = Path(outdir)
+        else:
+            outdir_path = OUTPUT_DIR / "duration_reports"
+        outdir_path.mkdir(parents=True, exist_ok=True)
+
+        def _parse_date(s: str) -> date:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date()
+            except Exception:
+                return date.fromisoformat(s)
+
+        if start_date and end_date:
+            start_obj = _parse_date(start_date)
+            end_obj = _parse_date(end_date)
+            if start_obj > end_obj:
+                raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+            max_days = 92
+            days_count = (end_obj - start_obj).days + 1
+            if days_count > max_days:
+                raise HTTPException(status_code=400, detail=f"Date range too large (> {max_days} days). Please request a smaller range.")
+            date_list = [start_obj + timedelta(days=i) for i in range(days_count)]
+            range_mode = True
+        else:
+            if date_param:
+                target_date = _parse_date(date_param)
+            else:
+                tz = ZoneInfo("Asia/Kolkata")
+                target_date = datetime.now(tz).date()
+            date_list = [target_date]
+            start_obj = end_obj = date_list[0]
+            range_mode = False
+
+        # import duration_report (guarded)
+        try:
+            import importlib
+            duration_report = importlib.import_module("duration_report")
+        except Exception as e:
+            logger.exception("Failed importing duration_report module")
+            raise HTTPException(status_code=500, detail=f"duration module import failed: {e}")
+
+        # timeout seconds (fallback if not defined)
+        timeout_seconds = globals().get("COMPUTE_WAIT_TIMEOUT_SECONDS", None)
+        if timeout_seconds is None:
+            timeout_seconds = int(os.getenv("DURATION_COMPUTE_TIMEOUT", "120"))  # default 120s
+        else:
+            timeout_seconds = int(timeout_seconds)
+
+        loop = asyncio.get_running_loop()
+
+        # helper to run the blocking run_for_date in a thread with timeout
+        async def _run_date_in_thread(single_date):
+            start_ts = time.time()
+            logger.info("Scheduling duration computation for date %s", single_date)
+            try:
+                # prefer asyncio.to_thread when available (py>=3.9)
+                if hasattr(asyncio, "to_thread"):
+                    coro = asyncio.to_thread(duration_report.run_for_date, single_date, regions_list, str(outdir_path), city)
+                else:
+                    # fallback: run in executor
+                    coro = loop.run_in_executor(None, duration_report.run_for_date, single_date, regions_list, str(outdir_path), city)
+                result = await asyncio.wait_for(coro, timeout=timeout_seconds)
+                logger.info("Completed duration computation for date %s in %.1fs", single_date, time.time() - start_ts)
+                return result
+            except asyncio.TimeoutError:
+                logger.exception("Duration computation timed out for date %s after %s seconds", single_date, timeout_seconds)
+                raise
+            except Exception as e:
+                logger.exception("Duration computation failed for date %s: %s", single_date, e)
+                raise
+
+        # schedule all date jobs concurrently but keep per-date timeout (gather with return_exceptions=True)
+        tasks = [asyncio.create_task(_run_date_in_thread(d)) for d in date_list]
+        per_date_results: Dict[str, Any] = {}
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for iso_d, res in zip([d.isoformat() for d in date_list], results):
+            if isinstance(res, asyncio.TimeoutError) or isinstance(res, asyncio.CancelledError):
+                per_date_results[iso_d] = {"__error": f"timeout after {timeout_seconds}s"}
+            elif isinstance(res, Exception):
+                # an exception object returned by gather
+                logger.exception("Duration run_for_date raised for date %s: %s", iso_d, res)
+                per_date_results[iso_d] = {"__error": f"{res}"}
+            else:
+                # res expected: dict(region -> {"swipes": DataFrame, "durations": DataFrame})
+                per_date_results[iso_d] = res if isinstance(res, dict) else {}
+
+        dates_iso = [d.isoformat() for d in date_list]
+        date_objs = [d for d in date_list]
+        week_starts = sorted({(d - timedelta(days=d.weekday())) for d in date_objs})
+
+        resp: Dict[str, Any] = {
+            "start_date": start_obj.isoformat(),
+            "end_date": end_obj.isoformat(),
+            "regions": {},
+            "diagnostics": {"per_date_status": {}}
+        }
+
+        # helper: if a returned value is a filesystem path to CSV(s), try reading with pandas
+        def _coerce_result_region(region_val):
+            # Accept dict with DataFrames or CSV paths (strings). Return dict {'durations': DataFrame, 'swipes': DataFrame}
+            out = {"durations": pd.DataFrame(), "swipes": pd.DataFrame()}
+            if not region_val:
+                return out
+            if isinstance(region_val, dict):
+                dur = region_val.get("durations")
+                sw = region_val.get("swipes")
+
+                # DURATIONS handling
+                try:
+                    if isinstance(dur, str):
+                        p = Path(dur)
+                        if p.exists():
+                            try:
+                                out["durations"] = _read_csv_compat(p, parse_dates=["LocaleMessageTime"], dtype=str)
+                            except Exception:
+                                logger.exception("Failed to read durations CSV path %s", p)
+                                out["durations"] = pd.DataFrame()
+                        else:
+                            out["durations"] = pd.DataFrame()
+                    elif isinstance(dur, pd.DataFrame):
+                        out["durations"] = dur.copy()
+                except Exception:
+                    logger.exception("Failed to coerce durations into DataFrame (dur may be %s)", type(dur))
+
+                # SWIPES handling
+                try:
+                    if isinstance(sw, str):
+                        p = Path(sw)
+                        if p.exists():
+                            try:
+                                out["swipes"] = _read_csv_compat(p, parse_dates=["LocaleMessageTime"], dtype=str)
+                            except Exception:
+                                logger.exception("Failed to read swipes CSV path %s", p)
+                                out["swipes"] = pd.DataFrame()
+                        else:
+                            out["swipes"] = pd.DataFrame()
+                    elif isinstance(sw, pd.DataFrame):
+                        out["swipes"] = sw.copy()
+                except Exception:
+                    logger.exception("Failed to coerce swipes into DataFrame (sw may be %s)", type(sw))
+
+                return out
+
+            # If caller provided a DataFrame directly
+            if isinstance(region_val, pd.DataFrame):
+                return {"durations": region_val.copy(), "swipes": pd.DataFrame()}
+
+            # unexpected types
+            return out
+
+        # aggregate by region (unchanged logic from original but uses per_date_results)
+        for r in regions_list:
+            try:
+                employees_map: Dict[str, Dict[str, Any]] = {}
+                swipes_by_date: Dict[str, List[Dict[str, Any]]] = {}
+                date_rows = {}
+
+                # aggregate per-date
+                for iso_d, day_res in per_date_results.items():
+                    # check for error recorded earlier
+                    if isinstance(day_res, dict) and "__error" in day_res:
+                        resp["diagnostics"]["per_date_status"][iso_d] = day_res["__error"]
+                        # mark empty row counts for this date
+                        date_rows.setdefault(iso_d, {"rows": 0, "swipe_rows": 0})
+                        swipes_by_date.setdefault(iso_d, [])
+                        continue
+
+                    region_obj = day_res.get(r) if isinstance(day_res, dict) else None
+                    coerced = _coerce_result_region(region_obj)
+                    durations_df = coerced.get("durations")
+                    swipes_df = coerced.get("swipes")
+
+                    rows_count = int(len(durations_df)) if isinstance(durations_df, pd.DataFrame) else 0
+                    swipe_count = int(len(swipes_df)) if isinstance(swipes_df, pd.DataFrame) else 0
+                    date_rows[iso_d] = {"rows": rows_count, "swipe_rows": swipe_count}
+
+                    # SWIPES -> convert to list of dicts (safe)
+                    if isinstance(swipes_df, pd.DataFrame) and not swipes_df.empty:
+                        for c in ["LocaleMessageTime", "EmployeeName", "Door", "EmployeeID", "CardNumber", "PartitionName2", "PersonnelTypeName", "CompanyName", "PrimaryLocation", "Direction", "EmployeeIdentity", "MessageType", "Text5"]:
+                            if c not in swipes_df.columns:
+                                swipes_df[c] = None
+                        swipe_records = []
+                        for _, srow in swipes_df.iterrows():
+                            dt = srow.get("LocaleMessageTime")
+                            iso_ts = None
+                            if pd.notna(dt):
+                                try:
+                                    iso_ts = pd.to_datetime(dt).isoformat()
+                                except Exception:
+                                    try:
+                                        iso_ts = datetime.fromtimestamp(float(dt)).isoformat()
+                                    except Exception:
+                                        iso_ts = str(dt)
+                            swipe_records.append({
+                                "LocaleMessageTime": iso_ts,
+                                "Dateonly": iso_d,
+                                "Swipe_Time": (pd.to_datetime(srow.get("LocaleMessageTime")).time().isoformat() if pd.notna(srow.get("LocaleMessageTime")) else None),
+                                "EmployeeID": srow.get("EmployeeID") if srow.get("EmployeeID") is not None else None,
+                                "PersonGUID": srow.get("EmployeeIdentity") or srow.get("EmployeeIdentity"),
+                                "ObjectName1": srow.get("EmployeeName"),
+                                "Door": srow.get("Door"),
+                                "PersonnelType": srow.get("PersonnelTypeName") or srow.get("PersonnelType"),
+                                "CardNumber": srow.get("CardNumber"),
+                                "Text5": srow.get("PrimaryLocation") or srow.get("Text5"),
+                                "PartitionName2": srow.get("PartitionName2"),
+                                "AdmitCode": srow.get("AdmitCode") or srow.get("MessageType"),
+                                "Direction": srow.get("Direction"),
+                                "CompanyName": srow.get("CompanyName"),
+                                "PrimaryLocation": srow.get("PrimaryLocation") or srow.get("Text5"),
+                            })
+                        swipes_by_date[iso_d] = swipe_records
+                    else:
+                        swipes_by_date.setdefault(iso_d, [])
+
+                    # DURATIONS -> iterate rows and aggregate per person
+                    if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
+                        # ensure columns exist
+                        for col in ["person_uid", "EmployeeID", "EmployeeName", "CardNumber", "Date",
+                                    "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor",
+                                    "Duration", "DurationSeconds", "PersonnelTypeName", "PartitionName2",
+                                    "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"]:
+                            if col not in durations_df.columns:
+                                durations_df[col] = None
+
+                        for _, drow in durations_df.iterrows():
+                            try:
+                                person_uid = drow.get("person_uid")
+                                if pd.isna(person_uid) or person_uid is None or str(person_uid).strip() == "":
+                                    person_uid = f"{_to_json_safe(drow.get('EmployeeID'))}|{_to_json_safe(drow.get('EmployeeName'))}"
+
+                                if person_uid not in employees_map:
+                                    employees_map[person_uid] = {
+                                        "person_uid": person_uid,
+                                        "EmployeeID": _to_json_safe(drow.get("EmployeeID")),
+                                        "EmployeeName": _to_json_safe(drow.get("EmployeeName")),
+                                        "CardNumber": _to_json_safe(drow.get("CardNumber")),
+                                        "durations": {d: None for d in dates_iso},
+                                        "durations_seconds": {d: None for d in dates_iso},
+                                        "total_seconds_present_in_range": 0,
+                                        # keep internal First/Last but we'll remove them before returning
+                                        "FirstSwipe": None,
+                                        "LastSwipe": None,
+                                        "FirstDoor": _to_json_safe(drow.get("FirstDoor")),
+                                        "LastDoor": _to_json_safe(drow.get("LastDoor")),
+                                        "PersonnelType": _to_json_safe(drow.get("PersonnelTypeName") or drow.get("PersonnelType")),
+                                        "PartitionName2": _to_json_safe(drow.get("PartitionName2")),
+                                        "CompanyName": _to_json_safe(drow.get("CompanyName")),
+                                        "PrimaryLocation": _to_json_safe(drow.get("PrimaryLocation")),
+                                        "FirstDirection": _to_json_safe(drow.get("FirstDirection")),
+                                        "LastDirection": _to_json_safe(drow.get("LastDirection")),
+                                    }
+
+                                dur_str = None if pd.isna(drow.get("Duration")) else str(drow.get("Duration"))
+                                dur_secs = None
+                                try:
+                                    v = drow.get("DurationSeconds")
+                                    if pd.notna(v):
+                                        dur_secs = int(float(v))
+                                except Exception:
+                                    dur_secs = None
+
+                                employees_map[person_uid]["durations"][iso_d] = dur_str
+                                employees_map[person_uid]["durations_seconds"][iso_d] = dur_secs
+                                if dur_secs is not None:
+                                    employees_map[person_uid]["total_seconds_present_in_range"] += dur_secs
+
+                                # First/Last swipe times: keep earliest first, latest last
+                                try:
+                                    fs = drow.get("FirstSwipe")
+                                    ls = drow.get("LastSwipe")
+                                    if pd.notna(fs):
+                                        fs_dt = pd.to_datetime(fs)
+                                        cur_fs = employees_map[person_uid].get("FirstSwipe")
+                                        if cur_fs is None:
+                                            employees_map[person_uid]["FirstSwipe"] = _to_json_safe(fs_dt)
+                                        else:
+                                            if pd.to_datetime(cur_fs) > fs_dt:
+                                                employees_map[person_uid]["FirstSwipe"] = _to_json_safe(fs_dt)
+                                    if pd.notna(ls):
+                                        ls_dt = pd.to_datetime(ls)
+                                        cur_ls = employees_map[person_uid].get("LastSwipe")
+                                        if cur_ls is None:
+                                            employees_map[person_uid]["LastSwipe"] = _to_json_safe(ls_dt)
+                                        else:
+                                            if pd.to_datetime(cur_ls) < ls_dt:
+                                                employees_map[person_uid]["LastSwipe"] = _to_json_safe(ls_dt)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                logger.exception("Failed processing duration row for region %s date %s", r, iso_d)
+
+                # (rest of aggregation / shift-fix / compliance/category code unchanged)
+                # ... (copy the exact same logic you had for shift-fix, compliance computation, sorting,
+                #  building emp_list, and building resp["regions"][r]) ...
+
+                # Build list sorted by name
+                emp_list = list(employees_map.values())
+                emp_list.sort(key=lambda x: ((x.get("EmployeeName") or "") or "").lower())
+
+                # SHIFT-FIX, compute weeks, categories, cleanup, etc. (unchanged original code)
+                # --- (for brevity, reuse your existing block here exactly) ---
+                # After that block, set:
+                durations_sample = emp_list[:sample_rows] if sample_rows and sample_rows > 0 else []
+
+                resp["regions"][r] = {
+                    "dates": dates_iso,
+                    "employees": emp_list,
+                    "durations_sample": durations_sample,
+                    "date_rows": date_rows,
+                    "swipes_by_date": swipes_by_date
+                }
+            except Exception:
+                logger.exception("Failed to aggregate range results for region %s", r)
+                resp["regions"][r] = {"dates": [d.isoformat() for d in date_list], "employees": [], "durations_sample": [], "date_rows": {}, "swipes_by_date": {}}
+
+        # ensure all numpy/pandas types are converted to serializable Python types
+        safe_content = jsonable_encoder(resp)
+        return JSONResponse(safe_content)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("api_duration (range) failed")
+        raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Understand issue is Check below App.py file also i will shar you another file also 
 We have isse for Duration API 
 
