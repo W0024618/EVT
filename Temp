@@ -1,4 +1,960 @@
-our Issue is 
+# duration_report.py
+"""
+duration_report.py
+
+Updated: supports querying multiple monthly ACVSUJournal databases (current + previous N).
+Fixes: use pyodbc cursor -> DataFrame to avoid pandas SQLAlchemy warning,
+       replace groupby.apply with groupby.agg for better performance and avoid FutureWarning.
+"""
+import argparse
+import logging
+import os
+import re
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+
+# Optional: import pyodbc only when connecting (allows importing this module even without driver)
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# (REGION_CONFIG unchanged - keep your config)
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+        ]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "last_n_databases": 2,
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+
+# helper functions (split name, expand DB list, connect master, filter existing dbs)
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+# DB connection helper (same as before)
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Build SQL and fetch using pyodbc cursor -> DataFrame to avoid pandas.read_sql warnings.
+    """
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
+        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
+    ]
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(region_key)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        # cursor.description may be None if no rows, but still try to get column names
+        descr = cursor.description or []
+        colnames = [d[0] for d in descr] if descr else []
+        if rows:
+            try:
+                df = pd.DataFrame.from_records(rows, columns=colnames)
+            except Exception:
+                # fallback: convert row to tuple list
+                df = pd.DataFrame([tuple(r) for r in rows], columns=colnames)
+        else:
+            # no rows -> empty df with expected columns
+            df = pd.DataFrame(columns=colnames)
+    except Exception:
+        logging.exception("Database fetch failed for region %s; returning empty DataFrame", region_key)
+        df = pd.DataFrame(columns=cols)
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+    # ensure expected columns exist even if SQL returned different set
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    return df[cols]
+
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    try:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+    except Exception:
+        # if drop_duplicates fails for unexpected dtypes, ignore and continue
+        pass
+
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    df = df[df["person_uid"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # sort then groupby + agg (avoid apply)
+    try:
+        df_sorted = df.sort_values(["person_uid", "LocaleMessageTime"])
+    except Exception:
+        df_sorted = df.copy()
+
+    grouped = df_sorted.groupby(["person_uid", "Date"], sort=False).agg(
+        EmployeeIdentity=("EmployeeIdentity", "first"),
+        EmployeeID=("EmployeeID", "first"),
+        EmployeeName=("EmployeeName", "first"),
+        CardNumber=("CardNumber", "first"),
+        FirstSwipe=("LocaleMessageTime", "min"),
+        LastSwipe=("LocaleMessageTime", "max"),
+        FirstDoor=("Door", "first"),
+        LastDoor=("Door", "last"),
+        CountSwipes=("LocaleMessageTime", "count"),
+        PersonnelTypeName=("PersonnelTypeName", "first"),
+        PartitionName2=("PartitionName2", "first"),
+        CompanyName=("CompanyName", "first"),
+        PrimaryLocation=("PrimaryLocation", "first"),
+        FirstDirection=("Direction", "first"),
+        LastDirection=("Direction", "last")
+    ).reset_index()
+
+    # compute durations
+    try:
+        grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    except Exception:
+        # if dtype not datetime or subtraction fails
+        def _safe_dur(row):
+            try:
+                if pd.isna(row["FirstSwipe"]) or pd.isna(row["LastSwipe"]):
+                    return None
+                return max(0, int((row["LastSwipe"] - row["FirstSwipe"]).total_seconds()))
+            except Exception:
+                return None
+        grouped["DurationSeconds"] = grouped.apply(_safe_dur, axis=1)
+
+    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # ensure all output columns present
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    return grouped[out_cols]
+
+def categorize_seconds(s: Optional[int]) -> str:
+    try:
+        if s is None or s <= 0:
+            return "0-30m"
+        s = int(s)
+        if s <= 1800:
+            return "0-30m"
+        if s <= 7200:
+            return "30m-2h"
+        if s <= 21600:
+            return "2h-6h"
+        if s < 28800:
+            return "6h-8h"
+        return "8h+"
+    except Exception:
+        return "0-30m"
+
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+            else:
+                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+
+    return results
+
+# CLI runner (unchanged)
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir, city=args.city)
+
+    for r, obj in results.items():
+        dur = obj.get("durations")
+        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
+
+
+
+
+
+
+
+
+# region_clients.py
+"""
+HTTP helpers for region occupancy endpoints.
+Returns:
+ - fetch_all_regions() -> list of {"region": <name>, "count": <int>}
+ - fetch_all_details(timeout=...) -> list of person-detail dicts (where available)
+ - fetch_all_history(timeout=...) -> list of date-or-detail dicts (history endpoints)
+
+Drop-in replacement for your region_clients.py (more defensive retries + per-endpoint cooldown).
+"""
+import requests
+from requests.exceptions import RequestException
+from datetime import datetime
+import logging
+import time
+import sys
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger("region_clients")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# endpoints (edit if your hosts differ)
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+history_endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/history",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
+}
+
+DEFAULT_ATTEMPTS = 3
+DEFAULT_BACKOFF = 0.6
+# per-endpoint cooldown in seconds after repeated failure to avoid hammering
+ENDPOINT_COOLDOWN_SECONDS = 60
+ENDPOINT_FAILURES = {}  # url -> (last_failed_ts, fail_count)
+
+def _build_session():
+    s = requests.Session()
+    try:
+        # Retry for idempotent GETs
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'HEAD'])
+        )
+    except TypeError:
+        # older urllib3
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(['GET', 'HEAD'])
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+_SESSION = _build_session()
+
+def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
+    now = time.time()
+    # cooldown check
+    last = ENDPOINT_FAILURES.get(url)
+    if last:
+        last_failed_ts, fail_count = last
+        if now - last_failed_ts < ENDPOINT_COOLDOWN_SECONDS:
+            logger.debug("[region_clients] skipping %s (in cooldown, last failure %ds ago)", url, int(now - last_failed_ts))
+            return None
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # use separate connect/read timeouts
+            r = _SESSION.get(url, timeout=(3, max(5, timeout)))
+            r.raise_for_status()
+            try:
+                return r.json()
+            except ValueError:
+                try:
+                    return {"_raw_text": r.text}
+                except Exception:
+                    return None
+        except RequestException as e:
+            last_err = e
+            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[region_clients] unexpected error fetching {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+
+    # mark failure
+    ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
+    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
+    return None
+
+def fetch_all_regions(timeout=6):
+    results = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            realtime = {}
+            if isinstance(data, dict):
+                realtime = data.get("realtime", {}) or {}
+            total = 0
+            for site in realtime.values():
+                try:
+                    total += int(site.get("total", 0))
+                except Exception:
+                    pass
+            if total == 0 and isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict) and "total" in v:
+                        try:
+                            total += int(v.get("total", 0))
+                        except Exception:
+                            pass
+            results.append({"region": region, "count": total})
+        except Exception as e:
+            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
+            results.append({"region": region, "count": None})
+    return results
+
+def _extract_list_candidates(data):
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for k in ("details","people","list","items","results","data","entries"):
+            if k in data and isinstance(data[k], list):
+                return [x for x in data[k] if isinstance(x, dict)]
+        return []
+    return []
+
+def fetch_all_details(timeout=6):
+    all_details = []
+    for region, url in endpoints.items():
+        try:
+            data = _do_get_with_retries(url, timeout=timeout) or {}
+            details = _extract_list_candidates(data)
+            if not details and isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, dict):
+                        candidates = _extract_list_candidates(v)
+                        if candidates:
+                            details.extend(candidates)
+            for d in details:
+                try:
+                    d2 = dict(d)
+                    d2["_region"] = region
+                    d2["_source_url"] = url
+                    all_details.append(d2)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
+            continue
+
+    # try history endpoints as second chance
+    if not all_details:
+        for region, url in history_endpoints.items():
+            try:
+                data = _do_get_with_retries(url, timeout=timeout) or {}
+                details = _extract_list_candidates(data)
+                for d in details:
+                    try:
+                        d2 = dict(d)
+                        d2["_region"] = region
+                        d2["_source_url"] = url
+                        all_details.append(d2)
+                    except Exception:
+                        continue
+            except Exception:
+                logger.debug(f"[region_clients] history details fetch for {region} failed", exc_info=True)
+                continue
+
+    logger.info("[region_clients] fetched %d detail rows across endpoints", len(all_details))
+    return all_details
+
+def fetch_history_for_region(region, timeout=6):
+    url = history_endpoints.get(region)
+    if not url:
+        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
+        return []
+    try:
+        data = _do_get_with_retries(url, timeout=timeout) or {}
+        summary = []
+        if isinstance(data, dict):
+            for key in ("summaryByDate","summary","data","entries","results","details","items"):
+                if key in data and isinstance(data.get(key), list):
+                    for s in data.get(key):
+                        if isinstance(s, dict):
+                            s2 = dict(s)
+                            s2["_region"] = region
+                            s2["_source_url"] = url
+                            summary.append(s2)
+                    break
+            else:
+                if "date" in data or "day" in data:
+                    s2 = dict(data)
+                    s2["_region"] = region
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        elif isinstance(data, list):
+            for s in data:
+                if isinstance(s, dict):
+                    s2 = dict(s)
+                    s2["_region"] = region
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        return summary
+    except Exception as e:
+        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
+        # mark failure timestamp so callers don't hammer this endpoint in the same run
+        ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
+        return []
+
+def fetch_all_history(timeout=6):
+    all_entries = []
+    for region in history_endpoints.keys():
+        try:
+            entries = fetch_history_for_region(region, timeout=timeout)
+            if entries:
+                all_entries.extend(entries)
+        except Exception:
+            logger.exception(f"[region_clients] error aggregating history for {region}")
+            continue
+    logger.info("[region_clients] fetched %d history entries", len(all_entries))
+    return all_entries
+
+
+
+
+
+
+
+
+
+
+
+
+# ccure_client.py
+"""
+Lightweight CCURE client wrappers used by compare service.
+This file is defensive: missing 'requests' or network failures return None instead of raising.
+Improved: requests.Session with retries/backoff and configurable base URL via env var CCURE_BASE.
+"""
+
+import math
+import logging
+import os
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger("ccure_client")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    import sys
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Base URL for CCURE API - configurable via env var
+BASE = os.getenv("CCURE_BASE", "http://10.199.22.57:5001").rstrip("/")
+DEFAULT_TIMEOUT = int(os.getenv("CCURE_TIMEOUT", "12"))
+
+HEADERS = {
+    "Accept": "application/json"
+}
+
+# Defensive import of requests
+try:
+    import requests
+except Exception:
+    requests = None
+    logger.warning("requests module not available; ccure_client will return None for HTTP calls")
+
+def _build_session():
+    if requests is None:
+        return None
+    s = requests.Session()
+    try:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'HEAD'])
+        )
+    except TypeError:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(['GET', 'HEAD'])
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+_SESSION = _build_session() if requests is not None else None
+
+def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
+    """
+    Safe GET wrapper. Returns parsed JSON on success or None on failure.
+    """
+    if requests is None:
+        logger.debug("_safe_get: requests not available")
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    url = BASE + path
+    session = _SESSION or requests
+    try:
+        r = session.get(url, params=params, headers=HEADERS, timeout=(3, max(5, timeout)))
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            logger.warning(f"[ccure_client] response not JSON for {url}")
+            return None
+    except RequestException as e:
+        logger.warning(f"[ccure_client] request failed {url} params={params} -> {e}")
+        return None
+    except Exception:
+        logger.exception(f"[ccure_client] unexpected error fetching {url}")
+        return None
+
+def fetch_all_employees_full():
+    """Try to fetch a full dump from /api/employees (may return list or None)."""
+    return _safe_get("/api/employees")
+
+def fetch_stats_page(detail, page=1, limit=500):
+    params = {"details": detail, "page": page, "limit": limit}
+    return _safe_get("/api/stats", params=params)
+
+def fetch_all_stats(detail, limit=1000):
+    first = fetch_stats_page(detail, page=1, limit=limit)
+    if not first:
+        return None
+    data = first.get("data") or []
+    total = int(first.get("total") or len(data) or 0)
+    if total <= len(data):
+        return data
+    pages = int(math.ceil(total / float(limit)))
+    for p in range(2, pages + 1):
+        page_res = fetch_stats_page(detail, page=p, limit=limit)
+        if not page_res:
+            break
+        data.extend(page_res.get("data") or [])
+    return data
+
+def get_global_stats():
+    """
+    Best-effort summary using /api/stats (preferred) or /api/employees (fallback).
+    Returns dict or None.
+    """
+    details = ["TotalProfiles", "ActiveProfiles", "ActiveEmployees", "ActiveContractors",
+               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
+    out = {}
+
+    # Try a single call to /api/stats
+    try:
+        summary = _safe_get("/api/stats")
+        if isinstance(summary, dict) and any(k in summary for k in details):
+            for k in details:
+                for key in summary.keys():
+                    if key.lower() == k.lower():
+                        out[k] = summary.get(key)
+                        break
+            if out:
+                safe_out = {}
+                for k, v in out.items():
+                    try:
+                        safe_out[k] = int(v) if v is not None and str(v).strip() != "" else None
+                    except Exception:
+                        safe_out[k] = v
+                return safe_out
+    except Exception:
+        logger.exception("get_global_stats: top-level /api/stats failed")
+
+    # Try per-detail endpoints
+    try:
+        any_found = False
+        for d in details:
+            resp = fetch_stats_page(d, page=1, limit=1)
+            if isinstance(resp, dict):
+                if 'total' in resp and isinstance(resp['total'], (int, float, str)):
+                    out[d] = int(resp['total'])
+                    any_found = True
+                elif d in resp:
+                    out[d] = resp.get(d)
+                    any_found = True
+                else:
+                    for key in resp.keys():
+                        if key.lower() == d.lower() and isinstance(resp.get(key), (int, float, str)):
+                            try:
+                                out[d] = int(resp.get(key))
+                                any_found = True
+                            except Exception:
+                                out[d] = resp.get(key)
+                                any_found = True
+                            break
+        if any_found:
+            return {k: (int(v) if (v is not None and str(v).strip() != "") else None) for k, v in out.items()}
+    except Exception:
+        logger.exception("fetch per-detail stats failed")
+
+    # Fallback: try /api/employees dump
+    try:
+        full = fetch_all_employees_full()
+        if isinstance(full, list):
+            total = len(full)
+            active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
+            active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
+            active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
+            terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
+            return {
+                "TotalProfiles": total,
+                "ActiveProfiles": active_profiles,
+                "ActiveEmployees": active_emps,
+                "ActiveContractors": active_contractors,
+                "TerminatedProfiles": terminated
+            }
+    except Exception:
+        logger.exception("Error calculating global stats from full dump fallback")
+
+    return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+mmour Issue is 
 1)we Got Failed to load CCURE averages this error again and again need to fix this issue 
 2) Duration report continoulsy in loading state need to fix both issue how we can improve this performanve ..
 
