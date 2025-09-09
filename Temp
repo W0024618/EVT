@@ -1,1124 +1,9 @@
-# app.py (updated)
-# Top portion (minor cleanup + fixes)
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.encoders import jsonable_encoder
-import shutil
-import uuid
-import json
-import logging
-from pathlib import Path
-from datetime import date, datetime, timedelta
-import re
-import asyncio
-from typing import Optional, Dict, Any, List
+Understand issue is Check below App.py file also i will shar you another file also 
+We have isse for Duration API 
 
-# NEW imports required to fix NameError and duration timezone usage
-import pandas as pd
-from zoneinfo import ZoneInfo
+like Duration page continous in loading sate it not display anything on UI also it not display any error on Ui so lets debug issue and fix this issue carefully..
 
-# --- DB / models imports (kept for endpoints that still use DB like headcount/attendance fallback) ---
-from db import SessionLocal
-from models import LiveSwipe, AttendanceSummary
 
-# --- settings (optional override) ---
-try:
-    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
-    DATA_DIR = Path(SETTINGS_DATA_DIR)
-    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
-except Exception:
-    DATA_DIR = Path(__file__).resolve().parent / "data"
-    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-
-import sys  # ensure logging stream available
-RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="Attendance Analytics")
-
-logger = logging.getLogger("attendance_app")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-
-# ----------------- GLOBAL TIMEOUTS (UNIFY) -----------------
-REGION_TIMEOUT_SECONDS = 20
-COMPUTE_WAIT_TIMEOUT_SECONDS = 30
-COMPUTE_SYNC_TIMEOUT_SECONDS = 60
-# QUICK attempt — small window to get a fast compute (if possible)
-QUICK_COMPUTE_TIMEOUT_SECONDS = 3
-# ----------------------------------------------------------
-
-_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://localhost:3008"
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-_broadcaster_clients = set()
-
-def broadcast_ccure_update(payload: dict):
-    if not _broadcaster_clients:
-        return
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-    for q in list(_broadcaster_clients):
-        try:
-            if loop and loop.is_running():
-                loop.call_soon_threadsafe(q.put_nowait, payload)
-            else:
-                q.put_nowait(payload)
-        except Exception:
-            logger.exception("Failed to push payload to SSE client (will remove client)")
-            try:
-                _broadcaster_clients.discard(q)
-            except Exception:
-                pass
-
-async def _sse_event_generator(client_queue: asyncio.Queue):
-    try:
-        while True:
-            payload = await client_queue.get()
-            try:
-                data = json.dumps(payload, default=str)
-            except Exception:
-                data = json.dumps({"error": "serialization error", "payload": str(payload)})
-            yield f"data: {data}\n\n"
-    finally:
-        try:
-            _broadcaster_clients.discard(client_queue)
-        except Exception:
-            pass
-        return
-
-@app.get("/ccure/stream")
-async def ccure_stream():
-    q = asyncio.Queue()
-    _broadcaster_clients.add(q)
-    generator = _sse_event_generator(q)
-    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
-
-def _guess_region_from_text(txt: str) -> str:
-    if not txt:
-        return "unknown"
-    s = str(txt).strip().lower()
-    s = re.sub(r"[,\-/()]", " ", s)
-    if any(k in s for k in ("pune","quezon city","taguig city","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
-        return "apac"
-    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
-        return "emea"
-    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
-        return "laca"
-    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
-        return "namer"
-    return "unknown"
-
-@app.get("/headcount")
-def api_headcount():
-    try:
-        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
-        with SessionLocal() as db:
-            try:
-                today = date.today()
-                rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
-                if rows:
-                    for r in rows:
-                        try:
-                            partition = None
-                            if r.derived and isinstance(r.derived, dict):
-                                partition = r.derived.get("partition")
-                            loc = partition or "unknown"
-                            region = _guess_region_from_text(loc)
-                            totals[region] = totals.get(region, 0) + 1
-                        except Exception:
-                            totals["unknown"] += 1
-                else:
-                    start = datetime.combine(today, datetime.min.time())
-                    end = datetime.combine(today, datetime.max.time())
-                    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
-                    for s in swipes:
-                        loc = s.partition or "unknown"
-                        region = _guess_region_from_text(loc)
-                        totals[region] = totals.get(region, 0) + 1
-            except Exception:
-                logger.exception("Failed to compute headcount regions")
-        out = {
-            "apac": int(totals.get("apac", 0)),
-            "emea": int(totals.get("emea", 0)),
-            "laca": int(totals.get("laca", 0)),
-            "namer": int(totals.get("namer", 0))
-        }
-        return JSONResponse(out)
-    except Exception as exc:
-        logger.exception("api_headcount failed")
-        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
-
-# ---------- Helpers retained (normalize / safe conversions) -------------
-def _normalize_employee_key(x) -> Optional[str]:
-    if x is None:
-        return None
-    try:
-        s = str(x).strip()
-        if s == "" or s.lower() in ("nan", "none", "na", "null"):
-            return None
-        return s
-    except Exception:
-        return None
-
-def _normalize_card_like(s) -> Optional[str]:
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "":
-            return None
-        digits = re.sub(r'\D+', '', ss)
-        if digits == "":
-            return None
-        return digits.lstrip('0') or digits
-    except Exception:
-        return None
-
-def _safe_int(v):
-    try:
-        if v is None:
-            return None
-        return int(v)
-    except Exception:
-        try:
-            return int(float(v))
-        except Exception:
-            return None
-
-# ---------- small helper to read CSV/XLS(X) robustly used in /duration -------------
-def _read_csv_compat(p: Path, parse_dates: Optional[List[str]] = None, dtype=None) -> pd.DataFrame:
-    """
-    Safe read for csv/xls/xlsx used by duration endpoint (defensive).
-    Returns an empty DataFrame on failure.
-    """
-    try:
-        suffix = p.suffix.lower()
-        if suffix in (".xls", ".xlsx"):
-            df = pd.read_excel(p, sheet_name=0, dtype=dtype)
-        else:
-            df = pd.read_csv(p, dtype=dtype, low_memory=False)
-        # normalize column names
-        df.columns = [str(c) for c in df.columns]
-        if parse_dates:
-            for col in parse_dates:
-                if col in df.columns:
-                    try:
-                        df[col] = pd.to_datetime(df[col], errors='coerce')
-                    except Exception:
-                        # leave as-is if parse fails
-                        pass
-        return df
-    except Exception:
-        logger.exception("Failed to read table %s", str(p))
-        return pd.DataFrame()
-
-# ---------- build_ccure_averages (fallback) ------------------------------
-def build_ccure_averages(start_date: Optional[str] = None, end_date: Optional[str] = None):
-    """
-    Fallback averages computation using AttendanceSummary only.
-    Returns a compact shape (live_today, ccure_active, averages, notes).
-    """
-    try:
-        def _parse_date_param(s):
-            if not s:
-                return None
-            try:
-                return datetime.strptime(s, "%Y-%m-%d").date()
-            except Exception:
-                try:
-                    return date.fromisoformat(s)
-                except Exception:
-                    return None
-
-        today = date.today()
-        start_obj = _parse_date_param(start_date) if start_date else (today - timedelta(days=6))
-        end_obj = _parse_date_param(end_date) if end_date else today
-        if start_obj is None or end_obj is None or start_obj > end_obj:
-            start_obj = today - timedelta(days=6)
-            end_obj = today
-
-        with SessionLocal() as db:
-            try:
-                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
-            except Exception:
-                logger.exception("Failed to query AttendanceSummary")
-                att_rows = []
-
-            live_emp = 0
-            live_contr = 0
-            unknown_count = 0
-            seen_keys = set()
-
-            def classify_from_derived(derived):
-                try:
-                    if not derived or not isinstance(derived, dict):
-                        return "contractor"
-                    for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
-                        v = derived.get(k)
-                        if v and "employee" in str(v).strip().lower():
-                            return "employee"
-                    for k in ("Employee_Status","Employee Status","Status"):
-                        v = derived.get(k)
-                        if v and "terminated" in str(v).strip().lower():
-                            return "employee"
-                    return "contractor"
-                except Exception:
-                    return "contractor"
-
-            # extract live_today (from AttendanceSummary "today" rows if present)
-            if att_rows:
-                for a in att_rows:
-                    key = None
-                    try:
-                        key = _normalize_employee_key(a.employee_id)
-                    except Exception:
-                        key = None
-                    if not key:
-                        try:
-                            key = _normalize_card_like(a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None)
-                        except Exception:
-                            key = None
-                    if not key:
-                        unknown_count += 1
-                        continue
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    cls = classify_from_derived(a.derived)
-                    if cls == "employee":
-                        live_emp += 1
-                    elif cls == "contractor":
-                        live_contr += 1
-                    else:
-                        unknown_count += 1
-
-                live_total_reported = live_emp + live_contr + unknown_count
-                live_total_details = len(att_rows)
-            else:
-                live_total_reported = 0
-                live_total_details = 0
-                try:
-                    import region_clients
-                    details = []
-                    try:
-                        details = region_clients.fetch_all_details(timeout=REGION_TIMEOUT_SECONDS) or []
-                    except Exception:
-                        logger.exception("region_clients.fetch_all_details failed in build_ccure_averages()")
-                        details = []
-                    if details:
-                        for d in details:
-                            try:
-                                cls = "contractor"
-                                for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
-                                    v = d.get(k)
-                                    if v and "employee" in str(v).strip().lower():
-                                        cls = "employee"
-                                        break
-                                if cls == "employee":
-                                    live_emp += 1
-                                else:
-                                    live_contr += 1
-                                live_total_details += 1
-                            except Exception:
-                                continue
-                        live_total_reported = live_emp + live_contr
-                    else:
-                        try:
-                            regions = region_clients.fetch_all_regions(timeout=REGION_TIMEOUT_SECONDS) or []
-                            for r in regions:
-                                try:
-                                    c = r.get("count")
-                                    if isinstance(c, (int, float)):
-                                        live_total_reported += int(c)
-                                except Exception:
-                                    continue
-                        except Exception:
-                            logger.exception("region_clients.fetch_all_regions failed in build_ccure_averages()")
-                except Exception:
-                    logger.exception("region_clients not importable in build_ccure_averages()")
-
-            # compute avg range using AttendanceSummary if possible
-            avg_range = None
-            try:
-                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
-                      .filter(AttendanceSummary.date >= start_obj, AttendanceSummary.date <= end_obj).all()
-                by_date = {}
-                for row in q:
-                    d = row[0]
-                    key = (row[1] or "").strip() if row[1] else None
-                    if not key:
-                        continue
-                    if d not in by_date:
-                        by_date[d] = set()
-                    try:
-                        presence_val = getattr(row, 'presence_count', row[2])
-                        if int(presence_val) > 0:
-                            by_date[d].add(key)
-                    except Exception:
-                        by_date[d].add(key)
-                days_count = (end_obj - start_obj).days + 1
-                daily_counts = [len(by_date.get(start_obj + timedelta(days=i), set())) for i in range(days_count)]
-                if days_count and any(daily_counts):
-                    avg_range = int(round(sum(daily_counts) / float(days_count)))
-                else:
-                    avg_range = None
-            except Exception:
-                logger.exception("Failed computing range average from AttendanceSummary")
-                avg_range = None
-
-            # ---------- NEW: location averages using AttendanceSummary (history_avg_by_location_last_7_days)
-            history_avg_by_location = {}
-            try:
-                # Query rows that include derived so we can extract location and personnel type
-                q2 = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count, AttendanceSummary.derived)\
-                       .filter(AttendanceSummary.date >= start_obj, AttendanceSummary.date <= end_obj).all()
-                # per-date, per-location unique sets (employee vs contractor)
-                per_date_loc_emp = {}   # (date_iso, loc) -> set(keys)
-                per_date_loc_con = {}
-
-                def _loc_from_derived(derived):
-                    if not derived or not isinstance(derived, dict):
-                        return None
-                    # common keys that might hold location/site
-                    for k in ("PartitionName2","PrimaryLocation","PartitionName","Partition","Location","location","location_desc","Location Description","Site","SiteName"):
-                        v = derived.get(k)
-                        if v:
-                            return str(v).strip()
-                    # try nested or alternative keys
-                    for k in derived.keys():
-                        if "location" in str(k).lower() or "site" in str(k).lower():
-                            v = derived.get(k)
-                            if v:
-                                return str(v).strip()
-                    return None
-
-                for row in q2:
-                    try:
-                        d = row[0]
-                        if not d:
-                            continue
-                        d_iso = d.isoformat()
-                        raw_key = row[1]
-                        if not raw_key:
-                            # try card_number in derived
-                            raw_key = None
-                            dd = row[3] if len(row) >= 4 else None
-                            if dd and isinstance(dd, dict):
-                                raw_key = dd.get("card_number") or dd.get("CardNumber") or dd.get("EmployeeID")
-                        key = (str(raw_key).strip() if raw_key else None)
-                        if not key:
-                            continue
-                        derived = row[3] if len(row) >= 4 else None
-                        presence_val = None
-                        try:
-                            presence_val = int(row[2] or 0)
-                        except Exception:
-                            presence_val = 1 if (row[2] and str(row[2]).strip() != "0") else 0
-                        if presence_val <= 0:
-                            continue
-                        loc = _loc_from_derived(derived) or "unknown"
-                        cls = classify_from_derived(derived)
-                        # emp set
-                        per_date_loc_emp.setdefault((d_iso, loc), set())
-                        per_date_loc_con.setdefault((d_iso, loc), set())
-                        if cls == "employee":
-                            per_date_loc_emp[(d_iso, loc)].add(key)
-                        else:
-                            per_date_loc_con[(d_iso, loc)].add(key)
-                    except Exception:
-                        continue
-
-                # compute per-location averages across days
-                # build set of locations seen
-                locs = set()
-                days_count = (end_obj - start_obj).days + 1
-                dates_list = [(start_obj + timedelta(days=i)).isoformat() for i in range(days_count)]
-                for (d_iso, loc) in list(per_date_loc_emp.keys()) + list(per_date_loc_con.keys()):
-                    locs.add(loc)
-
-                for loc in locs:
-                    per_day_emp_totals = []
-                    per_day_con_totals = []
-                    valid_day_count = 0
-                    for d_iso in dates_list:
-                        emp_set = per_date_loc_emp.get((d_iso, loc), set())
-                        con_set = per_date_loc_con.get((d_iso, loc), set())
-                        if emp_set or con_set:
-                            valid_day_count += 1
-                        per_day_emp_totals.append(len(emp_set))
-                        per_day_con_totals.append(len(con_set))
-                    if valid_day_count == 0:
-                        # If no days had data for this loc, we'll still average over full window for consistency
-                        valid_day_count = days_count if days_count > 0 else 1
-                    # daily average per location
-                    avg_emp = int(round(sum(per_day_emp_totals) / float(days_count))) if days_count > 0 else None
-                    avg_con = int(round(sum(per_day_con_totals) / float(days_count))) if days_count > 0 else None
-                    avg_overall = None
-                    try:
-                        if avg_emp is not None or avg_con is not None:
-                            avg_overall = int(round(((avg_emp or 0) + (avg_con or 0))))
-                    except Exception:
-                        avg_overall = None
-
-                    history_avg_by_location[loc] = {
-                        "avg_employee_last_7_days": avg_emp,
-                        "avg_contractor_last_7_days": avg_con,
-                        "avg_overall_last_7_days": avg_overall,
-                        "history_days_counted": valid_day_count
-                    }
-            except Exception:
-                logger.exception("Failed computing history_avg_by_location_last_7_days from AttendanceSummary")
-                history_avg_by_location = {}
-
-        # fallback: use region history to compute avg_range if still None (existing logic)
-        if avg_range is None:
-            try:
-                import region_clients
-                entries = region_clients.fetch_all_history(timeout=REGION_TIMEOUT_SECONDS) or []
-                agg = {}
-                for e in entries:
-                    try:
-                        dstr = e.get("date")
-                        if not dstr:
-                            continue
-                        region_obj = e.get("region") if isinstance(e.get("region"), dict) else None
-                        emp = None
-                        con = None
-                        tot = None
-                        if region_obj:
-                            emp = _safe_int(region_obj.get("Employee"))
-                            con = _safe_int(region_obj.get("Contractor"))
-                            tot = _safe_int(region_obj.get("total")) or ((emp or 0) + (con or 0))
-                        else:
-                            emp = _safe_int(e.get("Employee"))
-                            con = _safe_int(e.get("Contractor"))
-                            tot = _safe_int(e.get("total"))
-                        if emp is None and con is None:
-                            continue
-                        if tot is None:
-                            tot = (emp or 0) + (con or 0)
-                        if dstr not in agg:
-                            agg[dstr] = {"total": 0, "count": 0}
-                        agg[dstr]["total"] += tot or 0
-                        agg[dstr]["count"] += 1
-                    except Exception:
-                        continue
-                per_date_totals = []
-                days_count = (end_obj - start_obj).days + 1
-                for i in range(days_count):
-                    dcheck = (start_obj + timedelta(days=i)).isoformat()
-                    if dcheck in agg and agg[dcheck]["count"] > 0:
-                        per_day_avg = float(agg[dcheck]["total"]) / float(agg[dcheck]["count"])
-                        per_date_totals.append(per_day_avg)
-                if per_date_totals:
-                    avg_range = int(round(sum(per_date_totals) / float(len(per_date_totals))))
-            except Exception:
-                logger.exception("Failed computing avg_range from region history in fallback")
-
-        # get ccure stats if available
-        ccure_stats = {}
-        try:
-            import ccure_client
-            if hasattr(ccure_client, "get_global_stats"):
-                ccure_stats = ccure_client.get_global_stats() or {}
-        except Exception:
-            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
-
-        cc_active_emps = None
-        cc_active_contractors = None
-        try:
-            if isinstance(ccure_stats, dict):
-                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
-                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
-                if a is not None and str(a).strip() != "":
-                    cc_active_emps = int(a)
-                if b is not None and str(b).strip() != "":
-                    cc_active_contractors = int(b)
-        except Exception:
-            cc_active_emps = cc_active_contractors = None
-
-        emp_pct = None
-        contr_pct = None
-        overall_pct = None
-        try:
-            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
-                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
-            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
-                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
-            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
-                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
-        except Exception:
-            emp_pct = contr_pct = overall_pct = None
-
-        resp = {
-            "date": today.isoformat(),
-            "notes": f"Computed over range {start_obj.isoformat()} -> {end_obj.isoformat()}" if (start_date or end_date) else None,
-            "live_today": {
-                "employee": live_emp,
-                "contractor": live_contr,
-                "total_reported": live_total_reported,
-                "total_from_details": live_total_details
-            },
-            "ccure_active": {
-                "active_employees": cc_active_emps,
-                "active_contractors": cc_active_contractors,
-                "ccure_active_employees_reported": cc_active_emps,
-                "ccure_active_contractors_reported": cc_active_contractors
-            },
-            "averages": {
-                "employee_pct": emp_pct,
-                "contractor_pct": contr_pct,
-                "overall_pct": overall_pct,
-                "avg_headcount_last_7_days": avg_range,
-                "head_emp_pct_vs_ccure_today": emp_pct,
-                "head_contractor_pct_vs_ccure_today": contr_pct,
-                "headcount_overall_pct_vs_ccure_today": overall_pct,
-                "history_avg_overall_last_7_days": avg_range,
-                # include location averages computed above
-                "history_avg_by_location_last_7_days": history_avg_by_location
-            }
-        }
-
-        return resp
-    except Exception:
-        logger.exception("build_ccure_averages failed")
-        raise
-
-# -------------------------
-# Upload endpoints (store uploads under data/ and data/raw_uploads/ and rotate)
-# -------------------------
-ALLOWED_EXT = (".xls", ".xlsx", ".csv")
-
-def _remove_old_files_for_kind(kind: str):
-    """
-    Remove previous canonical files and previous raw uploads that include kind in filename.
-    """
-    try:
-        # canonical in DATA_DIR
-        for p in DATA_DIR.iterdir():
-            if p.is_file() and f"active_{kind}" in p.name.lower():
-                try:
-                    p.unlink()
-                except Exception:
-                    logger.warning("Could not remove old canonical file %s", p)
-        # remove raw uploads for same kind to keep only latest raw (user requested)
-        for p in RAW_UPLOADS_DIR.iterdir():
-            if p.is_file() and kind in p.name.lower():
-                try:
-                    p.unlink()
-                except Exception:
-                    logger.warning("Could not remove old raw file %s", p)
-    except Exception:
-        logger.exception("error while removing old files for kind=%s", kind)
-
-def _save_upload_and_rotate(upload_file: UploadFile, kind: str) -> dict:
-    """
-    Save the uploaded file as:
-      - data/active_<kind>.<ext>     (canonical)
-      - data/raw_uploads/<timestamp>_<kind>_<origname>  (raw trace)
-    Remove previous files for same kind (both canonical & raw).
-    Returns metadata dict.
-    """
-    fname = Path(upload_file.filename).name
-    ext = Path(fname).suffix.lower()
-    if ext not in ALLOWED_EXT:
-        raise HTTPException(status_code=400, detail="Only .xls .xlsx .csv allowed")
-
-    # rotate old files
-    _remove_old_files_for_kind(kind)
-
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    raw_name = f"{ts}_{kind}_{fname}"
-    raw_path = RAW_UPLOADS_DIR / raw_name
-
-    # Save raw
-    try:
-        with raw_path.open("wb") as out_f:
-            shutil.copyfileobj(upload_file.file, out_f)
-    finally:
-        try:
-            upload_file.file.close()
-        except Exception:
-            pass
-
-    # Write canonical: keep same extension as original (simpler)
-    canonical_path = DATA_DIR / f"active_{kind}{ext}"
-    try:
-        shutil.copy(raw_path, canonical_path)
-    except Exception:
-        logger.exception("Failed to write canonical copy for %s", canonical_path)
-
-    info = {
-        "raw_saved": str(raw_path),
-        "canonical_saved": str(canonical_path),
-        "original_filename": fname,
-        "size_bytes": raw_path.stat().st_size if raw_path.exists() else None
-    }
-    logger.info("Uploaded %s: %s", kind, info)
-    return info
-
-
-@app.post("/api/upload/active-employees")
-async def upload_active_employees_api(file: UploadFile = File(...)):
-    return await upload_active_employees(file)
-
-@app.post("/api/upload/active-contractors")
-async def upload_active_contractors_api(file: UploadFile = File(...)):
-    return await upload_active_contractors(file)
-
-
-@app.post("/upload/active-employees")
-async def upload_active_employees(file: UploadFile = File(...)):
-    """
-    Upload Active Employee sheet:
-      - stores raw to data/raw_uploads and canonical to data/active_employee.*
-      - removes previous uploaded employee sheets (raw + canonical)
-      - does NOT write rows into DB
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="no file provided")
-    try:
-        info = _save_upload_and_rotate(file, kind="employee")
-        return JSONResponse({"status": "ok", "detail": info})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("employee upload failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/upload/active-contractors")
-async def upload_active_contractors(file: UploadFile = File(...)):
-    """
-    Upload Active Contractor sheet:
-      - stores raw to data/raw_uploads and canonical to data/active_contractor.*
-      - removes previous uploaded contractor sheets (raw + canonical)
-      - does NOT write rows into DB
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="no file provided")
-    try:
-        info = _save_upload_and_rotate(file, kind="contractor")
-        return JSONResponse({"status": "ok", "detail": info})
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("contractor upload failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------- map detailed -> resp (unchanged) ----
-def _map_detailed_to_resp(detailed: Dict[str, Any]) -> Dict[str, Any]:
-    # unchanged mapping from earlier implementation (kept identical to previous)
-    live_h = detailed.get("live_headcount", {}) or {}
-    head_h = detailed.get("headcount", {}) or {}
-    ccure_active_obj = detailed.get("ccure_active", {}) or {}
-    averages_obj = detailed.get("averages", {}) or {}
-
-    def to_int(v):
-        try:
-            return None if v is None else int(v)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return None
-
-    live_employee = int(live_h.get("employee") or head_h.get("employee") or 0)
-    live_contractor = int(live_h.get("contractor") or head_h.get("contractor") or 0)
-    total_reported = int(
-        live_h.get("currently_present_total")
-        or head_h.get("total_visited_today")
-        or (live_employee + live_contractor)
-        or 0
-    )
-    total_from_details = int(head_h.get("total_visited_today") or 0)
-
-    mapped_headcount = {
-        "total_visited_today": int(head_h.get("total_visited_today") or 0),
-        "employee": int(head_h.get("employee") or 0),
-        "contractor": int(head_h.get("contractor") or 0),
-        "by_location": head_h.get("by_location") or {}
-    }
-
-    resp = {
-        "date": detailed.get("date"),
-        "notes": detailed.get("notes"),
-        "live_today": {
-            "employee": live_employee,
-            "contractor": live_contractor,
-            "total_reported": total_reported,
-            "total_from_details": total_from_details
-        },
-        "headcount": mapped_headcount,
-        "live_headcount": live_h,
-        "ccure_active": {
-            "active_employees": ccure_active_obj.get("ccure_active_employees_reported")
-                             or ccure_active_obj.get("active_employees"),
-            "active_contractors": ccure_active_obj.get("ccure_active_contractors_reported")
-                               or ccure_active_obj.get("active_contractors"),
-            "ccure_active_employees_reported": ccure_active_obj.get("ccure_active_employees_reported"),
-            "ccure_active_contractors_reported": ccure_active_obj.get("ccure_active_contractors_reported")
-        },
-        "averages": averages_obj
-    }
-    return resp
-
-# ---------- build a verify-compatible summary from mapped payload -----------
-def _build_verify_like_summary_from_mapped(mapped: Dict[str, Any], include_raw: bool = False) -> Dict[str, Any]:
-    def to_int(v):
-        try:
-            return None if v is None else int(v)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return None
-
-    cc = mapped.get("ccure_active", {}) or {}
-    head = mapped.get("headcount", {}) or {}
-    live_head = mapped.get("live_headcount", {}) or {}
-    averages = mapped.get("averages", {}) or {}
-
-    cc_emp = to_int(cc.get("ccure_active_employees_reported") or cc.get("active_employees"))
-    cc_con = to_int(cc.get("ccure_active_contractors_reported") or cc.get("active_contractors"))
-
-    head_total = to_int(head.get("total_visited_today") or mapped.get("live_today", {}).get("total_from_details"))
-    head_emp = to_int(head.get("employee") or mapped.get("live_today", {}).get("employee"))
-    head_con = to_int(head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
-
-    live_total = to_int(live_head.get("currently_present_total") or mapped.get("live_today", {}).get("total_reported"))
-    live_emp = to_int(live_head.get("employee") or mapped.get("live_today", {}).get("employee"))
-    live_con = to_int(live_head.get("contractor") or mapped.get("live_today", {}).get("contractor"))
-
-    history_emp_avg = averages.get("history_avg_employee_last_7_days")
-    history_con_avg = averages.get("history_avg_contractor_last_7_days")
-    history_overall_avg = averages.get("history_avg_overall_last_7_days")
-
-    def pct(n, d):
-        try:
-            if n is None or d is None:
-                return None
-            if float(d) == 0:
-                return None
-            return round((float(n) / float(d)) * 100.0, 2)
-        except Exception:
-            return None
-
-    summary = {
-        "date": mapped.get("date"),
-        "ccure_reported": {
-            "employees": cc_emp,
-            "contractors": cc_con,
-            "total_reported": (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None
-        },
-        "headcount_attendance_summary": {
-            "total_visited_today": head_total,
-            "employee": head_emp,
-            "contractor": head_con,
-        },
-        "live_headcount_region_clients": {
-            "currently_present_total": live_total,
-            "employee": live_emp,
-            "contractor": live_con,
-        },
-        "percentages_vs_ccure": {
-            "head_employee_pct_vs_ccure_today": pct(head_emp, cc_emp),
-            "head_contractor_pct_vs_ccure_today": pct(head_con, cc_con),
-            "head_overall_pct_vs_ccure_today": pct(head_total, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None),
-            "live_employee_pct_vs_ccure_today": pct(live_emp, cc_emp),
-            "live_contractor_pct_vs_ccure_today": pct(live_con, cc_con),
-            "live_overall_pct_vs_ccure_today": pct(live_total, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None),
-            "history_employee_pct_vs_ccure": pct(history_emp_avg, cc_emp),
-            "history_contractor_pct_vs_ccure": pct(history_con_avg, cc_con),
-            "history_overall_pct_vs_ccure": pct(history_overall_avg, (cc_emp + cc_con) if (cc_emp is not None and cc_con is not None) else None)
-        },
-        "averages": {
-            "history_avg_employee_last_7_days": history_emp_avg,
-            "history_avg_contractor_last_7_days": history_con_avg,
-            "history_avg_overall_last_7_days": history_overall_avg,
-            "avg_headcount_last_7_days_db": averages.get("avg_headcount_last_7_days") or averages.get("avg_headcount_last_7_days_db"),
-            "avg_headcount_per_site_last_7_days": averages.get("avg_headcount_per_site_last_7_days"),
-            "employee_pct": averages.get("employee_pct"),
-            "contractor_pct": averages.get("contractor_pct"),
-            "overall_pct": averages.get("overall_pct"),
-            **({k: v for k, v in averages.items() if k not in (
-                "history_avg_employee_last_7_days",
-                "history_avg_contractor_last_7_days",
-                "history_avg_overall_last_7_days",
-                "avg_headcount_last_7_days",
-                "avg_headcount_last_7_days_db",
-                "avg_headcount_per_site_last_7_days",
-                "employee_pct","contractor_pct","overall_pct"
-            )})
-        },
-        "notes": mapped.get("notes")
-    }
-
-    summary["headcount_details"] = {
-        "total_visited_today": head_total,
-        "employee": head_emp,
-        "contractor": head_con,
-        "by_location": head.get("by_location") if isinstance(head.get("by_location"), dict) else {}
-    }
-    summary["live_headcount_details"] = {
-        "currently_present_total": live_total,
-        "employee": live_emp,
-        "contractor": live_con,
-        "by_location": live_head.get("by_location") if isinstance(live_head.get("by_location"), dict) else {}
-    }
-
-    summary["ccure_active"] = {
-        "active_employees": cc.get("active_employees") or cc.get("ccure_active_employees_reported"),
-        "active_contractors": cc.get("active_contractors") or cc.get("ccure_active_contractors_reported"),
-        "ccure_active_employees_reported": cc.get("ccure_active_employees_reported"),
-        "ccure_active_contractors_reported": cc.get("ccure_active_contractors_reported")
-    }
-
-    return summary
-
-# ---------- utility to run compute_visit_averages in executor with timeout and optional broadcasting ----------
-async def _background_compute_and_broadcast(func, start_date: Optional[str], end_date: Optional[str]):
-    """
-    Run the heavy compute in background (thread pool) and broadcast result via SSE when ready.
-    This allows /ccure/verify to return quickly while frontends receive updates later.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-        # Give the background compute a longer timeout
-        try:
-            fut = loop.run_in_executor(None, func, start_date, end_date, REGION_TIMEOUT_SECONDS)
-            detailed = await asyncio.wait_for(fut, timeout=COMPUTE_SYNC_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            logger.exception("Background compute_visit_averages timed out after %ds", COMPUTE_SYNC_TIMEOUT_SECONDS)
-            return
-        except Exception:
-            # compute function might itself raise quickly; log and exit
-            logger.exception("Background compute_visit_averages raised")
-            return
-
-        if isinstance(detailed, dict):
-            try:
-                mapped = _map_detailed_to_resp(detailed)
-                summary = _build_verify_like_summary_from_mapped(mapped, include_raw=True)
-                # include raw for debugging on frontend if desired
-                summary["raw"] = detailed
-                # broadcast to connected SSE clients
-                broadcast_ccure_update(summary)
-                logger.info("Broadcasted background compute result to SSE clients")
-            except Exception:
-                logger.exception("Failed mapping/broadcasting background compute result")
-    except Exception:
-        logger.exception("_background_compute_and_broadcast failed unexpectedly")
-
-# ---------- /ccure/verify (updated to be async + quick fallback + background update) -----
-@app.get("/ccure/verify")
-async def ccure_verify(
-    raw: bool = Query(False, description="if true, include the raw compute payload for debugging"),
-    start_date: Optional[str] = Query(None, description="YYYY-MM-DD start date (inclusive)"),
-    end_date: Optional[str] = Query(None, description="End date (inclusive)")
-):
-    """
-    Synchronous verification endpoint. Prefer compute_visit_averages (short attempt).
-    If heavy compute is slow, we return build_ccure_averages() immediately (fast fallback)
-    and schedule a background compute that will broadcast an updated payload to SSE clients.
-    """
-    try:
-        detailed = None
-        compute_func = None
-        try:
-            # optional heavy compute (may not be importable in some deployments)
-            from ccure_compare_service import compute_visit_averages
-            compute_func = compute_visit_averages
-        except Exception:
-            logger.exception("compute_visit_averages import failed or not available (will use fallback)")
-
-        # If compute_func is available, try a very quick run in executor (QUICK_COMPUTE_TIMEOUT_SECONDS)
-        if compute_func:
-            try:
-                loop = asyncio.get_running_loop()
-                fut = loop.run_in_executor(None, compute_func, start_date, end_date, REGION_TIMEOUT_SECONDS)
-                try:
-                    detailed = await asyncio.wait_for(fut, timeout=QUICK_COMPUTE_TIMEOUT_SECONDS)
-                    logger.info("Quick compute_visit_averages returned within %ds", QUICK_COMPUTE_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
-                    logger.info("Quick compute_visit_averages did not finish within %ds - returning fast fallback and scheduling background compute", QUICK_COMPUTE_TIMEOUT_SECONDS)
-                    detailed = None
-                    # schedule background compute to run and broadcast when ready
-                    try:
-                        asyncio.create_task(_background_compute_and_broadcast(compute_func, start_date, end_date))
-                    except Exception:
-                        logger.exception("Could not schedule background compute task")
-                except Exception:
-                    logger.exception("compute_visit_averages quick attempt raised")
-                    detailed = None
-                    try:
-                        asyncio.create_task(_background_compute_and_broadcast(compute_func, start_date, end_date))
-                    except Exception:
-                        logger.exception("Could not schedule background compute task after quick failure")
-            except Exception:
-                logger.exception("Failed to run compute_visit_averages in executor")
-                detailed = None
-        else:
-            logger.info("compute_visit_averages not available - will use fallback only")
-
-        if isinstance(detailed, dict):
-            mapped = _map_detailed_to_resp(detailed)
-            summary = _build_verify_like_summary_from_mapped(mapped, include_raw=raw)
-            if raw and isinstance(detailed, dict):
-                summary["raw"] = detailed
-            return JSONResponse(summary)
-        else:
-            # Quick fallback (fast) — build from DB / AttendanceSummary
-            try:
-                fallback = build_ccure_averages(start_date, end_date)
-            except Exception:
-                logger.exception("build_ccure_averages() failed - returning minimal error")
-                raise HTTPException(status_code=500, detail="Both compute_visit_averages and build_ccure_averages failed")
-
-            mapped_fallback = {
-                "date": fallback.get("date"),
-                "notes": fallback.get("notes"),
-                "live_today": fallback.get("live_today", {}),
-                "headcount": {
-                    "total_visited_today": fallback.get("live_today", {}).get("total_from_details") or fallback.get("live_today", {}).get("total_reported"),
-                    "employee": fallback.get("live_today", {}).get("employee"),
-                    "contractor": fallback.get("live_today", {}).get("contractor"),
-                    "by_location": {}
-                },
-                "live_headcount": {
-                    "currently_present_total": fallback.get("live_today", {}).get("total_reported"),
-                    "employee": fallback.get("live_today", {}).get("employee"),
-                    "contractor": fallback.get("live_today", {}).get("contractor"),
-                    "by_location": {}
-                },
-                "ccure_active": fallback.get("ccure_active", {}),
-                "averages": fallback.get("averages", {})
-            }
-
-            summary = _build_verify_like_summary_from_mapped(mapped_fallback, include_raw=raw)
-            if raw:
-                summary["raw"] = mapped_fallback
-
-            # Return fallback quickly — background compute (if any) will SSE-update clients when ready
-            return JSONResponse(summary)
-    except Exception as e:
-        logger.exception("ccure_verify failed")
-        raise HTTPException(status_code=500, detail=f"ccure verify error: {e}")
-
-# ---------- /ccure/compare -> uses data_compare_service.compare_ccure_vs_sheets ----------
-@app.get("/ccure/compare")
-def ccure_compare(
-    mode: str = Query("full", description="full or stats"),
-    stats_detail: str = Query("ActiveProfiles", description="when mode=stats use this"),
-    limit_list: int = Query(200, ge=1, le=5000, description="max rows returned in list samples"),
-    export: bool = Query(False, description="if true, writes Excel report to server and returns report_path")
-):
-    try:
-        from data_compare_service import compare_ccure_vs_sheets
-    except Exception as e:
-        logger.exception("data_compare_service import failed")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    res = compare_ccure_vs_sheets(mode=mode, stats_detail=stats_detail, limit_list=limit_list, export=export)
-    if not isinstance(res, dict):
-        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
-    return JSONResponse(res)
-
-
-@app.get("/ccure/export_uploaded")
-def ccure_export_uploaded():
-    """
-    Export the currently uploaded canonical sheets into one workbook.
-    Returns JSON: { status: "ok", report_path: "<filename>" }
-    Downloadable at /ccure/report/{filename}
-    """
-    try:
-        from data_compare_service import export_uploaded_sheets
-    except Exception as e:
-        logger.exception("data_compare_service import failed for export_uploaded")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    fname = export_uploaded_sheets()
-    if not fname:
-        raise HTTPException(status_code=500, detail="failed to export uploaded sheets")
-    return JSONResponse({"status": "ok", "report_path": fname})
-
-
-@app.get("/ccure/compare_v2")
-def ccure_compare_v2(
-    mode: str = Query("full"),
-    stats_detail: str = Query("ActiveProfiles"),
-    limit_list: int = Query(200, ge=1, le=5000),
-    export: bool = Query(False),
-    region_filter: Optional[str] = Query(None, description="Region code e.g. APAC"),
-    location_city: Optional[str] = Query(None, description="Location city e.g. Pune"),
-    location_state: Optional[str] = Query(None, description="Location state/province"),
-    location_description: Optional[str] = Query(None, description="Location Description"),
-    week_ref_date: Optional[str] = Query(None, description="YYYY-MM-DD for week (Mon-Fri)")
-):
-    try:
-        from data_compare_service_v2 import compare_ccure_vs_sheets
-    except Exception as e:
-        logger.exception("data_compare_service_v2 import failed")
-        raise HTTPException(status_code=500, detail=f"compare service unavailable: {e}")
-
-    res = compare_ccure_vs_sheets(
-        mode=mode,
-        stats_detail=stats_detail,
-        limit_list=limit_list,
-        export=export,
-        region_filter=region_filter,
-        location_city=location_city,
-        location_state=location_state,
-        location_description=location_description,
-        week_ref_date=week_ref_date
-    )
-    if not isinstance(res, dict):
-        return JSONResponse({"error": "compare service returned unexpected result"}, status_code=500)
-    return JSONResponse(res)
-
-
-@app.get("/ccure/report/{filename}")
-def ccure_report_download(filename: str):
-    try:
-        safe_name = Path(filename).name
-        full = OUTPUT_DIR / safe_name
-        if not full.exists() or not full.is_file():
-            raise HTTPException(status_code=404, detail="Report not found")
-        return FileResponse(str(full),
-                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            filename=safe_name)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to serve report")
-        raise HTTPException(status_code=500, detail=f"Failed to serve report: {e}")
-      
-# End of app.py (rest of file continues unchanged)
-# -------------------------------------------------------------------------------
-# DURATION endpoint (unchanged except relying on imported pandas/ZoneInfo/_read_csv_compat)
-# -------------------------------------------------------------------------------
 
 @app.get("/duration")
 async def api_duration(
@@ -1688,6 +573,1252 @@ async def api_duration(
     except Exception as exc:
         logger.exception("api_duration (range) failed")
         raise HTTPException(status_code=500, detail=f"duration api error: {exc}")
+
+
+
+
+
+
+
+
+
+
+
+
+# duration_report.py
+"""
+duration_report.py
+
+Updated: supports querying multiple monthly ACVSUJournal databases (current + previous N).
+Fixes: use pyodbc cursor -> DataFrame to avoid pandas SQLAlchemy warning,
+       replace groupby.apply with groupby.agg for better performance and avoid FutureWarning.
+"""
+import argparse
+import logging
+import os
+import re
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+
+# Optional: import pyodbc only when connecting (allows importing this module even without driver)
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# (REGION_CONFIG unchanged - keep your config)
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+        ]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "last_n_databases": 2,
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 2,
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+
+# helper functions (split name, expand DB list, connect master, filter existing dbs)
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+# DB connection helper (same as before)
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Build SQL and fetch using pyodbc cursor -> DataFrame to avoid pandas.read_sql warnings.
+    """
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
+        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
+    ]
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(region_key)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        # cursor.description may be None if no rows, but still try to get column names
+        descr = cursor.description or []
+        colnames = [d[0] for d in descr] if descr else []
+        if rows:
+            try:
+                df = pd.DataFrame.from_records(rows, columns=colnames)
+            except Exception:
+                # fallback: convert row to tuple list
+                df = pd.DataFrame([tuple(r) for r in rows], columns=colnames)
+        else:
+            # no rows -> empty df with expected columns
+            df = pd.DataFrame(columns=colnames)
+    except Exception:
+        logging.exception("Database fetch failed for region %s; returning empty DataFrame", region_key)
+        df = pd.DataFrame(columns=cols)
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+    # ensure expected columns exist even if SQL returned different set
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    return df[cols]
+
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    try:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+    except Exception:
+        # if drop_duplicates fails for unexpected dtypes, ignore and continue
+        pass
+
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    df = df[df["person_uid"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # sort then groupby + agg (avoid apply)
+    try:
+        df_sorted = df.sort_values(["person_uid", "LocaleMessageTime"])
+    except Exception:
+        df_sorted = df.copy()
+
+    grouped = df_sorted.groupby(["person_uid", "Date"], sort=False).agg(
+        EmployeeIdentity=("EmployeeIdentity", "first"),
+        EmployeeID=("EmployeeID", "first"),
+        EmployeeName=("EmployeeName", "first"),
+        CardNumber=("CardNumber", "first"),
+        FirstSwipe=("LocaleMessageTime", "min"),
+        LastSwipe=("LocaleMessageTime", "max"),
+        FirstDoor=("Door", "first"),
+        LastDoor=("Door", "last"),
+        CountSwipes=("LocaleMessageTime", "count"),
+        PersonnelTypeName=("PersonnelTypeName", "first"),
+        PartitionName2=("PartitionName2", "first"),
+        CompanyName=("CompanyName", "first"),
+        PrimaryLocation=("PrimaryLocation", "first"),
+        FirstDirection=("Direction", "first"),
+        LastDirection=("Direction", "last")
+    ).reset_index()
+
+    # compute durations
+    try:
+        grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    except Exception:
+        # if dtype not datetime or subtraction fails
+        def _safe_dur(row):
+            try:
+                if pd.isna(row["FirstSwipe"]) or pd.isna(row["LastSwipe"]):
+                    return None
+                return max(0, int((row["LastSwipe"] - row["FirstSwipe"]).total_seconds()))
+            except Exception:
+                return None
+        grouped["DurationSeconds"] = grouped.apply(_safe_dur, axis=1)
+
+    grouped["Duration"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # ensure all output columns present
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    return grouped[out_cols]
+
+def categorize_seconds(s: Optional[int]) -> str:
+    try:
+        if s is None or s <= 0:
+            return "0-30m"
+        s = int(s)
+        if s <= 1800:
+            return "0-30m"
+        if s <= 7200:
+            return "30m-2h"
+        if s <= 21600:
+            return "2h-6h"
+        if s < 28800:
+            return "6h-8h"
+        return "8h+"
+    except Exception:
+        return "0-30m"
+
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+            else:
+                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+
+    return results
+
+# CLI runner (unchanged)
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration report from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir, city=args.city)
+
+    for r, obj in results.items():
+        dur = obj.get("durations")
+        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// frontend/src/pages/DurationPage.jsx
+import React, { useState, useMemo } from "react";
+import axios from "axios";
+import {
+  Box,
+  Grid,
+  Paper,
+  Typography,
+  TextField,
+  Button,
+  Table,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableBody,
+  TableContainer,
+  CircularProgress,
+  IconButton,
+  Tooltip,
+  Card,
+  CardContent,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  Divider,
+} from "@mui/material";
+import DateRangeIcon from "@mui/icons-material/DateRange";
+import SearchIcon from "@mui/icons-material/Search";
+import DownloadIcon from "@mui/icons-material/CloudDownload";
+import ClearIcon from "@mui/icons-material/Clear";
+import VisibilityIcon from "@mui/icons-material/Visibility";
+
+const API_BASE = import.meta.env.VITE_API_BASE || import.meta.env.REACT_APP_API_BASE || "http://localhost:8000";
+
+const REGIONS = [
+  { value: "apac", label: "APAC" },
+  { value: "emea", label: "EMEA" },
+  { value: "laca", label: "LACA" },
+  { value: "namer", label: "NAMER" },
+];
+
+function secondsToHMS(s) {
+  if (s == null) return "";
+  const sec = Number(s);
+  if (!Number.isFinite(sec)) return "";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const r = Math.floor(sec % 60);
+  return `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+}
+
+function isoToDDMMYYYY(iso) {
+  if (!iso) return iso;
+  const dt = new Date(iso.includes("T") ? iso : `${iso}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return iso;
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = dt.getUTCFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+function isoToLongDateNoCommas(iso) {
+  // produce a header string without internal commas to avoid CSV splitting
+  if (!iso) return iso;
+  const dt = new Date(iso.includes("T") ? iso : `${iso}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return iso;
+  const weekday = dt.toLocaleDateString(undefined, { weekday: "short" }); // Mon/Tue...
+  const day = String(dt.getUTCDate()).padStart(2, "0");
+  const month = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const year = dt.getUTCFullYear();
+  return `${weekday} ${day}-${month}-${year}`; // no commas
+}
+
+export default function DurationPage() {
+  const [region, setRegion] = useState("apac");
+  const [city, setCity] = useState("");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [singleDate, setSingleDate] = useState("");
+  const [useRange, setUseRange] = useState(true);
+
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const [searchEmployeeId, setSearchEmployeeId] = useState("");
+  const [searchEmployeeName, setSearchEmployeeName] = useState("");
+  const [searchCardNumber, setSearchCardNumber] = useState("");
+
+  const [swipeDialogOpen, setSwipeDialogOpen] = useState(false);
+  const [selectedEmployee, setSelectedEmployee] = useState(null);
+  const [selectedSwipes, setSelectedSwipes] = useState([]);
+
+  // --- fetch durations ---
+  const fetchDurations = async () => {
+    setError("");
+    setLoading(true);
+    setData(null);
+
+    try {
+      const params = {};
+      if (useRange && startDate && endDate) {
+        params.start_date = startDate;
+        params.end_date = endDate;
+      } else if (!useRange && singleDate) {
+        params.date = singleDate;
+      } else {
+        if (singleDate) params.date = singleDate;
+      }
+
+      if (region) params.regions = region;
+      if (city) params.city = city;
+
+      const res = await axios.get(`${API_BASE}/duration`, { params, timeout: 12000000 });
+      setData(res.data);
+    } catch (err) {
+      console.error(err);
+      setError(err?.response?.data?.detail || err.message || "Failed to fetch duration data");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const regionObj = useMemo(() => {
+    if (!data || !region) return null;
+    return data.regions?.[region] || null;
+  }, [data, region]);
+
+  // helpers to compute week starts from regionObj.dates
+  const computeWeekStarts = (datesIso) => {
+    if (!datesIso || datesIso.length === 0) return [];
+    const dateObjs = datesIso.map(d => new Date(d + "T00:00:00Z"));
+    const weekStartSet = new Set();
+    dateObjs.forEach(dt => {
+      const day = dt.getUTCDay(); // 0 Sun..6 Sat
+      const diff = (day + 6) % 7; // days since Monday
+      const monday = new Date(dt);
+      monday.setUTCDate(dt.getUTCDate() - diff);
+      weekStartSet.add(monday.toISOString().slice(0,10));
+    });
+    return Array.from(weekStartSet).sort();
+  };
+
+  // --- CSV exports ---
+
+  const quote = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`;
+
+  const exportSummaryCsv = () => {
+    if (!regionObj) return;
+    const dates = regionObj.dates || [];
+    const rows = regionObj.employees || [];
+
+    const header = ["EmployeeID", "EmployeeName", "TotalSecondsPresentInRange", "DominantCategory", "ComplianceSummary", ...dates.map(d => d)];
+    const csvRows = [header.map(h => quote(h)).join(",")];
+
+    rows.forEach((r) => {
+      const complianceText = r.compliance?.month_summary || "";
+      const complianceCell = `'${complianceText}`; // force text in Excel
+      const row = [
+        quote(r.EmployeeID || ""),
+        quote(r.EmployeeName || ""),
+        r.total_seconds_present_in_range ?? "",
+        quote(r.duration_categories?.dominant_category || ""),
+        quote(complianceCell),
+        ...dates.map(d => quote(r.durations?.[d] ?? ""))
+      ];
+      csvRows.push(row.join(","));
+    });
+
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const filename = `duration_summary_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+
+
+
+
+
+
+ const exportReportCsv = () => {
+    if (!regionObj) return;
+    const datesIso = regionObj.dates || [];
+    const weekStarts = computeWeekStarts(datesIso);
+
+    // base header
+    const baseHeader = [
+      "Sr.No", "EmployeeID", "EmployeeName", "CardNumber", "PersonnelType", "PartitionName2", "TotalSecondsPresentInRange"
+    ];
+
+    // per-day headers (Mon..Sun for each week) - use a no-comma format
+    const perDayHeaders = [];
+    weekStarts.forEach(ws => {
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(ws + "T00:00:00Z");
+        d.setUTCDate(d.getUTCDate() + i);
+        const iso = d.toISOString().slice(0,10);
+        perDayHeaders.push(isoToLongDateNoCommas(iso));
+      }
+    });
+
+    // per-week compliance headers
+    const perWeekHeaders = weekStarts.map(ws => `Week compliance ${ws}`);
+
+    const header = [...baseHeader, ...perDayHeaders, ...perWeekHeaders, "DominantCategory", "ComplianceSummary"];
+    const csvRows = [header.map(h => quote(h)).join(",")];
+
+    const rows = regionObj.employees || [];
+    rows.forEach((r, idx) => {
+      const srNo = idx + 1;
+      const employeeId = r.EmployeeID ?? "";
+      const employeeName = r.EmployeeName ?? "";
+      const cardNumber = r.CardNumber ?? "";
+      const personnelType = r.PersonnelType ?? r.PersonnelTypeName ?? "";
+      const partition = r.PartitionName2 ?? "";
+      const totalSeconds = r.total_seconds_present_in_range ?? "";
+
+      // per-day durations (string) or "0" when absent
+      const perDayVals = [];
+      weekStarts.forEach(ws => {
+        for (let i = 0; i < 7; i++) {
+          const d = new Date(ws + "T00:00:00Z");
+          d.setUTCDate(d.getUTCDate() + i);
+          const iso = d.toISOString().slice(0,10);
+
+          // prefer API-provided week map if present
+          const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+          let outVal = "0";
+
+          if (wk && wk.dates && Object.prototype.hasOwnProperty.call(wk.dates, iso)) {
+            const secs = wk.dates[iso];
+            if (secs !== null && secs !== undefined) {
+              // prefer already formatted string if available
+              outVal = (r.durations && r.durations[iso]) ? r.durations[iso] : secondsToHMS(secs);
+            } else {
+              outVal = "0";
+            }
+          } else if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && r.durations[iso]) {
+            outVal = r.durations[iso];
+          } else if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso) && r.durations_seconds[iso]) {
+            outVal = secondsToHMS(r.durations_seconds[iso]);
+          } else {
+            outVal = "0";
+          }
+
+          perDayVals.push(outVal);
+        }
+      });
+
+      // per-week compliance Yes/No
+      const perWeekVals = weekStarts.map(ws => {
+        const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+        return wk && wk.compliant ? "Yes" : "No";
+      });
+
+      const complianceText = r.compliance?.month_summary || "";
+      const complianceCell = `'${complianceText}`;
+
+      const row = [
+        `${srNo}`,
+        quote(employeeId),
+        quote(employeeName),
+        quote(cardNumber),
+        quote(personnelType),
+        quote(partition),
+        `${totalSeconds}`,
+        ...perDayVals.map(v => quote(v)),
+        ...perWeekVals.map(v => quote(v)),
+        quote(r.duration_categories?.dominant_category || ""),
+        quote(complianceCell)
+      ];
+
+      csvRows.push(row.join(","));
+    });
+
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const filename = `duration_report_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+
+
+
+
+  const exportSwipesCsv = () => {
+    if (!regionObj) return;
+    const swipesByDate = regionObj.swipes_by_date || {};
+    const rows = [];
+    Object.entries(swipesByDate).forEach(([d, arr]) => {
+      arr.forEach(s => {
+        rows.push({
+          Date: d,
+          LocaleMessageTime: s.LocaleMessageTime || "",
+          Swipe_Time: s.Swipe_Time || "",
+          EmployeeID: s.EmployeeID || "",
+          PersonGUID: s.PersonGUID || "",
+          ObjectName1: s.ObjectName1 || "",
+          Door: s.Door || "",
+          PersonnelType: s.PersonnelType || "",
+          CardNumber: s.CardNumber || "",
+          PrimaryLocation: s.PrimaryLocation || s.Text5 || "",
+          PartitionName2: s.PartitionName2 || "",
+          AdmitCode: s.AdmitCode || "",
+          Direction: s.Direction || "",
+          CompanyName: s.CompanyName || ""
+        });
+      });
+    });
+
+    if (rows.length === 0) {
+      alert("No swipe rows available for current selection to export.");
+      return;
+    }
+
+    const headers = [
+      "Date",
+      "LocaleMessageTime",
+      "Swipe_Time",
+      "EmployeeID",
+      "PersonGUID",
+      "ObjectName1",
+      "Door",
+      "PersonnelType",
+      "CardNumber",
+      "PrimaryLocation",
+      "PartitionName2",
+      "AdmitCode",
+      "Direction",
+      "CompanyName"
+    ];
+    const csvRows = [headers.map(h => quote(h)).join(",")];
+    rows.forEach(r => {
+      const line = headers.map(h => quote(r[h] ?? "")).join(",");
+      csvRows.push(line);
+    });
+
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const filename = `swipes_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // --- Render helpers ---
+  const getFilteredRows = () => {
+    if (!regionObj) return [];
+    const rows = regionObj.employees || [];
+    return rows.filter(r => {
+      const matchesEmployeeId = !searchEmployeeId || String(r.EmployeeID || "").toLowerCase().includes(searchEmployeeId.toLowerCase());
+      const matchesName = !searchEmployeeName || String(r.EmployeeName || "").toLowerCase().includes(searchEmployeeName.toLowerCase());
+      const matchesCard = !searchCardNumber || String(r.CardNumber || "").toLowerCase().includes(searchCardNumber.toLowerCase());
+      return matchesEmployeeId && matchesName && matchesCard;
+    });
+  };
+
+  const openSwipeDialogFor = (emp) => {
+    setSelectedEmployee(emp);
+    const swipesByDate = regionObj?.swipes_by_date || {};
+    const matches = [];
+    Object.entries(swipesByDate).forEach(([d, arr]) => {
+      arr.forEach(s => {
+        const matchByEmployeeId = emp.EmployeeID && s.EmployeeID && String(s.EmployeeID) === String(emp.EmployeeID);
+        const matchByCard = emp.CardNumber && s.CardNumber && String(s.CardNumber) === String(emp.CardNumber);
+        const matchByPersonGuid = emp.person_uid && s.PersonGUID && String(s.PersonGUID) === String(emp.person_uid);
+        if (matchByEmployeeId || matchByCard || matchByPersonGuid) {
+          matches.push({ ...s, Date: d });
+        }
+      });
+    });
+    matches.sort((a,b) => {
+      const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
+      const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
+      return ta - tb;
+    });
+
+    setSelectedSwipes(matches);
+    setSwipeDialogOpen(true);
+  };
+
+  const renderTable = () => {
+    if (!regionObj) return <Typography>No data for selected region.</Typography>;
+
+    const dates = regionObj.dates || [];
+    const rows = getFilteredRows();
+
+    const weekStarts = computeWeekStarts(dates);
+
+    return (
+      <TableContainer component={Paper} sx={{ mt: 2, width: "100%", overflowX: "auto" }}>
+        <Table size="small" stickyHeader>
+          <TableHead>
+            <TableRow>
+              <TableCell><b>Sr.No</b></TableCell>
+              <TableCell><b>EmployeeID</b></TableCell>
+              <TableCell><b>EmployeeName</b></TableCell>
+              <TableCell><b>CardNumber</b></TableCell>
+              <TableCell><b>PersonnelType</b></TableCell>
+              <TableCell><b>PartitionName2</b></TableCell>
+              <TableCell align="right"><b>Total (hh:mm:ss)</b></TableCell>
+              {dates.map((d) => (
+                <TableCell key={d} align="center"><b>{isoToDDMMYYYY(d)}</b></TableCell>
+              ))}
+              {/* add week-level compliance columns */}
+              {weekStarts.map(ws => (
+                <TableCell key={ws} align="center"><b>{`Week ${ws} compliant`}</b></TableCell>
+              ))}
+              <TableCell align="center"><b>Dominant Category</b></TableCell>
+              <TableCell align="center"><b>Compliance (weeks met/total)</b></TableCell>
+              <TableCell align="center"><b>View</b></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {rows.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={9 + (regionObj.dates || []).length + weekStarts.length} align="center">No employees in the response.</TableCell>
+              </TableRow>
+            ) : (
+              rows.map((r, idx) => (
+                <TableRow key={r.person_uid || `${r.EmployeeID}-${r.EmployeeName}`}>
+                  <TableCell>{idx + 1}</TableCell>
+                  <TableCell>{r.EmployeeID || "-"}</TableCell>
+                  <TableCell>{r.EmployeeName || "-"}</TableCell>
+                  <TableCell>{r.CardNumber || "-"}</TableCell>
+                  <TableCell>{r.PersonnelType || r.PersonnelTypeName || "-"}</TableCell>
+                  <TableCell>{r.PartitionName2 || "-"}</TableCell>
+                  <TableCell align="right">{secondsToHMS(r.total_seconds_present_in_range)}</TableCell>
+                  {dates.map((d) => (
+                    <TableCell key={d} align="center">{r.durations?.[d] ?? "-"}</TableCell>
+                  ))}
+                  {weekStarts.map(ws => {
+                    const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+                    return <TableCell key={ws} align="center">{wk && wk.compliant ? "Yes" : "No"}</TableCell>;
+                  })}
+                  <TableCell align="center">
+                    {r.duration_categories?.dominant_category || "-"}
+                    {r.duration_categories?.red_flag > 0 ? " ⚠️" : ""}
+                  </TableCell>
+                  <TableCell align="center">{r.compliance?.month_summary || "-"}</TableCell>
+                  <TableCell align="center">
+                    <Tooltip title="View swipe records for this employee">
+                      <IconButton size="small" onClick={() => openSwipeDialogFor(r)}>
+                        <VisibilityIcon />
+                      </IconButton>
+                    </Tooltip>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    );
+  };
+
+  // --- JSX UI (top controls) ---
+  return (
+    <Box sx={{ p: 3, width: "100%", maxWidth: "100vw", boxSizing: "border-box" }}>
+      <Typography variant="h5" gutterBottom>
+        Duration Reports (with Compliance & Category)
+      </Typography>
+
+      <Grid container spacing={2}>
+        <Grid item xs={12}>
+          <Card>
+            <CardContent>
+              <Grid container spacing={2} alignItems="center">
+                <Grid item xs={12} md={2}>
+                  <TextField
+                    select
+                    fullWidth
+                    label="Region"
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
+                  >
+                    {REGIONS.map((r) => (
+                      <option key={r.value} value={r.value}>{r.label}</option>
+                    ))}
+                  </TextField>
+                </Grid>
+
+                <Grid item xs={12} md={3}>
+                  <TextField
+                    fullWidth
+                    label="City / Partition (optional)"
+                    placeholder="e.g. CR.Costa Rica Partition"
+                    value={city}
+                    onChange={(e) => setCity(e.target.value)}
+                  />
+                </Grid>
+
+                <Grid item xs={12} md={5} sx={{ display: "flex", gap: 1, justifyContent: "flex-end" }}>
+                  <Button
+                    startIcon={<DateRangeIcon />}
+                    variant={useRange ? "contained" : "outlined"}
+                    onClick={() => setUseRange(true)}
+                  >
+                    Range
+                  </Button>
+                  <Button
+                    startIcon={<DateRangeIcon />}
+                    variant={!useRange ? "contained" : "outlined"}
+                    onClick={() => setUseRange(false)}
+                  >
+                    Single Day
+                  </Button>
+                </Grid>
+
+                {useRange ? (
+                  <>
+                    <Grid item xs={12} md={3}>
+                      <TextField
+                        label="Start date"
+                        type="date"
+                        fullWidth
+                        InputLabelProps={{ shrink: true }}
+                        value={startDate}
+                        onChange={(e) => setStartDate(e.target.value)}
+                      />
+                    </Grid>
+                    <Grid item xs={12} md={3}>
+                      <TextField
+                        label="End date"
+                        type="date"
+                        fullWidth
+                        InputLabelProps={{ shrink: true }}
+                        value={endDate}
+                        onChange={(e) => setEndDate(e.target.value)}
+                      />
+                    </Grid>
+                  </>
+                ) : (
+                  <Grid item xs={12} md={3}>
+                    <TextField
+                      label="Date"
+                      type="date"
+                      fullWidth
+                      InputLabelProps={{ shrink: true }}
+                      value={singleDate}
+                      onChange={(e) => setSingleDate(e.target.value)}
+                    />
+                  </Grid>
+                )}
+
+                <Grid item xs={12} md={6} sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+                  <Button
+                    variant="contained"
+                    startIcon={<SearchIcon />}
+                    onClick={fetchDurations}
+                    disabled={loading}
+                  >
+                    {loading ? "Loading..." : "Run"}
+                  </Button>
+
+                  <Button
+                    variant="outlined"
+                    startIcon={<ClearIcon />}
+                    onClick={() => {
+                      setStartDate("");
+                      setEndDate("");
+                      setSingleDate("");
+                      setCity("");
+                      setData(null);
+                      setError("");
+                    }}
+                  >
+                    Clear
+                  </Button>
+
+                  <Tooltip title="Export Summary CSV (per-person)">
+                    <span>
+                      <IconButton onClick={exportSummaryCsv} disabled={!regionObj || (regionObj.employees || []).length === 0}>
+                        <DownloadIcon />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+
+                  <Tooltip title="Export full report (Sr.No, ... Compliance)">
+                    <span>
+                      <Button variant="contained" onClick={exportReportCsv} disabled={!regionObj || (regionObj.employees || []).length === 0}>
+                        Export Report
+                      </Button>
+                    </span>
+                  </Tooltip>
+
+                  <Tooltip title="Export raw swipes for this region/date range">
+                    <span>
+                      <Button variant="outlined" onClick={exportSwipesCsv} disabled={!regionObj || Object.keys(regionObj.swipes_by_date || {}).length === 0}>
+                        Export Swipes
+                      </Button>
+                    </span>
+                  </Tooltip>
+                </Grid>
+
+                <Grid item xs={12} md={4}>
+                  <TextField
+                    fullWidth
+                    label="Search Employee ID"
+                    value={searchEmployeeId}
+                    onChange={(e) => setSearchEmployeeId(e.target.value)}
+                    size="small"
+                  />
+                </Grid>
+                <Grid item xs={12} md={4}>
+                  <TextField
+                    fullWidth
+                    label="Search Employee Name"
+                    value={searchEmployeeName}
+                    onChange={(e) => setSearchEmployeeName(e.target.value)}
+                    size="small"
+                  />
+                </Grid>
+                <Grid item xs={12} md={4}>
+                  <TextField
+                    fullWidth
+                    label="Search Card Number"
+                    value={searchCardNumber}
+                    onChange={(e) => setSearchCardNumber(e.target.value)}
+                    size="small"
+                  />
+                </Grid>
+
+              </Grid>
+            </CardContent>
+          </Card>
+        </Grid>
+
+        <Grid item xs={12}>
+          <Paper sx={{ p: 2 }}>
+            <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <Typography variant="subtitle1">
+                {data ? `Showing ${region.toUpperCase()} — ${data.start_date} → ${data.end_date}` : "No results yet"}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Tip: use the CSV export for offline analysis
+              </Typography>
+            </Box>
+
+            {loading && (
+              <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
+                <CircularProgress />
+              </Box>
+            )}
+
+            {error && (
+              <Typography color="error" sx={{ mt: 2 }}>
+                {error}
+              </Typography>
+            )}
+
+            {!loading && !error && (
+              <Box sx={{ mt: 2 }}>
+                {renderTable()}
+              </Box>
+            )}
+          </Paper>
+        </Grid>
+      </Grid>
+
+      {/* Swipe dialog */}
+      <Dialog open={swipeDialogOpen} onClose={() => setSwipeDialogOpen(false)} fullWidth maxWidth="xl">
+        <DialogTitle>
+          Swipe records for: {selectedEmployee ? `${selectedEmployee.EmployeeID || ""} — ${selectedEmployee.EmployeeName || ""}` : ""}
+        </DialogTitle>
+        <DialogContent dividers>
+          {selectedSwipes.length === 0 ? (
+            <Typography>No swipe records found for this employee in the selected range.</Typography>
+          ) : (
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell><b>Date</b></TableCell>
+                  <TableCell><b>Time (local)</b></TableCell>
+                  <TableCell><b>Door</b></TableCell>
+                  <TableCell><b>Direction</b></TableCell>
+                  <TableCell><b>CardNumber</b></TableCell>
+                  <TableCell><b>PersonnelType</b></TableCell>
+                  <TableCell><b>Partition</b></TableCell>
+                  <TableCell><b>PrimaryLocation</b></TableCell>
+                  <TableCell><b>Company</b></TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {selectedSwipes.map((s, i) => (
+                  <TableRow key={i}>
+                    <TableCell>{s.Date}</TableCell>
+                    <TableCell>{s.Swipe_Time ?? (s.LocaleMessageTime ? new Date(s.LocaleMessageTime).toLocaleString() : "-")}</TableCell>
+                    <TableCell>{s.Door || s.ObjectName1 || "-"}</TableCell>
+                    <TableCell>{s.Direction || "-"}</TableCell>
+                    <TableCell>{s.CardNumber || "-"}</TableCell>
+                    <TableCell>{s.PersonnelType || "-"}</TableCell>
+                    <TableCell>{s.PartitionName2 || "-"}</TableCell>
+                    <TableCell>{s.PrimaryLocation || s.Text5 || "-"}</TableCell>
+                    <TableCell>{s.CompanyName || "-"}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </DialogContent>
+        <Divider />
+        <Box sx={{ p: 1, display: "flex", justifyContent: "flex-end" }}>
+          <Button onClick={() => setSwipeDialogOpen(false)}>Close</Button>
+        </Box>
+      </Dialog>
+    </Box>
+  );
+}
+
+
+
+
+
 
 
 
