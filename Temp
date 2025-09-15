@@ -1,1 +1,1051 @@
+"""
+Lightweight CCURE client wrappers used by compare service.
+This file is defensive: missing 'requests' or network failures return None instead of raising.
+Improved: requests.Session with retries/backoff and configurable base URL via env var CCURE_BASE.
+Timeouts configurable via CCURE_TIMEOUT (seconds).
+"""
+
+import math
+import logging
+import os
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger("ccure_client")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    import sys
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Base URL for CCURE API - configurable via env var
+BASE = os.getenv("CCURE_BASE", "http://10.199.22.57:5001").rstrip("/")
+
+# Default request timeout (seconds). Increase via env var CCURE_TIMEOUT if your endpoints are slow.
+DEFAULT_TIMEOUT = int(os.getenv("CCURE_TIMEOUT", "120"))
+
+HEADERS = {
+    "Accept": "application/json"
+}
+
+# Defensive import of requests
+try:
+    import requests
+except Exception:
+    requests = None
+    logger.warning("requests module not available; ccure_client will return None for HTTP calls")
+
+
+def _build_session():
+    if requests is None:
+        return None
+    s = requests.Session()
+    try:
+        # stronger retry behaviour by default; respects Retry semantics from urllib3
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'HEAD', 'OPTIONS'])
+        )
+    except TypeError:
+        # older urllib3
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(['GET', 'HEAD', 'OPTIONS'])
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    # nice-to-have: small default headers
+    s.headers.update({"User-Agent": "ccure_client/1.0"})
+    return s
+
+_SESSION = _build_session() if requests is not None else None
+
+
+def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
+    """
+    Safe GET wrapper. Returns parsed JSON on success or None on failure.
+
+    timeout: seconds for read timeout (connect timeout is fixed low)
+    """
+    if requests is None:
+        logger.debug("_safe_get: requests not available")
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    url = BASE + path
+    session = _SESSION or requests
+    try:
+        # use (connect, read) tuple: short connect, larger read (for slow APIs)
+        r = session.get(url, params=params, headers=HEADERS, timeout=(5, max(5, int(timeout))))
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            logger.warning(f"[ccure_client] response not JSON for {url}")
+            return None
+    except RequestException as e:
+        logger.warning(f"[ccure_client] request failed {url} params={params} -> {e}")
+        return None
+    except Exception:
+        logger.exception(f"[ccure_client] unexpected error fetching {url}")
+        return None
+
+
+def fetch_all_employees_full():
+    """Try to fetch a full dump from /api/employees (may return list or None)."""
+    return _safe_get("/api/employees")
+
+
+def fetch_stats_page(detail, page=1, limit=500):
+    params = {"details": detail, "page": page, "limit": limit}
+    return _safe_get("/api/stats", params=params)
+
+
+def fetch_all_stats(detail, limit=1000):
+    first = fetch_stats_page(detail, page=1, limit=limit)
+    if not first:
+        return None
+    data = first.get("data") or []
+    total = int(first.get("total") or len(data) or 0)
+    if total <= len(data):
+        return data
+    pages = int(math.ceil(total / float(limit)))
+    for p in range(2, pages + 1):
+        page_res = fetch_stats_page(detail, page=p, limit=limit)
+        if not page_res:
+            break
+        data.extend(page_res.get("data") or [])
+    return data
+
+
+def get_global_stats():
+    """
+    Best-effort summary using /api/stats (preferred) or /api/employees (fallback).
+    Returns dict or None.
+    """
+    details = ["TotalProfiles", "ActiveProfiles", "ActiveEmployees", "ActiveContractors",
+               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
+    out = {}
+
+    # Try a single call to /api/stats
+    try:
+        summary = _safe_get("/api/stats")
+        if isinstance(summary, dict) and any(k in summary for k in details):
+            for k in details:
+                for key in summary.keys():
+                    if key.lower() == k.lower():
+                        out[k] = summary.get(key)
+                        break
+            if out:
+                safe_out = {}
+                for k, v in out.items():
+                    try:
+                        safe_out[k] = int(v) if v is not None and str(v).strip() != "" else None
+                    except Exception:
+                        safe_out[k] = v
+                return safe_out
+    except Exception:
+        logger.exception("get_global_stats: top-level /api/stats failed")
+
+    # Try per-detail endpoints
+    try:
+        any_found = False
+        for d in details:
+            resp = fetch_stats_page(d, page=1, limit=1)
+            if isinstance(resp, dict):
+                if 'total' in resp and isinstance(resp['total'], (int, float, str)):
+                    out[d] = int(resp['total'])
+                    any_found = True
+                elif d in resp:
+                    out[d] = resp.get(d)
+                    any_found = True
+                else:
+                    for key in resp.keys():
+                        if key.lower() == d.lower() and isinstance(resp.get(key), (int, float, str)):
+                            try:
+                                out[d] = int(resp.get(key))
+                                any_found = True
+                            except Exception:
+                                out[d] = resp.get(key)
+                                any_found = True
+                            break
+        if any_found:
+            return {k: (int(v) if (v is not None and str(v).strip() != "") else None) for k, v in out.items()}
+    except Exception:
+        logger.exception("fetch per-detail stats failed")
+
+    # Fallback: try /api/employees dump
+    try:
+        full = fetch_all_employees_full()
+        if isinstance(full, list):
+            total = len(full)
+            active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
+            active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
+            active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
+            terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
+            return {
+                "TotalProfiles": total,
+                "ActiveProfiles": active_profiles,
+                "ActiveEmployees": active_emps,
+                "ActiveContractors": active_contractors,
+                "TerminatedProfiles": terminated
+            }
+    except Exception:
+        logger.exception("Error calculating global stats from full dump fallback")
+
+    return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# data_compare_service_v2.py
+"""
+Comparison service (v2) with broadened matching heuristics, safer prefetch/cache,
+and explicit Sheet vs AttendanceSummary comparison diagnostics.
+
+Drop-in replacement for your existing data_compare_service_v2.py
+"""
+
+import sys
+import re
+import uuid
+import logging
+import os
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
+import pandas as pd
+
+# HTTP client for region histories
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+except Exception:
+    requests = None
+
+# DB imports (same as your project)
+from db import SessionLocal
+from models import AttendanceSummary
+
+# Settings / defaults
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR, REGION_HISTORY_URLS as SETTINGS_REGION_HISTORY_URLS
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+    REGION_HISTORY_URLS = SETTINGS_REGION_HISTORY_URLS
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+    REGION_HISTORY_URLS = [
+        "http://10.199.22.57:3008/api/occupancy/history",  # APAC
+        "http://10.199.22.57:3006/api/occupancy/history",  # NAMER
+        "http://10.199.22.57:3007/api/occupancy/history",  # EMEA
+        "http://10.199.22.57:4000/api/occupancy/history"   # LACA
+    ]
+
+# Timeout for region history fetches; configurable via env
+REGION_HISTORY_TIMEOUT = int(os.getenv("REGION_HISTORY_TIMEOUT", "120"))
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("data_compare_service_v2")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# In-memory cache for prefetched region history entries
+REGION_HISTORY_CACHE = None
+REGION_HISTORY_CACHE_FETCHED_AT = None
+REGION_HISTORY_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+# Matching config
+ID_FIELD_CANDIDATES = [
+    "EmployeeID","employeeId","Employee Id","EmpID","Emp Id","EmpNo","EmployeeNo","Employee_Number",
+    "PersonID","PersonId","personId","person_id","employee_id","id","Id","employeeNumber","EmployeeNumber",
+    "worker_system_id","wsid","WorkerID","Worker System Id","workerId","WorkerSystemId"
+]
+CARD_FIELD_CANDIDATES = [
+    "CardNumber","Card","cardNumber","card_number","BadgeNumber","BadgeNo","Badge","badgeNumber","badge_no",
+    "iPassID","IPassID","iPass","i_pass_id","CardNo","card_no","card","IPASSID","IPass"
+]
+NAME_FIELD_CANDIDATES = [
+    "FullName","Full Name","EmpName","Name","full_name","displayName","personName","PersonName"
+]
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _find_active_employee_file():
+    for ext in (".xlsx", ".xls", ".csv"):
+        p = DATA_DIR / f"active_employee{ext}"
+        if p.exists():
+            return p
+    for p in DATA_DIR.iterdir():
+        if p.is_file() and "active_employee" in p.name.lower():
+            return p
+    return None
+
+def _normalize_key(k):
+    if k is None:
+        return None
+    try:
+        s = str(k).strip()
+        return s if s != "" else None
+    except Exception:
+        return None
+
+def _digits_only(s):
+    if s is None:
+        return ""
+    return re.sub(r'\D+', '', str(s))
+
+def _safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+def _week_monday_and_friday(ref_date: Optional[date] = None):
+    if ref_date is None:
+        ref_date = date.today()
+    iso = ref_date.isoweekday()
+    monday = ref_date - timedelta(days=(iso - 1))
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+def _maybe_mark_on_leave(status_str: Optional[str]) -> bool:
+    if not status_str:
+        return False
+    s = str(status_str).strip().lower()
+    for tok in ("leave", "vacation", "on leave", "holiday", "sabbatical", "furlough", "loa"):
+        if tok in s:
+            return True
+    return False
+
+# ----------------------------
+# Load active sheet
+# ----------------------------
+def load_active_employees_dataframe() -> pd.DataFrame:
+    src = _find_active_employee_file()
+    if not src:
+        raise FileNotFoundError(f"Active employee canonical file not found in {DATA_DIR}")
+    ext = src.suffix.lower()
+    if ext in (".xls", ".xlsx"):
+        df = pd.read_excel(src, sheet_name=0, dtype=str)
+    else:
+        df = pd.read_csv(src, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+
+    def _first_present(row, candidates):
+        for c in candidates:
+            if c in row and pd.notna(row[c]) and str(row[c]).strip() != "":
+                return row[c]
+        return None
+
+    rows = []
+    for _, row in df.iterrows():
+        emp_id = _first_present(row, ['Employee ID','EmployeeID','Employee Id','EmpID','Emp Id','EmployeeNo','Employee No'])
+        if emp_id is None:
+            continue
+        full_name = _first_present(row, ['Full Name','FullName','EmpName','Name']) or (
+            f"{row.get('First Name','') or ''} {row.get('Last Name','') or ''}".strip()
+        )
+        location_city = _first_present(row, ['Location City','Location','City'])
+        location_desc = _first_present(row, ['Location Description','LocationDescription'])
+        location_state = _first_present(row, ['Location State / Province','Location State','State','Province'])
+        region_code = _first_present(row, ['Region Code','Region','RegionCode'])
+        current_status = _first_present(row, ['Current Status','Status','Employee Status'])
+        employee_type = _first_present(row, ['Employee Type','Type','Time Type'])
+        rows.append({
+            "employee_id": _normalize_key(emp_id),
+            "full_name": _normalize_key(full_name),
+            "location_city": _normalize_key(location_city),
+            "location_desc": _normalize_key(location_desc),
+            "location_state": _normalize_key(location_state),
+            "region_code": (str(region_code).strip() if region_code is not None else None),
+            "current_status": _normalize_key(current_status),
+            "employee_type": _normalize_key(employee_type),
+            "raw_row": row.to_dict()
+        })
+    ndf = pd.DataFrame(rows)
+    for col in ("employee_id","full_name","location_city","location_desc","location_state","region_code","current_status","employee_type","raw_row"):
+        if col not in ndf:
+            ndf[col] = None
+    ndf = ndf[ndf["employee_id"].notna() & (ndf["employee_id"].str.strip() != "")]
+    ndf.reset_index(drop=True, inplace=True)
+    return ndf
+
+# ----------------------------
+# HTTP Session factory (retries/backoff)
+# ----------------------------
+def _build_requests_session():
+    if requests is None:
+        return None
+    s = requests.Session()
+    allowed = frozenset(['GET', 'HEAD', 'OPTIONS'])
+    try:
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=allowed
+        )
+    except TypeError:
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=allowed
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+# ----------------------------
+# Prefetch / cache helpers
+# ----------------------------
+def prefetch_region_history(timeout: Optional[int] = None, force: bool = False):
+    """
+    Fetch region history entries (cached). Returns list of raw entries.
+
+    timeout: seconds to wait for read timeout. If None uses REGION_HISTORY_TIMEOUT env/default.
+    """
+    global REGION_HISTORY_CACHE, REGION_HISTORY_CACHE_FETCHED_AT
+    if timeout is None:
+        timeout = REGION_HISTORY_TIMEOUT
+    try:
+        now = datetime.utcnow()
+        if not force and REGION_HISTORY_CACHE is not None and REGION_HISTORY_CACHE_FETCHED_AT:
+            elapsed = (now - REGION_HISTORY_CACHE_FETCHED_AT).total_seconds()
+            if elapsed < REGION_HISTORY_CACHE_TTL_SECONDS:
+                logger.info("[region_cache] Using cached region history (age %.1fs)", elapsed)
+                return REGION_HISTORY_CACHE
+
+        entries = []
+        # Prefer region_clients when available
+        try:
+            import region_clients
+            logger.info("[region_cache] fetching region history via region_clients.fetch_all_history()")
+            try:
+                got = region_clients.fetch_all_history(timeout=timeout)
+            except TypeError:
+                got = region_clients.fetch_all_history()
+            entries = got or []
+        except Exception:
+            entries = []
+
+        # If empty, try direct requests to configured URLs
+        if not entries and requests is not None:
+            logger.info("[region_cache] fetching region history directly from endpoints")
+            session = _build_requests_session() or requests
+            for url in REGION_HISTORY_URLS:
+                if not url:
+                    continue
+                try:
+                    resp = session.get(url, timeout=(5, max(10, int(timeout))))
+                    if not resp or resp.status_code != 200:
+                        logger.debug("[region_cache] non-200 or empty response from %s (status=%s)", url, getattr(resp, "status_code", None))
+                        continue
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        logger.debug("[region_cache] non-json response from %s", url)
+                        continue
+                    # flatten possible lists
+                    if isinstance(payload, list):
+                        for p in payload:
+                            if isinstance(p, dict):
+                                p['_source_url'] = url
+                                entries.append(p)
+                    elif isinstance(payload, dict):
+                        found_list = False
+                        for k in ("results","summaryByDate","details","data","entries","list","people","items"):
+                            if k in payload and isinstance(payload[k], list):
+                                for p in payload[k]:
+                                    if isinstance(p, dict):
+                                        p['_source_url'] = url
+                                        entries.append(p)
+                                found_list = True
+                                break
+                        if not found_list:
+                            payload['_source_url'] = url
+                            entries.append(payload)
+                except requests.exceptions.RequestException as e:
+                    logger.warning("[region_cache] fetch failed for %s: %s", url, str(e))
+                    continue
+
+        REGION_HISTORY_CACHE = entries or []
+        REGION_HISTORY_CACHE_FETCHED_AT = datetime.utcnow()
+        logger.info("[region_cache] prefetched %d region history entries", len(REGION_HISTORY_CACHE))
+        return REGION_HISTORY_CACHE
+    except Exception:
+        logger.exception("[region_cache] prefetch failed")
+        REGION_HISTORY_CACHE = REGION_HISTORY_CACHE or []
+        REGION_HISTORY_CACHE_FETCHED_AT = datetime.utcnow()
+        return REGION_HISTORY_CACHE
+
+# ----------------------------
+# ... rest of the file unchanged from your provided implementation ...
+# For brevity in this snippet I keep the rest of your original functions identical,
+# including _iter_scalars_in_obj, _extract_details_from_payload, _match_candidate_to_employees,
+# _fetch_presence_from_region_histories, _fetch_presence_for_employees, _compare_sheet_vs_db_summary,
+# and compare_ccure_vs_sheets.
+#
+# Only the sections that actively fetch/HTTP/timeouts were adjusted above to use REGION_HISTORY_TIMEOUT,
+# and session retry/backoff was strengthened.
+#
+# Paste the remainder of your original file here unchanged (from your earlier copy).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# combined_app_with_duration.py
+# Single-file: app + duration_report (updated shift/session logic + overrides)
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+from typing import Optional, Dict, Any, List
+
+# NEW imports required to fix NameError and duration timezone usage
+import pandas as pd
+from zoneinfo import ZoneInfo
+import os
+
+# --- DB / models imports (kept for endpoints that still use DB like headcount/attendance fallback) ---
+try:
+    from db import SessionLocal
+    from models import LiveSwipe, AttendanceSummary
+except Exception:
+    # If you're running without DB for testing, these imports may fail.
+    SessionLocal = None
+    LiveSwipe = None
+    AttendanceSummary = None
+
+# --- settings (optional override) ---
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+import sys  # ensure logging stream available
+RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+app = FastAPI(title="Attendance Analytics")
+
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+
+# ----------------- GLOBAL TIMEOUTS (UNIFY) -----------------
+# Make these configurable via environment variables if your endpoints are slow (defaults increased)
+REGION_TIMEOUT_SECONDS = int(os.getenv("REGION_TIMEOUT_SECONDS", "120"))        # used for region_clients/ccure calls
+COMPUTE_WAIT_TIMEOUT_SECONDS = int(os.getenv("COMPUTE_WAIT_TIMEOUT_SECONDS", "180"))  # per-date compute in /duration
+COMPUTE_SYNC_TIMEOUT_SECONDS = int(os.getenv("COMPUTE_SYNC_TIMEOUT_SECONDS", "240"))  # other sync compute timeouts
+# ----------------------------------------------------------
+
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+_broadcaster_clients = set()
+
+def broadcast_ccure_update(payload: dict):
+    if not _broadcaster_clients:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    for q in list(_broadcaster_clients):
+        try:
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to push payload to SSE client (will remove client)")
+            try:
+                _broadcaster_clients.discard(q)
+            except Exception:
+                pass
+
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    try:
+        while True:
+            payload = await client_queue.get()
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            yield f"data: {data}\n\n"
+    finally:
+        try:
+            _broadcaster_clients.discard(client_queue)
+        except Exception:
+            pass
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    generator = _sse_event_generator(q)
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
+
+def _guess_region_from_text(txt: str) -> str:
+    if not txt:
+        return "unknown"
+    s = str(txt).strip().lower()
+    s = re.sub(r"[,\-/()]", " ", s)
+    if any(k in s for k in ("pune","quezon city","taguig city","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+        return "apac"
+    if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+        return "emea"
+    if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas")):
+        return "laca"
+    if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami")):
+        return "namer"
+    return "unknown"
+
+@app.get("/headcount")
+def api_headcount():
+    try:
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0, "unknown": 0}
+        if SessionLocal is None:
+            return JSONResponse({"apac": 0, "emea": 0, "laca": 0, "namer": 0})
+        with SessionLocal() as db:
+            try:
+                today = date.today()
+                rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+                if rows:
+                    for r in rows:
+                        try:
+                            partition = None
+                            if r.derived and isinstance(r.derived, dict):
+                                partition = r.derived.get("partition")
+                            loc = partition or "unknown"
+                            region = _guess_region_from_text(loc)
+                            totals[region] = totals.get(region, 0) + 1
+                        except Exception:
+                            totals["unknown"] += 1
+                else:
+                    start = datetime.combine(today, datetime.min.time())
+                    end = datetime.combine(today, datetime.max.time())
+                    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+                    for s in swipes:
+                        loc = s.partition or "unknown"
+                        region = _guess_region_from_text(loc)
+                        totals[region] = totals.get(region, 0) + 1
+            except Exception:
+                logger.exception("Failed to compute headcount regions")
+        out = {
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        }
+        return JSONResponse(out)
+    except Exception as exc:
+        logger.exception("api_headcount failed")
+        raise HTTPException(status_code=500, detail=f"headcount error: {exc}")
+
+# ---------- Helpers retained (normalize / safe conversions) -------------
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# ---------- build_ccure_averages (fallback) ------------------------------
+def build_ccure_averages(start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """
+    Fallback averages computation using AttendanceSummary only.
+    Returns a compact shape (live_today, ccure_active, averages, notes).
+    """
+    try:
+        def _parse_date_param(s):
+            if not s:
+                return None
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date()
+            except Exception:
+                try:
+                    return date.fromisoformat(s)
+                except Exception:
+                    return None
+
+        today = date.today()
+        start_obj = _parse_date_param(start_date) if start_date else (today - timedelta(days=6))
+        end_obj = _parse_date_param(end_date) if end_date else today
+        if start_obj is None or end_obj is None or start_obj > end_obj:
+            start_obj = today - timedelta(days=6)
+            end_obj = today
+
+        if SessionLocal is None:
+            return {
+                "date": today.isoformat(),
+                "notes": None,
+                "live_today": {"employee": 0, "contractor": 0, "total_reported": 0, "total_from_details": 0},
+                "ccure_active": {},
+                "averages": {}
+            }
+
+        with SessionLocal() as db:
+            try:
+                att_rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            except Exception:
+                logger.exception("Failed to query AttendanceSummary")
+                att_rows = []
+
+            live_emp = 0
+            live_contr = 0
+            unknown_count = 0
+            seen_keys = set()
+
+            def classify_from_derived(derived):
+                try:
+                    if not derived or not isinstance(derived, dict):
+                        return "contractor"
+                    for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                        v = derived.get(k)
+                        if v and "employee" in str(v).strip().lower():
+                            return "employee"
+                    for k in ("Employee_Status","Employee Status","Status"):
+                        v = derived.get(k)
+                        if v and "terminated" in str(v).strip().lower():
+                            return "employee"
+                    return "contractor"
+                except Exception:
+                    return "contractor"
+
+            if att_rows:
+                for a in att_rows:
+                    key = None
+                    try:
+                        key = _normalize_employee_key(a.employee_id)
+                    except Exception:
+                        key = None
+                    if not key:
+                        try:
+                            key = _normalize_card_like(a.derived.get('card_number') if (a.derived and isinstance(a.derived, dict)) else None)
+                        except Exception:
+                            key = None
+                    if not key:
+                        unknown_count += 1
+                        continue
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    cls = classify_from_derived(a.derived)
+                    if cls == "employee":
+                        live_emp += 1
+                    elif cls == "contractor":
+                        live_contr += 1
+                    else:
+                        unknown_count += 1
+
+                live_total_reported = live_emp + live_contr + unknown_count
+                live_total_details = len(att_rows)
+            else:
+                live_total_reported = 0
+                live_total_details = 0
+                try:
+                    import region_clients
+                    details = []
+                    try:
+                        details = region_clients.fetch_all_details(timeout=REGION_TIMEOUT_SECONDS) or []
+                    except TypeError:
+                        details = region_clients.fetch_all_details()
+                    except Exception:
+                        logger.exception("region_clients.fetch_all_details failed in build_ccure_averages()")
+                        details = []
+                    if details:
+                        for d in details:
+                            try:
+                                cls = "contractor"
+                                for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                                    v = d.get(k)
+                                    if v and "employee" in str(v).strip().lower():
+                                        cls = "employee"
+                                        break
+                                if cls == "employee":
+                                    live_emp += 1
+                                else:
+                                    live_contr += 1
+                                live_total_details += 1
+                            except Exception:
+                                continue
+                        live_total_reported = live_emp + live_contr
+                    else:
+                        try:
+                            regions = region_clients.fetch_all_regions(timeout=REGION_TIMEOUT_SECONDS) or []
+                            for r in regions:
+                                try:
+                                    c = r.get("count")
+                                    if isinstance(c, (int, float)):
+                                        live_total_reported += int(c)
+                                except Exception:
+                                    continue
+                        except Exception:
+                            logger.exception("region_clients.fetch_all_regions failed in build_ccure_averages()")
+                except Exception:
+                    logger.exception("region_clients not importable in build_ccure_averages()")
+
+            # compute avg range using AttendanceSummary if possible
+            avg_range = None
+            try:
+                q = db.query(AttendanceSummary.date, AttendanceSummary.employee_id, AttendanceSummary.presence_count)\
+                      .filter(AttendanceSummary.date >= start_obj, AttendanceSummary.date <= end_obj).all()
+                by_date = {}
+                for row in q:
+                    d = row[0]
+                    key = (row[1] or "").strip() if row[1] else None
+                    if not key:
+                        continue
+                    if d not in by_date:
+                        by_date[d] = set()
+                    try:
+                        presence_val = getattr(row, 'presence_count', row[2])
+                        if int(presence_val) > 0:
+                            by_date[d].add(key)
+                    except Exception:
+                        by_date[d].add(key)
+                days_count = (end_obj - start_obj).days + 1
+                daily_counts = [len(by_date.get(start_obj + timedelta(days=i), set())) for i in range(days_count)]
+                if days_count and any(daily_counts):
+                    avg_range = int(round(sum(daily_counts) / float(days_count)))
+                else:
+                    avg_range = None
+            except Exception:
+                logger.exception("Failed computing range average from AttendanceSummary")
+                avg_range = None
+
+        # fallback: use region history to compute avg_range if still None
+        if avg_range is None:
+            try:
+                import region_clients
+                entries = region_clients.fetch_all_history(timeout=REGION_TIMEOUT_SECONDS) or []
+                agg = {}
+                for e in entries:
+                    try:
+                        dstr = e.get("date")
+                        if not dstr:
+                            continue
+                        region_obj = e.get("region") if isinstance(e.get("region"), dict) else None
+                        emp = None
+                        con = None
+                        tot = None
+                        if region_obj:
+                            emp = _safe_int(region_obj.get("Employee"))
+                            con = _safe_int(region_obj.get("Contractor"))
+                            tot = _safe_int(region_obj.get("total")) or ((emp or 0) + (con or 0))
+                        else:
+                            emp = _safe_int(e.get("Employee"))
+                            con = _safe_int(e.get("Contractor"))
+                            tot = _safe_int(e.get("total"))
+                        if emp is None and con is None:
+                            continue
+                        if tot is None:
+                            tot = (emp or 0) + (con or 0)
+                        if dstr not in agg:
+                            agg[dstr] = {"total": 0, "count": 0}
+                        agg[dstr]["total"] += tot or 0
+                        agg[dstr]["count"] += 1
+                    except Exception:
+                        continue
+                per_date_totals = []
+                days_count = (end_obj - start_obj).days + 1
+                for i in range(days_count):
+                    dcheck = (start_obj + timedelta(days=i)).isoformat()
+                    if dcheck in agg and agg[dcheck]["count"] > 0:
+                        per_day_avg = float(agg[dcheck]["total"]) / float(agg[dcheck]["count"])
+                        per_date_totals.append(per_day_avg)
+                if per_date_totals:
+                    avg_range = int(round(sum(per_date_totals) / float(len(per_date_totals))))
+            except Exception:
+                logger.exception("Failed computing avg_range from region history in fallback")
+
+        # get ccure stats if available
+        ccure_stats = {}
+        try:
+            import ccure_client
+            if hasattr(ccure_client, "get_global_stats"):
+                ccure_stats = ccure_client.get_global_stats() or {}
+        except Exception:
+            logger.debug("ccure_client.get_global_stats not available", exc_info=True)
+
+        cc_active_emps = None
+        cc_active_contractors = None
+        try:
+            if isinstance(ccure_stats, dict):
+                a = ccure_stats.get("ActiveEmployees") or ccure_stats.get("active_employees") or None
+                b = ccure_stats.get("ActiveContractors") or ccure_stats.get("active_contractors") or None
+                if a is not None and str(a).strip() != "":
+                    cc_active_emps = int(a)
+                if b is not None and str(b).strip() != "":
+                    cc_active_contractors = int(b)
+        except Exception:
+            cc_active_emps = cc_active_contractors = None
+
+        emp_pct = None
+        contr_pct = None
+        overall_pct = None
+        try:
+            if isinstance(cc_active_emps, int) and cc_active_emps > 0:
+                emp_pct = round((live_emp / float(cc_active_emps)) * 100.0, 2)
+            if isinstance(cc_active_contractors, int) and cc_active_contractors > 0:
+                contr_pct = round((live_contr / float(cc_active_contractors)) * 100.0, 2)
+            if isinstance(cc_active_emps, int) and isinstance(cc_active_contractors, int) and (cc_active_emps + cc_active_contractors) > 0:
+                overall_pct = round(((live_emp + live_contr) / float(cc_active_emps + cc_active_contractors)) * 100.0, 2)
+        except Exception:
+            emp_pct = contr_pct = overall_pct = None
+
+        resp = {
+            "date": today.isoformat(),
+            "notes": f"Computed over range {start_obj.isoformat()} -> {end_obj.isoformat()}" if (start_date or end_date) else None,
+            "live_today": {
+                "employee": live_emp,
+                "contractor": live_contr,
+                "total_reported": live_total_reported,
+                "total_from_details": live_total_details
+            },
+            "ccure_active": {
+                "active_employees": cc_active_emps,
+                "active_contractors": cc_active_contractors,
+                "ccure_active_employees_reported": cc_active_emps,
+                "ccure_active_contractors_reported": cc_active_contractors
+            },
+            "averages": {
+                "employee_pct": emp_pct,
+                "contractor_pct": contr_pct,
+                "overall_pct": overall_pct,
+                "avg_headcount_last_7_days": avg_range,
+                "head_emp_pct_vs_ccure_today": emp_pct,
+                "head_contractor_pct_vs_ccure_today": contr_pct,
+                "headcount_overall_pct_vs_ccure_today": overall_pct,
+                "history_avg_overall_last_7_days": avg_range
+            }
+        }
+
+        return resp
+    except Exception:
+        logger.exception("build_ccure_averages failed")
+        raise
+
+# ---------- Upload endpoints (store uploads under data/ and data/raw_uploads/ and rotate) ----------
+# (rest of file unchanged; only timeout constants were increased and region_client calls use REGION_TIMEOUT_SECONDS)
+# For brevity I'm not pasting the ENTIRE file twice — the prior version you provided is used as-is with the
+# GLOBAL TIMEOUT variables adjusted above (REGION_TIMEOUT_SECONDS, COMPUTE_WAIT_TIMEOUT_SECONDS, COMPUTE_SYNC_TIMEOUT_SECONDS)
+# and calls to region_clients.fetch_all_* use the REGION_TIMEOUT_SECONDS variable.
+#
+# If you prefer, I can paste the full combined file inlined (complete) so you can replace the file in one go.
+
+
+
+
+
+
+
+
+
 
