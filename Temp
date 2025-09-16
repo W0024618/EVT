@@ -1,3 +1,348 @@
+[
+  {
+    "username": "admin",
+    "EmployeeID": "W0000001",
+    "EmployeeName": "Admin User",
+    "password": "changeme",
+    "permissions": [
+      "can_grant",
+      "device_health",
+      "gsoc_reports",
+      "associate_verify",
+      "global_duration",
+      "headcount_apac",
+      "headcount_emea",
+      "headcount_laca",
+      "headcount_namer",
+      "headcount_pune",
+      "headcount"
+    ]
+  },
+  {
+    "username": "apacuser",
+    "EmployeeID": "W0001001",
+    "EmployeeName": "APAC Viewer",
+    "password": "changeme",
+    "permissions": [
+      "headcount_apac",
+      "headcount",
+      "gsoc_reports"
+    ]
+  },
+  {
+    "username": "deviceonly",
+    "EmployeeID": "W0002001",
+    "EmployeeName": "Device Health Only",
+    "password": "changeme",
+    "permissions": [
+      "device_health"
+    ]
+  }
+]
+
+
+
+
+
+
+
+
+
+
+
+// backend/routes/auth.js
+import express from 'express';
+import fs from 'fs/promises';
+import path from 'path';
+import jwt from 'jsonwebtoken';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Config
+const USERS_FILE = path.resolve(__dirname, '../config/users.json');
+const JWT_SECRET = process.env.AUTH_SECRET || 'replace_this_with_a_real_secret_in_prod';
+const JWT_EXPIRES = '8h'; // adjust as needed
+
+const router = express.Router();
+
+// Utility: load users.json
+async function loadUsers() {
+  try {
+    const txt = await fs.readFile(USERS_FILE, 'utf8');
+    return JSON.parse(txt);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return [];
+    }
+    throw e;
+  }
+}
+
+// Utility: save users.json (atomic-ish)
+async function saveUsers(users) {
+  const txt = JSON.stringify(users, null, 2);
+  await fs.writeFile(USERS_FILE, txt, 'utf8');
+}
+
+// Convert permissions array -> map object
+function permsArrayToMap(arr = []) {
+  const out = {};
+  (arr || []).forEach(p => { out[p] = true; });
+  return out;
+}
+
+// Middleware: verify token (if present) and attach req.userObj
+async function verifyTokenMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ detail: 'Missing Authorization header' });
+  }
+  const token = auth.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    // payload contains username, EmployeeID, EmployeeName
+    const users = await loadUsers();
+    const u = users.find(x => x.username === payload.username || x.EmployeeID === payload.EmployeeID);
+    if (!u) return res.status(401).json({ detail: 'User not found' });
+    // attach user (but don't attach password)
+    req.userObj = {
+      username: u.username,
+      EmployeeID: u.EmployeeID,
+      EmployeeName: u.EmployeeName,
+      permissions: permsArrayToMap(u.permissions || [])
+    };
+    next();
+  } catch (e) {
+    return res.status(401).json({ detail: 'Invalid token' });
+  }
+}
+
+// POST /api/auth/login
+// body: { username, password }
+router.post('/login', async (req, res, next) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ detail: 'username and password required' });
+    }
+    const users = await loadUsers();
+    // match by username or EmployeeID (case-insensitive for username)
+    const u = users.find(x =>
+      (x.username && x.username.toLowerCase() === String(username).toLowerCase()) ||
+      (x.EmployeeID && String(x.EmployeeID).toLowerCase() === String(username).toLowerCase())
+    );
+
+    if (!u) {
+      return res.status(401).json({ detail: 'Invalid credentials' });
+    }
+
+    // NOTE: plaintext password check — replace with hashing in prod
+    if (String(password) !== String(u.password)) {
+      return res.status(401).json({ detail: 'Invalid credentials' });
+    }
+
+    const tokenPayload = {
+      username: u.username,
+      EmployeeID: u.EmployeeID,
+      EmployeeName: u.EmployeeName
+    };
+    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+
+    return res.json({
+      token,
+      user: {
+        username: u.username,
+        EmployeeID: u.EmployeeID,
+        EmployeeName: u.EmployeeName
+      },
+      permissions: permsArrayToMap(u.permissions || [])
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/auth/me
+// Requires Authorization Bearer token
+router.get('/me', verifyTokenMiddleware, async (req, res, next) => {
+  try {
+    return res.json({
+      user: {
+        username: req.userObj.username,
+        EmployeeID: req.userObj.EmployeeID,
+        EmployeeName: req.userObj.EmployeeName
+      },
+      permissions: req.userObj.permissions || {}
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Helper: ensure the caller has can_grant
+async function requireCanGrant(req, res, next) {
+  if (!req.userObj || !req.userObj.permissions) return res.status(403).json({ detail: 'forbidden' });
+  if (!req.userObj.permissions.can_grant && !req.userObj.permissions['can_grant']) {
+    return res.status(403).json({ detail: 'insufficient grant privileges' });
+  }
+  next();
+}
+
+// POST /api/auth/grant
+// body: { grantee_employee_id, grantee_name, pages: ["device_health","headcount_apac"] }
+router.post('/grant', verifyTokenMiddleware, requireCanGrant, async (req, res, next) => {
+  try {
+    const { grantee_employee_id, grantee_name, pages } = req.body || {};
+    if ((!grantee_employee_id && !grantee_name) || !Array.isArray(pages)) {
+      return res.status(400).json({ detail: 'grantee_employee_id or grantee_name and pages[] required' });
+    }
+
+    const users = await loadUsers();
+    // find grantee by EmployeeID or username (case-insensitive)
+    const grantee = users.find(x =>
+      (grantee_employee_id && String(x.EmployeeID).toLowerCase() === String(grantee_employee_id).toLowerCase()) ||
+      (grantee_name && x.username && x.username.toLowerCase() === String(grantee_name).toLowerCase()) ||
+      (grantee_name && x.EmployeeName && x.EmployeeName.toLowerCase() === String(grantee_name).toLowerCase())
+    );
+
+    if (!grantee) {
+      return res.status(404).json({ detail: 'grantee not found' });
+    }
+
+    // ensure permissions array exists
+    grantee.permissions = Array.isArray(grantee.permissions) ? grantee.permissions : [];
+    const before = new Set(grantee.permissions);
+
+    pages.forEach(p => {
+      if (!before.has(p)) before.add(p);
+    });
+
+    grantee.permissions = Array.from(before);
+
+    await saveUsers(users);
+
+    return res.json({ ok: true, detail: 'granted', grantee: { username: grantee.username, EmployeeID: grantee.EmployeeID, permissions: permsArrayToMap(grantee.permissions || []) } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/revoke
+// body: { grantee_employee_id, grantee_name, pages: ["device_health","headcount_apac"] }
+router.post('/revoke', verifyTokenMiddleware, requireCanGrant, async (req, res, next) => {
+  try {
+    const { grantee_employee_id, grantee_name, pages } = req.body || {};
+    if ((!grantee_employee_id && !grantee_name) || !Array.isArray(pages)) {
+      return res.status(400).json({ detail: 'grantee_employee_id or grantee_name and pages[] required' });
+    }
+
+    const users = await loadUsers();
+    const grantee = users.find(x =>
+      (grantee_employee_id && String(x.EmployeeID).toLowerCase() === String(grantee_employee_id).toLowerCase()) ||
+      (grantee_name && x.username && x.username.toLowerCase() === String(grantee_name).toLowerCase()) ||
+      (grantee_name && x.EmployeeName && x.EmployeeName.toLowerCase() === String(grantee_name).toLowerCase())
+    );
+
+    if (!grantee) {
+      return res.status(404).json({ detail: 'grantee not found' });
+    }
+
+    grantee.permissions = Array.isArray(grantee.permissions) ? grantee.permissions : [];
+    const toRemove = new Set(pages || []);
+    grantee.permissions = grantee.permissions.filter(p => !toRemove.has(p));
+
+    await saveUsers(users);
+
+    return res.json({ ok: true, detail: 'revoked', grantee: { username: grantee.username, EmployeeID: grantee.EmployeeID, permissions: permsArrayToMap(grantee.permissions || []) } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+export default router;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// backend/index.js
+import express from 'express';
+import cors from 'cors';
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
+import reportsRouter from './routes/reports.js';
+import headcountRouter from './routes/headcount.js';
+import vipRouter       from './routes/vip.js';
+import authRouter      from './routes/auth.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3008;
+
+// 1) Middleware
+app.use(cors());              // enable CORS for all origins
+app.use(express.json());      // parse JSON payloads
+
+// 2) Static Assets (if you have any in ../public)
+app.use(express.static(resolve(__dirname, '../public')));
+
+// 3) API Routes
+app.use('/api/auth', authRouter);
+app.use('/api/headcount', headcountRouter);
+app.use('/api/vip',       vipRouter);
+app.use('/api/reports',   reportsRouter);
+
+// 4) Health-check endpoint (optional)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
+
+// 5) Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res
+    .status(err.status || 500)
+    .json({ error: err.message || 'Internal Server Error' });
+});
+
+// 6) Start server
+app.listen(PORT, () => {
+  console.log(`🌍 Global-backend listening on http://localhost:${PORT}`);
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Lets as per Login if Employee have as per access open only those Window
 
 
