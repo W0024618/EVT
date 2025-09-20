@@ -1,3 +1,436 @@
+# region_clients.py  (updated history -> MSSQL headcount)
+import requests
+from requests.exceptions import RequestException
+from datetime import datetime, date
+import logging
+import time
+import sys
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger("region_clients")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# endpoints (live) - keep as-is
+endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
+}
+
+# legacy HTTP history endpoints (kept as fallback)
+history_endpoints = {
+    "namer": "http://10.199.22.57:3006/api/occupancy/history",
+    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
+    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
+    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
+}
+
+DEFAULT_ATTEMPTS = 3
+DEFAULT_BACKOFF = 0.6
+ENDPOINT_COOLDOWN_SECONDS = 60
+ENDPOINT_FAILURES = {}  # url -> (last_failed_ts, fail_count)
+
+# ---------------------------------------------------------------------
+# HTTP helpers (unchanged)
+# ---------------------------------------------------------------------
+def _build_session():
+    s = requests.Session()
+    try:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET', 'HEAD'])
+        )
+    except TypeError:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(['GET', 'HEAD'])
+        )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+_SESSION = _build_session()
+
+def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
+    now = time.time()
+    last = ENDPOINT_FAILURES.get(url)
+    if last:
+        last_failed_ts, fail_count = last
+        if now - last_failed_ts < ENDPOINT_COOLDOWN_SECONDS:
+            logger.debug("[region_clients] skipping %s (in cooldown)", url)
+            return None
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = _SESSION.get(url, timeout=(3, max(5, timeout)))
+            r.raise_for_status()
+            try:
+                return r.json()
+            except ValueError:
+                try:
+                    return {"_raw_text": r.text}
+                except Exception:
+                    return None
+        except RequestException as e:
+            last_err = e
+            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[region_clients] unexpected error fetching {url}: {e}")
+            if attempt < attempts:
+                time.sleep(backoff * attempt)
+            continue
+
+    ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
+    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
+    return None
+
+# ---------------------------------------------------------------------
+# New: DB-backed history fetch (preferred). Falls back to HTTP history endpoint.
+# Uses duration_report.REGION_CONFIG (if available) for DB credentials and DB name.
+# ---------------------------------------------------------------------
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+    logger.debug("pyodbc not available; history will fall back to HTTP endpoints")
+
+# Try to reuse REGION_CONFIG from duration_report (where your DBs are defined)
+try:
+    import duration_report
+    REGION_CONFIG = getattr(duration_report, "REGION_CONFIG", {})
+    ODBC_DRIVER = getattr(duration_report, "ODBC_DRIVER", os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server"))
+except Exception:
+    REGION_CONFIG = {}
+    import os
+    ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+def _get_region_db_config(region: str):
+    rc = REGION_CONFIG.get(region.lower())
+    if not rc:
+        return None
+    # expected keys: server, user, password, database
+    return rc
+
+def _make_conn(rc: dict):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not available")
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def _build_headcount_sql(region: str, dbname: str, target_date: str) -> str:
+    """
+    Build region-specific SQL using provided headcount queries but WITHOUT hardcoded db name.
+    The supplied dbname will be injected into references to ACVSUJournalLog table.
+    target_date must be 'YYYY-MM-DD' string.
+    """
+    if region == "apac":
+        # Use the CTE + dedupe approach you provided for APAC (adapted)
+        sql = f"""
+WITH CombinedEmployeeData AS (
+    SELECT
+        t1.[ObjectName1],
+        t1.[ObjectName2],
+        CASE
+            WHEN t2.[Int1] = 0 THEN t2.[Text12]
+            ELSE CAST(t2.[Int1] AS NVARCHAR)
+        END AS EmployeeID,
+        t2.[PersonnelTypeID],
+        t3.[Name] AS PersonnelTypeName,
+        t1.Objectidentity1 AS EmployeeIdentity,
+        CASE
+            WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+            WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+            WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+            ELSE t1.PartitionName2
+        END AS Location,
+        t1.PartitionName2,
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        t1.MessageType
+    FROM
+        [{dbname}].dbo.ACVSUJournalLog AS t1
+        INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+        INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+    WHERE
+        t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN ('APAC.Default', 'IN.HYD', 'JP.Tokyo', 'PH.Manila', 'MY.Kuala Lumpur')
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
+),
+RankedEmployeeData AS (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY EmployeeIdentity, CONVERT(DATE, LocaleMessageTime) ORDER BY LocaleMessageTime DESC) AS rn
+    FROM
+        CombinedEmployeeData
+)
+SELECT
+    [ObjectName1],
+    PersonnelTypeName,
+    EmployeeID,
+    Location,
+    MessageType,
+    CONVERT(DATE, LocaleMessageTime) AS Date
+FROM
+    RankedEmployeeData
+WHERE
+    rn = 1
+;
+"""
+        return sql
+
+    if region == "emea":
+        sql = f"""
+SELECT DISTINCT
+    t1.[ObjectName1] AS ObjectName1,
+    t3.[Name] AS PersonnelTypeName,
+    CASE
+        WHEN t2.[Int1] = 0 THEN t2.[Text12]
+        ELSE CAST(t2.[Int1] AS NVARCHAR)
+    END AS EmployeeID,
+    t2.text5,
+    t1.PartitionName2,
+    t1.MessageType,
+    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
+FROM [{dbname}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
+    AND t1.PartitionName2 IN ('LT.Vilnius', 'AUT.Vienna', 'IE.DUblin', 'DU.Abu Dhab', 'ES.Madrid', 'IT.Rome', 'MA.Casablanca', 'RU.Moscow', 'UK.London')
+;
+"""
+        return sql
+
+    if region == "laca":
+        sql = f"""
+SELECT DISTINCT
+    t1.[ObjectName1] AS ObjectName1,
+    t3.[Name] AS PersonnelTypeName,
+    CASE
+        WHEN t2.[Int1] = 0 THEN t2.[Text12]
+        ELSE CAST(t2.[Int1] AS NVARCHAR)
+    END AS EmployeeID,
+    t2.text5,
+    t1.PartitionName2,
+    t1.MessageType,
+    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
+FROM [{dbname}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
+    AND t1.PartitionName2 IN ('AR.Cordoba', 'BR.Sao Paulo', 'CR.Costa Rica Partition', 'MX.Mexico City', 'PA.Panama City', 'PE.Lima')
+;
+"""
+        return sql
+
+    if region == "namer":
+        sql = f"""
+SELECT DISTINCT
+    t1.[ObjectName1] AS ObjectName1,
+    t3.[Name] AS PersonnelTypeName,
+    CASE
+        WHEN t2.[Int1] = 0 THEN t2.[Text12]
+        ELSE CAST(t2.[Int1] AS NVARCHAR)
+    END AS EmployeeID,
+    t2.Text5,
+    CASE
+        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
+        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
+        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
+        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
+        ELSE 'Other'
+    END AS LogicalLocation,
+    t1.MessageType,
+    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
+FROM [{dbname}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
+    AND (t1.[ObjectName2] LIKE '%HQ%' OR t1.[ObjectName2] LIKE '%Austin%' OR t1.[ObjectName2] LIKE '%Miami%' OR t1.[ObjectName2] LIKE '%NYC%')
+;
+"""
+        return sql
+
+    # Default generic (safe) fallback - query CardAdmitted for that partition/date
+    sql = f"""
+SELECT
+    t1.[ObjectName1] AS ObjectName1,
+    t3.[Name] AS PersonnelTypeName,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t1.PartitionName2,
+    t1.MessageType,
+    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
+FROM [{dbname}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
+;
+"""
+    return sql
+
+def fetch_history_for_region(region, target_date: date = None, timeout=6):
+    """
+    Prefer DB-based headcount fetch for the given region and date.
+    Returns list of dict rows. If DB path fails, falls back to HTTP history endpoint.
+    """
+    if target_date is None:
+        target_date = date.today()
+    target_date_str = target_date.strftime("%Y-%m-%d")
+    region_key = region.lower()
+
+    # Try DB path if possible
+    rc = _get_region_db_config(region_key)
+    if rc and pyodbc is not None:
+        dbname = rc.get("database")
+        try:
+            conn = _make_conn(rc)
+            cur = conn.cursor()
+            sql = _build_headcount_sql(region_key, dbname, target_date_str)
+            logger.info("[region_clients] executing headcount SQL for region=%s date=%s", region_key, target_date_str)
+            cur.execute(sql)
+            cols = [c[0] for c in cur.description] if cur.description else []
+            rows = []
+            for r in cur.fetchall():
+                row = {}
+                for i, val in enumerate(r):
+                    key = cols[i] if i < len(cols) else f"col{i}"
+                    # normalize column names to predictable keys used by callers
+                    nk = key
+                    # mapping common column names to canonical keys used earlier
+                    if nk.lower() in ("objectname1", "objectname1"):
+                        nk = "ObjectName1"
+                    elif nk.lower() in ("personneltypename", "name"):
+                        nk = "PersonnelTypeName"
+                    elif nk.lower() in ("employeeid",):
+                        nk = "EmployeeID"
+                    elif nk.lower() in ("location", "logicallocation"):
+                        nk = "Location"
+                    elif nk.lower() in ("partitionname2",):
+                        nk = "PartitionName2"
+                    elif nk.lower() in ("messagetype",):
+                        nk = "MessageType"
+                    elif nk.lower() == "date":
+                        nk = "Date"
+                    row[nk] = val
+                rows.append(row)
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            logger.info("[region_clients] DB headcount rows fetched=%d for region=%s", len(rows), region_key)
+            return rows
+        except Exception as e:
+            logger.exception("[region_clients] DB headcount query failed for region=%s: %s", region_key, e)
+            # continue to HTTP fallback
+
+    # HTTP fallback (keep previous behaviour)
+    url = history_endpoints.get(region_key)
+    if not url:
+        logger.debug(f"[fetch_history_for_region] no history endpoint configured for {region_key}")
+        return []
+
+    try:
+        data = _do_get_with_retries(url, timeout=timeout) or {}
+        summary = []
+        if isinstance(data, dict):
+            for key in ("summaryByDate","summary","data","entries","results","details","items"):
+                if key in data and isinstance(data.get(key), list):
+                    for s in data.get(key):
+                        if isinstance(s, dict):
+                            s2 = dict(s)
+                            s2["_region"] = region_key
+                            s2["_source_url"] = url
+                            summary.append(s2)
+                    break
+            else:
+                if "date" in data or "day" in data:
+                    s2 = dict(data)
+                    s2["_region"] = region_key
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        elif isinstance(data, list):
+            for s in data:
+                if isinstance(s, dict):
+                    s2 = dict(s)
+                    s2["_region"] = region_key
+                    s2["_source_url"] = url
+                    summary.append(s2)
+        return summary
+    except Exception as e:
+        logger.warning(f"[region_clients] cannot fetch history for {region_key}@{url}: {e}")
+        ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
+        return []
+
+def fetch_all_history(timeout=6):
+    """
+    Aggregate history entries across configured regions.
+    Uses DB-based fetch where possible, otherwise HTTP fallback.
+    """
+    all_entries = []
+    for region in ("apac","emea","laca","namer"):
+        try:
+            rows = fetch_history_for_region(region, target_date=date.today(), timeout=timeout)
+            if rows:
+                # ensure each row is dict and include region/source metadata
+                for r in rows:
+                    if isinstance(r, dict):
+                        r["_region"] = region
+                        all_entries.append(r)
+        except Exception:
+            logger.exception(f"[region_clients] error aggregating history for {region}")
+            continue
+    logger.info("[region_clients] fetched %d history entries", len(all_entries))
+    return all_entries
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check Below Each file 
 http://localhost:8000/ccure/verify?raw=true
 for this API Previous logic is we are fetching data from Histoy API...
