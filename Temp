@@ -1,783 +1,239 @@
-# region_clients.py  (updated history -> MSSQL headcount)
-import requests
-from requests.exceptions import RequestException
-from datetime import datetime, date
-import logging
-import time
-import sys
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+Now Check API Responce carefully line by line....
 
-logger = logging.getLogger("region_clients")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
+http://localhost:8000/ccure/verify?raw=true
 
-# endpoints (live) - keep as-is
-endpoints = {
+
+{
+  "date": "2025-09-20",
+  "ccure_reported": {
+    "employees": 8576,
+    "contractors": 636,
+    "total_reported": 9212
+  },
+  "headcount_attendance_summary": {
+    "total_visited_today": 235,
+    "employee": 159,
+    "contractor": 76
+  },
+  "live_headcount_region_clients": { --------------------this Count is Wrong 
+    "currently_present_total": 238,
+    "employee": 159,
+    "contractor": 79
+  },
+
+
+Calculate this Count using 
     "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
     "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
+     "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
     "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
-}
+this API ..so this API respond like ...
 
-# legacy HTTP history endpoints (kept as fallback)
-history_endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/history",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
-}
-
-DEFAULT_ATTEMPTS = 3
-DEFAULT_BACKOFF = 0.6
-ENDPOINT_COOLDOWN_SECONDS = 60
-ENDPOINT_FAILURES = {}  # url -> (last_failed_ts, fail_count)
-
-# ---------------------------------------------------------------------
-# HTTP helpers (unchanged)
-# ---------------------------------------------------------------------
-def _build_session():
-    s = requests.Session()
-    try:
-        retry = Retry(
-            total=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(['GET', 'HEAD'])
-        )
-    except TypeError:
-        retry = Retry(
-            total=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=frozenset(['GET', 'HEAD'])
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-_SESSION = _build_session()
-
-def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
-    now = time.time()
-    last = ENDPOINT_FAILURES.get(url)
-    if last:
-        last_failed_ts, fail_count = last
-        if now - last_failed_ts < ENDPOINT_COOLDOWN_SECONDS:
-            logger.debug("[region_clients] skipping %s (in cooldown)", url)
-            return None
-
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            r = _SESSION.get(url, timeout=(3, max(5, timeout)))
-            r.raise_for_status()
-            try:
-                return r.json()
-            except ValueError:
-                try:
-                    return {"_raw_text": r.text}
-                except Exception:
-                    return None
-        except RequestException as e:
-            last_err = e
-            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
-            if attempt < attempts:
-                time.sleep(backoff * attempt)
-            continue
-        except Exception as e:
-            last_err = e
-            logger.warning(f"[region_clients] unexpected error fetching {url}: {e}")
-            if attempt < attempts:
-                time.sleep(backoff * attempt)
-            continue
-
-    ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
-    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
-    return None
-
-# ---------------------------------------------------------------------
-# New: DB-backed history fetch (preferred). Falls back to HTTP history endpoint.
-# Uses duration_report.REGION_CONFIG (if available) for DB credentials and DB name.
-# ---------------------------------------------------------------------
-try:
-    import pyodbc
-except Exception:
-    pyodbc = None
-    logger.debug("pyodbc not available; history will fall back to HTTP endpoints")
-
-# Try to reuse REGION_CONFIG from duration_report (where your DBs are defined)
-try:
-    import duration_report
-    REGION_CONFIG = getattr(duration_report, "REGION_CONFIG", {})
-    ODBC_DRIVER = getattr(duration_report, "ODBC_DRIVER", os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server"))
-except Exception:
-    REGION_CONFIG = {}
-    import os
-    ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-
-def _get_region_db_config(region: str):
-    rc = REGION_CONFIG.get(region.lower())
-    if not rc:
-        return None
-    # expected keys: server, user, password, database
-    return rc
-
-def _make_conn(rc: dict):
-    if pyodbc is None:
-        raise RuntimeError("pyodbc not available")
-    conn_str = (
-        f"DRIVER={{{ODBC_DRIVER}}};"
-        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
-        "TrustServerCertificate=Yes;"
-    )
-    return pyodbc.connect(conn_str, autocommit=True)
-
-def _build_headcount_sql(region: str, dbname: str, target_date: str) -> str:
-    """
-    Build region-specific SQL using provided headcount queries but WITHOUT hardcoded db name.
-    The supplied dbname will be injected into references to ACVSUJournalLog table.
-    target_date must be 'YYYY-MM-DD' string.
-    """
-    if region == "apac":
-        # Use the CTE + dedupe approach you provided for APAC (adapted)
-        sql = f"""
-WITH CombinedEmployeeData AS (
-    SELECT
-        t1.[ObjectName1],
-        t1.[ObjectName2],
-        CASE
-            WHEN t2.[Int1] = 0 THEN t2.[Text12]
-            ELSE CAST(t2.[Int1] AS NVARCHAR)
-        END AS EmployeeID,
-        t2.[PersonnelTypeID],
-        t3.[Name] AS PersonnelTypeName,
-        t1.Objectidentity1 AS EmployeeIdentity,
-        CASE
-            WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
-            WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
-            WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
-            ELSE t1.PartitionName2
-        END AS Location,
-        t1.PartitionName2,
-        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-        t1.MessageType
-    FROM
-        [{dbname}].dbo.ACVSUJournalLog AS t1
-        INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-        INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-    WHERE
-        t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN ('APAC.Default', 'IN.HYD', 'JP.Tokyo', 'PH.Manila', 'MY.Kuala Lumpur')
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
-),
-RankedEmployeeData AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY EmployeeIdentity, CONVERT(DATE, LocaleMessageTime) ORDER BY LocaleMessageTime DESC) AS rn
-    FROM
-        CombinedEmployeeData
-)
-SELECT
-    [ObjectName1],
-    PersonnelTypeName,
-    EmployeeID,
-    Location,
-    MessageType,
-    CONVERT(DATE, LocaleMessageTime) AS Date
-FROM
-    RankedEmployeeData
-WHERE
-    rn = 1
-;
-"""
-        return sql
-
-    if region == "emea":
-        sql = f"""
-SELECT DISTINCT
-    t1.[ObjectName1] AS ObjectName1,
-    t3.[Name] AS PersonnelTypeName,
-    CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.text5,
-    t1.PartitionName2,
-    t1.MessageType,
-    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
-FROM [{dbname}].dbo.ACVSUJournalLog AS t1
-INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-WHERE
-    t1.MessageType = 'CardAdmitted'
-    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
-    AND t1.PartitionName2 IN ('LT.Vilnius', 'AUT.Vienna', 'IE.DUblin', 'DU.Abu Dhab', 'ES.Madrid', 'IT.Rome', 'MA.Casablanca', 'RU.Moscow', 'UK.London')
-;
-"""
-        return sql
-
-    if region == "laca":
-        sql = f"""
-SELECT DISTINCT
-    t1.[ObjectName1] AS ObjectName1,
-    t3.[Name] AS PersonnelTypeName,
-    CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.text5,
-    t1.PartitionName2,
-    t1.MessageType,
-    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
-FROM [{dbname}].dbo.ACVSUJournalLog AS t1
-INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-WHERE
-    t1.MessageType = 'CardAdmitted'
-    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
-    AND t1.PartitionName2 IN ('AR.Cordoba', 'BR.Sao Paulo', 'CR.Costa Rica Partition', 'MX.Mexico City', 'PA.Panama City', 'PE.Lima')
-;
-"""
-        return sql
-
-    if region == "namer":
-        sql = f"""
-SELECT DISTINCT
-    t1.[ObjectName1] AS ObjectName1,
-    t3.[Name] AS PersonnelTypeName,
-    CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.Text5,
-    CASE
-        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
-        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
-        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
-        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
-        ELSE 'Other'
-    END AS LogicalLocation,
-    t1.MessageType,
-    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
-FROM [{dbname}].dbo.ACVSUJournalLog AS t1
-INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-WHERE
-    t1.MessageType = 'CardAdmitted'
-    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
-    AND (t1.[ObjectName2] LIKE '%HQ%' OR t1.[ObjectName2] LIKE '%Austin%' OR t1.[ObjectName2] LIKE '%Miami%' OR t1.[ObjectName2] LIKE '%NYC%')
-;
-"""
-        return sql
-
-    # Default generic (safe) fallback - query CardAdmitted for that partition/date
-    sql = f"""
-SELECT
-    t1.[ObjectName1] AS ObjectName1,
-    t3.[Name] AS PersonnelTypeName,
-    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
-    t1.PartitionName2,
-    t1.MessageType,
-    CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Date
-FROM [{dbname}].dbo.ACVSUJournalLog AS t1
-INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-WHERE t1.MessageType = 'CardAdmitted'
-  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{target_date}'
-;
-"""
-    return sql
-
-def fetch_history_for_region(region, target_date: date = None, timeout=6):
-    """
-    Prefer DB-based headcount fetch for the given region and date.
-    Returns list of dict rows. If DB path fails, falls back to HTTP history endpoint.
-    """
-    if target_date is None:
-        target_date = date.today()
-    target_date_str = target_date.strftime("%Y-%m-%d")
-    region_key = region.lower()
-
-    # Try DB path if possible
-    rc = _get_region_db_config(region_key)
-    if rc and pyodbc is not None:
-        dbname = rc.get("database")
-        try:
-            conn = _make_conn(rc)
-            cur = conn.cursor()
-            sql = _build_headcount_sql(region_key, dbname, target_date_str)
-            logger.info("[region_clients] executing headcount SQL for region=%s date=%s", region_key, target_date_str)
-            cur.execute(sql)
-            cols = [c[0] for c in cur.description] if cur.description else []
-            rows = []
-            for r in cur.fetchall():
-                row = {}
-                for i, val in enumerate(r):
-                    key = cols[i] if i < len(cols) else f"col{i}"
-                    # normalize column names to predictable keys used by callers
-                    nk = key
-                    # mapping common column names to canonical keys used earlier
-                    if nk.lower() in ("objectname1", "objectname1"):
-                        nk = "ObjectName1"
-                    elif nk.lower() in ("personneltypename", "name"):
-                        nk = "PersonnelTypeName"
-                    elif nk.lower() in ("employeeid",):
-                        nk = "EmployeeID"
-                    elif nk.lower() in ("location", "logicallocation"):
-                        nk = "Location"
-                    elif nk.lower() in ("partitionname2",):
-                        nk = "PartitionName2"
-                    elif nk.lower() in ("messagetype",):
-                        nk = "MessageType"
-                    elif nk.lower() == "date":
-                        nk = "Date"
-                    row[nk] = val
-                rows.append(row)
-            try:
-                cur.close()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            logger.info("[region_clients] DB headcount rows fetched=%d for region=%s", len(rows), region_key)
-            return rows
-        except Exception as e:
-            logger.exception("[region_clients] DB headcount query failed for region=%s: %s", region_key, e)
-            # continue to HTTP fallback
-
-    # HTTP fallback (keep previous behaviour)
-    url = history_endpoints.get(region_key)
-    if not url:
-        logger.debug(f"[fetch_history_for_region] no history endpoint configured for {region_key}")
-        return []
-
-    try:
-        data = _do_get_with_retries(url, timeout=timeout) or {}
-        summary = []
-        if isinstance(data, dict):
-            for key in ("summaryByDate","summary","data","entries","results","details","items"):
-                if key in data and isinstance(data.get(key), list):
-                    for s in data.get(key):
-                        if isinstance(s, dict):
-                            s2 = dict(s)
-                            s2["_region"] = region_key
-                            s2["_source_url"] = url
-                            summary.append(s2)
-                    break
-            else:
-                if "date" in data or "day" in data:
-                    s2 = dict(data)
-                    s2["_region"] = region_key
-                    s2["_source_url"] = url
-                    summary.append(s2)
-        elif isinstance(data, list):
-            for s in data:
-                if isinstance(s, dict):
-                    s2 = dict(s)
-                    s2["_region"] = region_key
-                    s2["_source_url"] = url
-                    summary.append(s2)
-        return summary
-    except Exception as e:
-        logger.warning(f"[region_clients] cannot fetch history for {region_key}@{url}: {e}")
-        ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
-        return []
-
-def fetch_all_history(timeout=6):
-    """
-    Aggregate history entries across configured regions.
-    Uses DB-based fetch where possible, otherwise HTTP fallback.
-    """
-    all_entries = []
-    for region in ("apac","emea","laca","namer"):
-        try:
-            rows = fetch_history_for_region(region, target_date=date.today(), timeout=timeout)
-            if rows:
-                # ensure each row is dict and include region/source metadata
-                for r in rows:
-                    if isinstance(r, dict):
-                        r["_region"] = region
-                        all_entries.append(r)
-        except Exception:
-            logger.exception(f"[region_clients] error aggregating history for {region}")
-            continue
-    logger.info("[region_clients] fetched %d history entries", len(all_entries))
-    return all_entries
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Check Below Each file 
-http://localhost:8000/ccure/verify?raw=true
-for this API Previous logic is we are fetching data from Histoy API...
-
-history_endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/history",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
-}
-
-
-Keep Live Logic as it is ..
-so i just want to update history endpoint to fetch HeadCount from MSSQL
-so Remove only Histoty API Logic and 
-keep Live Count and Remening logic as it is 
-
-Refer below HeadCount Query and fetch data From db....
-
-below is database connection file which is already 
-present ..
-
-
-C:\Users\W0024618\Desktop\global-page\backend\config\dbConfig.js
-
-
-// C:\Users\W0024618\Desktop\global-page\backend\config\dbConfig.js
-import sql from 'mssql';
-
-// shared options
-const commonOpts = {
-  options: {
-    encrypt: true,
-    trustServerCertificate: true
-  }
-};
-
-// lowercase keys only
-const regions = {
-  apac: {
-    user: 'GSOC_Test',
-    password: 'Westernccure@2025',
-    server: 'SRVWUPNQ0986V',
-    database: 'ACVSUJournal_00010029',
-    ...commonOpts
+{
+  "success": true,
+  "today": {
+    "total": 18,
+    "Employee": 12,
+    "Contractor": 6
   },
-  emea: {
-    user: 'GSOC_Test',
-    password: 'Westernccure@2025',
-    server: 'SRVWUFRA0986V',
-    database: 'ACVSUJournal_00011028',
-    ...commonOpts
+  "realtime": {
+    "LT.Vilnius": {
+      "total": 8,
+      "Employee": 6,
+      "Contractor": 2,
+      "floors": {
+        "1st Floor": 2,
+        "9th Floor": 3,
+        "6th Floor": 1,
+        "5th Floor": 1,
+        "10th Floor": 1
+      }
+    },
+    "DU.Abu Dhab": {
+      "total": 1,
+      "Employee": 0,
+      "Contractor": 1,
+      "floors": {
+        "Dubai": 1
+      }
+    }
   },
-  laca: {
-    user: 'GSOC_Test',
-    password: 'Westernccure@2025',
-    server: 'SRVWUSJO0986V',
-    database: 'ACVSUJournal_00010029',
-    ...commonOpts
+
+
+so ALL API respond same 
+
+
+Currect live headCount is 92  (APAC 78 , EMEA 9, LACA 1, NAMER 3)
+this is Current Count..
+
+
+  "percentages_vs_ccure": {
+    "head_employee_pct_vs_ccure_today": 1.85,
+    "head_contractor_pct_vs_ccure_today": 11.95,
+    "head_overall_pct_vs_ccure_today": 2.55
+
+
   },
-  namer: {
-    user: 'GSOC_Test',
-    password: 'Westernccure@2025',
-    server: 'SRVWUDEN0891V',
-    database: 'ACVSUJournal_00010029',
-    ...commonOpts
-  }
-};
+  "averages": {
+    "history_avg_employee_last_7_days": 2169.14,
+    "history_avg_contractor_last_7_days": 291.57,
+    "history_avg_overall_last_7_days": 2460.86,
 
-const pools = {};
 
-/**
- * @param {string} regionKey  one of the keys in `regions`, case-insensitive
- */
-export async function getPool(regionKey) {
-  const key = (regionKey || '').toLowerCase();
-  const cfg = regions[key];
-  if (!cfg) {
-    throw new Error(`Unknown region: ${regionKey}`);
+percentages_vs_ccure Calculate above and below Percentage using Historical data using currecty added QUERY..
+
+    "avg_by_location_last_7_days": {
+
+    },
+    "history_avg_by_location_last_7_days": {
+      "US.CO.OBS": {
+        "history_days_counted": 6,
+        "avg_employee_last_7_days": 400.67,
+        "avg_contractor_last_7_days": 39,
+        "avg_overall_last_7_days": 439.67
+      },
+      "LT.Vilnius": {
+        "history_days_counted": 7,
+        "avg_employee_last_7_days": 310.57,
+        "avg_contractor_last_7_days": 18.57,
+        "avg_overall_last_7_days": 329.14
+      },
+      "DU.Abu Dhab": {
+        "history_days_counted": 7,
+        "avg_employee_last_7_days": 24.29,
+        "avg_contractor_last_7_days": 1.14,
+        "avg_overall_last_7_days": 25.43
+      },
+      "AUT.Vienna": {
+        "history_days_counted": 6,
+        "avg_employee_last_7_days": 27,
+        "avg_contractor_last_7_days": 4.83,
+        "avg_overall_last_7_days": 31.83
+      },
+      "Quezon City": {
+        "history_days_counted": 7,
+        "avg_employee_last_7_days": 201.57,
+        "avg_contractor_last_7_days": 39.29,
+        "avg_overall_last_7_days": 240.86
+      },
+      "Pune": {
+        "history_days_counted": 7,
+        "avg_employee_last_7_days": 469.71,
+        "avg_contractor_last_7_days": 90.86,
+        "avg_overall_last_7_days": 560.57
+      },
+      "CR.Costa Rica Partition": {
+        "history_days_counted": 6,
+        "avg_employee_last_7_days": 444,
+        "avg_contractor_last_7_days": 43.83,
+        "avg_overall_last_7_days": 487.83
+      },
+      "AR.Cordoba": {
+        "history_days_counted": 7,
+        "avg_employee_last_7_days": 114.57,
+        "avg_contractor_last_7_days": 31.43,
+        "avg_overall_last_7_days": 146
+      },
+      "USA/Canada Default": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 52,
+        "avg_contractor_last_7_days": 4,
+        "avg_overall_last_7_days": 56
+      },
+      "US.FL.Miami": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 18.6,
+        "avg_contractor_last_7_days": 3,
+        "avg_overall_last_7_days": 21.6
+      },
+      "US.NYC": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 31.2,
+        "avg_contractor_last_7_days": 1,
+        "avg_overall_last_7_days": 32.2
+      },
+      "UK.London": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 28,
+        "avg_contractor_last_7_days": 1.6,
+        "avg_overall_last_7_days": 29.6
+      },
+      "MA.Casablanca": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 21,
+        "avg_contractor_last_7_days": 1,
+        "avg_overall_last_7_days": 22
+      },
+      "IE.Dublin": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 23.4,
+        "avg_contractor_last_7_days": 2,
+        "avg_overall_last_7_days": 25.4
+      },
+      "ES.Madrid": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 47.4,
+        "avg_contractor_last_7_days": 2,
+        "avg_overall_last_7_days": 49.4
+      },
+      "IT.Rome": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 27.2,
+        "avg_contractor_last_7_days": 1.6,
+        "avg_overall_last_7_days": 28.8
+      },
+      "RU.Moscow": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 8,
+        "avg_contractor_last_7_days": 0.8,
+        "avg_overall_last_7_days": 8.8
+      },
+      "Taguig City": {
+        "history_days_counted": 6,
+        "avg_employee_last_7_days": 12.17,
+        "avg_contractor_last_7_days": 3.5,
+        "avg_overall_last_7_days": 15.67
+      },
+      "JP.Tokyo": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 8.6,
+        "avg_contractor_last_7_days": 0.8,
+        "avg_overall_last_7_days": 9.4
+      },
+      "BR.Sao Paulo": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 49,
+        "avg_contractor_last_7_days": 13.4,
+        "avg_overall_last_7_days": 62.4
+      },
+      "MX.Mexico City": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 33.8,
+        "avg_contractor_last_7_days": 4.2,
+        "avg_overall_last_7_days": 38.2
+      },
+      "PA.Panama City": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 15.6,
+        "avg_contractor_last_7_days": 2.8,
+        "avg_overall_last_7_days": 18.4
+      },
+      "PE.Lima": {
+        "history_days_counted": 5,
+        "avg_employee_last_7_days": 40,
+        "avg_contractor_last_7_days": 6.4,
+        "avg_overall_last_7_days": 46.4
+      },
+      "MY.Kuala Lumpur": {
+        "history_days_counted": 3,
+        "avg_employee_last_7_days": 5.67,
+        "avg_contractor_last_7_days": 0.67,
+        "avg_overall_last_7_days": 6.33
+      }
+    }
   }
-  if (!pools[key]) {
-    pools[key] = await new sql.ConnectionPool(cfg).connect();
-  }
-  return pools[key];
 }
 
-export { sql };
-
-
-
-
-Refer below HeadCount Query and Update 
-so Dont mention Database name in Query use database from Config file 
-
-
-APAC -HeadCount..
-
-/*SELECT 
-    t1.[ObjectName1],
-    t1.[ObjectName2],
-   CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.[PersonnelTypeID],
-    t3.[Name],  -- Adding the PersonnelType from the third table
-	Case
-		WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
-		WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
-		WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
-		ELSE t1.PartitionName2
-	END AS Location,
-	t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-	t1.MessageType
-INTO 
-    #CombinedEmployeeData  -- Temporary table
-FROM 
-    [ACVSUJournal_00010020].[dbo].[ACVSUJournalLog] AS t1  -- Replace with your actual table name
-INNER JOIN 
-    [ACVSCore].[Access].[Personnel] AS t2  -- Replace with the actual table name
-ON 
-    t1.ObjectIdentity1 = t2.GUID
-INNER JOIN 
-    [ACVSCore].[Access].[PersonnelType] AS t3  -- Replace with the actual table name containing PersonnelType
-ON 
-    t2.[PersonnelTypeId] = t3.[ObjectID];
-	SELECT DISTINCT
-    [ObjectName1],
-    [Name],
-	EmployeeID,
-	Location,
-	Messagetype,
-    CONVERT(DATE, LocaleMessageTime) AS Date
-	FROM 
-    #CombinedEmployeeData  -- Use the temporary table with combined data
-	WHERE 
-    CONVERT (DATE, LocaleMessageTime) = '2025-05-5' 
-	AND PartitionName2 IN ('APAC.Default', 'CN.Beijing', 'JP.Tokyo', 'PH.Manila', 'MY.Kuala Lumpur') 
-	AND MessageType = 'CardAdmitted';
-	*/
-	
-
-
-	WITH CombinedEmployeeData AS (
-    SELECT
-        t1.[ObjectName1],
-        t1.[ObjectName2],
-        CASE
-            WHEN t2.[Int1] = 0 THEN t2.[Text12]
-            ELSE CAST(t2.[Int1] AS NVARCHAR)
-        END AS EmployeeID,
-        t2.[PersonnelTypeID],
-        t3.[Name] AS PersonnelTypeName,
-		t1.Objectidentity1 AS EmployeeIdentity,
-        CASE
-            WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
-            WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
-            WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
-            ELSE t1.PartitionName2
-        END AS Location,
-        t1.PartitionName2,
-        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-        t1.MessageType
-    FROM
-        [ACVSUJournal_00010028].[dbo].[ACVSUJournalLog] AS t1
-        INNER JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-        INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-    WHERE
-        t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN ('APAC.Default', 'IN.HYD', 'JP.Tokyo', 'PH.Manila', 'MY.Kuala Lumpur')
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '2025-06-26'
-),
-RankedEmployeeData AS (
-    SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY EmployeeIdentity, CONVERT(DATE, LocaleMessageTime) ORDER BY LocaleMessageTime DESC) AS rn
-    FROM
-        CombinedEmployeeData
-)
-SELECT
-    [ObjectName1],
-    PersonnelTypeName,
-    EmployeeID,
-    Location,
-    MessageType,
-    CONVERT(DATE, LocaleMessageTime) AS Date
-FROM
-    RankedEmployeeData
-WHERE
-    rn = 1;
-
-	--DROP Table #CombinedEmployeeData;
-
-
-
-
-
-
-2) EMEA Headcount QUERY
-
-SELECT 
-    t1.[ObjectName1],
-    t1.[ObjectName2],
-   CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.[PersonnelTypeID],
-    t3.[Name],  -- Adding the PersonnelType from the third table
-	t2.text5,
-	t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-	t1.MessageType
-INTO 
-    #CombinedEmployeeData  -- Temporary table
-FROM 
-    [ACVSUJournal_00011027].[dbo].[ACVSUJournalLog] AS t1  -- Replace with your actual table name
-INNER JOIN 
-    [ACVSCore].[Access].[Personnel] AS t2  -- Replace with the actual table name
-ON 
-    t1.ObjectIdentity1 = t2.GUID
-INNER JOIN 
-    [ACVSCore].[Access].[PersonnelType] AS t3  -- Replace with the actual table name containing PersonnelType
-ON 
-    t2.[PersonnelTypeId] = t3.[ObjectID];
-	SELECT DISTINCT
-    [ObjectName1],
-    [Name],
-	EmployeeID,
-	text5,
-	PartitionName2,
-	Messagetype,
-    CONVERT(DATE, LocaleMessageTime) AS Date
-	FROM 
-    #CombinedEmployeeData  -- Use the temporary table with combined data
-	WHERE 
-    CONVERT (DATE, LocaleMessageTime) = '2025-06-26' 
-	AND PartitionName2 IN ('LT.Vilnius', 'AUT.Vienna', 'IE.DUblin', 'DU.Abu Dhab', 'ES.Madrid', 'IT.Rome', 'MA.Casablanca', 'RU.Moscow',
-	'UK.London') 
-	AND MessageType = 'CardAdmitted';
-
-	DROP Table #CombinedEmployeeData;
-
-
-
-
-
-
-3
-LACA HeadCount QUERY
-
-SELECT 
-    t1.[ObjectName1],
-    t1.[ObjectName2],
-   CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.[PersonnelTypeID],
-    t3.[Name],  -- Adding the PersonnelType from the third table
-	t2.text5,
-	t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-	t1.MessageType
-INTO 
-    #CombinedEmployeeData  -- Temporary table
-FROM 
-    [ACVSUJournal_00010028].[dbo].[ACVSUJournalLog] AS t1  -- Replace with your actual table name
-INNER JOIN 
-    [ACVSCore].[Access].[Personnel] AS t2  -- Replace with the actual table name
-ON 
-    t1.ObjectIdentity1 = t2.GUID
-INNER JOIN 
-    [ACVSCore].[Access].[PersonnelType] AS t3  -- Replace with the actual table name containing PersonnelType
-ON 
-    t2.[PersonnelTypeId] = t3.[ObjectID];
-	SELECT DISTINCT
-    [ObjectName1],
-    [Name],
-	EmployeeID,
-	text5,
-	PartitionName2,
-	Messagetype,
-    CONVERT(DATE, LocaleMessageTime) AS Date
-	FROM 
-    #CombinedEmployeeData  -- Use the temporary table with combined data
-	WHERE 
-    CONVERT (DATE, LocaleMessageTime) = '2025-07-12' 
-	AND PartitionName2 IN ('AR.Cordoba', 'BR.Sao Paulo', 'CR.Costa Rica Partition', 'MX.Mexico City', 'PA.Panama City', 'PE.Lima') 
-	AND MessageType = 'CardAdmitted';
-
-	DROP Table #CombinedEmployeeData;
-
-
-
-
-4)
-NAMER HeadCount QUERY
--- Step 1: Build the temp table with corrected logical location using door name (ObjectName2)
-SELECT
-    t1.[ObjectName1],
-    t1.[ObjectName2],
-    CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t2.[PersonnelTypeID],
-    t3.[Name], -- Personnel type
-    t2.[Text5],
-    t1.[PartitionName2],
- 
-    -- Assign accurate LogicalLocation using door name (ObjectName2)
-    CASE
-        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
-        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
-        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
-        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
-        ELSE 'Other'
-    END AS LogicalLocation,
- 
-    t1.[MessageType],
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime
- 
-INTO #CombinedEmployeeData
-FROM [ACVSUJournal_00010028].[dbo].[ACVSUJournalLog] AS t1
-INNER JOIN [ACVSCore].[Access].[Personnel] AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3
-    ON t2.[PersonnelTypeID] = t3.[ObjectID];
- 
--- Step 2: Select cleaned data for specific logical locations
-SELECT DISTINCT
-    [ObjectName1],
-    [Name],
-    EmployeeID,
-    Text5,
-    LogicalLocation,
-    MessageType,
-    CONVERT(DATE, LocaleMessageTime) AS [Date]
-FROM #CombinedEmployeeData
-WHERE
-    CONVERT(DATE, LocaleMessageTime) = '2025-07-21'
-    AND LogicalLocation IN ('Denver', 'Austin', 'Miami', 'New York')
-    AND MessageType = 'CardAdmitted';
-
-DROP TABLE #CombinedEmployeeData;
- 
 
 
 
@@ -787,8 +243,8 @@ DROP TABLE #CombinedEmployeeData;
 
 
 
-1)
-# combined_app_with_duration.py
+
+# C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
 # (Place this file replacing your previous combined_app_with_duration.py)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
@@ -3387,473 +2843,3 @@ if __name__ == "__main__":
         logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
     logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
 # ---- END duration_report.py content ----
-
-
-
-
-
-
-
-
-2)
-
-
-#C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\ccure_client.py
-
-"""
-Lightweight CCURE client wrappers used by compare service.
-This file is defensive: missing 'requests' or network failures return None instead of raising.
-Improved: requests.Session with retries/backoff and configurable base URL via env var CCURE_BASE.
-Timeouts configurable via CCURE_TIMEOUT (seconds).
-"""
-
-import math
-import logging
-import os
-from requests.exceptions import RequestException
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
-
-logger = logging.getLogger("ccure_client")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    import sys
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# Base URL for CCURE API - configurable via env var
-BASE = os.getenv("CCURE_BASE", "http://10.199.22.57:5001").rstrip("/")
-
-# Default request timeout (seconds). Increase via env var CCURE_TIMEOUT if your endpoints are slow.
-DEFAULT_TIMEOUT = int(os.getenv("CCURE_TIMEOUT", "120"))
-
-HEADERS = {
-    "Accept": "application/json"
-}
-
-# Defensive import of requests
-try:
-    import requests
-except Exception:
-    requests = None
-    logger.warning("requests module not available; ccure_client will return None for HTTP calls")
-
-
-def _build_session():
-    if requests is None:
-        return None
-    s = requests.Session()
-    try:
-        # stronger retry behaviour by default; respects Retry semantics from urllib3
-        retry = Retry(
-            total=5,
-            backoff_factor=1.0,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(['GET', 'HEAD', 'OPTIONS'])
-        )
-    except TypeError:
-        # older urllib3
-        retry = Retry(
-            total=5,
-            backoff_factor=1.0,
-            status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=frozenset(['GET', 'HEAD', 'OPTIONS'])
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    # nice-to-have: small default headers
-    s.headers.update({"User-Agent": "ccure_client/1.0"})
-    return s
-
-_SESSION = _build_session() if requests is not None else None
-
-
-def _safe_get(path, params=None, timeout=DEFAULT_TIMEOUT):
-    """
-    Safe GET wrapper. Returns parsed JSON on success or None on failure.
-
-    timeout: seconds for read timeout (connect timeout is fixed low)
-    """
-    if requests is None:
-        logger.debug("_safe_get: requests not available")
-        return None
-    if not path.startswith("/"):
-        path = "/" + path
-    url = BASE + path
-    session = _SESSION or requests
-    try:
-        # use (connect, read) tuple: short connect, larger read (for slow APIs)
-        r = session.get(url, params=params, headers=HEADERS, timeout=(5, max(5, int(timeout))))
-        r.raise_for_status()
-        try:
-            return r.json()
-        except ValueError:
-            logger.warning(f"[ccure_client] response not JSON for {url}")
-            return None
-    except RequestException as e:
-        logger.warning(f"[ccure_client] request failed {url} params={params} -> {e}")
-        return None
-    except Exception:
-        logger.exception(f"[ccure_client] unexpected error fetching {url}")
-        return None
-
-
-def fetch_all_employees_full():
-    """Try to fetch a full dump from /api/employees (may return list or None)."""
-    return _safe_get("/api/employees")
-
-
-def fetch_stats_page(detail, page=1, limit=500):
-    params = {"details": detail, "page": page, "limit": limit}
-    return _safe_get("/api/stats", params=params)
-
-
-def fetch_all_stats(detail, limit=1000):
-    first = fetch_stats_page(detail, page=1, limit=limit)
-    if not first:
-        return None
-    data = first.get("data") or []
-    total = int(first.get("total") or len(data) or 0)
-    if total <= len(data):
-        return data
-    pages = int(math.ceil(total / float(limit)))
-    for p in range(2, pages + 1):
-        page_res = fetch_stats_page(detail, page=p, limit=limit)
-        if not page_res:
-            break
-        data.extend(page_res.get("data") or [])
-    return data
-
-
-def get_global_stats():
-    """
-    Best-effort summary using /api/stats (preferred) or /api/employees (fallback).
-    Returns dict or None.
-    """
-    details = ["TotalProfiles", "ActiveProfiles", "ActiveEmployees", "ActiveContractors",
-               "TerminatedProfiles", "TerminatedEmployees", "TerminatedContractors"]
-    out = {}
-
-    # Try a single call to /api/stats
-    try:
-        summary = _safe_get("/api/stats")
-        if isinstance(summary, dict) and any(k in summary for k in details):
-            for k in details:
-                for key in summary.keys():
-                    if key.lower() == k.lower():
-                        out[k] = summary.get(key)
-                        break
-            if out:
-                safe_out = {}
-                for k, v in out.items():
-                    try:
-                        safe_out[k] = int(v) if v is not None and str(v).strip() != "" else None
-                    except Exception:
-                        safe_out[k] = v
-                return safe_out
-    except Exception:
-        logger.exception("get_global_stats: top-level /api/stats failed")
-
-    # Try per-detail endpoints
-    try:
-        any_found = False
-        for d in details:
-            resp = fetch_stats_page(d, page=1, limit=1)
-            if isinstance(resp, dict):
-                if 'total' in resp and isinstance(resp['total'], (int, float, str)):
-                    out[d] = int(resp['total'])
-                    any_found = True
-                elif d in resp:
-                    out[d] = resp.get(d)
-                    any_found = True
-                else:
-                    for key in resp.keys():
-                        if key.lower() == d.lower() and isinstance(resp.get(key), (int, float, str)):
-                            try:
-                                out[d] = int(resp.get(key))
-                                any_found = True
-                            except Exception:
-                                out[d] = resp.get(key)
-                                any_found = True
-                            break
-        if any_found:
-            return {k: (int(v) if (v is not None and str(v).strip() != "") else None) for k, v in out.items()}
-    except Exception:
-        logger.exception("fetch per-detail stats failed")
-
-    # Fallback: try /api/employees dump
-    try:
-        full = fetch_all_employees_full()
-        if isinstance(full, list):
-            total = len(full)
-            active_profiles = sum(1 for r in full if (r.get("Employee_Status") or "").lower() == "active")
-            active_emps = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("employee") and (r.get("Employee_Status") or "").lower() == "active")
-            active_contractors = sum(1 for r in full if (r.get("PersonnelType") or "").lower().startswith("contractor") and (r.get("Employee_Status") or "").lower() == "active")
-            terminated = sum(1 for r in full if (r.get("Employee_Status") or "").lower() in ("deactive", "deactivated", "inactive", "terminated"))
-            return {
-                "TotalProfiles": total,
-                "ActiveProfiles": active_profiles,
-                "ActiveEmployees": active_emps,
-                "ActiveContractors": active_contractors,
-                "TerminatedProfiles": terminated
-            }
-    except Exception:
-        logger.exception("Error calculating global stats from full dump fallback")
-
-    return None
-
-
-
-
-
-
-3)
-# region_clients.py
-"""
-HTTP helpers for region occupancy endpoints.
-Returns:
- - fetch_all_regions() -> list of {"region": <name>, "count": <int>}
- - fetch_all_details(timeout=...) -> list of person-detail dicts (where available)
- - fetch_all_history(timeout=...) -> list of date-or-detail dicts (history endpoints)
-
-Drop-in replacement for your region_clients.py (more defensive retries + per-endpoint cooldown).
-"""
-import requests
-from requests.exceptions import RequestException
-from datetime import datetime
-import logging
-import time
-import sys
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-logger = logging.getLogger("region_clients")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(ch)
-
-# endpoints (edit if your hosts differ)
-endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/live-summary",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/live-summary",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/live-summary",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/live-summary"
-}
-
-history_endpoints = {
-    "namer": "http://10.199.22.57:3006/api/occupancy/history",
-    "emea":  "http://10.199.22.57:3007/api/occupancy/history",
-    "apac":  "http://10.199.22.57:3008/api/occupancy/history",
-    "laca":  "http://10.199.22.57:4000/api/occupancy/history"
-}
-
-DEFAULT_ATTEMPTS = 3
-DEFAULT_BACKOFF = 0.6
-# per-endpoint cooldown in seconds after repeated failure to avoid hammering
-ENDPOINT_COOLDOWN_SECONDS = 60
-ENDPOINT_FAILURES = {}  # url -> (last_failed_ts, fail_count)
-
-def _build_session():
-    s = requests.Session()
-    try:
-        # Retry for idempotent GETs
-        retry = Retry(
-            total=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(['GET', 'HEAD'])
-        )
-    except TypeError:
-        # older urllib3
-        retry = Retry(
-            total=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=frozenset(['GET', 'HEAD'])
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-_SESSION = _build_session()
-
-def _do_get_with_retries(url, timeout, attempts=DEFAULT_ATTEMPTS, backoff=DEFAULT_BACKOFF):
-    now = time.time()
-    # cooldown check
-    last = ENDPOINT_FAILURES.get(url)
-    if last:
-        last_failed_ts, fail_count = last
-        if now - last_failed_ts < ENDPOINT_COOLDOWN_SECONDS:
-            logger.debug("[region_clients] skipping %s (in cooldown, last failure %ds ago)", url, int(now - last_failed_ts))
-            return None
-
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            # use separate connect/read timeouts
-            r = _SESSION.get(url, timeout=(3, max(5, timeout)))
-            r.raise_for_status()
-            try:
-                return r.json()
-            except ValueError:
-                try:
-                    return {"_raw_text": r.text}
-                except Exception:
-                    return None
-        except RequestException as e:
-            last_err = e
-            logger.warning(f"[region_clients] attempt {attempt}/{attempts} failed for {url}: {e}")
-            if attempt < attempts:
-                time.sleep(backoff * attempt)
-            continue
-        except Exception as e:
-            last_err = e
-            logger.warning(f"[region_clients] unexpected error fetching {url}: {e}")
-            if attempt < attempts:
-                time.sleep(backoff * attempt)
-            continue
-
-    # mark failure
-    ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
-    logger.warning(f"[region_clients] all {attempts} attempts failed for {url}: {last_err}")
-    return None
-
-def fetch_all_regions(timeout=6):
-    results = []
-    for region, url in endpoints.items():
-        try:
-            data = _do_get_with_retries(url, timeout=timeout) or {}
-            realtime = {}
-            if isinstance(data, dict):
-                realtime = data.get("realtime", {}) or {}
-            total = 0
-            for site in realtime.values():
-                try:
-                    total += int(site.get("total", 0))
-                except Exception:
-                    pass
-            if total == 0 and isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, dict) and "total" in v:
-                        try:
-                            total += int(v.get("total", 0))
-                        except Exception:
-                            pass
-            results.append({"region": region, "count": total})
-        except Exception as e:
-            logger.exception(f"[region_clients] unexpected error fetching live-summary for {region}: {e}")
-            results.append({"region": region, "count": None})
-    return results
-
-def _extract_list_candidates(data):
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        for k in ("details","people","list","items","results","data","entries"):
-            if k in data and isinstance(data[k], list):
-                return [x for x in data[k] if isinstance(x, dict)]
-        return []
-    return []
-
-def fetch_all_details(timeout=6):
-    all_details = []
-    for region, url in endpoints.items():
-        try:
-            data = _do_get_with_retries(url, timeout=timeout) or {}
-            details = _extract_list_candidates(data)
-            if not details and isinstance(data, dict):
-                for v in data.values():
-                    if isinstance(v, dict):
-                        candidates = _extract_list_candidates(v)
-                        if candidates:
-                            details.extend(candidates)
-            for d in details:
-                try:
-                    d2 = dict(d)
-                    d2["_region"] = region
-                    d2["_source_url"] = url
-                    all_details.append(d2)
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"[region_clients] warning: cannot fetch details from {region}@{url}: {e}")
-            continue
-
-    # try history endpoints as second chance
-    if not all_details:
-        for region, url in history_endpoints.items():
-            try:
-                data = _do_get_with_retries(url, timeout=timeout) or {}
-                details = _extract_list_candidates(data)
-                for d in details:
-                    try:
-                        d2 = dict(d)
-                        d2["_region"] = region
-                        d2["_source_url"] = url
-                        all_details.append(d2)
-                    except Exception:
-                        continue
-            except Exception:
-                logger.debug(f"[region_clients] history details fetch for {region} failed", exc_info=True)
-                continue
-
-    logger.info("[region_clients] fetched %d detail rows across endpoints", len(all_details))
-    return all_details
-
-def fetch_history_for_region(region, timeout=6):
-    url = history_endpoints.get(region)
-    if not url:
-        logger.debug(f"[fetch_history_for_region] no history endpoint for {region}")
-        return []
-    try:
-        data = _do_get_with_retries(url, timeout=timeout) or {}
-        summary = []
-        if isinstance(data, dict):
-            for key in ("summaryByDate","summary","data","entries","results","details","items"):
-                if key in data and isinstance(data.get(key), list):
-                    for s in data.get(key):
-                        if isinstance(s, dict):
-                            s2 = dict(s)
-                            s2["_region"] = region
-                            s2["_source_url"] = url
-                            summary.append(s2)
-                    break
-            else:
-                if "date" in data or "day" in data:
-                    s2 = dict(data)
-                    s2["_region"] = region
-                    s2["_source_url"] = url
-                    summary.append(s2)
-        elif isinstance(data, list):
-            for s in data:
-                if isinstance(s, dict):
-                    s2 = dict(s)
-                    s2["_region"] = region
-                    s2["_source_url"] = url
-                    summary.append(s2)
-        return summary
-    except Exception as e:
-        logger.warning(f"[region_clients] cannot fetch history for {region}@{url}: {e}")
-        # mark failure timestamp so callers don't hammer this endpoint in the same run
-        ENDPOINT_FAILURES[url] = (time.time(), (ENDPOINT_FAILURES.get(url, (0,0))[1] or 0) + 1)
-        return []
-
-def fetch_all_history(timeout=6):
-    all_entries = []
-    for region in history_endpoints.keys():
-        try:
-            entries = fetch_history_for_region(region, timeout=timeout)
-            if entries:
-                all_entries.extend(entries)
-        except Exception:
-            logger.exception(f"[region_clients] error aggregating history for {region}")
-            continue
-    logger.info("[region_clients] fetched %d history entries", len(all_entries))
-    return all_entries
-
-
