@@ -1,3 +1,241 @@
+# ---------- DB-first helpers for visited-today and live totals ----------
+def _get_visited_today_from_db():
+    """
+    Authoritative: compute visited today counts from AttendanceSummary (SQL).
+    Returns dict: {"total": int, "employee": int, "contractor": int}
+    Returns None if DB unavailable or query fails.
+    """
+    try:
+        if SessionLocal is None or AttendanceSummary is None:
+            logger.debug("_get_visited_today_from_db: SessionLocal/AttendanceSummary not available")
+            return None
+        today = date.today()
+        emp_count = 0
+        contr_count = 0
+        total_seen = 0
+        seen_keys = set()
+
+        with SessionLocal() as db:
+            rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            if not rows:
+                logger.debug("_get_visited_today_from_db: no AttendanceSummary rows for today")
+                return {"total": 0, "employee": 0, "contractor": 0}
+
+            def classify_from_derived(derived):
+                try:
+                    if not derived or not isinstance(derived, dict):
+                        return "contractor"
+                    for k in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                        v = derived.get(k)
+                        if v and "employee" in str(v).strip().lower():
+                            return "employee"
+                    # fallback heuristics
+                    return "contractor"
+                except Exception:
+                    return "contractor"
+
+            for a in rows:
+                try:
+                    # build canonical key — prefer employee_id, else derived.card_number
+                    key = None
+                    try:
+                        key = _normalize_employee_key(getattr(a, "employee_id", None))
+                    except Exception:
+                        key = None
+                    if not key:
+                        try:
+                            derived = getattr(a, "derived", None)
+                            if isinstance(derived, dict):
+                                key = _normalize_card_like(derived.get("card_number") or derived.get("CardNumber") or derived.get("card"))
+                        except Exception:
+                            key = None
+                    if not key:
+                        # some entries may still have other unique identifiers, fall back to record id
+                        # but we prefer not to double-count unknowns. Count them into total nonetheless.
+                        # Use the DB row identity if that exists
+                        try:
+                            rid = getattr(a, "id", None) or getattr(a, "pk", None)
+                            key = f"__row__{rid}"
+                        except Exception:
+                            key = None
+
+                    if not key:
+                        # best effort increment total
+                        total_seen += 1
+                        continue
+
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    total_seen += 1
+
+                    cls = classify_from_derived(getattr(a, "derived", None))
+                    if cls == "employee":
+                        emp_count += 1
+                    else:
+                        contr_count += 1
+                except Exception:
+                    # if any row processing fails, still continue
+                    logger.debug("Visited-today row parse failed (non-fatal)", exc_info=True)
+                    continue
+
+        return {"total": int(total_seen), "employee": int(emp_count), "contractor": int(contr_count)}
+    except Exception:
+        logger.exception("_get_visited_today_from_db failed")
+        return None
+
+
+def _get_live_from_live_summary_or_db(live_summary_endpoints: List[str] = None, timeout: int = 5):
+    """
+    Prefer live-summary endpoints for currently present totals. If live-summary endpoints
+    fail to yield a credible total, fall back to DB counts:
+      - Use LiveSwipe table if available (distinct persons today)
+      - Else use AttendanceSummary counts for today (distinct)
+    Returns {"currently_present_total": int, "employee": int, "contractor": int} or None.
+    """
+    try:
+        # attempt HTTP / region_clients route first
+        if live_summary_endpoints is None:
+            live_summary_endpoints = [
+                "http://10.199.22.57:3006/api/occupancy/live-summary",
+                "http://10.199.22.57:3007/api/occupancy/live-summary",
+                "http://10.199.22.57:4000/api/occupancy/live-summary",
+                "http://10.199.22.57:3008/api/occupancy/live-summary"
+            ]
+        try:
+            totals = _fetch_live_summary_totals(live_summary_endpoints, timeout=timeout)
+            if isinstance(totals, dict):
+                # Validate numbers
+                emp = totals.get("employee")
+                contr = totals.get("contractor")
+                tot = totals.get("currently_present_total")
+                # if totals are plausible (non-negative and at least one present or zero but both present counts present),
+                # treat as authoritative
+                if tot is not None or (emp is not None or contr is not None):
+                    emp_i = int(emp or 0)
+                    contr_i = int(contr or 0)
+                    tot_i = int(tot if (tot is not None) else (emp_i + contr_i))
+                    return {"currently_present_total": tot_i, "employee": emp_i, "contractor": contr_i}
+        except Exception:
+            logger.debug("live-summary endpoints attempt failed (non-fatal)", exc_info=True)
+
+        # Fallback to DB: LiveSwipe (preferred) -> AttendanceSummary
+        if SessionLocal is not None and LiveSwipe is not None:
+            try:
+                today = date.today()
+                start = datetime.combine(today, datetime.min.time())
+                end = datetime.combine(today, datetime.max.time())
+                with SessionLocal() as db:
+                    # fetch swipes for today; count distinct person keys
+                    rows = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+                    seen = {}
+                    for s in rows:
+                        try:
+                            # use employee id, card number, or person GUID
+                            eid = getattr(s, "employee_id", None) or getattr(s, "EmployeeID", None)
+                            card = getattr(s, "card_number", None) or getattr(s, "CardNumber", None)
+                            pg = getattr(s, "person_guid", None) or getattr(s, "PersonGUID", None) or getattr(s, "EmployeeIdentity", None)
+                            key = _normalize_employee_key(eid) or _normalize_card_like(card) or (str(pg).strip() if pg is not None else None)
+                            if not key:
+                                continue
+                            if key in seen:
+                                continue
+                            # classification attempt (if LiveSwipe stores personnel type)
+                            ptype = None
+                            try:
+                                ptype = getattr(s, "personnel_type", None) or getattr(s, "PersonnelType", None) or getattr(s, "PersonnelTypeName", None)
+                            except Exception:
+                                ptype = None
+                            if ptype and "employee" in str(ptype).strip().lower():
+                                seen[key] = "employee"
+                            else:
+                                seen[key] = "contractor"
+                    emp_n = sum(1 for v in seen.values() if v == "employee")
+                    contr_n = sum(1 for v in seen.values() if v == "contractor")
+                    tot_n = len(seen)
+                    return {"currently_present_total": int(tot_n), "employee": int(emp_n), "contractor": int(contr_n)}
+            except Exception:
+                logger.exception("LiveSwipe DB fallback failed (non-fatal)")
+
+        # Last fallback: AttendanceSummary distinct keys for today (useful if LiveSwipe not populated)
+        try:
+            db_counts = _get_visited_today_from_db()
+            if db_counts is not None:
+                # AttendanceSummary describes today's presence; treat as last fallback for live if nothing better.
+                return {"currently_present_total": int(db_counts.get("total") or 0),
+                        "employee": int(db_counts.get("employee") or 0),
+                        "contractor": int(db_counts.get("contractor") or 0)}
+        except Exception:
+            logger.exception("AttendanceSummary fallback for live failed (non-fatal)")
+
+        # give up
+        return None
+    except Exception:
+        logger.exception("_get_live_from_live_summary_or_db failed")
+        return None
+
+
+
+
+
+
+
+
+
+
+
+
+            # after: pruned = _prune_summary(summary)
+            # --- ENSURE authoritative visited-today from SQL (AttendanceSummary) ---
+            try:
+                db_vis = _get_visited_today_from_db()
+                if isinstance(db_vis, dict):
+                    pruned["headcount_attendance_summary"] = {
+                        "total_visited_today": int(db_vis.get("total") or 0),
+                        "employee": int(db_vis.get("employee") or 0),
+                        "contractor": int(db_vis.get("contractor") or 0)
+                    }
+            except Exception:
+                logger.exception("Failed to override headcount_attendance_summary from DB (non-fatal)")
+
+            # --- ENSURE live totals come from live-summary endpoints (fallback to DB) ---
+            try:
+                LIVE_SUMMARY_ENDPOINTS = [
+                    "http://10.199.22.57:3006/api/occupancy/live-summary",
+                    "http://10.199.22.57:3007/api/occupancy/live-summary",
+                    "http://10.199.22.57:4000/api/occupancy/live-summary",
+                    "http://10.199.22.57:3008/api/occupancy/live-summary"
+                ]
+                live_tot = _get_live_from_live_summary_or_db(LIVE_SUMMARY_ENDPOINTS, timeout=5)
+                if isinstance(live_tot, dict):
+                    pruned["live_headcount_region_clients"] = {
+                        "currently_present_total": int(live_tot.get("currently_present_total") or 0),
+                        "employee": int(live_tot.get("employee") or 0),
+                        "contractor": int(live_tot.get("contractor") or 0)
+                    }
+            except Exception:
+                logger.exception("Failed to override live_headcount_region_clients (non-fatal)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 so Check below API responce 
 for below API responce inportant is Visited today count Fix this carefully...
 
