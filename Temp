@@ -1,3 +1,931 @@
+# app.py
+# Updated: compute visited-today strictly from SQL; live counts from live-summary endpoints (HTTP).
+# Drop-in replacement for the route portions of your backend. Assumes existing db/ models modules.
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
+import shutil
+import uuid
+import json
+import logging
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import re
+import asyncio
+from typing import Optional, Dict, Any, List
+import hashlib
+import time
+import os
+import sys
+import pandas as pd
+from zoneinfo import ZoneInfo
+import warnings
+import functools
+
+# Basic logging
+logger = logging.getLogger("attendance_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+# Try to import DB models (must exist in your project)
+try:
+    from db import SessionLocal
+    from models import LiveSwipe, AttendanceSummary
+except Exception:
+    SessionLocal = None
+    LiveSwipe = None
+    AttendanceSummary = None
+    logger.warning("DB models not importable; DB-backed features will be disabled or return zero.")
+
+# HTTP client
+try:
+    import requests
+except Exception:
+    requests = None
+
+# Directories
+try:
+    from settings import DATA_DIR as SETTINGS_DATA_DIR, OUTPUT_DIR as SETTINGS_OUTPUT_DIR
+    DATA_DIR = Path(SETTINGS_DATA_DIR)
+    OUTPUT_DIR = Path(SETTINGS_OUTPUT_DIR)
+except Exception:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+    OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+RAW_UPLOADS_DIR = DATA_DIR / "raw_uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RAW_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Attendance Analytics")
+
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:3008"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------------------------------
+# Helper utilities (normalization etc.)
+# -------------------------------------------------------------------------
+def _normalize_employee_key(x) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "null"):
+            return None
+        return s
+    except Exception:
+        return None
+
+def _normalize_card_like(s) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss == "":
+            return None
+        digits = re.sub(r'\D+', '', ss)
+        if digits == "":
+            return None
+        return digits.lstrip('0') or digits
+    except Exception:
+        return None
+
+def _safe_int(v):
+    try:
+        if v is None or v == "":
+            return None
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# -------------------------------------------------------------------------
+# Live-summary fetching (use first credible endpoint; do not sum across endpoints)
+# -------------------------------------------------------------------------
+def _build_requests_session():
+    if requests is None:
+        return None
+    from requests.adapters import HTTPAdapter
+    try:
+        from urllib3.util.retry import Retry
+        try:
+            retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504),
+                          allowed_methods=frozenset(['GET', 'HEAD']))
+        except TypeError:
+            retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504),
+                          method_whitelist=frozenset(['GET', 'HEAD']))
+        s = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        return s
+    except Exception:
+        return requests
+
+def _fetch_live_summary_totals(urls: List[str], timeout: int = 5) -> Optional[Dict[str, int]]:
+    """
+    Strict behavior:
+      - Try region_clients aggregated methods first (if available).
+      - Otherwise try each HTTP live-summary endpoint and return the first payload that contains a usable
+        totals shape: either a direct {'total'/'Employee'/'Contractor'} or a 'today' object or 'realtime' mapping.
+      - Do NOT sum across endpoints (endpoints overlap).
+      - Return None if no credible endpoint returned totals.
+    """
+    # try region_clients first if present
+    try:
+        import region_clients
+        # region_clients may provide single consolidated entries or a list of sites
+        for attr in ("fetch_all_live_summary","fetch_all_summary","fetch_all_details"):
+            if hasattr(region_clients, attr):
+                try:
+                    got = getattr(region_clients, attr)(timeout=timeout)
+                except TypeError:
+                    got = getattr(region_clients, attr)()
+                if got:
+                    # attempt to normalize as we did before
+                    if isinstance(got, dict):
+                        emp = got.get("Employee") or got.get("employee") or got.get("active_employees") or got.get("activeEmployeeCount")
+                        contr = got.get("Contractor") or got.get("contractor") or got.get("active_contractors") or got.get("activeContractorCount")
+                        tot = got.get("total") or got.get("currently_present_total") or (int(emp or 0) + int(contr or 0) if (emp is not None or contr is not None) else None)
+                        try:
+                            return {"currently_present_total": int(tot or 0), "employee": int(emp or 0), "contractor": int(contr or 0)}
+                        except Exception:
+                            pass
+                    if isinstance(got, list):
+                        # sum single list if it's clearly site-level rows and not aggregated across regions
+                        emp_sum = contr_sum = tot_sum = 0
+                        got_any = False
+                        for e in got:
+                            try:
+                                if isinstance(e, dict):
+                                    if "today" in e and isinstance(e["today"], dict):
+                                        t = e["today"]
+                                        emp_sum += int(t.get("Employee") or t.get("employee") or 0)
+                                        contr_sum += int(t.get("Contractor") or t.get("contractor") or 0)
+                                        tot_sum += int(t.get("total") or (int(t.get("Employee") or 0) + int(t.get("Contractor") or 0)))
+                                        got_any = True
+                                    elif "Employee" in e or "employee" in e:
+                                        emp_sum += int(e.get("Employee") or e.get("employee") or 0)
+                                        contr_sum += int(e.get("Contractor") or e.get("contractor") or 0)
+                                        tot_sum += int(e.get("total") or (int(e.get("Employee") or 0) + int(e.get("Contractor") or 0)))
+                                        got_any = True
+                            except Exception:
+                                continue
+                        if got_any:
+                            return {"currently_present_total": int(tot_sum or (emp_sum + contr_sum)), "employee": int(emp_sum), "contractor": int(contr_sum)}
+        # otherwise continue to HTTP fallback
+    except Exception:
+        pass
+
+    if requests is None:
+        return None
+
+    session = _build_requests_session() or requests
+
+    for url in urls:
+        if not url:
+            continue
+        try:
+            resp = session.get(url, timeout=(3, max(5, int(timeout))))
+            if not resp or getattr(resp, "status_code", None) != 200:
+                continue
+            try:
+                payload = resp.json()
+            except Exception:
+                continue
+
+            # try to extract totals from payload (single endpoint)
+            def compute(payload_obj):
+                emp_total = contr_total = tot_total = 0
+                got = False
+                try:
+                    if isinstance(payload_obj, dict):
+                        if "today" in payload_obj and isinstance(payload_obj["today"], dict):
+                            t = payload_obj["today"]
+                            emp = t.get("Employee") or t.get("employee") or 0
+                            contr = t.get("Contractor") or t.get("contractor") or 0
+                            tot = t.get("total") or (int(emp or 0) + int(contr or 0))
+                            emp_total += int(emp or 0)
+                            contr_total += int(contr or 0)
+                            tot_total += int(tot or (int(emp or 0) + int(contr or 0)))
+                            got = True
+                        elif "realtime" in payload_obj and isinstance(payload_obj["realtime"], dict):
+                            for site_obj in payload_obj["realtime"].values():
+                                try:
+                                    emp = site_obj.get("Employee") or site_obj.get("employee") or 0
+                                    contr = site_obj.get("Contractor") or site_obj.get("contractor") or 0
+                                    tot = site_obj.get("total") or (int(emp or 0) + int(contr or 0))
+                                    emp_total += int(emp or 0)
+                                    contr_total += int(contr or 0)
+                                    tot_total += int(tot or (int(emp or 0) + int(contr or 0)))
+                                    got = True
+                                except Exception:
+                                    continue
+                        elif "Employee" in payload_obj or "employee" in payload_obj or "total" in payload_obj:
+                            emp = payload_obj.get("Employee") or payload_obj.get("employee") or 0
+                            contr = payload_obj.get("Contractor") or payload_obj.get("contractor") or 0
+                            tot = payload_obj.get("total") or (int(emp or 0) + int(contr or 0))
+                            emp_total += int(emp or 0)
+                            contr_total += int(contr or 0)
+                            tot_total += int(tot or (int(emp or 0) + int(contr or 0)))
+                            got = True
+                        else:
+                            # search nested dicts for site-like dicts
+                            for v in payload_obj.values():
+                                if isinstance(v, dict) and ("Employee" in v or "employee" in v or "total" in v):
+                                    try:
+                                        emp = v.get("Employee") or v.get("employee") or 0
+                                        contr = v.get("Contractor") or v.get("contractor") or 0
+                                        tot = v.get("total") or (int(emp or 0) + int(contr or 0))
+                                        emp_total += int(emp or 0)
+                                        contr_total += int(contr or 0)
+                                        tot_total += int(tot or (int(emp or 0) + int(contr or 0)))
+                                        got = True
+                                    except Exception:
+                                        continue
+                    elif isinstance(payload_obj, list):
+                        for item in payload_obj:
+                            if isinstance(item, dict):
+                                s = compute(item)
+                                if s:
+                                    emp_total += s["employee"]
+                                    contr_total += s["contractor"]
+                                    tot_total += s["currently_present_total"]
+                                    got = True
+                except Exception:
+                    pass
+                if got:
+                    return {"currently_present_total": int(tot_total or (emp_total + contr_total)),
+                            "employee": int(emp_total),
+                            "contractor": int(contr_total)}
+                return None
+
+            totals = compute(payload)
+            if totals:
+                # Valid totals found in this single endpoint => return it
+                return totals
+        except Exception:
+            logger.debug("live-summary fetch failed for %s", url, exc_info=True)
+            continue
+
+    return None
+
+# -------------------------------------------------------------------------
+# DB-backed visited-today computation (AttendanceSummary / LiveSwipe fallback)
+# -------------------------------------------------------------------------
+def _compute_visited_today_from_db(target_date: Optional[date] = None) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      "total_visited_today": int,
+      "employee": int,
+      "contractor": int,
+      "by_location": { "PartitionName2": { "employee": int, "contractor": int, "total": int }, ... }
+    }
+    Strictly counts unique persons (dedupe by employee_id or derived.card_number or combination).
+    """
+    if target_date is None:
+        target_date = date.today()
+    out = {"total_visited_today": 0, "employee": 0, "contractor": 0, "by_location": {}}
+    if SessionLocal is None or AttendanceSummary is None:
+        return out
+
+    try:
+        seen = set()
+        with SessionLocal() as db:
+            try:
+                rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+            except Exception:
+                rows = []
+            if rows:
+                for r in rows:
+                    key = None
+                    try:
+                        key = _normalize_employee_key(getattr(r, "employee_id", None))
+                    except Exception:
+                        key = None
+                    if not key:
+                        # try derived card number
+                        try:
+                            derived = getattr(r, "derived", None)
+                            if isinstance(derived, dict):
+                                key = _normalize_card_like(derived.get("card_number") or derived.get("CardNumber") or derived.get("card") or None)
+                        except Exception:
+                            key = None
+                    if not key:
+                        # fallback: combine some fields (not ideal)
+                        try:
+                            derived = getattr(r, "derived", None)
+                            if isinstance(derived, dict):
+                                comb = "|".join([str(derived.get(k) or "") for k in ("card_number", "EmployeeID", "CardNumber")])
+                                if comb and comb.strip():
+                                    key = comb
+                        except Exception:
+                            key = None
+                    if not key:
+                        # increment unknown bucket (but do not dedupe)
+                        continue
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    # classify
+                    cls = "contractor"
+                    try:
+                        derived = getattr(r, "derived", None)
+                        if isinstance(derived, dict):
+                            for pk in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                                v = derived.get(pk)
+                                if v and "employee" in str(v).strip().lower():
+                                    cls = "employee"
+                                    break
+                    except Exception:
+                        pass
+
+                    # location partition (if available)
+                    try:
+                        derived = getattr(r, "derived", None)
+                        partition = None
+                        if isinstance(derived, dict):
+                            partition = derived.get("partition") or derived.get("PartitionName2") or derived.get("partitionName2")
+                        if not partition:
+                            # try r.partitionName2 attribute
+                            partition = getattr(r, "partition", None) or getattr(r, "PartitionName2", None)
+                    except Exception:
+                        partition = None
+
+                    out_key = partition if partition else "unknown"
+                    loc = out["by_location"].setdefault(out_key, {"employee": 0, "contractor": 0, "total": 0})
+                    if cls == "employee":
+                        loc["employee"] += 1
+                        out["employee"] += 1
+                    else:
+                        loc["contractor"] += 1
+                        out["contractor"] += 1
+                    loc["total"] += 1
+                    out["total_visited_today"] += 1
+
+            else:
+                # No AttendanceSummary rows today: fallback to LiveSwipe entries between start & end of day.
+                try:
+                    start = datetime.combine(target_date, datetime.min.time())
+                    end = datetime.combine(target_date, datetime.max.time())
+                    swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+                    seen_swipe_keys = set()
+                    for s in swipes:
+                        # dedupe by EmployeeIdentity, CardNumber or PersonGUID
+                        k = None
+                        try:
+                            k = getattr(s, "person_guid", None) or getattr(s, "EmployeeIdentity", None) or getattr(s, "PersonGUID", None)
+                        except Exception:
+                            k = None
+                        if not k:
+                            try:
+                                k = getattr(s, "card_number", None) or getattr(s, "CardNumber", None) or getattr(s, "Text12", None)
+                            except Exception:
+                                k = None
+                        if not k:
+                            continue
+                        if k in seen_swipe_keys:
+                            continue
+                        seen_swipe_keys.add(k)
+                        # classification: try personnel type or company
+                        cls = "contractor"
+                        try:
+                            ptype = getattr(s, "PersonnelTypeName", None) or getattr(s, "PersonnelType", None)
+                            if ptype and "employee" in str(ptype).strip().lower():
+                                cls = "employee"
+                        except Exception:
+                            pass
+                        partition = getattr(s, "PartitionName2", None) or getattr(s, "partition", None) or "unknown"
+                        out_key = partition
+                        loc = out["by_location"].setdefault(out_key, {"employee": 0, "contractor": 0, "total": 0})
+                        if cls == "employee":
+                            loc["employee"] += 1
+                            out["employee"] += 1
+                        else:
+                            loc["contractor"] += 1
+                            out["contractor"] += 1
+                        loc["total"] += 1
+                        out["total_visited_today"] += 1
+                except Exception:
+                    logger.exception("LiveSwipe fallback counting failed")
+    except Exception:
+        logger.exception("compute_visited_today_from_db failed")
+
+    return out
+
+# -------------------------------------------------------------------------
+# Helper to compute live counts from DB (fallback when live-summary HTTP fails)
+# -------------------------------------------------------------------------
+def _compute_live_from_db(target_date: Optional[date] = None) -> Dict[str, int]:
+    """
+    Return dict {"currently_present_total": int, "employee": int, "contractor": int}
+    using AttendanceSummary/LiveSwipe as fallback.
+    """
+    if target_date is None:
+        target_date = date.today()
+    counts = {"currently_present_total": 0, "employee": 0, "contractor": 0}
+    if SessionLocal is None:
+        return counts
+    try:
+        with SessionLocal() as db:
+            rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == target_date).all()
+            if rows:
+                seen = set()
+                for r in rows:
+                    key = _normalize_employee_key(getattr(r, "employee_id", None))
+                    if not key:
+                        derived = getattr(r, "derived", None)
+                        if isinstance(derived, dict):
+                            key = _normalize_card_like(derived.get("card_number") or derived.get("CardNumber") or None)
+                    if not key:
+                        continue
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cls = "contractor"
+                    derived = getattr(r, "derived", None)
+                    if isinstance(derived, dict):
+                        for pk in ("PersonnelType","personnelType","personnel_type","Personnel Type","Type","personnel"):
+                            v = derived.get(pk)
+                            if v and "employee" in str(v).strip().lower():
+                                cls = "employee"
+                                break
+                    if cls == "employee":
+                        counts["employee"] += 1
+                    else:
+                        counts["contractor"] += 1
+                counts["currently_present_total"] = counts["employee"] + counts["contractor"]
+                return counts
+            # else fallback to live swipes
+            start = datetime.combine(target_date, datetime.min.time())
+            end = datetime.combine(target_date, datetime.max.time())
+            swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+            seen_swipes = set()
+            for s in swipes:
+                k = getattr(s, "EmployeeIdentity", None) or getattr(s, "PersonGUID", None) or getattr(s, "CardNumber", None)
+                if not k:
+                    continue
+                if k in seen_swipes:
+                    continue
+                seen_swipes.add(k)
+                cls = "contractor"
+                try:
+                    ptype = getattr(s, "PersonnelTypeName", None) or getattr(s, "PersonnelType", None)
+                    if ptype and "employee" in str(ptype).strip().lower():
+                        cls = "employee"
+                except Exception:
+                    pass
+                if cls == "employee":
+                    counts["employee"] += 1
+                else:
+                    counts["contractor"] += 1
+            counts["currently_present_total"] = counts["employee"] + counts["contractor"]
+            return counts
+    except Exception:
+        logger.exception("compute_live_from_db failed")
+    return counts
+
+# -------------------------------------------------------------------------
+# API endpoints
+# -------------------------------------------------------------------------
+# small helpers for caching
+_CCURE_CACHE_DIR = OUTPUT_DIR / "ccure_cache"
+_CCURE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _sha_for_parts(*parts: str):
+    s = "|".join([str(p or "") for p in parts])
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _ccure_cache_path(start_date: Optional[str], end_date: Optional[str]):
+    key = _sha_for_parts(start_date or "", end_date or "")
+    return _CCURE_CACHE_DIR / f"ccure_verify_cache_{key}.json"
+
+def _load_ccure_cache(start_date: Optional[str], end_date: Optional[str], max_age_seconds: int):
+    p = _ccure_cache_path(start_date, end_date)
+    if not p.exists():
+        return None
+    try:
+        st = p.stat()
+        age = time.time() - st.st_mtime
+        if age > max_age_seconds:
+            return None
+        with p.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        logger.exception("Failed reading ccure cache at %s", p)
+        return None
+
+def _save_ccure_cache(start_date: Optional[str], end_date: Optional[str], payload: dict):
+    p = _ccure_cache_path(start_date, end_date)
+    try:
+        enc = jsonable_encoder(payload)
+        with p.open("w", encoding="utf-8") as fh:
+            json.dump({"cached_at": datetime.utcnow().isoformat(), "payload": enc}, fh)
+    except Exception:
+        logger.exception("Failed writing ccure cache to %s", p)
+
+# live-summary endpoints (authoritative)
+LIVE_SUMMARY_ENDPOINTS = [
+    "http://10.199.22.57:3006/api/occupancy/live-summary",
+    "http://10.199.22.57:3007/api/occupancy/live-summary",
+    "http://10.199.22.57:4000/api/occupancy/live-summary",
+    "http://10.199.22.57:3008/api/occupancy/live-summary"
+]
+
+@app.get("/ccure/verify")
+async def ccure_verify(
+    raw: bool = Query(False, description="if true, include the raw compute payload for debugging"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD start date (inclusive)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    refresh: bool = Query(False, description="If true, force recompute and update cache")
+):
+    """
+    Returns a compact payload used by UI.
+    Strict rules:
+      - visited-today counts (headcount_attendance_summary) are computed from SQL.
+      - live counts (live_headcount_region_clients) are fetched from live-summary endpoints; if they fail, fallback to SQL.
+    """
+    try:
+        CCURE_CACHE_TTL = 60 * 60 * 12  # 12 hours
+        if not refresh:
+            cached = _load_ccure_cache(start_date, end_date, CCURE_CACHE_TTL)
+            if cached and isinstance(cached, dict) and "payload" in cached:
+                payload = cached["payload"]
+                if not raw:
+                    return JSONResponse(payload)
+
+        # Try to compute a detailed summary by delegating to your compute service (non-strict); we will override important keys below.
+        detailed = None
+        try:
+            from ccure_compare_service import compute_visit_averages
+            loop = asyncio.get_running_loop()
+            compute_fn = functools.partial(compute_visit_averages, start_date, end_date, None)
+            try:
+                detailed = await asyncio.get_running_loop().run_in_executor(None, compute_fn)
+            except Exception:
+                detailed = None
+        except Exception:
+            detailed = None
+
+        # Build a safe minimal 'mapped' structure (keeps previous mapping helpers behaviour)
+        def _map_detailed_to_resp(detailed_obj: Dict[str, Any]) -> Dict[str, Any]:
+            # Minimal mapping to keep compatibility; callers only use a few fields, we'll override strict ones below.
+            mapped = {
+                "date": detailed_obj.get("date") if isinstance(detailed_obj, dict) else datetime.utcnow().date().isoformat(),
+                "notes": detailed_obj.get("notes") if isinstance(detailed_obj, dict) else None,
+                "live_today": detailed_obj.get("live_today") if isinstance(detailed_obj, dict) else {},
+                "headcount": detailed_obj.get("headcount") if isinstance(detailed_obj, dict) else {},
+                "live_headcount": detailed_obj.get("live_headcount") if isinstance(detailed_obj, dict) else {},
+                "ccure_active": detailed_obj.get("ccure_active") if isinstance(detailed_obj, dict) else {},
+                "averages": detailed_obj.get("averages") if isinstance(detailed_obj, dict) else {}
+            }
+            return mapped
+
+        mapped = None
+        if isinstance(detailed, dict):
+            mapped = _map_detailed_to_resp(detailed)
+        else:
+            # fallback compute using DB-based build (keeps earlier build_ccure_averages behaviour)
+            try:
+                # reuse earlier simpler builder (if defined in your project). If not, do a minimal DB-based build here.
+                from ccure_compare_service import build_ccure_averages as build_builder
+                mapped_fallback_raw = build_builder(start_date, end_date) if callable(build_builder) else {}
+                # If builder returned dict like build_ccure_averages earlier, map to expected shape
+                mf = mapped_fallback_raw if isinstance(mapped_fallback_raw, dict) else {}
+                mapped = {
+                    "date": mf.get("date"),
+                    "notes": mf.get("notes"),
+                    "live_today": mf.get("live_today", {}),
+                    "headcount": mf.get("headcount", {}) if isinstance(mf.get("headcount", {}), dict) else {},
+                    "live_headcount": mf.get("live_headcount", {}) if isinstance(mf.get("live_headcount", {}), dict) else {},
+                    "ccure_active": mf.get("ccure_active", {}) or {},
+                    "averages": mf.get("averages", {}) or {}
+                }
+            except Exception:
+                mapped = {
+                    "date": datetime.utcnow().date().isoformat(),
+                    "notes": None,
+                    "live_today": {"employee": 0, "contractor": 0, "total_reported": 0, "total_from_details": 0},
+                    "headcount": {"total_visited_today": None, "employee": None, "contractor": None, "by_location": {}},
+                    "live_headcount": {"currently_present_total": None, "employee": None, "contractor": None},
+                    "ccure_active": {},
+                    "averages": {}
+                }
+
+        # Build the pruned response skeleton (only keys UI expects); we'll strictly override headcount/live below
+        def _prune_summary(full_summary: Dict[str, Any]) -> Dict[str, Any]:
+            dt = full_summary.get("date") or datetime.utcnow().date().isoformat()
+            out = {
+                "date": dt,
+                "ccure_reported": {
+                    "employees": None,
+                    "contractors": None,
+                    "total_reported": None
+                },
+                "headcount_attendance_summary": {"total_visited_today": None, "employee": None, "contractor": None},
+                "live_headcount_region_clients": {"currently_present_total": None, "employee": None, "contractor": None},
+                "percentages_vs_ccure": {
+                    "head_employee_pct_vs_ccure_today": None,
+                    "head_contractor_pct_vs_ccure_today": None,
+                    "head_overall_pct_vs_ccure_today": None
+                },
+                "averages": {
+                    "history_avg_employee_last_7_days": (full_summary.get("averages") or {}).get("history_avg_employee_last_7_days"),
+                    "history_avg_contractor_last_7_days": (full_summary.get("averages") or {}).get("history_avg_contractor_last_7_days"),
+                    "history_avg_overall_last_7_days": (full_summary.get("averages") or {}).get("history_avg_overall_last_7_days"),
+                    "avg_by_location_last_7_days": (full_summary.get("averages") or {}).get("avg_by_location_last_7_days") or {},
+                    "history_avg_by_location_last_7_days": (full_summary.get("averages") or {}).get("history_avg_by_location_last_7_days") or {}
+                }
+            }
+            # try populate ccure_reported (if present in full_summary)
+            cc = full_summary.get("ccure_active") or full_summary.get("ccure_reported") or {}
+            try:
+                ce = cc.get("ccure_active_employees_reported") or cc.get("active_employees")
+                cc_ee = int(ce) if ce is not None and str(ce) != "" else None
+            except Exception:
+                cc_ee = None
+            try:
+                cc_c = cc.get("ccure_active_contractors_reported") or cc.get("active_contractors")
+                cc_cc = int(cc_c) if cc_c is not None and str(cc_c) != "" else None
+            except Exception:
+                cc_cc = None
+            out["ccure_reported"] = {"employees": cc_ee, "contractors": cc_cc, "total_reported": (cc_ee + cc_cc) if (cc_ee is not None and cc_cc is not None) else None}
+            return out
+
+        pruned = _prune_summary(mapped)
+
+        # ------------------------------------------------------------------
+        # STRICT RULE: compute visited-today from SQL and override pruned
+        # ------------------------------------------------------------------
+        try:
+            db_counts = _compute_visited_today_from_db(date.today())
+            pruned["headcount_attendance_summary"] = {
+                "total_visited_today": int(db_counts.get("total_visited_today") or 0),
+                "employee": int(db_counts.get("employee") or 0),
+                "contractor": int(db_counts.get("contractor") or 0)
+            }
+            # include by_location map in averages.history breakdown? Keep it separate to not violate prune shape.
+        except Exception:
+            logger.exception("Failed to compute visited-today from DB; leaving pruned default")
+
+        # ------------------------------------------------------------------
+        # STRICT RULE: get live counts from live-summary endpoints; if none, fallback to DB
+        # ------------------------------------------------------------------
+        try:
+            live_tot = _fetch_live_summary_totals(LIVE_SUMMARY_ENDPOINTS, timeout=5)
+            if live_tot and isinstance(live_tot, dict):
+                cur_present = int(live_tot.get("currently_present_total") or (int(live_tot.get("employee") or 0) + int(live_tot.get("contractor") or 0)))
+                emp = int(live_tot.get("employee") or 0)
+                contr = int(live_tot.get("contractor") or 0)
+                pruned["live_headcount_region_clients"] = {
+                    "currently_present_total": cur_present,
+                    "employee": emp,
+                    "contractor": contr
+                }
+            else:
+                # fallback to DB live counts
+                db_live = _compute_live_from_db(date.today())
+                pruned["live_headcount_region_clients"] = {
+                    "currently_present_total": int(db_live.get("currently_present_total") or 0),
+                    "employee": int(db_live.get("employee") or 0),
+                    "contractor": int(db_live.get("contractor") or 0)
+                }
+        except Exception:
+            logger.exception("Failed to determine live counts; falling back to DB")
+            db_live = _compute_live_from_db(date.today())
+            pruned["live_headcount_region_clients"] = {
+                "currently_present_total": int(db_live.get("currently_present_total") or 0),
+                "employee": int(db_live.get("employee") or 0),
+                "contractor": int(db_live.get("contractor") or 0)
+            }
+
+        # Save cache & broadcast (best-effort)
+        try:
+            _save_ccure_cache(start_date, end_date, pruned)
+            try:
+                # best-effort broadcast if you use SSE
+                from app import broadcast_ccure_update  # optional; will fail if not present in this module
+                try:
+                    broadcast_ccure_update(pruned)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("Failed to persist/broadcast pruned ccure payload (non-fatal)")
+
+        # If raw requested, return the mapped detailed object (but with strict overrides applied)
+        if raw:
+            # attach the strict headcount & live values into mapped for debugging parity
+            mapped["headcount"] = mapped.get("headcount", {})
+            mapped["headcount"]["total_visited_today"] = pruned["headcount_attendance_summary"]["total_visited_today"]
+            mapped["headcount"]["employee"] = pruned["headcount_attendance_summary"]["employee"]
+            mapped["headcount"]["contractor"] = pruned["headcount_attendance_summary"]["contractor"]
+            mapped["live_headcount"] = mapped.get("live_headcount", {})
+            mapped["live_headcount"]["currently_present_total"] = pruned["live_headcount_region_clients"]["currently_present_total"]
+            mapped["live_headcount"]["employee"] = pruned["live_headcount_region_clients"]["employee"]
+            mapped["live_headcount"]["contractor"] = pruned["live_headcount_region_clients"]["contractor"]
+            return JSONResponse(mapped)
+
+        return JSONResponse(pruned)
+
+    except Exception as e:
+        logger.exception("ccure_verify top-level failure")
+        return JSONResponse({"detail": f"ccure verify error: {e}"}, status_code=500)
+
+# Keep other endpoints (headcount, duration, uploads, compare) as in your project.
+# For convenience implement a minimal /headcount endpoint that uses DB (strict) or cache as fallback.
+
+@app.get("/headcount")
+def api_headcount():
+    """
+    Strict headcount by region: Try DB AttendanceSummary first (distinct persons for today).
+    If DB not available -> return zeros.
+    """
+    try:
+        if SessionLocal is None or AttendanceSummary is None:
+            return JSONResponse({"apac": 0, "emea": 0, "laca": 0, "namer": 0})
+        totals = {"apac": 0, "emea": 0, "laca": 0, "namer": 0}
+        # naive mapping: use PartitionName2 to guess region
+        def _guess_region_from_text(txt: str) -> str:
+            if not txt:
+                return "unknown"
+            s = str(txt).strip().lower()
+            s = re.sub(r"[,\-/()]", " ", s)
+            if any(k in s for k in ("pune","quezon city","taguig city","bengaluru","hyderabad","chennai","manila","singapore","hong kong","beijing","shanghai","jakarta","kuala","osaka","tokyo","seoul","bangkok")):
+                return "apac"
+            if any(k in s for k in ("london","dublin","paris","frankfurt","amsterdam","stockholm","cape town","johannesburg","berlin","brussels","madrid","rome","milan")):
+                return "emea"
+            if any(k in s for k in ("mexico","bogota","buenos","santiago","sao","salvador","lima","caracas","cordoba","panama","lima","sao paulo")):
+                return "laca"
+            if any(k in s for k in ("denver","new york","ny","chicago","toronto","vancouver","los angeles","san francisco","boston","houston","atlanta","miami","austin","miami")):
+                return "namer"
+            return "unknown"
+
+        today = date.today()
+        with SessionLocal() as db:
+            rows = db.query(AttendanceSummary).filter(AttendanceSummary.date == today).all()
+            seen = set()
+            if rows:
+                for r in rows:
+                    key = _normalize_employee_key(getattr(r, "employee_id", None))
+                    if not key:
+                        derived = getattr(r, "derived", None)
+                        if isinstance(derived, dict):
+                            key = _normalize_card_like(derived.get("card_number") or derived.get("CardNumber") or None)
+                    if not key:
+                        continue
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    partition = None
+                    try:
+                        derived = getattr(r, "derived", None)
+                        if isinstance(derived, dict):
+                            partition = derived.get("partition") or derived.get("PartitionName2") or None
+                    except Exception:
+                        partition = None
+                    if not partition:
+                        partition = getattr(r, "partition", None) or getattr(r, "PartitionName2", None)
+                    region = _guess_region_from_text(partition or "")
+                    if region in totals:
+                        totals[region] += 1
+                    else:
+                        # ignore unknowns
+                        pass
+            else:
+                # fallback to LiveSwipe
+                start = datetime.combine(today, datetime.min.time())
+                end = datetime.combine(today, datetime.max.time())
+                swipes = db.query(LiveSwipe).filter(LiveSwipe.timestamp >= start, LiveSwipe.timestamp <= end).all()
+                seen_swipes = set()
+                for s in swipes:
+                    k = getattr(s, "EmployeeIdentity", None) or getattr(s, "PersonGUID", None) or getattr(s, "CardNumber", None)
+                    if not k:
+                        continue
+                    if k in seen_swipes:
+                        continue
+                    seen_swipes.add(k)
+                    partition = getattr(s, "PartitionName2", None) or getattr(s, "partition", None)
+                    region = _guess_region_from_text(partition or "")
+                    if region in totals:
+                        totals[region] += 1
+        return JSONResponse({
+            "apac": int(totals.get("apac", 0)),
+            "emea": int(totals.get("emea", 0)),
+            "laca": int(totals.get("laca", 0)),
+            "namer": int(totals.get("namer", 0))
+        })
+    except Exception:
+        logger.exception("api_headcount failed")
+        return JSONResponse({"apac": 0, "emea": 0, "laca": 0, "namer": 0})
+
+# Keep the broadcasting factory if you use SSE elsewhere; minimal implementation (no-op if not used).
+_broadcaster_clients = set()
+def broadcast_ccure_update(payload: dict):
+    try:
+        if not _broadcaster_clients:
+            return
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            loop = None
+        for q in list(_broadcaster_clients):
+            try:
+                if loop and loop.is_running():
+                    loop.call_soon_threadsafe(q.put_nowait, payload)
+                else:
+                    q.put_nowait(payload)
+            except Exception:
+                try:
+                    _broadcaster_clients.discard(q)
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("broadcast_ccure_update failed")
+
+# SSE stream endpoint (keeps parity)
+async def _sse_event_generator(client_queue: asyncio.Queue):
+    try:
+        while True:
+            payload = await client_queue.get()
+            try:
+                data = json.dumps(payload, default=str)
+            except Exception:
+                data = json.dumps({"error": "serialization error", "payload": str(payload)})
+            yield f"data: {data}\n\n"
+    finally:
+        try:
+            _broadcaster_clients.discard(client_queue)
+        except Exception:
+            pass
+        return
+
+@app.get("/ccure/stream")
+async def ccure_stream():
+    q = asyncio.Queue()
+    _broadcaster_clients.add(q)
+    # Immediately push latest cache if present (unwrapped payload)
+    try:
+        files = sorted(_CCURE_CACHE_DIR.glob("ccure_verify_cache_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            with files[0].open("r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+            payload = cached.get("payload") if isinstance(cached, dict) else cached
+            try:
+                q.put_nowait(payload)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    generator = _sse_event_generator(q)
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
+
+# --- Keep the rest of your endpoints (uploads, compare, duration, etc.) unchanged in your repo ---
+# If you want me to produce a fully inlined single-file (including duration_report, data_compare_service, etc.)
+# let me know and I will paste an expanded file. For now this file is a focused, robust swap-in that
+# implements the strict visited-today DB count and strict live-summary-first behavior.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ---------- DB-first helpers for visited-today and live totals ----------
 def _get_visited_today_from_db():
     """
