@@ -1,461 +1,5 @@
-// backend/services/reportService.js
-import { getPool } from './db'; // adjust import to your project structure
-import sql from 'mssql';
-
-export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
-  const pool = await getPool('emea');
-  const req  = pool.request();
-
-  req.input('fromDate', sql.Date, from);
-  req.input('toDate',   sql.Date, to);
-  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
-  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
-
-  const query = `
-DECLARE @empCSV NVARCHAR(MAX) = @employees;
-
-;WITH EmpList AS (
-  SELECT LTRIM(RTRIM(value)) AS emp
-  FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
-  WHERE LTRIM(RTRIM(value)) <> ''
-),
-
-SwipeData AS (
-  SELECT
-    t1.ObjectName1,
-    t1.ObjectName2,
-    t1.Messagetype,
-    t2.Text12       AS EmployeeID,
-    t3.Name         AS PersonnelType,
-    t1.PartitionName2 AS location,
-
-    -- return server wall-clock as TEXT (no timezone info)
-    CONVERT(VARCHAR(23), DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC), 121) AS LocaleMessageTime,
-
-    -- also return the numeric offset (minutes) in case client wants to reconstruct differently
-    t1.MessageLocaleOffset AS MessageLocaleOffset,
-
-    CASE
-      WHEN t5_dir.Value = 'InDirection'  THEN 'IN'
-      WHEN t5_dir.Value = 'OutDirection' THEN 'OUT'
-      ELSE 'Unknown'
-    END AS Swipe,
-
-    t5_card.Value AS CardNumber,
-    CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID
-  FROM ACVSUJournal_00011028.dbo.ACVSUJournalLog AS t1
-  INNER JOIN ACVSCore.Access.Personnel     AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-  INNER JOIN ACVSCore.Access.PersonnelType AS t3
-    ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID
-    AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS t5_card
-    ON t1.XmlGUID = t5_card.GUID
-    AND t5_card.Value NOT IN ('InDirection','OutDirection')
-    AND t5_card.Value NOT LIKE '%[^0-9]%'
-    AND t5_card.Value IS NOT NULL
-    AND LTRIM(RTRIM(t5_card.Value)) <> ''
-  WHERE
-    DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
-      <= DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-    AND DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-      < DATEADD(HOUR, 8, DATEADD(DAY, 1, CAST(@toDate AS DATETIME)))
-
-    AND (
-      @empCSV IS NULL
-      OR LTRIM(RTRIM(@empCSV)) = ''
-      OR EXISTS (
-        SELECT 1 FROM EmpList e
-        WHERE e.emp = t1.ObjectName1
-           OR e.emp = t2.Text12
-           OR e.emp = CAST(t2.Int1 AS NVARCHAR(50))
-      )
-    )
-)
-SELECT
-  ObjectName1,
-  ObjectName2,
-  Messagetype,
-  PersonnelType,
-  EmployeeID,
-  location,
-  Swipe,
-  CardNumber,
-  LocaleMessageTime,
-  MessageLocaleOffset
-FROM SwipeData
-ORDER BY LocaleMessageTime;
-`;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-
-
-
-
-
-
-
-
-
-
-// src/pages/DailyAccessReport.jsx
-import ExcelJS from 'exceljs';
-
-const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const pad2 = n => String(n).padStart(2, '0');
-
-function _extractServerDateTimeParts(iso) {
-  if (!iso) return null;
-  const s = String(iso);
-  let datePart = '', timePart = '';
-  if (s.includes('T')) {
-    [datePart, timePart] = s.split('T');
-  } else if (s.includes(' ')) {
-    [datePart, timePart] = s.split(' ');
-  } else {
-    return null;
-  }
-  datePart = datePart.slice(0, 10);
-  timePart = (timePart || '').replace(/Z|[+-]\d{2}:\d{2}$/, '').replace(/\.\d+$/, '');
-  const dParts = datePart.split('-').map(p => parseInt(p, 10));
-  const tParts = timePart.split(':').map(p => parseInt(p || '0', 10));
-  return {
-    year: dParts[0] || 0,
-    month: dParts[1] || 0,
-    day: dParts[2] || 0,
-    hour: tParts[0] || 0,
-    minute: tParts[1] || 0,
-    second: tParts[2] || 0
-  };
-}
-
-function formatDateFromServerISO_forDaily(iso) {
-  const p = _extractServerDateTimeParts(iso);
-  if (!p) return '';
-  const mon = MONTH_ABBR[(p.month - 1) || 0];
-  return `${pad2(p.day)}-${mon}-${String(p.year).slice(-2)}`;
-}
-
-function formatTimeFromServerISO_forDaily(iso) {
-  const p = _extractServerDateTimeParts(iso);
-  if (!p) return '';
-  const hh = p.hour;
-  const mm = p.minute || 0;
-  const ss = p.second || 0;
-  const ampm = hh >= 12 ? 'PM' : 'AM';
-  const hh12 = ((hh + 11) % 12) + 1;
-  return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
-}
-
-// Helper used to produce the server "ISO-like" string if row only has DateOnly+Swipe_Time.
-// This mirrors your existing buildISOFromDateOnlyAndSwipe behavior but returns an ISO-like string
-function buildISOFromDateOnlyAndSwipe(dateOnlyIso, swipeIso) {
-  if (!dateOnlyIso) return '';
-  const datePart = dateOnlyIso.toString().slice(0,10);
-  if (!swipeIso) {
-    return `${datePart}T00:00:00.000`;
-  }
-  const t = new Date(swipeIso);
-  if (!isNaN(t.getTime())) {
-    const hh = pad2(t.getUTCHours());
-    const mm = pad2(t.getUTCMinutes());
-    const ss = pad2(t.getUTCSeconds());
-    return `${datePart}T${hh}:${mm}:${ss}.000`;
-  }
-  const parts = ('' + swipeIso).split(':').map(p => pad2(parseInt(p||0,10)||0));
-  const hh = parts[0] || '00';
-  const mm = parts[1] || '00';
-  const ss = parts[2] || '00';
-  return `${datePart}T${hh}:${mm}:${ss}.000`;
-}
-
-/**
- * Generate Daily Access Excel using server-provided literal wall-clock strings.
- * rows: array of objects from backend
- * opts: { from, to, selectedEmps, region }
- */
-export async function generateDailyAccessExcelFromRows(rows = [], opts = {}) {
-  const { from, to, selectedEmps = [], region = 'emea' } = opts;
-  const wb = new ExcelJS.Workbook();
-
-  // group rows by ObjectName1 (employee)
-  for (const emp of selectedEmps) {
-    const ws = wb.addWorksheet(emp.substring(0, 31));
-    const headers = ['Date', 'Time', 'Name', 'Contractor ID', 'Card No', 'Door Name', 'Message Type', 'Partition', 'Swipe'];
-    ws.addRow(headers);
-    const hdr = ws.getRow(1);
-    hdr.font = { bold: true };
-    hdr.alignment = { vertical: 'middle', horizontal: 'center' };
-    hdr.eachCell(c => {
-      c.border = {
-        top: { style: 'thin' }, left: { style: 'thin' },
-        bottom: { style: 'thin' }, right: { style: 'thin' }
-      };
-    });
-
-    ws.columns = [
-      { key: 'date', width: 12 },
-      { key: 'time', width: 12 },
-      { key: 'name', width: 25 },
-      { key: 'id', width: 15 },
-      { key: 'card', width: 15 },
-      { key: 'door', width: 40 },
-      { key: 'msg', width: 15 },
-      { key: 'part', width: 15 },
-      { key: 'swipe', width: 10 }
-    ];
-
-    const rowsForEmp = rows.filter(r => r.ObjectName1 === emp);
-    if (!rowsForEmp.length) {
-      ws.mergeCells('A2:I2');
-      ws.getCell('A2').value = 'There is no swipe records found in Ccure';
-      ws.getCell('A2').alignment = { horizontal: 'center' };
-    } else {
-      rowsForEmp.forEach(r => {
-        // prefer server-provided formatted string field `LocaleMessageTime`
-        // if backend returns DateOnly+Swipe_Time, build a pseudo-ISO from them
-        let isoText = '';
-        if (r.LocaleMessageTime) {
-          isoText = r.LocaleMessageTime; // should be "YYYY-MM-DD HH:MM:SS.mmm" (string)
-        } else if (r.LocaleMessageTimeStr) {
-          isoText = r.LocaleMessageTimeStr;
-        } else if (r.DateOnly) {
-          isoText = buildISOFromDateOnlyAndSwipe(r.DateOnly, r.Swipe_Time);
-        }
-
-        // Use the simple formatter that interprets the string as literal wall-clock parts
-        const dateStr = isoText ? formatDateFromServerISO_forDaily(isoText) : '';
-        const timeStr = isoText ? formatTimeFromServerISO_forDaily(isoText) : '';
-
-        const row = ws.addRow([
-          dateStr,
-          timeStr,
-          r.ObjectName1 || '',
-          r.EmployeeID || '',
-          r.CardNumber || '',
-          r.Door || r.ObjectName2 || '',
-          r.AdmitCode || r.Messagetype || '',
-          r.location || '',
-          r.Swipe || r.Direction || ''
-        ]);
-
-        row.getCell(1).alignment = { horizontal: 'left' };
-        row.getCell(2).alignment = { horizontal: 'left' };
-        row.eachCell(c => {
-          c.border = {
-            top: { style: 'thin' }, left: { style: 'thin' },
-            bottom: { style: 'thin' }, right: { style: 'thin' }
-          };
-          c.alignment = { vertical: 'middle', horizontal: 'left' };
-        });
-      });
-    }
-
-    ws.autoFilter = 'A1:I1';
-  }
-
-  const buf = await wb.xlsx.writeBuffer();
-  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-  const filename = `Daily Access Report(${from ? (new Date(from)).toLocaleDateString() : ''} to ${to ? (new Date(to)).toLocaleDateString() : ''}).xlsx`;
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = filename;
-  link.click();
-}
-
-export default {
-  generateDailyAccessExcelFromRows
-};
-
-
-
-
-
-
-
-
-
-
-
-
-// add near other imports:
-import { generateDailyAccessExcelFromRows } from './DailyAccessReport';
-
-
-
-
-// ----- 0: Daily Access -----
-if (tab === 0) {
-  const params = {
-    ...baseParams,
-    from: formatLocalDate(from),
-    to: formatLocalDate(to, true),
-    employees: selectedEmps.join(',')
-  };
-  const resp = await axios.get('/api/reports/daily-access', { params });
-
-  // rows as returned by backend (backend now returns LocaleMessageTime as text)
-  const rows = (resp.data && resp.data.data) || [];
-
-  // pass rows and current options; the new module writes Excel using server wall-clock text
-  await generateDailyAccessExcelFromRows(rows, { from, to, selectedEmps, region });
-  return;
-}
-
-
-
-
-
-
-const getServerISO = (r) => {
-  if (!r) return '';
-  // prefer the formatted string returned by backend (LocaleMessageTime)
-  if (r.LocaleMessageTime) return r.LocaleMessageTime;
-  if (r.LocaleMessageTimeStr) return r.LocaleMessageTimeStr;
-  if (r.DateOnly) return buildISOFromDateOnlyAndSwipe(r.DateOnly, r.Swipe_Time);
-  // fallback: if server accidentally returned a JS Date object (rare), stringify
-  if (r.LocaleMessageTime && typeof r.LocaleMessageTime === 'object' && r.LocaleMessageTime.toISOString) return r.LocaleMessageTime.toISOString();
-  return '';
-};
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Check both Snippet carefully and fix the issue carefully and share me Updated file carefully 
-
-//C:\Users\W0024618\Desktop\global-page\backend\services\reportService.js
-
-// updated dailyAccessReportEMEA in backend/services/reportService.js
-export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
-  const pool = await getPool('emea');
-  const req  = pool.request();
-
-  req.input('fromDate', sql.Date, from);
-  req.input('toDate',   sql.Date, to);
-  // accept comma separated list of names or IDs (nullable / empty allowed)
-  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
-  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
-
-  const query = `
--- employees CSV is passed in @employees (e.g. 'Vainilaitis, Valdas,32345')
--- If @employees is NULL or empty -> no employee filter applied.
-DECLARE @empCSV NVARCHAR(MAX) = @employees;
-
-;WITH EmpList AS (
-  SELECT LTRIM(RTRIM(value)) AS emp
-  FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
-  WHERE LTRIM(RTRIM(value)) <> ''
-),
-
-SwipeData AS (
-  SELECT
-    t1.ObjectName1,
-    t1.ObjectName2,
-    t1.Messagetype,
-    t2.Text12       AS EmployeeID,       -- contractor id stored here for contractors
-    t3.Name         AS PersonnelType,
-    t1.PartitionName2 AS location,
-
-CONVERT(VARCHAR(23),
-  DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC),
-  121
-) AS LocaleMessageTime,
-
-
-    CASE
-      WHEN t5_dir.Value = 'InDirection'  THEN 'IN'
-      WHEN t5_dir.Value = 'OutDirection' THEN 'OUT'
-      ELSE 'Unknown'
-    END AS Swipe,
-
-    t5_card.Value AS CardNumber,
-    -- numeric employee id
-    CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID
-  FROM ACVSUJournal_00011028.dbo.ACVSUJournalLog AS t1
-  INNER JOIN ACVSCore.Access.Personnel     AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-  INNER JOIN ACVSCore.Access.PersonnelType AS t3
-    ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID
-    AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS t5_card
-    ON t1.XmlGUID = t5_card.GUID
-    AND t5_card.Value NOT IN ('InDirection','OutDirection')
-    AND t5_card.Value NOT LIKE '%[^0-9]%'
-    AND t5_card.Value IS NOT NULL
-    AND LTRIM(RTRIM(t5_card.Value)) <> ''
-  WHERE
-    /* local‐time window:
-         >= 08:00 on fromDate
-         AND <  08:00 on the day after toDate */
-    DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
-      <= DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-    AND DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-      < DATEADD(
-          HOUR,
-          8,
-          DATEADD(DAY, 1, CAST(@toDate AS DATETIME))
-        )
-
-    /* EMPLOYEE FILTER:
-       - If @empCSV is NULL/empty => no filter
-       - Else match if any emp value equals ObjectName1 OR Text12 OR Int1 (as string)
-    */
-    AND (
-      @empCSV IS NULL
-      OR LTRIM(RTRIM(@empCSV)) = ''
-      OR EXISTS (
-        SELECT 1 FROM EmpList e
-        WHERE e.emp = t1.ObjectName1
-           OR e.emp = t2.Text12
-           OR e.emp = CAST(t2.Int1 AS NVARCHAR(50))
-      )
-    )
-)
-SELECT
-  ObjectName1,
-  ObjectName2,
-  Messagetype,
-  PersonnelType,
-  EmployeeID,
-  location,
-  Swipe,
-  CardNumber,
-  LocaleMessageTime
-FROM SwipeData
-ORDER BY LocaleMessageTime;
-`;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-
-
-
-
-
-
-
-
-
+Now Check both file line by line and remove all daily Access report logic from ReportsPage.jsx and add logic in DailyAccessReport.jsx
+and share me both fully updated file carefully so i can easily swap file each other dont make unnecessary changes  carefully
 // src/pages/ReportsPage.jsx
 import React, { useState } from 'react';
 import {
@@ -478,6 +22,7 @@ import PeopleIcon from '@mui/icons-material/People';
 import DownloadIcon from '@mui/icons-material/CloudDownload';
 import FilterListIcon from '@mui/icons-material/FilterList';
 import Avatar from '@mui/material/Avatar';
+import { generateDailyAccessExcelFromRows } from './DailyAccessReport';
 
 // Static lists
 const EMPLOYEE_OPTIONS = [
@@ -863,7 +408,18 @@ export default function ReportsPage() {
           // const dateStr = iso ? formatDateFromServerISO(iso) : '';
           // const timeStr = iso ? formatTimeFromServerISO(iso) : '';
 
-const iso = getServerISO(r);
+// const iso = getServerISO(r);
+
+const getServerISO = (r) => {
+  if (!r) return '';
+  // prefer the formatted string returned by backend (LocaleMessageTime)
+  if (r.LocaleMessageTime) return r.LocaleMessageTime;
+  if (r.LocaleMessageTimeStr) return r.LocaleMessageTimeStr;
+  if (r.DateOnly) return buildISOFromDateOnlyAndSwipe(r.DateOnly, r.Swipe_Time);
+  // fallback: if server accidentally returned a JS Date object (rare), stringify
+  if (r.LocaleMessageTime && typeof r.LocaleMessageTime === 'object' && r.LocaleMessageTime.toISOString) return r.LocaleMessageTime.toISOString();
+  return '';
+};
 const dateStr = iso ? formatDateFromServerISO_forDaily(iso) : '';
 const timeStr = iso ? formatTimeFromServerISO_forDaily(iso) : '';
 
@@ -1200,22 +756,13 @@ if (tab === 0) {
   };
   const resp = await axios.get('/api/reports/daily-access', { params });
 
-  // local date window that matches backend window (08:00 .. 08:00 next day)
-  const startDate = new Date(from); startDate.setHours(8, 0, 0, 0);
-  const endDate = new Date(to); endDate.setHours(8, 0, 0, 0);
-  // Note: we will compare server-provided wall-clock values as literal local dates
+  // rows as returned by backend (backend now returns LocaleMessageTime as text)
   const rows = (resp.data && resp.data.data) || [];
-  const filtered = rows.filter(r => {
-    const dt = parseServerISOToLocalDateForDaily(r.LocaleMessageTime);
-    if (!dt) return false;
-    return dt >= startDate && dt < endDate;
-  });
 
-  await generateDailyAccessExcel(filtered);
+  // pass rows and current options; the new module writes Excel using server wall-clock text
+  await generateDailyAccessExcelFromRows(rows, { from, to, selectedEmps, region });
   return;
 }
-
-
 
 
 
@@ -1970,5 +1517,180 @@ if (tab === 0) {
 }
 
 
+
+
+
+
+
+
+
+// src/pages/DailyAccessReport.jsx
+import ExcelJS from 'exceljs';
+
+const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const pad2 = n => String(n).padStart(2, '0');
+
+function _extractServerDateTimeParts(iso) {
+  if (!iso) return null;
+  const s = String(iso);
+  let datePart = '', timePart = '';
+  if (s.includes('T')) {
+    [datePart, timePart] = s.split('T');
+  } else if (s.includes(' ')) {
+    [datePart, timePart] = s.split(' ');
+  } else {
+    return null;
+  }
+  datePart = datePart.slice(0, 10);
+  timePart = (timePart || '').replace(/Z|[+-]\d{2}:\d{2}$/, '').replace(/\.\d+$/, '');
+  const dParts = datePart.split('-').map(p => parseInt(p, 10));
+  const tParts = timePart.split(':').map(p => parseInt(p || '0', 10));
+  return {
+    year: dParts[0] || 0,
+    month: dParts[1] || 0,
+    day: dParts[2] || 0,
+    hour: tParts[0] || 0,
+    minute: tParts[1] || 0,
+    second: tParts[2] || 0
+  };
+}
+
+function formatDateFromServerISO_forDaily(iso) {
+  const p = _extractServerDateTimeParts(iso);
+  if (!p) return '';
+  const mon = MONTH_ABBR[(p.month - 1) || 0];
+  return `${pad2(p.day)}-${mon}-${String(p.year).slice(-2)}`;
+}
+
+function formatTimeFromServerISO_forDaily(iso) {
+  const p = _extractServerDateTimeParts(iso);
+  if (!p) return '';
+  const hh = p.hour;
+  const mm = p.minute || 0;
+  const ss = p.second || 0;
+  const ampm = hh >= 12 ? 'PM' : 'AM';
+  const hh12 = ((hh + 11) % 12) + 1;
+  return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
+}
+
+// Helper used to produce the server "ISO-like" string if row only has DateOnly+Swipe_Time.
+// This mirrors your existing buildISOFromDateOnlyAndSwipe behavior but returns an ISO-like string
+function buildISOFromDateOnlyAndSwipe(dateOnlyIso, swipeIso) {
+  if (!dateOnlyIso) return '';
+  const datePart = dateOnlyIso.toString().slice(0,10);
+  if (!swipeIso) {
+    return `${datePart}T00:00:00.000`;
+  }
+  const t = new Date(swipeIso);
+  if (!isNaN(t.getTime())) {
+    const hh = pad2(t.getUTCHours());
+    const mm = pad2(t.getUTCMinutes());
+    const ss = pad2(t.getUTCSeconds());
+    return `${datePart}T${hh}:${mm}:${ss}.000`;
+  }
+  const parts = ('' + swipeIso).split(':').map(p => pad2(parseInt(p||0,10)||0));
+  const hh = parts[0] || '00';
+  const mm = parts[1] || '00';
+  const ss = parts[2] || '00';
+  return `${datePart}T${hh}:${mm}:${ss}.000`;
+}
+
+/**
+ * Generate Daily Access Excel using server-provided literal wall-clock strings.
+ * rows: array of objects from backend
+ * opts: { from, to, selectedEmps, region }
+ */
+export async function generateDailyAccessExcelFromRows(rows = [], opts = {}) {
+  const { from, to, selectedEmps = [], region = 'emea' } = opts;
+  const wb = new ExcelJS.Workbook();
+
+  // group rows by ObjectName1 (employee)
+  for (const emp of selectedEmps) {
+    const ws = wb.addWorksheet(emp.substring(0, 31));
+    const headers = ['Date', 'Time', 'Name', 'Contractor ID', 'Card No', 'Door Name', 'Message Type', 'Partition', 'Swipe'];
+    ws.addRow(headers);
+    const hdr = ws.getRow(1);
+    hdr.font = { bold: true };
+    hdr.alignment = { vertical: 'middle', horizontal: 'center' };
+    hdr.eachCell(c => {
+      c.border = {
+        top: { style: 'thin' }, left: { style: 'thin' },
+        bottom: { style: 'thin' }, right: { style: 'thin' }
+      };
+    });
+
+    ws.columns = [
+      { key: 'date', width: 12 },
+      { key: 'time', width: 12 },
+      { key: 'name', width: 25 },
+      { key: 'id', width: 15 },
+      { key: 'card', width: 15 },
+      { key: 'door', width: 40 },
+      { key: 'msg', width: 15 },
+      { key: 'part', width: 15 },
+      { key: 'swipe', width: 10 }
+    ];
+
+    const rowsForEmp = rows.filter(r => r.ObjectName1 === emp);
+    if (!rowsForEmp.length) {
+      ws.mergeCells('A2:I2');
+      ws.getCell('A2').value = 'There is no swipe records found in Ccure';
+      ws.getCell('A2').alignment = { horizontal: 'center' };
+    } else {
+      rowsForEmp.forEach(r => {
+        // prefer server-provided formatted string field `LocaleMessageTime`
+        // if backend returns DateOnly+Swipe_Time, build a pseudo-ISO from them
+        let isoText = '';
+        if (r.LocaleMessageTime) {
+          isoText = r.LocaleMessageTime; // should be "YYYY-MM-DD HH:MM:SS.mmm" (string)
+        } else if (r.LocaleMessageTimeStr) {
+          isoText = r.LocaleMessageTimeStr;
+        } else if (r.DateOnly) {
+          isoText = buildISOFromDateOnlyAndSwipe(r.DateOnly, r.Swipe_Time);
+        }
+
+        // Use the simple formatter that interprets the string as literal wall-clock parts
+        const dateStr = isoText ? formatDateFromServerISO_forDaily(isoText) : '';
+        const timeStr = isoText ? formatTimeFromServerISO_forDaily(isoText) : '';
+
+        const row = ws.addRow([
+          dateStr,
+          timeStr,
+          r.ObjectName1 || '',
+          r.EmployeeID || '',
+          r.CardNumber || '',
+          r.Door || r.ObjectName2 || '',
+          r.AdmitCode || r.Messagetype || '',
+          r.location || '',
+          r.Swipe || r.Direction || ''
+        ]);
+
+        row.getCell(1).alignment = { horizontal: 'left' };
+        row.getCell(2).alignment = { horizontal: 'left' };
+        row.eachCell(c => {
+          c.border = {
+            top: { style: 'thin' }, left: { style: 'thin' },
+            bottom: { style: 'thin' }, right: { style: 'thin' }
+          };
+          c.alignment = { vertical: 'middle', horizontal: 'left' };
+        });
+      });
+    }
+
+    ws.autoFilter = 'A1:I1';
+  }
+
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const filename = `Daily Access Report(${from ? (new Date(from)).toLocaleDateString() : ''} to ${to ? (new Date(to)).toLocaleDateString() : ''}).xlsx`;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+}
+
+export default {
+  generateDailyAccessExcelFromRows
+};
 
 
