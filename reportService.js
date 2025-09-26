@@ -198,91 +198,132 @@ ORDER BY LocaleMessageTime DESC;
 
 
 
-
-export async function dailyAccessReportEMEA({ from, to }) {
+// backend/services/reportService.js
+export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
   const pool = await getPool('emea');
   const req  = pool.request();
 
   req.input('fromDate', sql.Date, from);
   req.input('toDate',   sql.Date, to);
+  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
+  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
 
   const query = `
-WITH SwipeData AS (
+
+  -- expects parameters: @fromDate (DATE), @toDate (DATE), @employees (NVARCHAR(MAX) | NULL)
+DECLARE @empCSV NVARCHAR(MAX) = @employees;
+
+;WITH EmpList AS (
+  SELECT LTRIM(RTRIM(value)) AS emp
+  FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
+  WHERE LTRIM(RTRIM(value)) <> ''
+)
+
+-- Raw rows: compute LocaleMessageTime once and use OUTER APPLY to avoid duplicate shreddes
+, RawSwipes AS (
   SELECT
     t1.ObjectName1,
     t1.ObjectName2,
-    t1.Messagetype,
+    t1.MessageType,
     t2.Text12       AS EmployeeID,
+    CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID,
     t3.Name         AS PersonnelType,
-    t1.PartitionName2 AS location,
+    t1.PartitionName2 AS PartitionName2,
 
-    /* true LOCAL time = UTC + offset */
-    CAST(
-      DATEADD(
-        MINUTE,
-        t1.MessageLocaleOffset,
-        t1.MessageUTC
-      ) AS datetime2(3)
-    ) AS LocaleMessageTime,
+    -- compute local wall-clock once (DO NOT change sign here; using your -1 * MessageLocaleOffset)
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
 
+    -- direction/value picked by OUTER APPLY (single row)
     CASE
-      WHEN t5_dir.Value = 'InDirection'  THEN 'IN'
-      WHEN t5_dir.Value = 'OutDirection' THEN 'OUT'
+      WHEN dir.Value = 'InDirection'  THEN 'IN'
+      WHEN dir.Value = 'OutDirection' THEN 'OUT'
       ELSE 'Unknown'
     END AS Swipe,
 
-    t5_card.Value AS CardNumber
-  FROM ACVSUJournal_00011027.dbo.ACVSUJournalLog AS t1
+    card.Value AS CardNumber
+  FROM ACVSUJournal_00011028.dbo.ACVSUJournalLog AS t1
   INNER JOIN ACVSCore.Access.Personnel     AS t2
     ON t1.ObjectIdentity1 = t2.GUID
   INNER JOIN ACVSCore.Access.PersonnelType AS t3
     ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN ACVSUJournal_00011027.dbo.ACVSUJournalLogxmlShred AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID
-    AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournal_00011027.dbo.ACVSUJournalLogxmlShred AS t5_card
-    ON t1.XmlGUID = t5_card.GUID
-    AND t5_card.Value NOT IN ('InDirection','OutDirection')
-    AND t5_card.Value NOT LIKE '%[^0-9]%'
-    AND t5_card.Value IS NOT NULL
-    AND LTRIM(RTRIM(t5_card.Value)) <> ''
 
-  WHERE
-    /* local‐time window:
-         >= 08:00 on fromDate
-         AND <  08:00 on the day after toDate */
-    DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
-      <= DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-    AND DATEADD(MINUTE, t1.MessageLocaleOffset, t1.MessageUTC)
-      < DATEADD(
-          HOUR,
-          8,
-          DATEADD(DAY, 1, CAST(@toDate AS DATETIME))
-        )
+  -- pick at most one direction shred row (InDirection/OutDirection)
+  OUTER APPLY (
+    SELECT TOP (1) s.Value
+    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
+    WHERE s.GUID = t1.XmlGUID
+      AND s.Value IN ('InDirection','OutDirection')
+  ) AS dir
 
-    AND t1.ObjectName1 IN (
-      'Vainilaitis, Valdas',
-      'Tomasevic, Kazimez',
-      'Sesickis, Janas',
-      'Valiunas, Sigitas'
-    )
+  -- pick at most one numeric card value (exclude direction values, ensure numeric)
+  OUTER APPLY (
+    SELECT TOP (1) s.Value
+    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
+    WHERE s.GUID = t1.XmlGUID
+      AND s.Value NOT IN ('InDirection','OutDirection')
+      AND s.Value NOT LIKE '%[^0-9]%'
+      AND s.Value IS NOT NULL
+      AND LTRIM(RTRIM(s.Value)) <> ''
+  ) AS card
 )
+
+-- Strict time window: >= 08:00 on @fromDate, and < 08:00 on @toDate
+, Windowed AS (
+  SELECT *
+  FROM RawSwipes
+  WHERE
+    LocaleMessageTime >= DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
+    -- NOTE: removed extra DATEADD(DAY,1,...) — upper bound should be < toDate 08:00
+    AND LocaleMessageTime <  DATEADD(HOUR, 8, CAST(@toDate AS DATETIME))
+    AND Swipe IN ('IN','OUT') -- only real swipes
+)
+
+-- final projection + optional employee filter (supports CSV of names or IDs)
 SELECT
   ObjectName1,
   ObjectName2,
-  Messagetype,
   PersonnelType,
   EmployeeID,
-  location,
+  NumericEmployeeID,
+  -- alias PartitionName2 -> location so frontend sees r.location
+  PartitionName2 AS location,
+  -- alias MessageType -> Messagetype so frontend sees r.Messagetype
+  MessageType AS Messagetype,
   Swipe,
   CardNumber,
   LocaleMessageTime
-FROM SwipeData
-ORDER BY LocaleMessageTime;`;
+FROM Windowed w
+WHERE
+  (
+    @empCSV IS NULL
+    OR LTRIM(RTRIM(@empCSV)) = ''
+    OR EXISTS (
+      SELECT 1
+      FROM EmpList e
+      WHERE
+        e.emp = LTRIM(RTRIM(w.ObjectName1))
+        OR e.emp = w.EmployeeID
+        OR e.emp = w.NumericEmployeeID
+    )
+  )
+ORDER BY LocaleMessageTime;
+
+`;
 
   const { recordset } = await req.query(query);
   return recordset;
 }
+
+
+
+
+
+
+
+
+
+
+
 
 /**
  * In-vs-Out Report (parameterized) — groups by employee & month
@@ -389,7 +430,7 @@ SELECT
 INTO 
     #CombinedEmployeeData
 FROM 
-    [ACVSUJournal_00010028].[dbo].[ACVSUJournalLog] AS t1
+    [ACVSUJournal_00010029].[dbo].[ACVSUJournalLog] AS t1
 INNER JOIN 
     [ACVSCore].[Access].[Personnel] AS t2
     ON t1.ObjectIdentity1 = t2.GUID
