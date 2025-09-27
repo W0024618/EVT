@@ -169,11 +169,60 @@ export default function DurationPage() {
     fetchCities();
   }, [region]);
 
-  const fetchDurations = useCallback(
+
+
+  const searchDebounceRef = useRef(null);
+
+  // const fetchDurations = useCallback(
+  //   async (opts = {}) => {
+  //     setError("");
+  //     setLoading(true);
+  //     setData(null);
+
+  //     try {
+  //       const params = {};
+
+  //       if (useRange && startDate && endDate) {
+  //         params.start_date = startDate;
+  //         params.end_date = endDate;
+  //       } else if (!useRange && singleDate) {
+  //         params.date = singleDate;
+  //       } else {
+  //         if (singleDate) params.date = singleDate;
+  //       }
+
+  //       if (region) params.regions = region;
+  //       if (city) params.city = city;
+
+  //       if (searchEmployeeId) params.employee_id = searchEmployeeId;
+  //       if (searchEmployeeName) params.employee_name = searchEmployeeName;
+  //       if (searchCardNumber) params.card_number = searchCardNumber;
+
+  //       const timeout = opts.timeout || 1200000;
+
+  //       const res = await axios.get(`${API_BASE}/duration`, {
+  //         params,
+  //         timeout,
+  //       });
+  //       setData(res.data);
+  //     } catch (err) {
+  //       console.error(err);
+  //       setError(err?.response?.data?.detail || err.message || "Failed to fetch duration data");
+  //     } finally {
+  //       setLoading(false);
+  //     }
+  //   },
+  //   [useRange, startDate, endDate, singleDate, region, city, searchEmployeeId, searchEmployeeName, searchCardNumber]
+  // );
+
+
+
+const fetchDurations = useCallback(
     async (opts = {}) => {
       setError("");
+      // keep existing data visible while loading to avoid UI blanking
       setLoading(true);
-      setData(null);
+      // DO NOT setData(null) here — keeps table while we load a new dataset
 
       try {
         const params = {};
@@ -194,6 +243,7 @@ export default function DurationPage() {
         if (searchEmployeeName) params.employee_name = searchEmployeeName;
         if (searchCardNumber) params.card_number = searchCardNumber;
 
+        // keep long timeout for heavy queries; but UI won't block
         const timeout = opts.timeout || 1200000;
 
         const res = await axios.get(`${API_BASE}/duration`, {
@@ -210,6 +260,56 @@ export default function DurationPage() {
     },
     [useRange, startDate, endDate, singleDate, region, city, searchEmployeeId, searchEmployeeName, searchCardNumber]
   );
+
+
+// debounce search fields to call server-side search (500ms)
+// When the user clears search fields (non-empty -> empty), refetch once.
+// IMPORTANT: do NOT depend on `data` here (that caused a feedback loop).
+const prevSearchRef = useRef({ emp: "", name: "", card: "" });
+
+useEffect(() => {
+  // clear any pending timer
+  if (searchDebounceRef.current) {
+    clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = null;
+  }
+
+  const empQ = (searchEmployeeId || "").trim();
+  const nameQ = (searchEmployeeName || "").trim();
+  const cardQ = (searchCardNumber || "").trim();
+
+  const hadAnyBefore = !!(prevSearchRef.current.emp || prevSearchRef.current.name || prevSearchRef.current.card);
+  const hasAnyNow = !!(empQ || nameQ || cardQ);
+
+  // If user cleared queries (was non-empty, now empty) -> fetch full dataset once
+  if (!hasAnyNow && hadAnyBefore) {
+    fetchDurations();
+    // update prev and exit (no debounce)
+    prevSearchRef.current = { emp: empQ, name: nameQ, card: cardQ };
+    return;
+  }
+
+  // If there are queries now -> debounce server-side search
+  if (hasAnyNow) {
+    searchDebounceRef.current = setTimeout(() => {
+      fetchDurations();
+    }, 500);
+  }
+
+  // update previous search snapshot
+  prevSearchRef.current = { emp: empQ, name: nameQ, card: cardQ };
+
+  return () => {
+    if (searchDebounceRef.current) {
+      clearTimeout(searchDebounceRef.current);
+      searchDebounceRef.current = null;
+    }
+  };
+}, [searchEmployeeId, searchEmployeeName, searchCardNumber, fetchDurations]);
+
+
+
+
 
   const fetchAndMergeEmployee = useCallback(
     async ({ employeeId, person_uid } = {}) => {
@@ -538,16 +638,42 @@ export default function DurationPage() {
     URL.revokeObjectURL(url);
   };
 
-  const getFilteredRows = useCallback(() => {
+
+
+  // const getFilteredRows = useCallback(() => {
+  //   if (!regionObj) return [];
+  //   const rows = regionObj.employees || [];
+  //   return rows.filter((r) => {
+  //     const matchesEmployeeId = !searchEmployeeId || String(r.EmployeeID || "").toLowerCase().includes(searchEmployeeId.toLowerCase());
+  //     const matchesName = !searchEmployeeName || String(r.EmployeeName || "").toLowerCase().includes(searchEmployeeName.toLowerCase());
+  //     const matchesCard = !searchCardNumber || String(r.CardNumber || "").toLowerCase().includes(searchCardNumber.toLowerCase());
+  //     return matchesEmployeeId && matchesName && matchesCard;
+  //   });
+  // }, [regionObj, searchEmployeeId, searchEmployeeName, searchCardNumber]);
+
+
+ const filteredRows = useMemo(() => {
     if (!regionObj) return [];
     const rows = regionObj.employees || [];
+
+    const empIdQ = (searchEmployeeId || "").trim().toLowerCase();
+    const nameQ = (searchEmployeeName || "").trim().toLowerCase();
+    const cardQ = (searchCardNumber || "").trim().toLowerCase();
+
+    if (!empIdQ && !nameQ && !cardQ) {
+      return rows;
+    }
+
     return rows.filter((r) => {
-      const matchesEmployeeId = !searchEmployeeId || String(r.EmployeeID || "").toLowerCase().includes(searchEmployeeId.toLowerCase());
-      const matchesName = !searchEmployeeName || String(r.EmployeeName || "").toLowerCase().includes(searchEmployeeName.toLowerCase());
-      const matchesCard = !searchCardNumber || String(r.CardNumber || "").toLowerCase().includes(searchCardNumber.toLowerCase());
+      const matchesEmployeeId = !empIdQ || String(r.EmployeeID || "").toLowerCase().includes(empIdQ);
+      const matchesName = !nameQ || String(r.EmployeeName || "").toLowerCase().includes(nameQ);
+      const matchesCard = !cardQ || String(r.CardNumber || "").toLowerCase().includes(cardQ);
       return matchesEmployeeId && matchesName && matchesCard;
     });
   }, [regionObj, searchEmployeeId, searchEmployeeName, searchCardNumber]);
+
+
+
 
   const openSwipeDialogFor = (emp) => {
     setSelectedEmployee(emp);
@@ -799,7 +925,8 @@ export default function DurationPage() {
     if (!regionObj) return <Typography>No data for selected region.</Typography>;
 
     const dates = regionObj.dates || [];
-    const rows = getFilteredRows();
+    // const rows = getFilteredRows();
+    const rows = filteredRows;
 
     const weekStarts = computeWeekStarts(dates);
 
