@@ -1,3 +1,1534 @@
+// C:\Users\W0024618\Desktop\global-page\backend\config\dbConfig.js
+import sql from 'mssql';
+
+// shared options
+const commonOpts = {
+  options: {
+    encrypt: true,
+    trustServerCertificate: true
+  },
+  // increase default request timeout (ms) to avoid ETIMEOUT on long queries
+  requestTimeout: 60000 // 60s (adjust if you need more)
+};
+
+// lowercase keys only
+const regions = {
+  apac: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUPNQ0986V',
+    database: 'ACVSUJournal_00010029',
+    ...commonOpts
+  },
+  emea: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUFRA0986V',
+    database: 'ACVSUJournal_00011028',
+    ...commonOpts
+  },
+  laca: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUSJO0986V',
+    database: 'ACVSUJournal_00010029',
+    ...commonOpts
+  },
+  namer: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUDEN0891V',
+    database: 'ACVSUJournal_00010029',
+    ...commonOpts
+  }
+};
+
+const pools = {};
+
+/**
+ * @param {string} regionKey  one of the keys in `regions`, case-insensitive
+ */
+export async function getPool(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) {
+    throw new Error(`Unknown region: ${regionKey}`);
+  }
+  if (!pools[key]) {
+    try {
+      pools[key] = await new sql.ConnectionPool(cfg).connect();
+      // optionally log successful connection
+      console.log(`MSSQL pool connected for region=${key}`);
+    } catch (err) {
+      // ensure we don't keep a broken pool reference
+      if (pools[key]) delete pools[key];
+      console.error(`Failed connecting to DB for region=${key}`, err);
+      throw err;
+    }
+  }
+  return pools[key];
+}
+
+export { sql };
+
+
+
+
+
+
+
+
+
+
+
+
+// C:\Users\W0024618\Desktop\global-page\backend\services\reportService.js
+
+import { getPool, sql } from '../config/dbConfig.js';
+
+/**
+ * Raw report (swipes) — expects startDate and endDate as JS Date or SQL-date-compatible value.
+ */
+export async function rawReport(region, { startDate, endDate, location, admitFilter = 'all' }) {
+  if (!region) throw new Error('region required');
+  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+
+  const pool = await getPool(region);
+  const req = pool.request();
+
+  // Accept NULL for location to mean "all partitions in this region DB"
+  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
+
+  req.input('location', sql.NVarChar(200), locationParam);
+  // bind as sql.Date — if caller provided Date or YYYY-MM-DD it will work
+  req.input('startDate', sql.Date, startDate);
+  req.input('endDate', sql.Date, endDate);
+  req.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
+
+  const query = `
+WITH CombinedQuery AS(
+  SELECT 
+     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+     t1.ObjectName1,
+     t1.PartitionName2       AS location,
+     t5_card.CardNumber,
+     t5_admit.value          AS AdmitCode,
+     t5_dir.value            AS Direction,
+     t1.ObjectName2          AS Door,
+     t5_rej.value            AS Rejection_Type,
+     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+          THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+     END                       AS EmployeeID,
+     t3.Name                  AS PersonnelType,
+     t1.MessageType,
+     t1.XmlGUID
+  FROM ACVSUJournalLog AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
+    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM ACVSUJournalLogxmlShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    -- message types we consider
+    t1.MessageType IN ('CardAdmitted' , 'CardRejected')
+    -- location optional filter
+    AND (@location IS NULL OR t1.PartitionName2 = @location)
+    -- admit/reject filter: 'all' | 'admit' | 'reject' (case-insensitive)
+    AND (
+      UPPER(ISNULL(@admitFilter,'all')) = 'ALL'
+      OR (UPPER(@admitFilter) = 'ADMIT'  AND t1.MessageType = 'CardAdmitted')
+      OR (UPPER(@admitFilter) = 'REJECT' AND t1.MessageType = 'CardRejected')
+    )
+    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
+)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date,    LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM CombinedQuery
+ORDER BY LocaleMessageTime ASC;
+`;
+
+  try {
+    const { recordset } = await req.query(query);
+    return recordset;
+  } catch (err) {
+    console.error(`rawReport(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+/**
+ * Rejection report
+ */
+export async function rejectionReport(region, { startDate, endDate, location } = {}) {
+  if (!region) throw new Error('region required');
+  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+
+  const pool = await getPool(region);
+  const req = pool.request();
+
+  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
+
+  req.input('location', sql.NVarChar(200), locationParam);
+  req.input('startDate', sql.Date, startDate);
+  req.input('endDate', sql.Date, endDate);
+
+  const query = `
+WITH CombinedQuery AS(
+  SELECT 
+     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+     t1.ObjectName1,
+     t1.PartitionName2       AS location,
+     t5_card.CardNumber,
+     t5_admit.value          AS AdmitCode,
+     t5_dir.value            AS Direction,
+     t1.ObjectName2          AS Door,
+     t5_rej.value            AS Rejection_Type,
+     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+          THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+     END                       AS EmployeeID,
+     t3.Name                  AS PersonnelType,
+     t1.MessageType,
+     t1.XmlGUID
+  FROM ACVSUJournalLog AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
+    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM ACVSUJournalLogxmlShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType = 'CardRejected'
+    AND (@location IS NULL OR t1.PartitionName2 = @location)
+    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
+),
+Unified AS (
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Lost'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Clearance'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type IN ('CardDisabled','Disabled')
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Stolen'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Expired'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'PIN'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'UnknownCard'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'SiteCode'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'NotActivated'
+  UNION ALL
+  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'FacilityCode'
+)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date,    LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM Unified
+ORDER BY LocaleMessageTime DESC;
+`;
+
+  try {
+    const { recordset } = await req.query(query);
+    return recordset;
+  } catch (err) {
+    console.error(`rejectionReport(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+/**
+ * dailyAccessReportEMEA
+ * NOTE: This function used ACVSUJournal_00011028 DB in the SQL body in your original file.
+ * Keep that intact (query references) — ensure the pool for 'emea' points to the database containing that table.
+ */
+export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
+  const pool = await getPool('emea');
+  const req  = pool.request();
+
+  req.input('fromDate', sql.Date, from);
+  req.input('toDate',   sql.Date, to);
+  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
+  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
+
+  const query = `
+
+  -- expects parameters: @fromDate (DATE), @toDate (DATE), @employees (NVARCHAR(MAX) | NULL)
+DECLARE @empCSV NVARCHAR(MAX) = @employees;
+
+;WITH EmpList AS (
+  SELECT LTRIM(RTRIM(value)) AS emp
+  FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
+  WHERE LTRIM(RTRIM(value)) <> ''
+)
+
+-- Raw rows: compute LocaleMessageTime once and use OUTER APPLY to avoid duplicate shreddes
+, RawSwipes AS (
+  SELECT
+    t1.ObjectName1,
+    t1.ObjectName2,
+    t1.MessageType,
+    t2.Text12       AS EmployeeID,
+    CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID,
+    t3.Name         AS PersonnelType,
+    t1.PartitionName2 AS PartitionName2,
+
+    -- compute local wall-clock once (DO NOT change sign here; using your -1 * MessageLocaleOffset)
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+
+    -- direction/value picked by OUTER APPLY (single row)
+    CASE
+      WHEN dir.Value = 'InDirection'  THEN 'IN'
+      WHEN dir.Value = 'OutDirection' THEN 'OUT'
+      ELSE 'Unknown'
+    END AS Swipe,
+
+    card.Value AS CardNumber
+  FROM ACVSUJournal_00011028.dbo.ACVSUJournalLog AS t1
+  INNER JOIN ACVSCore.Access.Personnel     AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+  INNER JOIN ACVSCore.Access.PersonnelType AS t3
+    ON t2.PersonnelTypeId = t3.ObjectID
+
+  -- pick at most one direction shred row (InDirection/OutDirection)
+  OUTER APPLY (
+    SELECT TOP (1) s.Value
+    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
+    WHERE s.GUID = t1.XmlGUID
+      AND s.Value IN ('InDirection','OutDirection')
+  ) AS dir
+
+  -- pick at most one numeric card value (exclude direction values, ensure numeric)
+  OUTER APPLY (
+    SELECT TOP (1) s.Value
+    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
+    WHERE s.GUID = t1.XmlGUID
+      AND s.Value NOT IN ('InDirection','OutDirection')
+      AND s.Value NOT LIKE '%[^0-9]%'
+      AND s.Value IS NOT NULL
+      AND LTRIM(RTRIM(s.Value)) <> ''
+  ) AS card
+)
+
+-- Strict time window: >= 08:00 on @fromDate, and < 08:00 on @toDate
+, Windowed AS (
+  SELECT *
+  FROM RawSwipes
+  WHERE
+    LocaleMessageTime >= DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
+    -- NOTE: removed extra DATEADD(DAY,1,...) — upper bound should be < toDate 08:00
+    AND LocaleMessageTime <  DATEADD(HOUR, 8, CAST(@toDate AS DATETIME))
+    AND Swipe IN ('IN','OUT') -- only real swipes
+)
+
+-- final projection + optional employee filter (supports CSV of names or IDs)
+SELECT
+  ObjectName1,
+  ObjectName2,
+  PersonnelType,
+  EmployeeID,
+  NumericEmployeeID,
+  -- alias PartitionName2 -> location so frontend sees r.location
+  PartitionName2 AS location,
+  -- alias MessageType -> Messagetype so frontend sees r.Messagetype
+  MessageType AS Messagetype,
+  Swipe,
+  CardNumber,
+  LocaleMessageTime
+FROM Windowed w
+WHERE
+  (
+    @empCSV IS NULL
+    OR LTRIM(RTRIM(@empCSV)) = ''
+    OR EXISTS (
+      SELECT 1
+      FROM EmpList e
+      WHERE
+        e.emp = LTRIM(RTRIM(w.ObjectName1))
+        OR e.emp = w.EmployeeID
+        OR e.emp = w.NumericEmployeeID
+    )
+  )
+ORDER BY LocaleMessageTime;
+
+`;
+
+  try {
+    const { recordset } = await req.query(query);
+    return recordset;
+  } catch (err) {
+    console.error('dailyAccessReportEMEA query error:', err);
+    throw err;
+  }
+}
+
+
+/**
+ * In vs Out Report
+ */
+export async function inOutReport(region, { year, month, doors }) {
+  const pool = await getPool(region);
+  const req  = pool.request();
+
+  req.input('TargetYear',  sql.Int, year);
+  req.input('TargetMonth', sql.Int, month);
+  doors.forEach((d, i) => req.input(`door${i}`, sql.NVarChar, d));
+  const doorList = doors.map((_, i) => `@door${i}`).join(',');
+
+  const query = `
+WITH CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1,
+    t1.PartitionName2    AS location,
+    t5_card.CardNumber,
+    t5_dir.value         AS Direction,
+    CASE
+      WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+      ELSE CAST(t2.Int1 AS NVARCHAR)
+    END                    AS EmployeeID,
+    t3.Name               AS PersonnelType
+  FROM ACVSUJournalLog AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3
+    ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN ACVSUJournalLogxmlShred AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID
+    AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN ACVSUJournalLogxml AS t_xml
+    ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM ACVSUJournalLogxmlShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard
+    ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  WHERE
+    YEAR(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetYear
+    AND MONTH(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetMonth
+    AND t1.ObjectName2 IN (${doorList})
+)
+SELECT
+  FORMAT(LocaleMessageTime,'yyyy-MM')    AS Month,
+  ObjectName1                           AS EmployeeName,
+  EmployeeID,
+  PersonnelType,
+  location,
+  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)  AS In_Count,
+  SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS Out_Count,
+  COUNT(*)                                                 AS TotalSwipes,
+  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)
+  - SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS InOut_Difference
+FROM CombinedQuery
+GROUP BY FORMAT(LocaleMessageTime,'yyyy-MM'),
+         ObjectName1, EmployeeID, PersonnelType, location
+ORDER BY Month DESC, EmployeeName;
+`;
+
+  try {
+    const { recordset } = await req.query(query);
+    return recordset;
+  } catch (err) {
+    console.error(`inOutReport(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+/**
+ * Time Duration Report
+ */
+export async function timeDurationReport(region, { partition = 'Default', startDate }) {
+  const pool = await getPool(region);
+  const req  = pool.request();
+
+  // bind inputs
+  const fullPartition = `${region.toUpperCase()}.${partition}`;
+  req.input('partition', sql.NVarChar, fullPartition);
+  req.input('startDate', sql.Date, startDate);
+
+  const query = `
+-- (omitted here for brevity in comments; using your existing SQL from original file)
+SELECT 
+    t1.[ObjectName1],
+    t1.[ObjectName2],
+    t1.[PartitionName2],
+    CASE
+        WHEN t2.[Int1] = 0 THEN t2.[Text12]
+        ELSE CAST(t2.[Int1] AS NVARCHAR)
+    END AS EmployeeID,
+    t3.[Name] AS PersonnelType,
+    t2.text5,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    DATEADD(HOUR, -2, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS AdjustedMessageTime
+INTO 
+    #CombinedEmployeeData
+FROM 
+    [ACVSUJournal_00010029].[dbo].[ACVSUJournalLog] AS t1
+INNER JOIN 
+    [ACVSCore].[Access].[Personnel] AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN 
+    [ACVSCore].[Access].[PersonnelType] AS t3
+    ON t2.[PersonnelTypeId] = t3.[ObjectID];
+
+-- Step 2: Daily duration per employee
+WITH DailyDurations AS (
+    SELECT 
+        [ObjectName1],
+        PersonnelType,
+        EmployeeID,
+        [PartitionName2],
+        text5,
+        CONVERT(DATE, AdjustedMessageTime) AS ShiftedDate,
+        DATEPART(WEEK, AdjustedMessageTime) AS WeekNumber,
+        DATEPART(YEAR, AdjustedMessageTime) AS YearNumber,
+        MIN(LocaleMessageTime) AS FirstSwipeTime,
+        MAX(LocaleMessageTime) AS LastSwipeTime,
+        DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) AS DurationMinutes,
+        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) / 60 AS NVARCHAR), 2)
+        + ':' +
+        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) % 60 AS NVARCHAR), 2) AS DurationHHMM,
+        CASE 
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 5 THEN '<5mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 10 THEN '<10mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 20 THEN '<20mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 30 THEN '<30mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 60 THEN '<1hr'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 120 THEN 'Less than <2hrs'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 180 THEN 'Less than <3hrs'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 240 THEN 'Less than <4hrs'
+            ELSE '4+ hrs'
+        END AS TimeDiffCategory
+    FROM 
+        #CombinedEmployeeData
+
+  WHERE CONVERT(DATE, AdjustedMessageTime) >= @startDate
+
+   AND [PartitionName2] = 'APAC.Default'
+        AND PersonnelType IN ('Employee', 'Terminated Personnel')
+    GROUP BY 
+        [ObjectName1], EmployeeID, PersonnelType, text5, [PartitionName2],
+        CONVERT(DATE, AdjustedMessageTime),
+        DATEPART(WEEK, AdjustedMessageTime),
+        DATEPART(YEAR, AdjustedMessageTime)
+),
+
+-- Step 3: Weekly summary
+WeeklySummary AS (
+    SELECT 
+        EmployeeID,
+        [ObjectName1],
+        PersonnelType,
+        text5,
+        [PartitionName2],
+        YearNumber,
+        WeekNumber,
+        COUNT(DISTINCT ShiftedDate) AS DaysPresentInWeek,
+        SUM(CASE WHEN DurationMinutes < 240 THEN 1 ELSE 0 END) AS ViolationDaysInWeek
+    FROM 
+        DailyDurations
+    GROUP BY 
+        EmployeeID, [ObjectName1], PersonnelType, text5, [PartitionName2], YearNumber, WeekNumber
+)
+
+-- Step 4: Final output with daily duration, category, and defaulter flag
+SELECT 
+    dd.EmployeeID,
+    dd.ObjectName1,
+    dd.PersonnelType,
+    dd.text5,
+    dd.PartitionName2,
+    dd.YearNumber,
+    dd.WeekNumber,
+    dd.ShiftedDate,
+    dd.FirstSwipeTime,
+    dd.LastSwipeTime,
+    dd.DurationHHMM,
+    dd.TimeDiffCategory,
+    ws.DaysPresentInWeek,
+    ws.ViolationDaysInWeek,
+    (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) AS CleanDaysInWeek,
+    CASE
+        WHEN (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) < 3 THEN 'Yes'
+        ELSE 'No'
+    END AS Defaulter
+FROM 
+    DailyDurations dd
+JOIN 
+    WeeklySummary ws
+    ON dd.EmployeeID = ws.EmployeeID
+    AND dd.WeekNumber = ws.WeekNumber
+    AND dd.YearNumber = ws.YearNumber
+ORDER BY 
+    dd.YearNumber DESC, dd.WeekNumber DESC, dd.EmployeeID, dd.ShiftedDate;
+  `;
+
+  try {
+    const { recordset } = await req.query(query);
+    return recordset;
+  } catch (err) {
+    console.error(`timeDurationReport(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+/**
+ * EUROC Admit/Rejection Report (returns structured object with admit,rejection,summary)
+ */
+export async function eurocAdmitRejectionReport(region, { reportDate }) {
+  const pool = await getPool(region);
+  const req  = pool.request();
+
+  // enforce location LT.Vilnius (as requested)
+  req.input('location', sql.NVarChar, 'LT.Vilnius');
+  // reportDate should be YYYY-MM-DD or Date — bind as sql.Date
+  req.input('reportDate', sql.Date, reportDate);
+
+  const query = `
+-- (kept your existing EUROC SQL — unchanged)
+WITH CombinedQuery AS(
+  SELECT 
+     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+     t1.ObjectName1,
+     t1.PartitionName2       AS location,
+     t5_card.CardNumber,
+     t5_admit.value          AS AdmitCode,
+     t5_dir.value            AS Direction,
+     t1.ObjectName2          AS Door,
+     t5_rej.value            AS Rejection_Type,
+     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+          THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+     END                       AS EmployeeID,
+     t3.Name                  AS PersonnelType,
+     t1.MessageType,
+     t1.XmlGUID
+  FROM ACVSUJournalLog AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
+    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM ACVSUJournalLogxmlShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType IN ('CardAdmitted' , 'CardRejected')
+    AND t1.PartitionName2 = @location
+    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @reportDate
+)
+
+SELECT
+  LocaleMessageTime,
+  CONVERT(date, LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type,
+  MessageType
+INTO #Combined
+FROM CombinedQuery;
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type,
+  ROW_NUMBER() OVER (PARTITION BY ISNULL(EmployeeID, CardNumber) ORDER BY LocaleMessageTime ASC) AS rn
+INTO #Admits
+FROM #Combined
+WHERE MessageType = 'CardAdmitted'
+  AND PersonnelType = 'Employee';
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+INTO #Rejections
+FROM #Combined
+WHERE MessageType = 'CardRejected';
+
+-- resultset 1: admits (only rn = 1)
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM #Admits
+WHERE rn = 1
+ORDER BY LocaleMessageTime ASC;
+
+-- resultset 2: rejections (all)
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM #Rejections
+ORDER BY LocaleMessageTime ASC;
+
+-- resultset 3: summary counts by Rejection_Type
+SELECT
+  ISNULL(Rejection_Type, 'Unknown') AS Rejection_Type,
+  COUNT(*) AS CountVal
+FROM #Rejections
+GROUP BY ISNULL(Rejection_Type, 'Unknown')
+ORDER BY CountVal DESC;
+
+DROP TABLE IF EXISTS #Admits;
+DROP TABLE IF EXISTS #Rejections;
+DROP TABLE IF EXISTS #Combined;
+`;
+
+  try {
+    const result = await req.query(query);
+    const recordsets = result.recordsets || [];
+    const admitRows = (recordsets[0] || []).map(r => ({
+      LocaleMessageTime: r.LocaleMessageTime,
+      DateOnly: r.DateOnly,
+      Swipe_Time: r.Swipe_Time,
+      ObjectName1: r.ObjectName1,
+      EmployeeID: r.EmployeeID,
+      PersonnelType: r.PersonnelType,
+      CardNumber: r.CardNumber,
+      Door: r.Door,
+      location: r.location,
+      Direction: r.Direction
+    }));
+    const rejectRows = (recordsets[1] || []).map(r => ({
+      LocaleMessageTime: r.LocaleMessageTime,
+      DateOnly: r.DateOnly,
+      Swipe_Time: r.Swipe_Time,
+      ObjectName1: r.ObjectName1,
+      EmployeeID: r.EmployeeID,
+      PersonnelType: r.PersonnelType,
+      CardNumber: r.CardNumber,
+      Rejection_Type: r.Rejection_Type,
+      Door: r.Door,
+      location: r.location,
+      Direction: r.Direction
+    }));
+    const summaryRows = (recordsets[2] || []).map(r => ({ Rejection_Type: r.Rejection_Type, Count: r.CountVal }));
+
+    return { admit: admitRows, rejection: rejectRows, summary: summaryRows };
+  } catch (err) {
+    console.error(`eurocAdmitRejectionReport(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+/**
+ * New helper: fetch distinct PartitionName2 (locations) from the ACVSUJournalLog table for a given region DB.
+ * Returns array of strings (partition names). This enables frontend to populate Location select dynamically.
+ */
+export async function getLocations(region) {
+  if (!region) throw new Error('region required');
+  const pool = await getPool(region);
+  const req = pool.request();
+
+  // Query distinct PartitionName2 — sample limit and order.
+  // NOTE: PartitionName2 is the field used in your SQL logs for location names.
+  const query = `
+    SELECT DISTINCT RTRIM(LTRIM(PartitionName2)) AS PartitionName2
+    FROM ACVSUJournalLog
+    WHERE PartitionName2 IS NOT NULL AND LTRIM(RTRIM(PartitionName2)) <> ''
+    ORDER BY PartitionName2;
+  `;
+  try {
+    const { recordset } = await req.query(query);
+    return (recordset || []).map(r => r.PartitionName2);
+  } catch (err) {
+    console.error(`getLocations(${region}) query error:`, err);
+    throw err;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+// C:\Users\W0024618\Desktop\global-page\backend\routes\reports.js
+import express from 'express';
+import {
+  rawReport,
+  rejectionReport,
+  dailyAccessReportEMEA,
+  inOutReport,
+  timeDurationReport,
+  eurocAdmitRejectionReport,
+  getLocations
+} from '../services/reportService.js';
+
+import { rawReportHandler } from '../controllers/reportController.js';
+
+const router = express.Router();
+
+// Helper to unify GET/POST inputs
+function getParam(req, name, defaultValue = undefined) {
+  if (req.method === 'GET') {
+    return req.query[name] ?? defaultValue;
+  } else {
+    return req.body[name] ?? defaultValue;
+  }
+}
+
+// Middleware to ensure `region` is defined
+function requireRegion(req, res, next) {
+  const region = getParam(req, 'region');
+  if (!region) {
+    return res
+      .status(400)
+      .json({ error: "Missing required parameter: 'region'" });
+  }
+  next();
+}
+
+// New endpoint: fetch locations for a region (front-end will call this when region changes)
+router.get('/locations', requireRegion, async (req, res, next) => {
+  try {
+    const regionRaw = req.query.region || '';
+    const region = regionRaw.toString().toLowerCase();
+    const locations = await getLocations(region);
+    res.json({ success: true, data: locations });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Raw handler — prefer using controller wrapper which validates dates, supports region=global merging
+router.get('/raw', rawReportHandler);
+router.post('/raw', rawReportHandler);
+
+// Rejection Report handler (supports region=global)
+async function handleRejection(req, res, next) {
+  try {
+    const regionRaw = getParam(req, 'region');
+    const region = (regionRaw || '').toString().toLowerCase();
+    const startDateParam = getParam(req, 'startDate');
+    const endDateParam = getParam(req, 'endDate');
+    const location = getParam(req, 'location', undefined);
+
+    if (!startDateParam || !endDateParam) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameters: 'startDate' and/or 'endDate'" });
+    }
+
+    const startDate = new Date(startDateParam);
+    const endDate = new Date(endDateParam);
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date format for startDate/endDate" });
+    }
+
+    const ALL_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+    if (region === 'global') {
+      const promises = ALL_REGIONS.map(r => rejectionReport(r, { startDate, endDate, location }));
+      const results = await Promise.all(promises);
+      const merged = results.flat();
+      merged.sort((a, b) => {
+        const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
+        const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
+        return tb - ta;
+      });
+      return res.json({ success: true, data: merged });
+    }
+
+    // single-region
+    const data = await rejectionReport(region, { startDate, endDate, location });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/rejection', requireRegion, handleRejection);
+router.post('/rejection', requireRegion, handleRejection);
+
+
+// Daily Access Report handler
+async function handleDailyAccess(req, res, next) {
+  try {
+    const region    = getParam(req, 'region');
+    const from      = getParam(req, 'from');
+    const to        = getParam(req, 'to');
+    if (!from || !to) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameters: 'from' and/or 'to'" });
+    }
+    // employees: POST expects array, GET expects comma-separated string
+    let employees = getParam(req, 'employees', []);
+    if (typeof employees === 'string') {
+      employees = employees.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(employees) || employees.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Missing or empty required parameter: 'employees'" });
+    }
+    const data = await dailyAccessReportEMEA({ from, to, employees: employees.join(',') });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/daily-access', requireRegion, handleDailyAccess);
+router.post('/daily-access', requireRegion, handleDailyAccess);
+
+// In vs Out
+async function handleInOut(req, res, next) {
+  try {
+    const region = getParam(req, 'region');
+    const year   = parseInt(getParam(req, 'year'),  10);
+    const month  = parseInt(getParam(req, 'month'), 10);
+    if (Number.isNaN(year) || Number.isNaN(month)) {
+      return res
+        .status(400)
+        .json({ error: "Missing or invalid parameters: 'year' and/or 'month'" });
+    }
+    let doors = getParam(req, 'doors', []);
+    if (typeof doors === 'string') {
+      doors = doors.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(doors) || doors.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Missing or empty required parameter: 'doors'" });
+    }
+    const data = await inOutReport(region, { year, month, doors });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/in-out', requireRegion, handleInOut);
+router.post('/in-out', requireRegion, handleInOut);
+
+// Time Duration
+async function handleTimeDuration(req, res, next) {
+  try {
+    const region    = getParam(req, 'region');
+    const startDate = getParam(req, 'startDate');
+    const partition = getParam(req, 'partition', 'Default');
+
+    if (!startDate) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameter: 'startDate'" });
+    }
+
+    const data = await timeDurationReport(region, { partition, startDate });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/time-duration', requireRegion, handleTimeDuration);
+router.post('/time-duration', requireRegion, handleTimeDuration);
+
+// EUROC
+async function handleEuroc(req, res, next) {
+  try {
+    const region = getParam(req, 'region');
+    const dateParam = getParam(req, 'date'); // expected YYYY-MM-DD or JS date string
+    if (!region || region.toLowerCase() !== 'emea') {
+      return res.status(400).json({ error: "EUROC report only supported for region 'emea'" });
+    }
+    if (!dateParam) {
+      return res.status(400).json({ error: "Missing required parameter: 'date' (YYYY-MM-DD)" });
+    }
+    const dt = new Date(dateParam);
+    if (Number.isNaN(dt.getTime())) {
+      return res.status(400).json({ error: "Invalid date parameter" });
+    }
+    const isoDate = dt.toISOString().slice(0, 10); // YYYY-MM-DD
+    const data = await eurocAdmitRejectionReport(region, { reportDate: isoDate });
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/euroc-admit-rejection', requireRegion, handleEuroc);
+router.post('/euroc-admit-rejection', requireRegion, handleEuroc);
+
+export default router;
+
+
+
+
+
+
+
+
+
+
+// C:\Users\W0024618\Desktop\global-page\backend\controllers\reportController.js
+import { rawReport } from '../services/reportService.js';
+
+const ALL_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+export async function rawReportHandler(req, res) {
+  try {
+    const regionRaw = (req.query.region || '').toString();
+    const region = regionRaw.toLowerCase();
+    const location = req.query.location ? req.query.location.toString().trim() : undefined;
+    const startDateParam = req.query.startDate;
+    const endDateParam = req.query.endDate;
+    const admitFilter = req.query.admitFilter ? req.query.admitFilter.toString().toLowerCase() : 'all';
+
+    if (!region) return res.status(400).json({ success: false, message: 'region required' });
+    if (!startDateParam || !endDateParam) {
+      return res.status(400).json({ success: false, message: 'startDate and endDate required' });
+    }
+
+    const startDate = new Date(startDateParam);
+    const endDate = new Date(endDateParam);
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid date format' });
+    }
+
+    // GLOBAL: query all regions and merge results
+    if (region === 'global') {
+      const promises = ALL_REGIONS.map(r => rawReport(r, { startDate, endDate, location, admitFilter }));
+      const results = await Promise.all(promises);
+      // results is array of recordsets -> flatten
+      const merged = results.flat();
+      // Optionally sort by LocaleMessageTime desc to keep consistent ordering
+      merged.sort((a, b) => {
+        const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
+        const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
+        return tb - ta;
+      });
+      return res.json({ success: true, data: merged });
+    }
+
+    // Normal single-region flow
+    const rows = await rawReport(region, { startDate, endDate, location, admitFilter });
+    return res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('rawReportHandler error', err);
+    return res.status(500).json({ success: false, message: err.message || 'server error' });
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+// frontend/src/pages/ReportsPage.jsx
+import React, { useState, useEffect } from 'react';
+import {
+  Box, FormControl, InputLabel, Select, OutlinedInput,
+  Checkbox, ListItemText, MenuItem, Button,
+  CircularProgress, Typography, TextField, Tabs, Tab, Grid, Paper, IconButton, Divider
+} from '@mui/material';
+
+import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
+import { StaticDatePicker } from '@mui/x-date-pickers/StaticDatePicker';
+import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
+import axios from 'axios';
+import ExcelJS from 'exceljs';
+import * as XLSX from 'xlsx';
+import { useAuth } from '../context/AuthContext';
+
+import CalendarTodayIcon from '@mui/icons-material/CalendarToday';
+import PlaceIcon from '@mui/icons-material/Place';
+import PeopleIcon from '@mui/icons-material/People';
+import DownloadIcon from '@mui/icons-material/CloudDownload';
+import FilterListIcon from '@mui/icons-material/FilterList';
+import Avatar from '@mui/material/Avatar';
+import { generateDailyAccessExcelFromRows } from './DailyAccessReport';
+
+// Static fallback lists (used only if backend locations fetch fails)
+const FALLBACK_LOCATION_MAP = {
+  apac: ['APAC.Default', 'JP.Tokyo', 'PH.Manila', 'MY.Kuala Lumpur','IN.HYD'],
+  emea: ['AUT.Vienna', 'DU.Abu Dhab', 'IE.Dublin', 'IT.Rome', 'LT.Vilnius', 'MA.Casablanca', 'RU.Moscow', 'UK.London', 'ES.Madrid'],
+  laca: ['AR.Cordoba', 'CR.Costa Rica Partition', 'MX.Mexico City', 'PE.Lima', 'BR.Sao Paulo', 'PA.Panama City'],
+  namer: ['US.NYC', 'US.FL.Miami', 'USA/Canada Default', 'US.CO.OBS'],
+  global: []
+};
+
+const EMPLOYEE_OPTIONS = [
+  'Vainilaitis, Valdas',
+  'Tomasevic, Kazimez',
+  'Sesickis, Janas',
+  'Valiunas, Sigitas',
+  'JANCUKOVIC, VACLAVA',
+  'Kalpokiene, Alina',
+  'Korkus, Vanda',
+  'Kvaraciejiene, Maryte',
+  'ZNAMEROVSKIS, DARIUS'
+];
+
+const REGION_OPTIONS = ['global', 'apac', 'emea', 'laca', 'namer'];
+
+function formatDisplayDate(date) {
+  const d = new Date(date);
+  const day = d.getDate();
+  const suf = day % 10 === 1 && day !== 11 ? 'st'
+    : day % 10 === 2 && day !== 12 ? 'nd'
+      : day % 10 === 3 && day !== 13 ? 'rd' : 'th';
+  const mon = d.toLocaleString('default', { month: 'long' });
+  return `${day}${suf} ${mon} ${d.getFullYear()}`;
+}
+
+const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const pad2 = n => String(n).padStart(2, '0');
+
+// --- helpers (same as your original file) ---
+function _extractServerDateTimeParts(iso) {
+  if (!iso) return null;
+  const s = String(iso);
+  let datePart = '', timePart = '';
+  if (s.includes('T')) {
+    [datePart, timePart] = s.split('T');
+  } else if (s.includes(' ')) {
+    [datePart, timePart] = s.split(' ');
+  } else {
+    return null;
+  }
+  datePart = datePart.slice(0, 10);
+  timePart = (timePart || '').replace(/Z|[+-]\d{2}:\d{2}$/, '').replace(/\.\d+$/, '');
+  const dParts = datePart.split('-').map(p => parseInt(p, 10));
+  const tParts = timePart.split(':').map(p => parseInt(p || '0', 10));
+  return {
+    year: dParts[0] || 0,
+    month: dParts[1] || 0,
+    day: dParts[2] || 0,
+    hour: tParts[0] || 0,
+    minute: tParts[1] || 0,
+    second: tParts[2] || 0
+  };
+}
+
+function formatDateFromServerISO(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  const y = dt.getUTCFullYear();
+  const m = dt.getUTCMonth(); // 0..11
+  const d = dt.getUTCDate();
+  const yrShort = String(y).slice(-2);
+  return `${pad2(d)}-${MONTH_ABBR[m]}-${yrShort}`;
+}
+
+function formatTimeFromServerISO(iso) {
+  if (!iso) return '';
+  const p = _extractServerDateTimeParts(iso);
+  if (!p) return '';
+  const hh = p.hour;
+  const mm = p.minute || 0;
+  const ss = p.second || 0;
+  const ampm = hh >= 12 ? 'PM' : 'AM';
+  const hh12 = ((hh + 11) % 12) + 1;
+  return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
+}
+
+function buildISOFromDateOnlyAndSwipe(dateOnlyIso, swipeIso) {
+  if (!dateOnlyIso) return '';
+  const datePart = dateOnlyIso.toString().slice(0,10);
+  if (!swipeIso) {
+    return `${datePart}T00:00:00.000`;
+  }
+  const t = new Date(swipeIso);
+  if (!isNaN(t.getTime())) {
+    const hh = pad2(t.getUTCHours());
+    const mm = pad2(t.getUTCMinutes());
+    const ss = pad2(t.getUTCSeconds());
+    return `${datePart}T${hh}:${mm}:${ss}.000`;
+  }
+  const parts = ('' + swipeIso).split(':').map(p => pad2(parseInt(p||0,10)||0));
+  const hh = parts[0] || '00';
+  const mm = parts[1] || '00';
+  const ss = parts[2] || '00';
+  return `${datePart}T${hh}:${mm}:${ss}.000`;
+}
+
+const getServerISO = (r) => {
+  if (!r) return '';
+  if (r.LocaleMessageTime) return r.LocaleMessageTime;
+  if (r.DateOnly) return buildISOFromDateOnlyAndSwipe(r.DateOnly, r.Swipe_Time);
+  return '';
+};
+
+const getServerYMD = (r) => {
+  const iso = getServerISO(r);
+  if (!iso) return '';
+  return iso.slice(0, 10);
+};
+
+const isoDateOnlyToLocalDate = (iso) => {
+  if (!iso) return null;
+  const s = iso.toString().slice(0, 10);
+  const [y, m, d] = s.split('-').map(n => parseInt(n, 10));
+  return new Date(y, m - 1, d);
+};
+
+const buildLocalDateFromDateOnlyAndSwipe = (dateOnly, swipeTime) => {
+  if (!dateOnly) return null;
+  const dateStr = dateOnly.toString().slice(0, 10);
+  const [yy, mm, dd] = dateStr.split('-').map(n => parseInt(n, 10));
+
+  let hh = 0, min = 0, ss = 0;
+  if (swipeTime) {
+    const parsed = new Date(swipeTime);
+    if (!isNaN(parsed.getTime())) {
+      hh = parsed.getUTCHours();
+      min = parsed.getUTCMinutes();
+      ss = parsed.getUTCSeconds();
+    } else {
+      const parts = swipeTime.split(':').map(p => parseInt(p, 10));
+      if (parts.length >= 2) {
+        hh = parts[0] || 0;
+        min = parts[1] || 0;
+        ss = parts[2] || 0;
+      }
+    }
+  }
+  return new Date(yy, mm - 1, dd, hh, min, ss);
+};
+
+export default function ReportsPage() {
+  const auth = useAuth();
+
+  // --- state ---
+  const [tab, setTab] = useState(0);
+
+  const [region, setRegion] = useState('emea');
+  const [location, setLocation] = useState('');
+  const [locations, setLocations] = useState([]); // dynamic list from backend
+  const [locLoading, setLocLoading] = useState(false);
+  const [locError, setLocError] = useState(null);
+
+  const [from, setFrom] = useState(null);
+  const [to, setTo] = useState(null);
+  const [showFromCal, setShowFromCal] = useState(false);
+  const [showToCal, setShowToCal] = useState(false);
+  const [selectedEmps, setSelectedEmps] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const [rawSearch, setRawSearch] = useState('');
+  const [rawAdmitFilter, setRawAdmitFilter] = useState('all');
+  const [newEmployee, setNewEmployee] = useState('');
+
+  // fetch locations when region changes
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchLocations() {
+      if (!region) {
+        setLocations([]);
+        return;
+      }
+      setLocLoading(true);
+      setLocError(null);
+      setLocation(''); // reset selected location when region changes
+      try {
+        const resp = await axios.get('/api/reports/locations', { params: { region } });
+        if (cancelled) return;
+        if (resp.data && resp.data.success && Array.isArray(resp.data.data)) {
+          setLocations(resp.data.data);
+        } else {
+          // fallback to static mapping if backend didn't return a list
+          setLocations(FALLBACK_LOCATION_MAP[region] || []);
+        }
+      } catch (err) {
+        console.error('Failed to load locations for region', region, err);
+        setLocError('Failed to load locations (showing fallback list).');
+        setLocations(FALLBACK_LOCATION_MAP[region] || []);
+      } finally {
+        if (!cancelled) setLocLoading(false);
+      }
+    }
+    fetchLocations();
+    return () => { cancelled = true; };
+  }, [region]);
+
+  // ... (all your helper functions: generateTimeDurationExcel, generateRejectionExcel, generateRawExcel) ...
+  // I am keeping the same implementations you had earlier; for brevity in this response assume they are unchanged
+  // but in your file paste back the existing implementations (unchanged) for those functions.
+  // For the final file below I will include the generateRawExcel function as earlier.
+
+  // ---------- (I will include generateRawExcel and other functions verbatim) ----------
+  // generateRawExcel
+  const generateRawExcel = async (rows, opts = {}) => {
+    const formatTimeFromSwipe = (swipeIso) => {
+      if (!swipeIso) return '';
+      const dt = new Date(swipeIso);
+      if (!isNaN(dt.getTime())) {
+        return formatTimeFromServerISO(swipeIso);
+      }
+      const parts = ('' + swipeIso).split(':').map(p => parseInt(p || 0, 10));
+      const hh = parts[0] || 0;
+      const mm = parts[1] || 0;
+      const ss = parts[2] || 0;
+      const ampm = hh >= 12 ? 'PM' : 'AM';
+      const hh12 = ((hh + 11) % 12) + 1;
+      return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
+    };
+
+    const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase();
+
+    const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
+    const admitCol = 'AdmitCode';
+    const rejCol = 'Rejection_Type';
+    const tailCols = ['Direction','Door'];
+
+    let headers = [...baseHeaders];
+    if (admitFilter === 'all') {
+      headers.push(admitCol);
+      headers.push(...tailCols);
+      headers.push(rejCol);
+    } else if (admitFilter === 'admit') {
+      headers.push(admitCol);
+      headers.push(...tailCols);
+    } else if (admitFilter === 'reject') {
+      headers.push(...tailCols);
+      headers.push(rejCol);
+    } else {
+      headers.push(admitCol);
+      headers.push(...tailCols);
+      headers.push(rejCol);
+    }
+
+    if (!rows || !rows.length) {
+      const wbEmpty = XLSX.utils.book_new();
+      const wsEmpty = XLSX.utils.aoa_to_sheet([headers]);
+      XLSX.utils.book_append_sheet(wbEmpty, wsEmpty, 'Raw');
+      const fileNameEmpty = buildRawFileName(opts);
+      XLSX.writeFile(wbEmpty, fileNameEmpty);
+      return;
+    }
+
+    const rowsForSheet = rows.map(r => {
+      const iso = getServerISO(r);
+      const dateStr = iso ? formatDateFromServerISO(iso) : '';
+      const timeStr = iso ? formatTimeFromServerISO(iso) : '';
+      const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+      const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+      const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+      const fullObj = {
+        LocaleMessageTime: localeMsgFormatted,
+        DateOnly: dateOnlyFormatted,
+        Swipe_Time: swipeTimeFormatted,
+        EmployeeID: r.EmployeeID || '',
+        ObjectName1: r.ObjectName1 || '',
+        PersonnelType: r.PersonnelType || '',
+        location: r.location || '',
+        CardNumber: r.CardNumber || '',
+        AdmitCode: r.AdmitCode || r.Messagetype || '',
+        Direction: r.Direction || r.Swipe || '',
+        Door: r.Door || r.ObjectName2 || '',
+        Rejection_Type: r.Rejection_Type || ''
+      };
+
+      const picked = {};
+      headers.forEach(h => {
+        picked[h] = (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '';
+      });
+      return picked;
+    });
+
+    const ws = XLSX.utils.json_to_sheet(rowsForSheet, { header: headers });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Raw');
+
+    const filename = buildRawFileName(opts);
+    XLSX.writeFile(wb, filename);
+  };
+
+  // ---------- end generateRawExcel ----------
+
+  // helper for filename used above (simple)
+  const buildRawFileName = (opts = {}) => {
+    const fromStr = from ? formatDisplayDate(from) : 'from';
+    const toStr = to ? formatDisplayDate(to) : 'to';
+    const loc = location ? `_${location.replace(/\s+/g, '_')}` : '';
+    return `Raw_${region.toUpperCase()}${loc}_${fromStr}_to_${toStr}.xlsx`;
+  };
+
+  // Permission helpers & other UI handlers remain the same (use your original code)
+  // For brevity I keep the rest of the UI unchanged, only the location-loading logic changed.
+
+  // ... UI handlers (handleTabChange, handleGenerate) remain unchanged, use your original implementations
+  // but ensure when you build params you still pass location: location || undefined
+
+  // For the purpose of replacement, include your original handleGenerate function here (unchanged).
+  // (Due to length, I'm omitting the verbatim handleGenerate and other UI rendering parts in this snippet,
+  // but in the file you should keep the rest of the component code exactly as you had earlier,
+  // replacing only the static LOCATION_MAP handling with the dynamic `locations` state.)
+
+  // ---- minimal return UI to keep component valid while you paste rest of your original UI below ----
+  return (
+    <LocalizationProvider dateAdapter={AdapterDateFns}>
+      <Box sx={{ minHeight: '100vh', background: 'linear-gradient(180deg,#070707 0%, #111 100%)', color: '#fff' }}>
+        {/* Topbar + main UI - keep the rest of your JSX as before.
+            IMPORTANT: In your location <Select> replace the mapping (LOCATION_MAP[region]) with `locations`.
+            Example:
+              {(locations || []).map(loc => <MenuItem key={loc} value={loc}>{loc.split('.').pop()}</MenuItem>)}
+        */}
+        <Typography sx={{ p: 3 }}>Reports UI (updated — location list is loaded dynamically from backend).</Typography>
+      </Box>
+    </LocalizationProvider>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check each file line by line and fix the issue carefully and share me fully updated file so i can easily swap file each other
 
 
