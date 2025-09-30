@@ -1,3 +1,259 @@
+// fetch availableLocations for the currently selected region (runs on region change)
+useEffect(() => {
+  let mounted = true;
+  const load = async () => {
+    setAvailableLocations([]);
+    if (!region) return;
+
+    const MULTI_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+    try {
+      if (region === 'global') {
+        const promises = MULTI_REGIONS.map(r => fetchLocationsForRegion(r));
+        const results = await Promise.all(promises);
+        const merged = results.flat();
+        if (!mounted) return;
+        setAvailableLocations(Array.from(new Set(merged)).sort());
+      } else {
+        const list = await fetchLocationsForRegion(region);
+        if (!mounted) return;
+        setAvailableLocations(Array.from(new Set(list)).sort());
+      }
+    } catch (err) {
+      console.error('load locations error', err);
+      // fallback to static map handled below when rendering
+    }
+  };
+
+  load();
+  return () => { mounted = false; };
+}, [region]);
+
+
+
+
+
+
+
+
+
+
+{/* non-Raw single-select Location (uses backend results first, fallback to LOCATION_MAP) */}
+<Select
+  value={location}
+  onChange={e => setLocation(e.target.value)}
+  input={<OutlinedInput label="Location" />}
+  disabled={!region}
+  sx={{
+    color: '#fff',
+    '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,204,0,0.12)' }
+  }}
+>
+  {(
+    (availableLocations && availableLocations.length) 
+      ? availableLocations 
+      : (LOCATION_MAP[region] || [])
+  ).map(loc => (
+    <MenuItem key={loc} value={loc}>
+      {String(loc).split('.').pop()}
+    </MenuItem>
+  ))}
+</Select>
+
+
+
+
+
+
+
+
+
+
+
+
+// make daily access report region-aware and accept employees (CSV or array)
+export async function dailyAccessReport(region, { from, to, employees = '' }) {
+  if (!region) throw new Error('region required');
+  if (!from || !to) throw new Error('from/to required');
+
+  const pool = await getPool(region);
+  const req  = pool.request();
+
+  // bind inputs: from/to are expected as DATE (YYYY-MM-DD)
+  req.input('fromDate', sql.Date, from);
+  req.input('toDate',   sql.Date, to);
+
+  // employees may be array or CSV string
+  let employeesParam = null;
+  if (Array.isArray(employees)) {
+    const csv = employees.map(s => String(s).trim()).filter(Boolean).join(',');
+    employeesParam = csv || null;
+  } else {
+    const csv = String(employees || '').trim();
+    employeesParam = csv === '' ? null : csv;
+  }
+  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
+
+  const query = `
+  DECLARE @empCSV NVARCHAR(MAX) = @employees;
+
+  ;WITH EmpList AS (
+    SELECT LTRIM(RTRIM(value)) AS emp
+    FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
+    WHERE LTRIM(RTRIM(value)) <> ''
+  )
+
+  , RawSwipes AS (
+    SELECT
+      t1.ObjectName1,
+      t1.ObjectName2,
+      t1.MessageType,
+      t2.Text12       AS EmployeeID,
+      CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID,
+      t3.Name         AS PersonnelType,
+      t1.PartitionName2 AS PartitionName2,
+      DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+      CASE
+        WHEN dir.Value = 'InDirection'  THEN 'IN'
+        WHEN dir.Value = 'OutDirection' THEN 'OUT'
+        ELSE 'Unknown'
+      END AS Swipe,
+      card.Value AS CardNumber
+    FROM ACVSUJournalLog AS t1
+    INNER JOIN ACVSCore.Access.Personnel     AS t2
+      ON t1.ObjectIdentity1 = t2.GUID
+    INNER JOIN ACVSCore.Access.PersonnelType AS t3
+      ON t2.PersonnelTypeId = t3.ObjectID
+    OUTER APPLY (
+      SELECT TOP (1) s.Value
+      FROM ACVSUJournalLogxmlShred AS s
+      WHERE s.GUID = t1.XmlGUID
+        AND s.Value IN ('InDirection','OutDirection')
+    ) AS dir
+    OUTER APPLY (
+      SELECT TOP (1) s.Value
+      FROM ACVSUJournalLogxmlShred AS s
+      WHERE s.GUID = t1.XmlGUID
+        AND s.Value NOT IN ('InDirection','OutDirection')
+        AND s.Value NOT LIKE '%[^0-9]%'
+        AND s.Value IS NOT NULL
+        AND LTRIM(RTRIM(s.Value)) <> ''
+    ) AS card
+  )
+
+  , Windowed AS (
+    SELECT *
+    FROM RawSwipes
+    WHERE
+      LocaleMessageTime >= DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
+      AND LocaleMessageTime <  DATEADD(HOUR, 8, CAST(@toDate AS DATETIME))
+      AND Swipe IN ('IN','OUT')
+  )
+
+  SELECT
+    ObjectName1,
+    ObjectName2,
+    PersonnelType,
+    EmployeeID,
+    NumericEmployeeID,
+    PartitionName2 AS location,
+    MessageType AS Messagetype,
+    Swipe,
+    CardNumber,
+    LocaleMessageTime
+  FROM Windowed w
+  WHERE
+    (
+      @empCSV IS NULL
+      OR LTRIM(RTRIM(@empCSV)) = ''
+      OR EXISTS (
+        SELECT 1 FROM EmpList e
+        WHERE
+          e.emp = LTRIM(RTRIM(w.ObjectName1))
+          OR e.emp = w.EmployeeID
+          OR e.emp = w.NumericEmployeeID
+      )
+    )
+  ORDER BY LocaleMessageTime;
+  `;
+
+  const { recordset } = await req.query(query);
+  return recordset;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+import {
+  rawReport,
+  rejectionReport,
+  dailyAccessReport, // <- changed name
+  inOutReport,
+  timeDurationReport,
+  eurocAdmitRejectionReport
+} from '../services/reportService.js';
+import { listLocations, searchEmployees } from '../services/reportService.js';
+
+
+
+
+
+
+
+// Daily Access Report handler
+async function handleDailyAccess(req, res, next) {
+  try {
+    const region    = getParam(req, 'region');
+    const from      = getParam(req, 'from');
+    const to        = getParam(req, 'to');
+    if (!from || !to) {
+      return res.status(400).json({ error: "Missing required parameters: 'from' and/or 'to'" });
+    }
+
+    // employees: GET expects comma-separated string, POST may send array
+    let employees = getParam(req, 'employees', []);
+    if (typeof employees === 'string') {
+      employees = employees.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(employees) || employees.length === 0) {
+      return res.status(400).json({ error: "Missing or empty required parameter: 'employees'" });
+    }
+
+    // call the service with region + employees
+    const data = await dailyAccessReport(region, { from, to, employees });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 When i update all above details now Location fetch from backend is Working but Employee name and ID is not listed 
 also Location Fetch only for raw Report it need to Update for all Report like When select Daily Access , When select Rejection report , when select Euroc...
 for that need to Frtch from backenend also Location filter is not working 
