@@ -1,3 +1,187 @@
+                emp_list = list(employees_map.values())
+                emp_list.sort(key=lambda x: ((x.get("EmployeeName") or "") or "").lower())
+
+                # compute per-employee weekly compliance and categories
+                for emp in emp_list:
+                    weeks_info = {}
+                    weeks_met = 0
+                    weeks_total = 0
+
+                    cat_counts = {"0-30m": 0, "30m-2h": 0, "2h-6h": 0, "6h-8h": 0, "8h+": 0}
+                    cat_dates = {k: [] for k in cat_counts.keys()}
+
+                    low_swipe_dates = []
+                    low_swipe_threshold = 5  # less than 5 swipes in a single day => flagged
+
+                    for ws in week_starts:
+                        week_start_iso = ws.isoformat()
+                        # week is Mon->Sun (7 days)
+                        week_dates = [(ws + timedelta(days=i)).isoformat() for i in range(7)]
+                        relevant_dates = [d for d in week_dates if d in dates_iso]
+                        if not relevant_dates:
+                            continue
+
+                        days_present = 0
+                        days_ge8 = 0
+                        per_date_durations = {}
+                        per_date_compliance = {}
+                        week_swipe_total = 0
+                        per_date_swipe_counts = {}
+
+                        for d in relevant_dates:
+                            secs = emp["durations_seconds"].get(d)
+                            per_date_durations[d] = secs
+                            # swipe count for that date
+                            sc = emp.get("swipe_counts", {}).get(d, 0)
+                            per_date_swipe_counts[d] = sc
+                            week_swipe_total += (sc or 0)
+
+                            if secs is not None and secs > 0:
+                                days_present += 1
+                            is_ge8 = (secs is not None and secs >= 28800)
+                            if is_ge8:
+                                days_ge8 += 1
+                            per_date_compliance[d] = True if is_ge8 else False
+
+                            # low-swipe detection per-day
+                            if sc is not None and sc < low_swipe_threshold:
+                                low_swipe_dates.append(d)
+
+                            # categories (only count when secs present and > 0)
+                            if secs is not None and secs > 0:
+                                cat = duration_report.categorize_seconds(secs) if hasattr(duration_report, 'categorize_seconds') else "0-30m"
+                                if cat in cat_counts:
+                                    cat_counts[cat] += 1
+                                    cat_dates[cat].append(d)
+
+                        ct = int(compliance_target or 3)
+                        compliant = (days_ge8 >= ct)
+
+                        weeks_info[week_start_iso] = {
+                            "week_start": week_start_iso,
+                            "dates": per_date_durations,
+                            "dates_compliance": per_date_compliance,
+                            "days_present": days_present,
+                            "days_ge8": days_ge8,
+                            "compliant": compliant,
+                            "swipe_count_total": int(week_swipe_total),
+                            "swipe_counts": per_date_swipe_counts
+                        }
+
+                        weeks_total += 1
+                        if compliant:
+                            weeks_met += 1
+
+                    # dominant category: choose category with highest count (ties resolved by first encountered)
+                    dominant_category = None
+                    max_count = -1
+                    for k, v in cat_counts.items():
+                        if v > max_count:
+                            max_count = v
+                            dominant_category = k
+
+                    # Remove internal swipe fields from returned object (you requested not to return them)
+                    for _k in ("FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor"):
+                        if _k in emp:
+                            try:
+                                del emp[_k]
+                            except Exception:
+                                pass
+
+                    # compute low-swipe summary & duration anomalies (<6h)
+                    unique_low_swipe_dates = sorted(list(set(low_swipe_dates)))
+                    low_swipe_days_count = len(unique_low_swipe_dates)
+
+                    durations_lt6_days = []
+                    for d in dates_iso:
+                        v = emp["durations_seconds"].get(d)
+                        if v is not None and v > 0 and v < (6 * 3600):
+                            durations_lt6_days.append(d)
+
+                    # forecast note (simple rule-based)
+                    forecast_msgs = []
+                    if len(durations_lt6_days) >= 2:
+                        forecast_msgs.append(f"Duration <6h on {len(durations_lt6_days)} days")
+                    if low_swipe_days_count >= 1:
+                        forecast_msgs.append(f"Swipe count <{low_swipe_threshold} on {low_swipe_days_count} day(s)")
+                    if forecast_msgs:
+                        forecast_note = "Needs verification: " + "; ".join(forecast_msgs)
+                    else:
+                        forecast_note = "OK"
+
+                    emp["compliance"] = {
+                        "weeks": weeks_info,
+                        "weeks_met": weeks_met,
+                        "weeks_total": weeks_total,
+                        "month_summary": f"{weeks_met}/{weeks_total}" if weeks_total > 0 else "0/0",
+                        "compliance_target": int(compliance_target or 3)
+                    }
+                    emp["duration_categories"] = {
+                        "counts": cat_counts,
+                        "dominant_category": dominant_category,
+                        "category_dates": cat_dates,
+                        "red_flag": cat_counts.get("2h-6h", 0)
+                    }
+
+                    # Additional exposed fields for frontend:
+                    emp["swipe_flags"] = {
+                        "low_swipe_days_count": low_swipe_days_count,
+                        "low_swipe_dates": unique_low_swipe_dates
+                    }
+                    emp["forecast_note"] = forecast_note
+
+
+
+                # --- apply optional server-side employee filters (to reduce payload if requested) ---
+                try:
+                    if employee_id or employee_name or card_number:
+                        filtered = []
+                        emp_id_q = employee_id.strip().lower() if employee_id else None
+                        emp_name_q = employee_name.strip().lower() if employee_name else None
+                        card_q = card_number.strip().lower() if card_number else None
+
+                        for e in emp_list:
+                            match = True
+                            if emp_id_q:
+                                match = match and (e.get("EmployeeID") and emp_id_q in str(e.get("EmployeeID")).lower())
+                            if emp_name_q:
+                                match = match and (e.get("EmployeeName") and emp_name_q in str(e.get("EmployeeName")).lower())
+                            if card_q:
+                                match = match and (e.get("CardNumber") and card_q in str(e.get("CardNumber")).lower())
+                            if match:
+                                filtered.append(e)
+                        emp_list = filtered
+                except Exception:
+                    logger.exception("Error applying server-side employee filters")
+
+                # Ensure durations_sample is defined (was missing previously and caused NameError)
+                durations_sample = emp_list[:sample_rows] if sample_rows and isinstance(sample_rows, int) and sample_rows > 0 else []
+
+                resp["regions"][r] = {
+                    "dates": dates_iso,
+                    "employees": emp_list,
+                    "durations_sample": durations_sample,
+                    "date_rows": date_rows,
+                    "swipes_by_date": swipes_by_date
+                }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I have Update above file as per above guidance then 
 still frontend not display any data .. check both file line by line carefully and fix the issue carefully.....
 
