@@ -1,3 +1,455 @@
+                            if matched_uid:
+                                # store richer swipe info for later sessionization (timestamp + direction)
+                                swipes_per_person.setdefault(matched_uid, []).append({
+                                    "ts": ts,                                 # pandas.Timestamp or datetime
+                                    "Direction": (s.get("Direction") or "").strip() if s.get("Direction") else None,
+                                    "LocaleMessageTime": s.get("LocaleMessageTime"),
+                                    "Date": s.get("Date"),
+                                    "Door": s.get("Door"),
+                                    "CardNumber": s.get("CardNumber"),
+                                    "EmployeeID": s.get("EmployeeID"),
+                                })
+
+
+
+
+
+
+
+
+
+                            if person_uid not in employees_map:
+                                employees_map[person_uid] = {
+                                    "person_uid": person_uid,
+                                    "EmployeeID": _to_json_safe(drow.get("EmployeeID")),
+                                    "EmployeeName": _to_json_safe(drow.get("EmployeeName")),
+                                    "CardNumber": _to_json_safe(drow.get("CardNumber")),
+                                    # initialize durations only for the dates the user requested
+                                    "durations": {d: None for d in dates_iso},
+                                    "durations_seconds": {d: None for d in dates_iso},
+                                    "swipe_counts": {d: 0 for d in dates_iso},   # <--- NEW: store per-date swipe counts
+                                    "total_seconds_present_in_range": 0,
+                                    # keep internal First/Last but we'll remove them before returning
+                                    "FirstSwipe": None,
+                                    "LastSwipe": None,
+                                    "FirstDoor": _to_json_safe(drow.get("FirstDoor")),
+                                    "LastDoor": _to_json_safe(drow.get("LastDoor")),
+                                    "PersonnelType": _to_json_safe(drow.get("PersonnelTypeName") or drow.get("PersonnelType")),
+                                    "PartitionName2": _to_json_safe(drow.get("PartitionName2")),
+                                    "CompanyName": _to_json_safe(drow.get("CompanyName")),
+                                    "PrimaryLocation": _to_json_safe(drow.get("PrimaryLocation")),
+                                    "FirstDirection": _to_json_safe(drow.get("FirstDirection")),
+                                    "LastDirection": _to_json_safe(drow.get("LastDirection")),
+                                }
+
+                            # existing duration fields
+                            dur_str = None if pd.isna(drow.get("Duration")) else str(drow.get("Duration"))
+                            dur_secs = None
+                            try:
+                                v = drow.get("DurationSeconds")
+                                if pd.notna(v):
+                                    dur_secs = int(float(v))
+                            except Exception:
+                                dur_secs = None
+
+                            # CountSwipes from compute_daily_durations
+                            swipe_count_val = None
+                            try:
+                                scv = drow.get("CountSwipes")
+                                if pd.notna(scv):
+                                    swipe_count_val = int(scv)
+                            except Exception:
+                                swipe_count_val = None
+
+                            # Only store durations / swipe counts for the dates the user requested.
+                            if iso_d in employees_map[person_uid]["durations"]:
+                                employees_map[person_uid]["durations"][iso_d] = dur_str
+                                employees_map[person_uid]["durations_seconds"][iso_d] = dur_secs
+                                employees_map[person_uid]["swipe_counts"][iso_d] = swipe_count_val or 0
+                                if dur_secs is not None:
+                                    employees_map[person_uid]["total_seconds_present_in_range"] += dur_secs
+                            else:
+                                employees_map[person_uid].setdefault("other_dates", {})[iso_d] = {
+                                    "Duration": dur_str,
+                                    "DurationSeconds": dur_secs,
+                                    "CountSwipes": swipe_count_val or 0
+                                }
+
+
+
+
+
+
+
+
+
+                        # ----- NEW sessionization (direction-aware) -----
+                        # person_swipes now contains dicts with 'ts' and 'Direction'
+                        person_swipes_sorted = sorted(person_swipes, key=lambda x: x["ts"])
+                        # build preliminary sessions split by SHIFT_GAP_SECONDS
+                        sessions = []
+                        cur_start = person_swipes_sorted[0]["ts"]
+                        cur_last = person_swipes_sorted[0]["ts"]
+                        cur_start_idx = 0
+                        for idx, sdict in enumerate(person_swipes_sorted[1:], start=1):
+                            ts = sdict["ts"]
+                            gap = (ts - cur_last).total_seconds() if ts is not None and cur_last is not None else None
+                            if gap is None:
+                                gap = SHIFT_GAP_SECONDS + 1
+                            if gap > SHIFT_GAP_SECONDS:
+                                # finish current session: from cur_start to cur_last, track indices
+                                sessions.append({
+                                    "start": cur_start,
+                                    "end": cur_last,
+                                    "start_idx": cur_start_idx,
+                                    "end_idx": idx - 1
+                                })
+                                cur_start = ts
+                                cur_last = ts
+                                cur_start_idx = idx
+                            else:
+                                cur_last = ts
+                        # append final
+                        sessions.append({
+                            "start": cur_start,
+                            "end": cur_last,
+                            "start_idx": cur_start_idx,
+                            "end_idx": len(person_swipes_sorted) - 1
+                        })
+
+                        # attach direction metadata to session boundaries for gap analysis
+                        def _dir_for_index(i):
+                            try:
+                                d = person_swipes_sorted[i].get("Direction") or ""
+                                return str(d).strip().lower()
+                            except Exception:
+                                return ""
+
+                        # If multiple sessions on same calendar day, check for Out->In gaps
+                        if sessions and len(sessions) > 1:
+                            try:
+                                # only consider gaps where both adjacent sessions are on same calendar day
+                                out_in_gap_indices = []
+                                for gi in range(len(sessions) - 1):
+                                    prev_s = sessions[gi]
+                                    next_s = sessions[gi + 1]
+                                    prev_end_idx = prev_s["end_idx"]
+                                    next_start_idx = next_s["start_idx"]
+                                    prev_end_dir = _dir_for_index(prev_end_idx)
+                                    next_start_dir = _dir_for_index(next_start_idx)
+                                    # canonicalize tokens; look for substrings 'out' and 'in' (covers OutDirection/InDirection)
+                                    if ("out" in prev_end_dir) and ("in" in next_start_dir):
+                                        out_in_gap_indices.append(gi)
+
+                                # If we found at least one Out->In gap, rebuild sessions to split ONLY at Out->In gaps.
+                                if out_in_gap_indices:
+                                    # rebuild by grouping swipes into chunks split only where gap index in out_in_gap_indices
+                                    new_sessions = []
+                                    current_chunk_start_idx = 0
+                                    for gi, s in enumerate(sessions):
+                                        # when gi corresponds to a gap index and it's an out_in gap, close chunk
+                                        if gi < (len(sessions) - 1) and gi in out_in_gap_indices:
+                                            # chunk spans from current_chunk_start_idx .. sessions[gi].end_idx
+                                            new_sessions.append({
+                                                "start": person_swipes_sorted[current_chunk_start_idx]["ts"],
+                                                "end": person_swipes_sorted[sessions[gi]["end_idx"]]["ts"],
+                                                "start_idx": current_chunk_start_idx,
+                                                "end_idx": sessions[gi]["end_idx"]
+                                            })
+                                            # next chunk starts at next session's start_idx
+                                            current_chunk_start_idx = sessions[gi + 1]["start_idx"]
+                                    # append final chunk
+                                    new_sessions.append({
+                                        "start": person_swipes_sorted[current_chunk_start_idx]["ts"],
+                                        "end": person_swipes_sorted[sessions[-1]["end_idx"]]["ts"],
+                                        "start_idx": current_chunk_start_idx,
+                                        "end_idx": sessions[-1]["end_idx"]
+                                    })
+                                    sessions = new_sessions
+
+                                # still merge very small sessions on same day (the short-session merge)
+                                if sessions and len(sessions) > 1:
+                                    merged_sessions = []
+                                    for s_obj in sessions:
+                                        s_start = s_obj["start"]
+                                        s_end = s_obj["end"]
+                                        if not merged_sessions:
+                                            merged_sessions.append([s_start, s_end])
+                                            continue
+                                        prev_start, prev_end = merged_sessions[-1]
+                                        cur_start, cur_end = s_start, s_end
+                                        cur_dur = (cur_end - cur_start).total_seconds() if cur_end and cur_start else 0
+                                        if prev_start.date() == cur_start.date() and cur_dur <= MERGE_SHORT_SESSION_SECONDS:
+                                            # extend previous end to include this short session (if it's later)
+                                            if cur_end and cur_end > prev_end:
+                                                merged_sessions[-1][1] = cur_end
+                                        else:
+                                            merged_sessions.append([cur_start, cur_end])
+                                    sessions = [(s[0], s[1]) for s in merged_sessions]
+
+                                # final-day combine heuristic preserved (if many tiny sessions and final session tiny, combine into one)
+                                if sessions and len(sessions) > 1:
+                                    try:
+                                        first_day = sessions[0][0].date()
+                                        all_same_day = all((s[0].date() == first_day and s[1].date() == first_day) for s in sessions)
+                                        last_start, last_end = sessions[-1]
+                                        final_dur = (last_end - last_start).total_seconds() if last_start and last_end else 0
+                                        if all_same_day and final_dur <= MERGE_SHORT_SESSION_SECONDS:
+                                            combined_start = sessions[0][0]
+                                            combined_end = sessions[-1][1]
+                                            combined_dur = (combined_end - combined_start).total_seconds() if combined_start and combined_end else 0
+                                            if combined_dur > 0 and combined_dur <= ANOMALY_MAX_SECONDS:
+                                                sessions = [(combined_start, combined_end)]
+                                    except Exception:
+                                        logger.exception("Final-day-combine heuristic failed for uid=%s region=%s", uid, r)
+                            except Exception:
+                                logger.exception("Direction-aware gap handling failed for uid=%s region=%s", uid, r)
+
+
+
+
+
+
+
+
+
+                # compute per-employee weekly compliance and categories
+                for emp in emp_list:
+                    weeks_info = {}
+                    weeks_met = 0
+                    weeks_total = 0
+
+                    cat_counts = {"0-30m": 0, "30m-2h": 0, "2h-6h": 0, "6h-8h": 0, "8h+": 0}
+                    cat_dates = {k: [] for k in cat_counts.keys()}
+
+                    low_swipe_dates = []
+                    low_swipe_threshold = 5  # less than 5 swipes in a single day => flagged
+
+                    for ws in week_starts:
+                        week_start_iso = ws.isoformat()
+                        # week is Mon->Sun (7 days)
+                        week_dates = [(ws + timedelta(days=i)).isoformat() for i in range(7)]
+                        relevant_dates = [d for d in week_dates if d in dates_iso]
+                        if not relevant_dates:
+                            continue
+
+                        days_present = 0
+                        days_ge8 = 0
+                        per_date_durations = {}
+                        per_date_compliance = {}
+                        week_swipe_total = 0
+                        per_date_swipe_counts = {}
+
+                        for d in relevant_dates:
+                            secs = emp["durations_seconds"].get(d)
+                            per_date_durations[d] = secs
+                            # swipe count for that date
+                            sc = emp.get("swipe_counts", {}).get(d, 0)
+                            per_date_swipe_counts[d] = sc
+                            week_swipe_total += (sc or 0)
+
+                            if secs is not None and secs > 0:
+                                days_present += 1
+                            is_ge8 = (secs is not None and secs >= 28800)
+                            if is_ge8:
+                                days_ge8 += 1
+                            per_date_compliance[d] = True if is_ge8 else False
+
+                            # low-swipe detection per-day
+                            if sc is not None and sc < low_swipe_threshold:
+                                low_swipe_dates.append(d)
+
+                            # categories (only count when secs present and > 0)
+                            if secs is not None and secs > 0:
+                                cat = duration_report.categorize_seconds(secs) if hasattr(duration_report, 'categorize_seconds') else "0-30m"
+                                if cat in cat_counts:
+                                    cat_counts[cat] += 1
+                                    cat_dates[cat].append(d)
+
+                        ct = int(compliance_target or 3)
+                        compliant = (days_ge8 >= ct)
+
+                        weeks_info[week_start_iso] = {
+                            "week_start": week_start_iso,
+                            "dates": per_date_durations,
+                            "dates_compliance": per_date_compliance,
+                            "days_present": days_present,
+                            "days_ge8": days_ge8,
+                            "compliant": compliant,
+                            "swipe_count_total": int(week_swipe_total),
+                            "swipe_counts": per_date_swipe_counts
+                        }
+
+                        weeks_total += 1
+                        if compliant:
+                            weeks_met += 1
+
+                    # dominant category: choose category with highest count (ties resolved by first encountered)
+                    dominant_category = None
+                    max_count = -1
+                    for k, v in cat_counts.items():
+                        if v > max_count:
+                            max_count = v
+                            dominant_category = k
+
+                    # Remove internal swipe fields from returned object (you requested not to return them)
+                    for _k in ("FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor"):
+                        if _k in emp:
+                            try:
+                                del emp[_k]
+                            except Exception:
+                                pass
+
+                    # compute low-swipe summary & duration anomalies (<6h)
+                    unique_low_swipe_dates = sorted(list(set(low_swipe_dates)))
+                    low_swipe_days_count = len(unique_low_swipe_dates)
+
+                    durations_lt6_days = []
+                    for d in dates_iso:
+                        v = emp["durations_seconds"].get(d)
+                        if v is not None and v > 0 and v < (6 * 3600):
+                            durations_lt6_days.append(d)
+
+                    # forecast note (simple rule-based)
+                    forecast_msgs = []
+                    if len(durations_lt6_days) >= 2:
+                        forecast_msgs.append(f"Duration <6h on {len(durations_lt6_days)} days")
+                    if low_swipe_days_count >= 1:
+                        forecast_msgs.append(f"Swipe count <{low_swipe_threshold} on {low_swipe_days_count} day(s)")
+                    if forecast_msgs:
+                        forecast_note = "Needs verification: " + "; ".join(forecast_msgs)
+                    else:
+                        forecast_note = "OK"
+
+                    emp["compliance"] = {
+                        "weeks": weeks_info,
+                        "weeks_met": weeks_met,
+                        "weeks_total": weeks_total,
+                        "month_summary": f"{weeks_met}/{weeks_total}" if weeks_total > 0 else "0/0",
+                        "compliance_target": int(compliance_target or 3)
+                    }
+                    emp["duration_categories"] = {
+                        "counts": cat_counts,
+                        "dominant_category": dominant_category,
+                        "category_dates": cat_dates,
+                        "red_flag": cat_counts.get("2h-6h", 0)
+                    }
+
+                    # Additional exposed fields for frontend:
+                    emp["swipe_flags"] = {
+                        "low_swipe_days_count": low_swipe_days_count,
+                        "low_swipe_dates": unique_low_swipe_dates
+                    }
+                    emp["forecast_note"] = forecast_note
+
+
+
+
+
+
+
+
+
+{weekStarts.map((ws) => (
+  <React.Fragment key={ws}>
+    <TableCell align="center"><b>{`Week ${ws} compliant`}</b></TableCell>
+    <TableCell align="center"><b>{`Swipe Count (${ws})`}</b></TableCell>
+  </React.Fragment>
+))}
+
+
+
+
+
+
+
+
+
+
+{weekStarts.map((ws) => {
+  const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+  const compliantText = wk && wk.compliant ? "Yes" : "No";
+  const swipeCount = wk && typeof wk.swipe_count_total !== "undefined" ? String(wk.swipe_count_total) : (r.swipe_counts && r.swipe_counts[ws] ? String(r.swipe_counts[ws]) : "0");
+  return (
+    <React.Fragment key={ws}>
+      <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="center">{compliantText}</TableCell>
+      <TableCell sx={{ backgroundColor: "#FFF", color: (Number(swipeCount) < 5 ? "red" : "#000"), fontWeight: "700" }} align="center">{swipeCount}</TableCell>
+    </React.Fragment>
+  );
+})}
+
+
+
+
+
+
+
+<TableCell align="center"><b>Forecast</b></TableCell>
+
+<TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="center">
+  {r.forecast_note || "-"}
+</TableCell>
+
+
+
+
+
+
+
+
+
+
+
+      const perWeekVals = [];
+      const perWeekSwipeCounts = weekStarts.map((ws) => {
+        const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+        return wk && typeof wk.swipe_count_total !== "undefined" ? String(wk.swipe_count_total) : "0";
+      });
+
+      weekStarts.forEach((ws) => {
+        const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
+        perWeekVals.push(wk && wk.compliant ? "Yes" : "No");
+      });
+
+      const complianceText = r.compliance?.month_summary || "";
+      const complianceCell = `'${complianceText}`;
+
+      const row = [
+        `${srNo}`,
+        quote(employeeId),
+        quote(employeeName),
+        quote(cardNumber),
+        quote(personnelType),
+        quote(partition),
+        `${totalSeconds}`,
+        ...perDayVals.map((v) => quote(v)),
+        ...perWeekVals.map((v) => quote(v)),
+        ...perWeekSwipeCounts.map((v) => quote(v)),  // <-- new: swipe counts per week
+        quote(r.duration_categories?.dominant_category || ""),
+        quote(complianceCell),
+        quote(r.forecast_note || "")   // <-- new forecast column
+      ];
+
+
+
+
+
+const header = [...baseHeader, ...perDayHeaders, ...perWeekHeaders, ...perWeekSwipeHeader, "DominantCategory", "ComplianceSummary", "Forecast"];
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now please check below app.py file line by line carefully .. 
 i want to update and integrate logic for Duration 
 1) if there are more than 1 gap for same day 
