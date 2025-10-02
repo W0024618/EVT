@@ -1,3 +1,5 @@
+#Main 1
+
 # C:\Users\W0024618\Desktop\global-page\backend\attendance-analytics\app.py
 # (Place this file replacing your previous combined_app_with_duration.py)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
@@ -2447,7 +2449,7 @@ REGION_CONFIG = {
         "database": "ACVSUJournal_00010029",
         "last_n_databases": 2,
         "partitions": [
-            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur"
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur","IN.HYD"
         ]
     },
     "emea": {
@@ -2886,27 +2888,5 @@ if __name__ == "__main__":
         logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
     logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
 # ---- END duration_report.py content ----
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
