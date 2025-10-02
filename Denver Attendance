@@ -1,524 +1,7 @@
-# denverAttendance.py
-"""
-Generate Denver Monthly Attendance Excel report.
+Now I have Update all above file as per Suggestion now When i click Export button we got error
+Failed to download Denver attendance report: Request failed with status code 404
 
-Usage:
-    from denverAttendance import generate_monthly_denver_report
-    path = generate_monthly_denver_report(year=2025, month=9, outdir='/path/to/output', city_filter='Denver')
-"""
-from datetime import date, datetime, timedelta
-from pathlib import Path
-import pandas as pd
-import math
-import logging
-
-logger = logging.getLogger("denverAttendance")
-
-# Import duration_report (must be importable in same package/dir)
-try:
-    import duration_report
-except Exception:
-    duration_report = None
-
-def _month_date_range(year: int, month: int):
-    start = date(year, month, 1)
-    if month == 12:
-        end = date(year + 1, 1, 1) - timedelta(days=1)
-    else:
-        end = date(year, month + 1, 1) - timedelta(days=1)
-    return start, end
-
-def _normalize_person_uid(x):
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s or None
-
-def generate_monthly_denver_report(year: int = None, month: int = None, start_date: date = None, end_date: date = None,
-                                   outdir: str = None, city_filter: str = "Denver", region: str = "namer") -> str:
-    """
-    Generate the Denver monthly attendance report Excel file.
-
-    Either pass (year, month) OR (start_date, end_date). If both provided, (start_date,end_date) is used.
-    Returns the full path to the created xlsx file.
-
-    This function uses duration_report.run_for_date to collect per-day durations and then
-    pivots them into a monthly attendance sheet and a summary sheet.
-    """
-    if duration_report is None:
-        raise RuntimeError("duration_report module not importable. Ensure duration_report.py is available.")
-
-    # compute date range
-    if start_date is None or end_date is None:
-        if year is None or month is None:
-            raise ValueError("Either (year and month) or (start_date and end_date) must be provided")
-        start_date, end_date = _month_date_range(year, month)
-
-    if not outdir:
-        outdir = Path.cwd() / "output"
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # gather per-day durations (we will call run_for_date for each day)
-    current = start_date
-    all_durations = []      # list of DataFrames
-    all_swipes = []         # optional if you want raw swipes
-
-    dates = []
-    while current <= end_date:
-        dates.append(current)
-        current = current + timedelta(days=1)
-
-    # run_for_date can be expensive; we call it day-by-day (mirrors duration_report.run_for_date)
-    for d in dates:
-        try:
-            # call run_for_date for 'namer' and pass city_filter so duration_report filters using Door/PrimaryLocation
-            res = duration_report.run_for_date(d, regions=[region], outdir=str(outdir), city=city_filter)
-            region_obj = res.get(region, {})
-            durations_df = region_obj.get("durations") if isinstance(region_obj, dict) else None
-            swipes_df = region_obj.get("swipes") if isinstance(region_obj, dict) else None
-
-            if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
-                # ensure Date column is date type
-                if 'Date' in durations_df.columns:
-                    durations_df['Date'] = pd.to_datetime(durations_df['Date']).dt.date
-                else:
-                    durations_df['Date'] = d
-                all_durations.append(durations_df)
-            # store raw swipes optional
-            if isinstance(swipes_df, pd.DataFrame) and not swipes_df.empty:
-                swipes_df['DateOnly'] = pd.to_datetime(swipes_df['LocaleMessageTime'], errors='coerce').dt.date
-                all_swipes.append(swipes_df)
-
-        except Exception:
-            logger.exception("Failed running duration_report.run_for_date for %s", d)
-            continue
-
-    if not all_durations:
-        # create empty workbook with a minimal Summary sheet
-        filename = outdir / f"denver_attendance_{start_date.strftime('%Y%m')}.xlsx"
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            pd.DataFrame([{"Note": f"No durations found for {start_date.isoformat()} -> {end_date.isoformat()}"}]).to_excel(writer, sheet_name="Summary", index=False)
-        return str(filename)
-
-    # concat all durations into one DataFrame
-    df_all = pd.concat(all_durations, ignore_index=True, sort=False)
-    # ensure person_uid exists
-    if "person_uid" not in df_all.columns:
-        # fallback: make person_uid as EmployeeIdentity or concatenation
-        def make_person_uid(row):
-            eid = row.get("EmployeeIdentity")
-            if pd.notna(eid) and str(eid).strip():
-                return str(eid).strip()
-            parts = []
-            for k in ("EmployeeID", "CardNumber", "EmployeeName"):
-                v = row.get(k)
-                if pd.notna(v) and str(v).strip():
-                    parts.append(str(v).strip())
-            return "|".join(parts) or None
-        df_all["person_uid"] = df_all.apply(make_person_uid, axis=1)
-
-    # keep only rows within our month date range (safety)
-    df_all = df_all[df_all["Date"].between(start_date, end_date)]
-
-    # Normalize DurationSeconds
-    if "DurationSeconds" not in df_all.columns:
-        # compute if LastSwipe/FirstSwipe exist
-        if "FirstSwipe" in df_all.columns and "LastSwipe" in df_all.columns:
-            try:
-                df_all["DurationSeconds"] = (pd.to_datetime(df_all["LastSwipe"]) - pd.to_datetime(df_all["FirstSwipe"])).dt.total_seconds().clip(lower=0).astype("Int64")
-            except Exception:
-                df_all["DurationSeconds"] = None
-        else:
-            df_all["DurationSeconds"] = None
-
-    # For robustness: set Date column to date type
-    df_all["Date"] = pd.to_datetime(df_all["Date"]).dt.date
-
-    # Build pivot table: for each person_uid and Date store DurationSeconds and Duration string
-    df_all["DurationStr"] = df_all["Duration"].astype(str).where(df_all["Duration"].notna(), None)
-
-    # We want one row per person over month. Choose representative values for EmployeeName/EmployeeID/etc using 'first'
-    agg_first = df_all.groupby("person_uid", sort=False).agg({
-        "EmployeeName": "first",
-        "EmployeeID": "first",
-        "PersonnelTypeName": "first" if "PersonnelTypeName" in df_all.columns else ("PersonnelType" if "PersonnelType" in df_all.columns else "first"),
-        "CardNumber": "first",
-        "PartitionName2": "first" if "PartitionName2" in df_all.columns else "first",
-        "PrimaryLocation": "first" if "PrimaryLocation" in df_all.columns else "first"
-    }).rename(columns={
-        "PersonnelTypeName": "PersonnelType",
-        "PersonnelType": "PersonnelType"
-    })
-
-    # Build per-day presence and secs
-    pivot_secs = df_all.pivot_table(index="person_uid", columns="Date", values="DurationSeconds", aggfunc="first")
-    pivot_strs = df_all.pivot_table(index="person_uid", columns="Date", values="DurationStr", aggfunc="first")
-
-    # Fill missing dates into columns
-    all_dates = pd.date_range(start=start_date, end=end_date).date
-    for d in all_dates:
-        if d not in pivot_secs.columns:
-            pivot_secs[d] = pd.NA
-            pivot_strs[d] = pd.NA
-
-    # ensure column order by date asc
-    pivot_secs = pivot_secs.reindex(sorted(pivot_secs.columns), axis=1)
-    pivot_strs = pivot_strs.reindex(sorted(pivot_strs.columns), axis=1)
-
-    # Combine into final frame
-    summary = agg_first.copy()
-    # Days present: count of dates where DurationSeconds > 0
-    days_present = (pivot_secs.notna() & (pivot_secs.astype('float') > 0)).sum(axis=1)
-    days_ge8 = (pivot_secs.astype('float') >= 28800).sum(axis=1)  # >= 8 hours
-    days_in_month = len(all_dates)
-
-    summary["DaysPresent"] = days_present.astype(int)
-    summary["DaysGe8"] = days_ge8.astype(int)
-    summary["DaysInMonth"] = int(days_in_month)
-    # percent compliance (daysGe8 / daysInMonth)
-    summary["PercentGe8"] = (summary["DaysGe8"] / summary["DaysInMonth"]).round(3) * 100
-
-    # Attach daily columns (string durations) to summary for Attendance sheet format
-    # Build attendance_strs frame with ISO date column names (YYYY-MM-DD)
-    attendance_strs = pivot_strs.copy()
-    attendance_strs.columns = [d.isoformat() for d in attendance_strs.columns]
-    # Replace NaN with empty string for clarity
-    attendance_strs = attendance_strs.fillna("")
-
-    # final summary frame for Excel: bring key columns then DaysPresent etc.
-    final_summary = summary.reset_index().rename(columns={"person_uid": "PersonUID"})
-    # ensure EmployeeName exists
-    if "EmployeeName" not in final_summary.columns:
-        final_summary["EmployeeName"] = final_summary["PersonUID"]
-
-    # reorder columns intentionally
-    cols_order = ["PersonUID", "EmployeeName", "EmployeeID", "PersonnelType", "CardNumber", "PrimaryLocation", "DaysInMonth", "DaysPresent", "DaysGe8", "PercentGe8"]
-    other_cols = [c for c in final_summary.columns if c not in cols_order]
-    final_summary = final_summary[[c for c in cols_order if c in final_summary.columns] + other_cols]
-
-    # Prepare output filename
-    mon_str = start_date.strftime("%Y%m")
-    filename = outdir / f"denver_attendance_{mon_str}.xlsx"
-
-    # Write to Excel: two sheets - Summary and Attendance
-    try:
-        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-            # Summary sheet
-            final_summary.to_excel(writer, sheet_name="Summary", index=False)
-
-            # Attendance sheet: combine final_summary identifying columns + daily columns
-            attendance_index = final_summary[["PersonUID", "EmployeeName", "EmployeeID", "PersonnelType", "CardNumber", "PrimaryLocation"]].copy()
-            attendance_df = pd.concat([attendance_index.reset_index(drop=True), attendance_strs.reset_index(drop=True)], axis=1)
-            attendance_df.to_excel(writer, sheet_name="Attendance", index=False)
-
-            # Optionally save raw durations/durations_seconds sheet
-            try:
-                # prepare a tidy durations_seconds sheet (person_uid, Date, DurationSeconds, Duration)
-                tidy = df_all[["person_uid", "Date", "DurationSeconds", "Duration"]].copy()
-                tidy = tidy.rename(columns={"person_uid": "PersonUID"})
-                tidy = tidy.sort_values(["PersonUID", "Date"])
-                tidy.to_excel(writer, sheet_name="DurationsRaw", index=False)
-            except Exception:
-                logger.debug("Could not write DurationsRaw sheet (non-fatal)", exc_info=True)
-
-        logger.info("Wrote Denver attendance report to %s", filename)
-    except Exception:
-        logger.exception("Failed writing Excel report")
-        raise
-
-    return str(filename)
-
-
-
-
-
-
-
-
-
-
-
-
-# at top of app.py add imports
-from fastapi.responses import FileResponse
-# add near other imports
-try:
-    import denverAttendance
-except Exception:
-    denverAttendance = None
-
-# ... later in app.py, add endpoint:
-
-@app.get("/api/reports/denver-attendance")
-async def api_denver_attendance(
-    year: Optional[int] = Query(None, description="Year (e.g. 2025)"),
-    month: Optional[int] = Query(None, description="Month 1..12"),
-    from_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
-    to_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
-    refresh: bool = Query(False, description="If true, do not use cache (not implemented)"),
-):
-    """
-    Generate Denver Monthly Attendance report (Excel) and return file.
-    Provide either year+month OR from_date+to_date (YYYY-MM-DD).
-    If neither provided, defaults to previous month relative to Asia/Kolkata.
-    """
-    try:
-        if denverAttendance is None:
-            raise HTTPException(status_code=500, detail="denverAttendance module not available on server")
-
-        # parse dates
-        tz = ZoneInfo("Asia/Kolkata")
-        today = datetime.now(tz).date()
-
-        if from_date and to_date:
-            try:
-                s = datetime.strptime(from_date[:10], "%Y-%m-%d").date()
-                e = datetime.strptime(to_date[:10], "%Y-%m-%d").date()
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid from_date/to_date format. Use YYYY-MM-DD")
-            start_date = s
-            end_date = e
-        else:
-            # use year & month if provided, else previous month
-            if year and month:
-                start_date, end_date = denverAttendance._month_date_range(year, month)
-            else:
-                # default to previous month
-                prev_month_end = (today.replace(day=1) - timedelta(days=1))
-                start_date, end_date = denverAttendance._month_date_range(prev_month_end.year, prev_month_end.month)
-
-        # call generator
-        outdir = OUTPUT_DIR  # your configured OUTPUT_DIR
-        # Allow a city filter override if needed; default "Denver"
-        path = denverAttendance.generate_monthly_denver_report(
-            start_date=start_date,
-            end_date=end_date,
-            outdir=str(outdir),
-            city_filter="Denver",
-            region="namer"
-        )
-
-        if not path:
-            raise HTTPException(status_code=500, detail="Report generation failed (no path returned)")
-
-        # Return file response
-        p = Path(path)
-        if not p.exists():
-            raise HTTPException(status_code=500, detail="Generated file not found")
-        # set Content-Disposition so frontend gets a suggested filename
-        return FileResponse(str(p), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=p.name)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("api_denver_attendance failed")
-        raise HTTPException(status_code=500, detail=f"denver attendance error: {e}")
-
-
-
-
-
-
-
-
-
-<Tab icon={<PeopleIcon />} label="Denver Monthly" />
-
-
-if (tab === 6) return ['gsoc_reports.denver_monthly', 'gsoc_reports'];
-...
-if (tab === 6) return ['gsoc_reports.denver_monthly', 'gsoc_reports'];
-
-
-
-
-
-
-
-// ----- Denver Monthly Attendance (new tab index 6) -----
-if (tab === 6) {
-  // permission check already done above
-  // Determine month/year to request:
-  let useYear = null;
-  let useMonth = null;
-  if (from) {
-    const d = new Date(from);
-    useYear = d.getFullYear();
-    useMonth = d.getMonth() + 1;
-  } else {
-    // default: request previous month relative to client local (backend also defaults)
-    const dt = new Date();
-    dt.setDate(1); dt.setHours(0,0,0,0);
-    dt.setMonth(dt.getMonth() - 1);
-    useYear = dt.getFullYear();
-    useMonth = dt.getMonth() + 1;
-  }
-
-  try {
-    setLoading(true);
-    const resp = await axios.get('/api/reports/denver-attendance', {
-      params: { year: useYear, month: useMonth },
-      responseType: 'blob'
-    });
-
-    // Get filename from content-disposition if provided
-    let filename = `denver_attendance_${useYear}${String(useMonth).padStart(2,'0')}.xlsx`;
-    const cd = resp.headers['content-disposition'];
-    if (cd) {
-      const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
-      if (m && m[1]) filename = decodeURIComponent(m[1]);
-    }
-
-    const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const link = document.createElement('a');
-    link.href = window.URL.createObjectURL(blob);
-    link.download = filename;
-    link.click();
-  } catch (err) {
-    console.error('Denver attendance download error', err);
-    let msg = 'Failed to download Denver attendance report';
-    if (err?.response?.data) {
-      msg += `: ${err.response?.data?.detail || err.message || JSON.stringify(err.response.data)}`;
-    } else if (err?.message) {
-      msg += `: ${err.message}`;
-    }
-    alert(msg);
-  } finally {
-    setLoading(false);
-  }
-  return;
-}
-
-
-
-
-
-
-
-
-{tab === 6 && (
-  <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.7)', mt: 1 }}>
-    Denver Monthly report: pick any date inside the month you want (or leave empty to export previous month).
-  </Typography>
-)}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Now I want to add Denver Attendance Report Monthly Check above Report format carefully check both Sheet summary as well attendance want to Build Attemndance same for 
-next month ..
-
-
-So in app.py add new Api endpoint and create new denverAttendance.py file 
-and add Report in frontend 
-we need excat same format as per above Attached file carefully...
-
-
-check Query carefully...
-
-
--- Step 1: Build the temp table with corrected logical location using door name (ObjectName2)
-SELECT
-    t1.[ObjectName1] AS EmployeeName,   -- use ObjectName1 as Employee Name
-    t1.[ObjectName2] AS Door,           -- Door
-    CASE
-        WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-        ELSE CAST(t2.Int1 AS NVARCHAR(50))
-    END AS EmployeeID,                  -- EmployeeID logic
-    t3.[Name] AS PersonnelType,         -- Personnel Type
-    t2.[Text5] AS PrimaryLocation,      -- Text5 as PrimaryLocation
-    t1.[PartitionName2],
-    -- include PersonGUID for deduplication
-    t1.ObjectIdentity1 AS PersonGUID,
-
-    -- CardNumber (extracted from XML)
-    COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
-      sc.value
-    ) AS CardNumber,
-
-    -- Assign accurate LogicalLocation using door name (ObjectName2)
-    CASE
-        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
-        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
-        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
-        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
-        ELSE 'Other'
-    END AS LogicalLocation,
-
-    t1.[MessageType],
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime
-
-INTO #CombinedEmployeeData
-FROM [ACVSUJournal_00010029].[dbo].[ACVSUJournalLog] AS t1
-INNER JOIN [ACVSCore].[Access].[Personnel] AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3
-    ON t2.[PersonnelTypeID] = t3.[ObjectID]
-LEFT JOIN [ACVSUJournal_00010029].[dbo].[ACVSUJournalLogxml] t_xml
-    ON t1.XmlGUID = t_xml.GUID
-LEFT JOIN (
-    SELECT GUID, value
-    FROM [ACVSUJournal_00010029].[dbo].[ACVSUJournalLogxmlShred]
-    WHERE Name IN ('Card','CHUID')
-) sc ON t1.XmlGUID = sc.GUID;
-
-
--- Step 2: Keep only one swipe per PersonGUID per day (earliest swipe)
-;WITH Dedup AS (
-    SELECT
-        EmployeeName,
-        EmployeeID,
-        PersonnelType,
-        PrimaryLocation,
-        Door,
-        CardNumber,
-        LogicalLocation,
-        MessageType,
-        LocaleMessageTime,
-        CONVERT(DATE, LocaleMessageTime) AS SwipeDate,
-        ROW_NUMBER() OVER (
-            PARTITION BY PersonGUID, CONVERT(DATE, LocaleMessageTime)
-            ORDER BY LocaleMessageTime ASC            -- keep earliest swipe; use DESC to keep latest
-        ) AS rn
-    FROM #CombinedEmployeeData
-    WHERE
-        MessageType = 'CardAdmitted'
-        AND LogicalLocation = 'Denver'
-        AND CONVERT(DATE, LocaleMessageTime) = '2025-09-30'
-)
-SELECT
-    EmployeeName,
-    EmployeeID,
-    PersonnelType,
-    PrimaryLocation,
-    Door,
-    CardNumber,
-    LogicalLocation,
-    MessageType,
-    SwipeDate AS [Date],
-    LocaleMessageTime
-FROM Dedup
-WHERE rn = 1
-ORDER BY LocaleMessageTime ASC;
-
-DROP TABLE #CombinedEmployeeData;
-
-
-
-
+Check below Each file line by line and Fix the error carefully
 
 
 #Main 1
@@ -529,6 +12,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse
 import shutil
 import uuid
 import json
@@ -556,6 +40,13 @@ try:
     import requests
 except Exception:
     requests = None
+
+    # add near other imports
+try:
+    import denverAttendance
+except Exception:
+    denverAttendance = None
+
 
 def _fetch_live_summary_totals(urls: List[str], timeout: int = 5) -> Dict[str, int]:
     """
@@ -3413,6 +2904,403 @@ if __name__ == "__main__":
 # ---- END duration_report.py content ----
 
 
+# ... later in app.py, add endpoint:
+
+@app.get("/api/reports/denver-attendance")
+async def api_denver_attendance(
+    year: Optional[int] = Query(None, description="Year (e.g. 2025)"),
+    month: Optional[int] = Query(None, description="Month 1..12"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
+    refresh: bool = Query(False, description="If true, do not use cache (not implemented)"),
+):
+    """
+    Generate Denver Monthly Attendance report (Excel) and return file.
+    Provide either year+month OR from_date+to_date (YYYY-MM-DD).
+    If neither provided, defaults to previous month relative to Asia/Kolkata.
+    """
+    try:
+        if denverAttendance is None:
+            raise HTTPException(status_code=500, detail="denverAttendance module not available on server")
+
+        # parse dates
+        tz = ZoneInfo("Asia/Kolkata")
+        today = datetime.now(tz).date()
+
+        if from_date and to_date:
+            try:
+                s = datetime.strptime(from_date[:10], "%Y-%m-%d").date()
+                e = datetime.strptime(to_date[:10], "%Y-%m-%d").date()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid from_date/to_date format. Use YYYY-MM-DD")
+            start_date = s
+            end_date = e
+        else:
+            # use year & month if provided, else previous month
+            if year and month:
+                start_date, end_date = denverAttendance._month_date_range(year, month)
+            else:
+                # default to previous month
+                prev_month_end = (today.replace(day=1) - timedelta(days=1))
+                start_date, end_date = denverAttendance._month_date_range(prev_month_end.year, prev_month_end.month)
+
+        # call generator
+        outdir = OUTPUT_DIR  # your configured OUTPUT_DIR
+        # Allow a city filter override if needed; default "Denver"
+        path = denverAttendance.generate_monthly_denver_report(
+            start_date=start_date,
+            end_date=end_date,
+            outdir=str(outdir),
+            city_filter="Denver",
+            region="namer"
+        )
+
+        if not path:
+            raise HTTPException(status_code=500, detail="Report generation failed (no path returned)")
+
+        # Return file response
+        p = Path(path)
+        if not p.exists():
+            raise HTTPException(status_code=500, detail="Generated file not found")
+        # set Content-Disposition so frontend gets a suggested filename
+        return FileResponse(str(p), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=p.name)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("api_denver_attendance failed")
+        raise HTTPException(status_code=500, detail=f"denver attendance error: {e}")
+
+
+
+
+
+
+
+
+2)
+
+# denverAttendance.py
+"""
+Generate Denver Monthly Attendance Excel report.
+
+Usage:
+    from denverAttendance import generate_monthly_denver_report
+    path = generate_monthly_denver_report(year=2025, month=9, outdir='/path/to/output', city_filter='Denver')
+"""
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import pandas as pd
+import math
+import logging
+
+logger = logging.getLogger("denverAttendance")
+
+# Import duration_report (must be importable in same package/dir)
+try:
+    import duration_report
+except Exception:
+    duration_report = None
+
+def _month_date_range(year: int, month: int):
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end = date(year, month + 1, 1) - timedelta(days=1)
+    return start, end
+
+def _normalize_person_uid(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s or None
+
+def generate_monthly_denver_report(year: int = None, month: int = None, start_date: date = None, end_date: date = None,
+                                   outdir: str = None, city_filter: str = "Denver", region: str = "namer") -> str:
+    """
+    Generate the Denver monthly attendance report Excel file.
+
+    Either pass (year, month) OR (start_date, end_date). If both provided, (start_date,end_date) is used.
+    Returns the full path to the created xlsx file.
+
+    This function uses duration_report.run_for_date to collect per-day durations and then
+    pivots them into a monthly attendance sheet and a summary sheet.
+    """
+    if duration_report is None:
+        raise RuntimeError("duration_report module not importable. Ensure duration_report.py is available.")
+
+    # compute date range
+    if start_date is None or end_date is None:
+        if year is None or month is None:
+            raise ValueError("Either (year and month) or (start_date and end_date) must be provided")
+        start_date, end_date = _month_date_range(year, month)
+
+    if not outdir:
+        outdir = Path.cwd() / "output"
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # gather per-day durations (we will call run_for_date for each day)
+    current = start_date
+    all_durations = []      # list of DataFrames
+    all_swipes = []         # optional if you want raw swipes
+
+    dates = []
+    while current <= end_date:
+        dates.append(current)
+        current = current + timedelta(days=1)
+
+    # run_for_date can be expensive; we call it day-by-day (mirrors duration_report.run_for_date)
+    for d in dates:
+        try:
+            # call run_for_date for 'namer' and pass city_filter so duration_report filters using Door/PrimaryLocation
+            res = duration_report.run_for_date(d, regions=[region], outdir=str(outdir), city=city_filter)
+            region_obj = res.get(region, {})
+            durations_df = region_obj.get("durations") if isinstance(region_obj, dict) else None
+            swipes_df = region_obj.get("swipes") if isinstance(region_obj, dict) else None
+
+            if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
+                # ensure Date column is date type
+                if 'Date' in durations_df.columns:
+                    durations_df['Date'] = pd.to_datetime(durations_df['Date']).dt.date
+                else:
+                    durations_df['Date'] = d
+                all_durations.append(durations_df)
+            # store raw swipes optional
+            if isinstance(swipes_df, pd.DataFrame) and not swipes_df.empty:
+                swipes_df['DateOnly'] = pd.to_datetime(swipes_df['LocaleMessageTime'], errors='coerce').dt.date
+                all_swipes.append(swipes_df)
+
+        except Exception:
+            logger.exception("Failed running duration_report.run_for_date for %s", d)
+            continue
+
+    if not all_durations:
+        # create empty workbook with a minimal Summary sheet
+        filename = outdir / f"denver_attendance_{start_date.strftime('%Y%m')}.xlsx"
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            pd.DataFrame([{"Note": f"No durations found for {start_date.isoformat()} -> {end_date.isoformat()}"}]).to_excel(writer, sheet_name="Summary", index=False)
+        return str(filename)
+
+    # concat all durations into one DataFrame
+    df_all = pd.concat(all_durations, ignore_index=True, sort=False)
+    # ensure person_uid exists
+    if "person_uid" not in df_all.columns:
+        # fallback: make person_uid as EmployeeIdentity or concatenation
+        def make_person_uid(row):
+            eid = row.get("EmployeeIdentity")
+            if pd.notna(eid) and str(eid).strip():
+                return str(eid).strip()
+            parts = []
+            for k in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(k)
+                if pd.notna(v) and str(v).strip():
+                    parts.append(str(v).strip())
+            return "|".join(parts) or None
+        df_all["person_uid"] = df_all.apply(make_person_uid, axis=1)
+
+    # keep only rows within our month date range (safety)
+    df_all = df_all[df_all["Date"].between(start_date, end_date)]
+
+    # Normalize DurationSeconds
+    if "DurationSeconds" not in df_all.columns:
+        # compute if LastSwipe/FirstSwipe exist
+        if "FirstSwipe" in df_all.columns and "LastSwipe" in df_all.columns:
+            try:
+                df_all["DurationSeconds"] = (pd.to_datetime(df_all["LastSwipe"]) - pd.to_datetime(df_all["FirstSwipe"])).dt.total_seconds().clip(lower=0).astype("Int64")
+            except Exception:
+                df_all["DurationSeconds"] = None
+        else:
+            df_all["DurationSeconds"] = None
+
+    # For robustness: set Date column to date type
+    df_all["Date"] = pd.to_datetime(df_all["Date"]).dt.date
+
+    # Build pivot table: for each person_uid and Date store DurationSeconds and Duration string
+    df_all["DurationStr"] = df_all["Duration"].astype(str).where(df_all["Duration"].notna(), None)
+
+    # We want one row per person over month. Choose representative values for EmployeeName/EmployeeID/etc using 'first'
+    agg_first = df_all.groupby("person_uid", sort=False).agg({
+        "EmployeeName": "first",
+        "EmployeeID": "first",
+        "PersonnelTypeName": "first" if "PersonnelTypeName" in df_all.columns else ("PersonnelType" if "PersonnelType" in df_all.columns else "first"),
+        "CardNumber": "first",
+        "PartitionName2": "first" if "PartitionName2" in df_all.columns else "first",
+        "PrimaryLocation": "first" if "PrimaryLocation" in df_all.columns else "first"
+    }).rename(columns={
+        "PersonnelTypeName": "PersonnelType",
+        "PersonnelType": "PersonnelType"
+    })
+
+    # Build per-day presence and secs
+    pivot_secs = df_all.pivot_table(index="person_uid", columns="Date", values="DurationSeconds", aggfunc="first")
+    pivot_strs = df_all.pivot_table(index="person_uid", columns="Date", values="DurationStr", aggfunc="first")
+
+    # Fill missing dates into columns
+    all_dates = pd.date_range(start=start_date, end=end_date).date
+    for d in all_dates:
+        if d not in pivot_secs.columns:
+            pivot_secs[d] = pd.NA
+            pivot_strs[d] = pd.NA
+
+    # ensure column order by date asc
+    pivot_secs = pivot_secs.reindex(sorted(pivot_secs.columns), axis=1)
+    pivot_strs = pivot_strs.reindex(sorted(pivot_strs.columns), axis=1)
+
+    # Combine into final frame
+    summary = agg_first.copy()
+    # Days present: count of dates where DurationSeconds > 0
+    days_present = (pivot_secs.notna() & (pivot_secs.astype('float') > 0)).sum(axis=1)
+    days_ge8 = (pivot_secs.astype('float') >= 28800).sum(axis=1)  # >= 8 hours
+    days_in_month = len(all_dates)
+
+    summary["DaysPresent"] = days_present.astype(int)
+    summary["DaysGe8"] = days_ge8.astype(int)
+    summary["DaysInMonth"] = int(days_in_month)
+    # percent compliance (daysGe8 / daysInMonth)
+    summary["PercentGe8"] = (summary["DaysGe8"] / summary["DaysInMonth"]).round(3) * 100
+
+    # Attach daily columns (string durations) to summary for Attendance sheet format
+    # Build attendance_strs frame with ISO date column names (YYYY-MM-DD)
+    attendance_strs = pivot_strs.copy()
+    attendance_strs.columns = [d.isoformat() for d in attendance_strs.columns]
+    # Replace NaN with empty string for clarity
+    attendance_strs = attendance_strs.fillna("")
+
+    # final summary frame for Excel: bring key columns then DaysPresent etc.
+    final_summary = summary.reset_index().rename(columns={"person_uid": "PersonUID"})
+    # ensure EmployeeName exists
+    if "EmployeeName" not in final_summary.columns:
+        final_summary["EmployeeName"] = final_summary["PersonUID"]
+
+    # reorder columns intentionally
+    cols_order = ["PersonUID", "EmployeeName", "EmployeeID", "PersonnelType", "CardNumber", "PrimaryLocation", "DaysInMonth", "DaysPresent", "DaysGe8", "PercentGe8"]
+    other_cols = [c for c in final_summary.columns if c not in cols_order]
+    final_summary = final_summary[[c for c in cols_order if c in final_summary.columns] + other_cols]
+
+    # Prepare output filename
+    mon_str = start_date.strftime("%Y%m")
+    filename = outdir / f"denver_attendance_{mon_str}.xlsx"
+
+    # Write to Excel: two sheets - Summary and Attendance
+    try:
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            # Summary sheet
+            final_summary.to_excel(writer, sheet_name="Summary", index=False)
+
+            # Attendance sheet: combine final_summary identifying columns + daily columns
+            attendance_index = final_summary[["PersonUID", "EmployeeName", "EmployeeID", "PersonnelType", "CardNumber", "PrimaryLocation"]].copy()
+            attendance_df = pd.concat([attendance_index.reset_index(drop=True), attendance_strs.reset_index(drop=True)], axis=1)
+            attendance_df.to_excel(writer, sheet_name="Attendance", index=False)
+
+            # Optionally save raw durations/durations_seconds sheet
+            try:
+                # prepare a tidy durations_seconds sheet (person_uid, Date, DurationSeconds, Duration)
+                tidy = df_all[["person_uid", "Date", "DurationSeconds", "Duration"]].copy()
+                tidy = tidy.rename(columns={"person_uid": "PersonUID"})
+                tidy = tidy.sort_values(["PersonUID", "Date"])
+                tidy.to_excel(writer, sheet_name="DurationsRaw", index=False)
+            except Exception:
+                logger.debug("Could not write DurationsRaw sheet (non-fatal)", exc_info=True)
+
+        logger.info("Wrote Denver attendance report to %s", filename)
+    except Exception:
+        logger.exception("Failed writing Excel report")
+        raise
+
+    return str(filename)
+
+
+
+
+
+
+
+
+
+
+
+
+// frontend/src/App.jsx
+import React from 'react';
+import { Routes, Route, Navigate } from 'react-router-dom';
+import { Box } from '@mui/material';
+
+import GlobalPage   from './pages/GlobalPage.jsx';
+import VipPage      from './pages/VipPage.jsx';
+import ReportsPage  from './pages/ReportsPage.jsx';
+import DurationPage from "./pages/DurationPage";
+import { AuthProvider, useAuth } from './context/AuthContext';
+import LoginPage from './pages/LoginPage';
+import ProtectedRoute from './components/ProtectedRoute';
+import AccessManager from './pages/AccessManager';
+
+// Optional: small wrapper to redirect authed users from /login
+function LoginGuard() {
+  const auth = useAuth();
+  if (auth.loading) return null;
+  if (auth.user) return <Navigate to="/" replace />;
+  return <LoginPage />;
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginGuard />} />
+
+        <Route path="/" element={
+          <ProtectedRoute>
+            <GlobalPage />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/vip" element={
+          <ProtectedRoute>
+            <VipPage />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/reports" element={
+          <ProtectedRoute>
+            <ReportsPage />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/duration" element={
+          <ProtectedRoute permission="global_duration">
+            <DurationPage />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/access-manager" element={
+          <ProtectedRoute permission="can_grant">
+            <AccessManager />
+          </ProtectedRoute>
+        } />
+
+
+
+    <Route path="/denver-attendance" element={
+          <ProtectedRoute permission="denver-attendance">
+            <AccessManager />
+          </ProtectedRoute>
+        } />
+
+
+
+
+        {/* fallback */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </AuthProvider>
+  );
+}
+
+
+
+
 
 
 
@@ -4120,6 +4008,8 @@ function buildRawFileName(opts = {}) {
     if (tab === 3) return ['gsoc_reports.euroc', 'gsoc_reports'];
     if (tab === 4) return ['gsoc_reports.time_duration', 'gsoc_reports'];
     if (tab === 5) return ['headcount', `headcount.${region}`, 'global_access'];
+    if (tab === 6) return ['gsoc_reports.denver_monthly', 'gsoc_reports'];
+
     return ['gsoc_reports'];
   };
 
@@ -4157,6 +4047,7 @@ function buildRawFileName(opts = {}) {
       if (tab === 3) return ['gsoc_reports.euroc', 'gsoc_reports'];
       if (tab === 4) return ['gsoc_reports.time_duration', 'gsoc_reports'];
       if (tab === 5) return ['headcount', `headcount.${region}`, 'global_access'];
+      if (tab === 6) return ['gsoc_reports.denver_monthly', 'gsoc_reports'];
       return ['gsoc_reports'];
     };
 
@@ -4675,6 +4566,64 @@ function buildRawFileName(opts = {}) {
 
 
 
+
+// ----- Denver Monthly Attendance (new tab index 6) -----
+if (tab === 6) {
+  // permission check already done above
+  // Determine month/year to request:
+  let useYear = null;
+  let useMonth = null;
+  if (from) {
+    const d = new Date(from);
+    useYear = d.getFullYear();
+    useMonth = d.getMonth() + 1;
+  } else {
+    // default: request previous month relative to client local (backend also defaults)
+    const dt = new Date();
+    dt.setDate(1); dt.setHours(0,0,0,0);
+    dt.setMonth(dt.getMonth() - 1);
+    useYear = dt.getFullYear();
+    useMonth = dt.getMonth() + 1;
+  }
+
+  try {
+    setLoading(true);
+    const resp = await axios.get('/api/reports/denver-attendance', {
+      params: { year: useYear, month: useMonth },
+      responseType: 'blob'
+    });
+
+    // Get filename from content-disposition if provided
+    let filename = `denver_attendance_${useYear}${String(useMonth).padStart(2,'0')}.xlsx`;
+    const cd = resp.headers['content-disposition'];
+    if (cd) {
+      const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
+      if (m && m[1]) filename = decodeURIComponent(m[1]);
+    }
+
+    const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const link = document.createElement('a');
+    link.href = window.URL.createObjectURL(blob);
+    link.download = filename;
+    link.click();
+  } catch (err) {
+    console.error('Denver attendance download error', err);
+    let msg = 'Failed to download Denver attendance report';
+    if (err?.response?.data) {
+      msg += `: ${err.response?.data?.detail || err.message || JSON.stringify(err.response.data)}`;
+    } else if (err?.message) {
+      msg += `: ${err.message}`;
+    }
+    alert(msg);
+  } finally {
+    setLoading(false);
+  }
+  return;
+}
+
+
+
+
 } catch (err) {
       console.error('handleGenerate error:', err);
       // Show backend message when available (axios)
@@ -4880,6 +4829,13 @@ function buildRawFileName(opts = {}) {
                   <Typography sx={{ color: 'rgba(255,255,255,0.7)', mb: 1, fontWeight: 700 }}>
                     Employee (name or ID) — multiple
                   </Typography>
+
+{tab === 6 && (
+  <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.7)', mt: 1 }}>
+    Denver Monthly report: pick any date inside the month you want (or leave empty to export previous month).
+  </Typography>
+)}
+
 
                   <Autocomplete
                     multiple
@@ -5157,6 +5113,8 @@ renderOption={(props, option) => <li {...props}>{typeof option === 'string' ? op
                   <Tab icon={<PeopleIcon />} label="EUROC Admit-Reject" />
                   <Tab icon={<CalendarTodayIcon />} label="Time Duration" />
                   <Tab icon={<PeopleIcon />} label="HeadCount" />
+                  <Tab icon={<PeopleIcon />} label="Denver Monthly" />
+
                 </Tabs>
 
                 <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
@@ -5215,8 +5173,6 @@ renderOption={(props, option) => <li {...props}>{typeof option === 'string' ? op
     </LocalizationProvider>
   );
 }
-
-
 
 
 
