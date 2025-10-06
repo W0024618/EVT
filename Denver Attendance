@@ -1,3 +1,169 @@
+def generate_monthly_denver_report(year: int = None, month: int = None, start_date: date = None, end_date: date = None,
+                                   outdir: str = None, city_filter: str = "Denver", region: str = "namer") -> str:
+    """
+    Generate the Denver monthly attendance report Excel file.
+    Accepts either year+month or start_date+end_date. Returns path to the xlsx file.
+    This version ensures we include *any* employee who physically swiped at a Denver door,
+    even if their primary location/PartitionName2 is not Denver.
+    """
+    if start_date is not None or end_date is not None:
+        start_date = _to_date(start_date)
+        end_date = _to_date(end_date)
+
+    if (start_date is None or end_date is None):
+        if year is None or month is None:
+            raise ValueError("Either (year and month) or (start_date and end_date) must be provided")
+        start_date, end_date = _month_date_range(int(year), int(month))
+
+    if not outdir:
+        outdir = Path.cwd() / "output"
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # build full date list
+    current = start_date
+    dates = []
+    while current <= end_date:
+        dates.append(current)
+        current = current + timedelta(days=1)
+
+    if not dates:
+        raise ValueError("Empty date range")
+
+    # helper: decide if a swipe row is a Denver visit based on Door/PartitionName2/PrimaryLocation
+    def _is_denver_visit_row(row) -> bool:
+        try:
+            # combine a few fields that might indicate the door/location
+            door = (row.get("Door") or "") if isinstance(row, dict) else (row.get("Door") if "Door" in row else "")
+            partition = (row.get("PartitionName2") or "") if isinstance(row, dict) else (row.get("PartitionName2") if "PartitionName2" in row else "")
+            prim = (row.get("PrimaryLocation") or "") if isinstance(row, dict) else (row.get("PrimaryLocation") if "PrimaryLocation" in row else "")
+            # lowercase join
+            s = " ".join([str(door), str(partition), str(prim)]).lower()
+            # check mapping/keywords: user mapping used '%HQ%' -> Denver; include direct 'denver' and abbreviations
+            keywords = ["denver", "hq", " hq ", " den ", "den."]
+            for kw in keywords:
+                if kw in s:
+                    return True
+            # also match common variants like 'co-denver' or 'denver - w'
+            if "denver -" in s or "denver " in s:
+                return True
+            return False
+        except Exception:
+            return False
+
+    # collect durations for each date from (A) normal namer run and (B) supplemental scans of all regions for door hits
+    all_durations = []
+
+    # regions to scan for supplemental door-based visits
+    regions_to_scan = list(getattr(duration_report, "REGION_CONFIG", {}).keys()) if duration_report and hasattr(duration_report, "REGION_CONFIG") else ["apac","emea","laca","namer"]
+
+    for d in dates:
+        # 1) primary (fast path) - existing behavior: run_for_date for the 'namer' region (this will include Denver-native people)
+        try:
+            res = duration_report.run_for_date(d, regions=[region], outdir=str(outdir), city=city_filter)
+            region_obj = res.get(region, {}) if isinstance(res, dict) else {}
+            durations_df = region_obj.get("durations") if isinstance(region_obj, dict) else None
+            if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
+                durations_df['Date'] = pd.to_datetime(durations_df['Date']).dt.date
+                all_durations.append(durations_df)
+        except Exception:
+            logger.exception("Primary run_for_date failed for date %s", d)
+
+        # 2) supplemental: scan ALL regions and pick swipe rows that indicate a Denver door
+        #    use fetch_swipes_for_region (lighter-weight) + compute_daily_durations()
+        for r in regions_to_scan:
+            try:
+                swipes = duration_report.fetch_swipes_for_region(r, d)
+            except Exception:
+                logger.exception("fetch_swipes_for_region failed for region %s date %s", r, d)
+                swipes = pd.DataFrame()
+
+            if swipes is None or swipes.empty:
+                continue
+
+            # normalize column names and ensure door/partition/primary exist
+            for c in ("Door", "PartitionName2", "PrimaryLocation", "EmployeeName"):
+                if c not in swipes.columns:
+                    swipes[c] = None
+
+            # filter swipes to only those that look like Denver visits (based on door/partition/primary)
+            try:
+                # run row-wise check (vectorize minimal)
+                mask = swipes.apply(lambda row: _is_denver_visit_row(row), axis=1)
+                denver_swipes = swipes[mask].copy()
+            except Exception:
+                denver_swipes = swipes  # fallback: if failure, be conservative and keep them (better to include than miss)
+            
+            if denver_swipes is None or denver_swipes.empty:
+                continue
+
+            # compute durations for the filtered swipes (this yields person_uid, DurationSeconds, Date, etc.)
+            try:
+                durations_df = duration_report.compute_daily_durations(denver_swipes)
+                if isinstance(durations_df, pd.DataFrame) and not durations_df.empty:
+                    # ensure Date is date type
+                    if 'Date' in durations_df.columns:
+                        durations_df['Date'] = pd.to_datetime(durations_df['Date']).dt.date
+                    else:
+                        durations_df['Date'] = d
+                    all_durations.append(durations_df)
+            except Exception:
+                logger.exception("compute_daily_durations failed for supplemental denver swipes region=%s date=%s", r, d)
+                continue
+
+    # concat and dedupe person/date to avoid double-counting (keep first occurrence)
+    if not all_durations:
+        mon_label = f"{start_date.strftime('%Y%m')}_{end_date.strftime('%Y%m')}"
+        filename = outdir / f"denver_attendance_{mon_label}.xlsx"
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            pd.DataFrame([{"Note": f"No durations found for {start_date.isoformat()} -> {end_date.isoformat()}"}]).to_excel(writer, sheet_name="Summary", index=False)
+        return str(filename)
+
+    df_all = pd.concat(all_durations, ignore_index=True, sort=False)
+
+    # normalize Date & person_uid and dedupe by person_uid+Date (keep first)
+    if "Date" in df_all.columns:
+        df_all["Date"] = pd.to_datetime(df_all["Date"]).dt.date
+    else:
+        # should not happen but set to start_date
+        df_all["Date"] = start_date
+
+    if "person_uid" not in df_all.columns:
+        def make_person_uid(row):
+            eid = row.get("EmployeeIdentity")
+            if pd.notna(eid) and str(eid).strip():
+                return str(eid).strip()
+            parts = []
+            for k in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(k)
+                if pd.notna(v) and str(v).strip():
+                    parts.append(str(v).strip())
+            return "|".join(parts) or None
+        df_all["person_uid"] = df_all.apply(make_person_uid, axis=1)
+
+    # drop duplicates keeping first occurrence (this prevents the same person/date appearing twice)
+    df_all = df_all.drop_duplicates(subset=["person_uid", "Date"], keep="first").reset_index(drop=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now We Got again and Again below Error 
 Failed to download Denver attendance report: Network Error
 
