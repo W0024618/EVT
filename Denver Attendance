@@ -1,3 +1,240 @@
+USE [ACVSUJournal_00010021];
+GO
+SET NOCOUNT ON;
+
+----------------------------------------------------------------
+-- Find which column in dbo.ACVSUJournalLog we can use to join
+----------------------------------------------------------------
+DECLARE @joinCol SYSNAME;
+
+SELECT TOP (1) @joinCol = name
+FROM sys.columns
+WHERE object_id = OBJECT_ID('dbo.ACVSUJournalLog')
+  AND name IN ('AccountName','Account','AccountNo','AccountID','PersonnelID','EmployeeID','Name')
+ORDER BY 
+  CASE 
+    WHEN name = 'AccountName' THEN 1
+    WHEN name = 'Account' THEN 2
+    WHEN name = 'AccountNo' THEN 3
+    WHEN name = 'AccountID' THEN 4
+    WHEN name = 'PersonnelID' THEN 5
+    WHEN name = 'EmployeeID' THEN 6
+    WHEN name = 'Name' THEN 7
+    ELSE 100
+  END;
+
+IF @joinCol IS NULL
+BEGIN
+  PRINT 'Warning: no candidate join column found in dbo.ACVSUJournalLog. [Location] will be NULL.';
+END
+ELSE
+BEGIN
+  PRINT 'Joining journal on column: ' + @joinCol;
+END
+
+----------------------------------------------------------------
+-- Build and execute the main query dynamically so we only reference
+-- the journal column that actually exists (avoids parse-time errors).
+----------------------------------------------------------------
+DECLARE @sql NVARCHAR(MAX);
+DECLARE @journalApply NVARCHAR(MAX);
+
+IF @joinCol IS NULL
+BEGIN
+  -- no suitable column: return NULL for PartitionName2
+  SET @journalApply = N'(SELECT NULL AS PartitionName2)';
+END
+ELSE
+BEGIN
+  -- join using the discovered column; TOP(1) without ORDER BY (non-deterministic)
+  -- If you have a timestamp column in the journal and want deterministic latest row,
+  -- let me know and I'll use it in ORDER BY.
+  SET @journalApply = N'(SELECT TOP (1) AJ.PartitionName2 FROM dbo.ACVSUJournalLog AJ WHERE AJ.' 
+                       + QUOTENAME(@joinCol) 
+                       + N' = e.EmployeeObjID)';
+END
+
+SET @sql = N'
+;WITH EmpAgg AS (
+    SELECT
+      AP.ObjectID           AS EmployeeObjID,
+      AP.Name               AS EmpName,
+      CASE WHEN AP.Int1 = 0 OR AP.Int1 IS NULL
+           THEN AP.Text12
+           ELSE CAST(AP.Int1 AS NVARCHAR(50))
+      END AS EmployeeID,
+      ISNULL(PT.Name, '''')   AS PersonnelType,
+      AP.Disabled           AS Profile_Disabled,
+      -- Primary location from Personnel.Text5
+      ISNULL(AP.Text5, '''')  AS PrimaryLocation,
+
+      COUNT(ACR.Name)       AS Profile_Cards,
+
+      SUM(
+        CASE
+          WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+            AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+            AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+            AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+          THEN 1 ELSE 0
+        END
+      ) AS Active_Cards,
+
+      CASE
+        WHEN COUNT(ACR.Name) - SUM(
+          CASE
+            WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+              AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+              AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+              AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+            THEN 1 ELSE 0
+          END
+        ) < 0 THEN 0
+        ELSE COUNT(ACR.Name) - SUM(
+          CASE
+            WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+              AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+              AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+              AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+            THEN 1 ELSE 0
+          END
+        )
+      END AS Deactive_Cards,
+
+      -- Active card numbers (CAST CardNumber to NVARCHAR to avoid varchar->numeric conversion)
+      ISNULL(
+        STUFF(
+          (
+            SELECT '', '' + COALESCE(CAST(ACR2.CardNumber AS NVARCHAR(100)), CAST(ACR2.ObjectID AS NVARCHAR(50)))
+            FROM ACVSCore.Access.Credential ACR2
+            WHERE ACR2.Name = AP.Name
+              AND (
+                 (ACR2.ExpirationDateTime IS NULL OR ACR2.ExpirationDateTime >= GETDATE())
+                 AND (ACR2.Disabled IS NULL OR ACR2.Disabled = 0)
+                 AND (ACR2.Lost IS NULL OR ACR2.Lost = 0)
+                 AND (ACR2.Stolen IS NULL OR ACR2.Stolen = 0)
+              )
+            FOR XML PATH(''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)'')
+        , 1, 2, '''')
+      , '''') AS Active_Card_Numbers,
+
+      -- Deactive card numbers (also cast)
+      ISNULL(
+        STUFF(
+          (
+            SELECT '', '' + COALESCE(CAST(ACR3.CardNumber AS NVARCHAR(100)), CAST(ACR3.ObjectID AS NVARCHAR(50)))
+            FROM ACVSCore.Access.Credential ACR3
+            WHERE ACR3.Name = AP.Name
+              AND NOT (
+                 (ACR3.ExpirationDateTime IS NULL OR ACR3.ExpirationDateTime >= GETDATE())
+                 AND (ACR3.Disabled IS NULL OR ACR3.Disabled = 0)
+                 AND (ACR3.Lost IS NULL OR ACR3.Lost = 0)
+                 AND (ACR3.Stolen IS NULL OR ACR3.Stolen = 0)
+              )
+            FOR XML PATH(''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)'')
+        , 1, 2, '''')
+      , '''') AS Deactive_Card_Numbers
+
+    FROM ACVSCore.Access.Personnel AP
+    LEFT JOIN ACVSCore.Access.Credential ACR
+      ON AP.Name = ACR.Name
+    LEFT JOIN ACVSCore.Access.PersonnelType PT
+      ON PT.ObjectID = AP.PersonnelTypeID
+    GROUP BY
+      AP.ObjectID,
+      AP.Name,
+      AP.Int1,
+      AP.Text12,
+      PT.Name,
+      AP.Disabled,
+      AP.Text5
+),
+EmpAggWithStatus AS (
+    SELECT
+      EmployeeObjID,
+      EmpName,
+      EmployeeID,
+      PersonnelType,
+      Profile_Disabled,
+      Profile_Cards,
+      Active_Cards,
+      Deactive_Cards,
+      Active_Card_Numbers,
+      Deactive_Card_Numbers,
+      PrimaryLocation,
+      CASE
+        WHEN Profile_Disabled = 1 THEN ''Deactive''
+        WHEN Profile_Disabled = 0 AND Active_Cards > 0 THEN ''Active''
+        ELSE ''Deactive''
+      END AS Employee_Status
+    FROM EmpAgg
+)
+
+SELECT
+  e.EmployeeObjID,
+  e.EmpName,
+  e.EmployeeID,
+  e.PersonnelType,
+  e.PrimaryLocation         AS [Primary Location],
+  j.PartitionName2          AS [Location],
+  e.Profile_Cards           AS [Profile cards],
+  e.Active_Cards,
+  e.Active_Card_Numbers     AS [Active card number],
+  e.Deactive_Cards,
+  e.Deactive_Card_Numbers   AS [Deactive card number],
+  CASE WHEN img.Image IS NULL THEN ''No'' ELSE ''Yes'' END AS [Image],
+  e.Employee_Status,
+  clr.ClearanceCount        AS [Clearance Count],
+  clr.Clearances            AS [Clearance]
+FROM EmpAggWithStatus e
+
+OUTER APPLY ' + @journalApply + N' j
+
+OUTER APPLY (
+    -- image presence check only (no binary returned)
+    SELECT TOP (1) AI.Image
+    FROM ACVSCore.Access.Images AI
+    WHERE AI.ParentId = e.EmployeeObjID
+      AND DATALENGTH(AI.Image) > 0
+    ORDER BY AI.ObjectID DESC
+) img
+
+OUTER APPLY (
+    -- return both clearance count and concatenated clearance names
+    SELECT
+      (SELECT COUNT(1) FROM ACVSCore.Access.PersonnelClearancePair APC_count WHERE APC_count.PersonnelID = e.EmployeeObjID) AS ClearanceCount,
+      STUFF((
+        SELECT '', '' + AC2.Name
+        FROM ACVSCore.Access.PersonnelClearancePair APC2
+        INNER JOIN ACVSCore.Access.Clearance AC2
+          ON AC2.ObjectID = APC2.ClearanceID
+        WHERE APC2.PersonnelID = e.EmployeeObjID
+        FOR XML PATH(''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''') AS Clearances
+) clr
+
+ORDER BY e.EmpName;
+';
+
+-- execute dynamic SQL
+EXEC sp_executesql @sql;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Msg 207, Level 16, State 1, Line 147
 Invalid column name 'AccountName'.
 Msg 207, Level 16, State 1, Line 148
