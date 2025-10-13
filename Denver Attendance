@@ -1,3 +1,267 @@
+USE [ACVSUJournal_00010021];
+GO
+SET NOCOUNT ON;
+
+-- temp table for mappings
+IF OBJECT_ID('tempdb..#DoorClearMap') IS NOT NULL DROP TABLE #DoorClearMap;
+CREATE TABLE #DoorClearMap (
+    DoorObjectID BIGINT NOT NULL,
+    ClearanceObjectID BIGINT NOT NULL
+);
+
+-- variables
+DECLARE
+  @obj_clear INT = OBJECT_ID('ACVSCore.Access.Clearance'),
+  @obj_door  INT = OBJECT_ID('ACVSCore.Access.Door'),
+  @pair_table_obj INT = NULL,
+  @schemaName SYSNAME = NULL,
+  @tableName SYSNAME = NULL,
+  @doorCol SYSNAME = NULL,
+  @clearCol SYSNAME = NULL,
+  @sql NVARCHAR(MAX),
+  @foundPairTblId INT = NULL,
+  @doorColName SYSNAME = NULL,
+  @clearColName SYSNAME = NULL,
+  @assocTblId INT = NULL,
+  @parentCol SYSNAME = NULL,
+  @childCol SYSNAME = NULL,
+  @childTypeCol SYSNAME = NULL;
+
+--------------------------------------------------------------------------------
+-- 1) Direct mapping: Clearance.ObjectID = Door.ObjectID
+--------------------------------------------------------------------------------
+INSERT INTO #DoorClearMap (DoorObjectID, ClearanceObjectID)
+SELECT D.ObjectID, C.ObjectID
+FROM ACVSCore.Access.Door D
+JOIN ACVSCore.Access.Clearance C
+  ON C.ObjectID = D.ObjectID
+WHERE D.ObjectID IS NOT NULL AND C.ObjectID IS NOT NULL;
+
+--------------------------------------------------------------------------------
+-- 2) Find FK-based pair table (table that has FKs to both Door and Clearance)
+--------------------------------------------------------------------------------
+IF @obj_clear IS NOT NULL AND @obj_door IS NOT NULL
+BEGIN
+    SELECT TOP (1) @pair_table_obj = parent_object_id
+    FROM (
+        SELECT parent_object_id,
+               SUM(CASE WHEN referenced_object_id = @obj_door THEN 1 ELSE 0 END) AS door_cnt,
+               SUM(CASE WHEN referenced_object_id = @obj_clear THEN 1 ELSE 0 END) AS clear_cnt
+        FROM sys.foreign_key_columns
+        GROUP BY parent_object_id
+    ) t
+    WHERE door_cnt > 0 AND clear_cnt > 0;
+
+    IF @pair_table_obj IS NOT NULL
+    BEGIN
+        SELECT @schemaName = s.name, @tableName = t.name
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE t.object_id = @pair_table_obj;
+
+        -- pick one parent column referencing Door and one referencing Clearance
+        SELECT TOP(1) @doorCol = c.name
+        FROM sys.foreign_key_columns fkc
+        JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id
+        WHERE fkc.parent_object_id = @pair_table_obj AND fkc.referenced_object_id = @obj_door;
+
+        SELECT TOP(1) @clearCol = c.name
+        FROM sys.foreign_key_columns fkc
+        JOIN sys.columns c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id
+        WHERE fkc.parent_object_id = @pair_table_obj AND fkc.referenced_object_id = @obj_clear;
+
+        IF @doorCol IS NOT NULL AND @clearCol IS NOT NULL
+        BEGIN
+            SET @sql = N'
+                INSERT INTO #DoorClearMap (DoorObjectID, ClearanceObjectID)
+                SELECT DISTINCT
+                  CAST(P.' + QUOTENAME(@doorCol) + ' AS BIGINT),
+                  CAST(P.' + QUOTENAME(@clearCol) + ' AS BIGINT)
+                FROM ' + QUOTENAME(@schemaName) + '.' + QUOTENAME(@tableName) + ' P
+                WHERE P.' + QUOTENAME(@doorCol) + ' IS NOT NULL
+                  AND P.' + QUOTENAME(@clearCol) + ' IS NOT NULL;
+            ';
+            EXEC sp_executesql @sql;
+        END
+    END
+END;
+
+--------------------------------------------------------------------------------
+-- 3) Heuristic: find any table that has a Door-like column and a Clearance-like column
+--    common column name patterns are used: doorid, door_id, doorobjectid, parentobjectid
+--    and clearanceid, clearance_id, childobjectid, childid
+--------------------------------------------------------------------------------
+SELECT TOP(1) @foundPairTblId = t.object_id
+FROM sys.tables t
+WHERE EXISTS (
+      SELECT 1 FROM sys.columns c
+      WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('doorid','door_id','doorobjectid','parentobjectid')
+)
+AND EXISTS (
+      SELECT 1 FROM sys.columns c
+      WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('clearanceid','clearance_id','childobjectid','childid')
+)
+AND t.is_ms_shipped = 0;
+
+IF @foundPairTblId IS NOT NULL
+BEGIN
+    SELECT @doorColName = TOP1.name FROM (
+        SELECT TOP(1) name FROM sys.columns
+        WHERE object_id = @foundPairTblId AND LOWER(name) IN ('doorid','door_id','doorobjectid','parentobjectid')
+        ORDER BY column_id
+    ) AS TOP1;
+    SELECT @clearColName = TOP2.name FROM (
+        SELECT TOP(1) name FROM sys.columns
+        WHERE object_id = @foundPairTblId AND LOWER(name) IN ('clearanceid','clearance_id','childobjectid','childid')
+        ORDER BY column_id
+    ) AS TOP2;
+
+    -- If selected, insert mappings
+    IF @doorColName IS NOT NULL AND @clearColName IS NOT NULL
+    BEGIN
+        SELECT @schemaName = s.name, @tableName = t.name
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE t.object_id = @foundPairTblId;
+
+        SET @sql = N'
+            INSERT INTO #DoorClearMap (DoorObjectID, ClearanceObjectID)
+            SELECT DISTINCT
+              CAST(P.' + QUOTENAME(@doorColName) + ' AS BIGINT),
+              CAST(P.' + QUOTENAME(@clearColName) + ' AS BIGINT)
+            FROM ' + QUOTENAME(@schemaName) + '.' + QUOTENAME(@tableName) + ' P
+            WHERE P.' + QUOTENAME(@doorColName) + ' IS NOT NULL
+              AND P.' + QUOTENAME(@clearColName) + ' IS NOT NULL;
+        ';
+        EXEC sp_executesql @sql;
+    END
+END
+
+--------------------------------------------------------------------------------
+-- 4) Generic association table: look for ParentObjectID / ChildObjectID pattern
+--------------------------------------------------------------------------------
+SELECT TOP(1) @assocTblId = t.object_id
+FROM sys.tables t
+WHERE EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('parentobjectid','parentid','parent_object_id'))
+  AND EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('childobjectid','childid','child_object_id'))
+  AND t.is_ms_shipped = 0;
+
+IF @assocTblId IS NOT NULL
+BEGIN
+    SELECT TOP(1) @parentCol = name
+    FROM sys.columns WHERE object_id = @assocTblId AND LOWER(name) IN ('parentobjectid','parentid','parent_object_id');
+
+    SELECT TOP(1) @childCol = name
+    FROM sys.columns WHERE object_id = @assocTblId AND LOWER(name) IN ('childobjectid','childid','child_object_id');
+
+    SELECT TOP(1) @childTypeCol = name
+    FROM sys.columns WHERE object_id = @assocTblId AND LOWER(name) IN ('childobjecttype','childtype','objecttype');
+
+    IF @parentCol IS NOT NULL AND @childCol IS NOT NULL
+    BEGIN
+        SELECT @schemaName = s.name, @tableName = t.name
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE t.object_id = @assocTblId;
+
+        SET @sql = N'
+            INSERT INTO #DoorClearMap (DoorObjectID, ClearanceObjectID)
+            SELECT DISTINCT
+              CAST(A.' + QUOTENAME(@parentCol) + ' AS BIGINT),
+              CAST(A.' + QUOTENAME(@childCol) + ' AS BIGINT)
+            FROM ' + QUOTENAME(@schemaName) + '.' + QUOTENAME(@tableName) + ' A
+            INNER JOIN ACVSCore.Access.Clearance C ON C.ObjectID = A.' + QUOTENAME(@childCol);
+
+        IF @childTypeCol IS NOT NULL
+            SET @sql += N' WHERE (A.' + QUOTENAME(@childTypeCol) + ' IS NULL OR A.' + QUOTENAME(@childTypeCol) + ' = ''Clearance'')';
+
+        EXEC sp_executesql @sql;
+    END
+END
+
+--------------------------------------------------------------------------------
+-- 5) Aggregate per door - use DISTINCT pairs to avoid duplicate counting
+--------------------------------------------------------------------------------
+;WITH DistinctMap AS (
+  SELECT DISTINCT DoorObjectID, ClearanceObjectID FROM #DoorClearMap
+),
+Agg AS (
+  SELECT
+    m.DoorObjectID,
+    COUNT(*) AS ClearanceCount,
+    STUFF((
+      SELECT ', ' + ISNULL(C2.Name,'')
+      FROM DistinctMap m2
+      JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = m2.ClearanceObjectID
+      WHERE m2.DoorObjectID = m.DoorObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS Clearance_Names,
+    STUFF((
+      SELECT ', ' + ISNULL(C2.FriendlyName,'')
+      FROM DistinctMap m2
+      JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = m2.ClearanceObjectID
+      WHERE m2.DoorObjectID = m.DoorObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS Clearance_FriendlyNames,
+    STUFF((
+      SELECT '; ' + ISNULL(C2.Description,'')
+      FROM DistinctMap m2
+      JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = m2.ClearanceObjectID
+      WHERE m2.DoorObjectID = m.DoorObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS Clearance_Descriptions,
+    MAX(C.LastModifiedTime) AS LatestClearanceTime,
+    (SELECT TOP(1) Cb.LastModifiedByID
+     FROM DistinctMap m3
+     JOIN ACVSCore.Access.Clearance Cb ON Cb.ObjectID = m3.ClearanceObjectID
+     WHERE m3.DoorObjectID = m.DoorObjectID
+     ORDER BY Cb.LastModifiedTime DESC
+    ) AS LatestLastModifiedByID
+  FROM DistinctMap m
+  LEFT JOIN ACVSCore.Access.Clearance C ON C.ObjectID = m.ClearanceObjectID
+  GROUP BY m.DoorObjectID
+)
+
+-- final result: one row per door
+SELECT
+  D.ObjectID               AS DoorObjectID,
+  D.Name                   AS DoorName,
+  COALESCE(A.ClearanceCount, 0) AS [Clearance Count],
+  NULLIF(A.Clearance_Names,'')    AS [Clearance (Name)],         -- strict Clearance.Name
+  NULLIF(A.Clearance_FriendlyNames,'') AS [Clearance (FriendlyName)],
+  NULLIF(A.Clearance_Descriptions,'')  AS [Clearance (Description)],
+  D.GUID                   AS DoorGUID,
+  D.ControllerID           AS ControllerID,
+  A.LatestClearanceTime    AS [Last Modified Time],
+  COALESCE(P.Name, CAST(A.LatestLastModifiedByID AS NVARCHAR(30))) AS [Last Modified By]
+FROM ACVSCore.Access.Door D
+LEFT JOIN Agg A ON A.DoorObjectID = D.ObjectID
+LEFT JOIN ACVSCore.Access.Personnel P ON P.ObjectID = A.LatestLastModifiedByID
+ORDER BY D.Name;
+
+-- cleanup
+DROP TABLE #DoorClearMap;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Msg 102, Level 15, State 1, Line 105
 Incorrect syntax near 'doorid'.
 Msg 102, Level 15, State 1, Line 106
