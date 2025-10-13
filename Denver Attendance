@@ -1,3 +1,257 @@
+USE [ACVSUJournal_00010021];
+GO
+SET NOCOUNT ON;
+
+/*
+  Door -> Clearance aggregator (strictly uses Clearance columns: Name, Description, FriendlyName)
+  - Detects mapping automatically (pair table OR association table OR fallback to Clearance.ObjectID = Door.ObjectID)
+  - Returns one row per door with aggregated clearance info
+*/
+
+-- helper existence check
+IF OBJECT_ID('ACVSCore.Access.Clearance','U') IS NULL BEGIN
+  RAISERROR('ACVSCore.Access.Clearance table not found. Aborting.',16,1); RETURN;
+END
+IF OBJECT_ID('ACVSCore.Access.Door','U') IS NULL BEGIN
+  RAISERROR('ACVSCore.Access.Door table not found. Aborting.',16,1); RETURN;
+END
+
+-- 1) Try to find a pair table that contains DoorID / ClearanceID style columns
+DECLARE @pairSchema SYSNAME = NULL, @pairTable SYSNAME = NULL;
+SELECT TOP(1 @pairSchema = s.name, @pairTable = t.name)
+FROM sys.schemas s
+JOIN sys.tables t ON t.schema_id = s.schema_id
+WHERE EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('doorid','door_id','door_id__','door_objid'))
+  AND EXISTS (SELECT 1 FROM sys.columns c2 WHERE c2.object_id = t.object_id AND LOWER(c2.name) IN ('clearanceid','clearance_id','clearance_id__','clearance_objid'))
+  AND t.name NOT LIKE 'sys%';
+
+IF @pairTable IS NOT NULL
+BEGIN
+  DECLARE @fullPair NVARCHAR(300) = QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable);
+
+  -- detect actual column names in that pair table for door and clearance (pick first match)
+  DECLARE @pairDoorCol SYSNAME = NULL, @pairClearCol SYSNAME = NULL;
+
+  SELECT TOP(1) @pairDoorCol = c.name
+  FROM sys.columns c
+  WHERE c.object_id = OBJECT_ID(@fullPair) AND LOWER(c.name) IN ('doorid','door_id','door_objid','door')
+
+  SELECT TOP(1) @pairClearCol = c.name
+  FROM sys.columns c
+  WHERE c.object_id = OBJECT_ID(@fullPair) AND LOWER(c.name) IN ('clearanceid','clearance_id','clearance_objid','clearance')
+
+  IF @pairDoorCol IS NULL OR @pairClearCol IS NULL
+  BEGIN
+    -- fallback to next strategy if detection fails
+    SET @pairTable = NULL;
+  END
+END
+
+IF @pairTable IS NOT NULL
+BEGIN
+  DECLARE @sql NVARCHAR(MAX) = N'
+  SELECT
+    D.ObjectID AS DoorObjectID,
+    D.Name     AS DoorName,
+    D.GUID     AS DoorGUID,
+    D.ControllerID AS ControllerID,
+    ISNULL(t.Cnt,0) AS [Clearance Count],
+    t.ClearanceNames   AS [Clearance (Name)],
+    t.ClearanceFriendlyNames AS [Clearance (FriendlyName)],
+    t.ClearanceDescriptions  AS [Clearance (Description)],
+    t.LatestClearanceTime    AS [Last Modified Time],
+    ISNULL(p.Name, CAST(t.LastModifiedByID AS NVARCHAR(30))) AS [Last Modified By]
+  FROM ACVSCore.Access.Door D
+  LEFT JOIN (
+    SELECT
+      P.' + QUOTENAME(@pairDoorCol) + ' AS DoorID,
+      COUNT(C.ObjectID) AS Cnt,
+      STUFF((
+        SELECT '', '' + ISNULL(C2.Name,'''')
+        FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' PP
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = PP.' + QUOTENAME(@pairClearCol) + '
+        WHERE PP.' + QUOTENAME(@pairDoorCol) + ' = P.' + QUOTENAME(@pairDoorCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceNames,
+      STUFF((
+        SELECT '', '' + ISNULL(C2.FriendlyName,'''')
+        FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' PP2
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = PP2.' + QUOTENAME(@pairClearCol) + '
+        WHERE PP2.' + QUOTENAME(@pairDoorCol) + ' = P.' + QUOTENAME(@pairDoorCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceFriendlyNames,
+      STUFF((
+        SELECT ''; '' + ISNULL(C2.Description,'''')
+        FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' PP3
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = PP3.' + QUOTENAME(@pairClearCol) + '
+        WHERE PP3.' + QUOTENAME(@pairDoorCol) + ' = P.' + QUOTENAME(@pairDoorCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceDescriptions,
+      (SELECT TOP(1) C3.LastModifiedTime
+       FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' PP4
+       INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = PP4.' + QUOTENAME(@pairClearCol) + '
+       WHERE PP4.' + QUOTENAME(@pairDoorCol) + ' = P.' + QUOTENAME(@pairDoorCol) + '
+       ORDER BY C3.LastModifiedTime DESC) AS LatestClearanceTime,
+      (SELECT TOP(1) C4.LastModifiedByID
+       FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' PP5
+       INNER JOIN ACVSCore.Access.Clearance C4 ON C4.ObjectID = PP5.' + QUOTENAME(@pairClearCol) + '
+       WHERE PP5.' + QUOTENAME(@pairDoorCol) + ' = P.' + QUOTENAME(@pairDoorCol) + '
+       ORDER BY C4.LastModifiedTime DESC) AS LastModifiedByID
+    FROM ' + QUOTENAME(@pairSchema) + '.' + QUOTENAME(@pairTable) + ' P
+    LEFT JOIN ACVSCore.Access.Clearance C ON C.ObjectID = P.' + QUOTENAME(@pairClearCol) + '
+    GROUP BY P.' + QUOTENAME(@pairDoorCol) + '
+  ) t ON t.DoorID = D.ObjectID
+  LEFT JOIN ACVSCore.Access.Personnel p ON p.ObjectID = t.LastModifiedByID
+  ORDER BY D.Name;
+  ';
+  EXEC sp_executesql @sql;
+  RETURN;
+END
+
+-- 2) Try association-style table with parent/child columns (search for likely column names)
+DECLARE @assocSchema SYSNAME = NULL, @assocTable SYSNAME = NULL, @assocParentCol SYSNAME = NULL, @assocChildCol SYSNAME = NULL;
+
+SELECT TOP(1 @assocSchema = s.name, @assocTable = t.name)
+FROM sys.schemas s
+JOIN sys.tables t ON t.schema_id = s.schema_id
+WHERE EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND LOWER(c.name) IN ('parentobjectid','parentid','parent_object_id'))
+  AND EXISTS (SELECT 1 FROM sys.columns c2 WHERE c2.object_id = t.object_id AND LOWER(c2.name) IN ('childobjectid','childid','child_object_id'))
+  AND t.name NOT LIKE 'sys%';
+
+IF @assocTable IS NOT NULL
+BEGIN
+  SELECT TOP(1 @assocParentCol = c.name)
+  FROM sys.columns c
+  WHERE c.object_id = OBJECT_ID(QUOTENAME(@assocSchema)+'.'+QUOTENAME(@assocTable)) AND LOWER(c.name) IN ('parentobjectid','parentid','parent_object_id');
+
+  SELECT TOP(1 @assocChildCol = c.name)
+  FROM sys.columns c
+  WHERE c.object_id = OBJECT_ID(QUOTENAME(@assocSchema)+'.'+QUOTENAME(@assocTable)) AND LOWER(c.name) IN ('childobjectid','childid','child_object_id');
+
+  IF @assocParentCol IS NULL OR @assocChildCol IS NULL
+  BEGIN
+    SET @assocTable = NULL;
+  END
+END
+
+IF @assocTable IS NOT NULL
+BEGIN
+  DECLARE @fullAssoc NVARCHAR(300) = QUOTENAME(@assocSchema) + '.' + QUOTENAME(@assocTable);
+
+  DECLARE @sql2 NVARCHAR(MAX) = N'
+  SELECT
+    D.ObjectID AS DoorObjectID,
+    D.Name     AS DoorName,
+    D.GUID     AS DoorGUID,
+    D.ControllerID AS ControllerID,
+    ISNULL(t.Cnt,0) AS [Clearance Count],
+    t.ClearanceNames   AS [Clearance (Name)],
+    t.ClearanceFriendlyNames AS [Clearance (FriendlyName)],
+    t.ClearanceDescriptions  AS [Clearance (Description)],
+    t.LatestClearanceTime    AS [Last Modified Time],
+    ISNULL(p.Name, CAST(t.LastModifiedByID AS NVARCHAR(30))) AS [Last Modified By]
+  FROM ACVSCore.Access.Door D
+  LEFT JOIN (
+    SELECT
+      A.' + QUOTENAME(@assocParentCol) + ' AS DoorID,
+      COUNT(C.ObjectID) AS Cnt,
+      STUFF((
+        SELECT '', '' + ISNULL(C2.Name,'''')
+        FROM ' + @fullAssoc + ' A2
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = A2.' + QUOTENAME(@assocChildCol) + '
+        WHERE A2.' + QUOTENAME(@assocParentCol) + ' = A.' + QUOTENAME(@assocParentCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceNames,
+      STUFF((
+        SELECT '', '' + ISNULL(C2.FriendlyName,'''')
+        FROM ' + @fullAssoc + ' A3
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = A3.' + QUOTENAME(@assocChildCol) + '
+        WHERE A3.' + QUOTENAME(@assocParentCol) + ' = A.' + QUOTENAME(@assocParentCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceFriendlyNames,
+      STUFF((
+        SELECT ''; '' + ISNULL(C2.Description,'''')
+        FROM ' + @fullAssoc + ' A4
+        INNER JOIN ACVSCore.Access.Clearance C2 ON C2.ObjectID = A4.' + QUOTENAME(@assocChildCol) + '
+        WHERE A4.' + QUOTENAME(@assocParentCol) + ' = A.' + QUOTENAME(@assocParentCol) + '
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''),1,2,'''') AS ClearanceDescriptions,
+      (SELECT TOP(1) C3.LastModifiedTime
+       FROM ' + @fullAssoc + ' A5
+       INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = A5.' + QUOTENAME(@assocChildCol) + '
+       WHERE A5.' + QUOTENAME(@assocParentCol) + ' = A.' + QUOTENAME(@assocParentCol) + '
+       ORDER BY C3.LastModifiedTime DESC) AS LatestClearanceTime,
+      (SELECT TOP(1) C4.LastModifiedByID
+       FROM ' + @fullAssoc + ' A6
+       INNER JOIN ACVSCore.Access.Clearance C4 ON C4.ObjectID = A6.' + QUOTENAME(@assocChildCol) + '
+       WHERE A6.' + QUOTENAME(@assocParentCol) + ' = A.' + QUOTENAME(@assocParentCol) + '
+       ORDER BY C4.LastModifiedTime DESC) AS LastModifiedByID
+    FROM ' + @fullAssoc + ' A
+    LEFT JOIN ACVSCore.Access.Clearance C ON C.ObjectID = A.' + QUOTENAME(@assocChildCol) + '
+    GROUP BY A.' + QUOTENAME(@assocParentCol) + '
+  ) t ON t.DoorID = D.ObjectID
+  LEFT JOIN ACVSCore.Access.Personnel p ON p.ObjectID = t.LastModifiedByID
+  ORDER BY D.Name;
+  ';
+  EXEC sp_executesql @sql2;
+  RETURN;
+END
+
+-- 3) Fallback: direct Clearance.ObjectID = Door.ObjectID
+SELECT
+  D.ObjectID                      AS DoorObjectID,
+  D.Name                          AS DoorName,
+  D.GUID                          AS DoorGUID,
+  D.ControllerID                  AS ControllerID,
+  ISNULL(agg.ClearanceCount,0)    AS [Clearance Count],
+  agg.ClearanceNames              AS [Clearance (Name)],
+  agg.ClearanceFriendlyNames      AS [Clearance (FriendlyName)],
+  agg.ClearanceDescriptions       AS [Clearance (Description)],
+  agg.LatestClearanceTime         AS [Last Modified Time],
+  COALESCE(P.Name, CAST(agg.LastModifiedByID AS NVARCHAR(30))) AS [Last Modified By]
+FROM ACVSCore.Access.Door D
+OUTER APPLY (
+  SELECT
+    COUNT(*) AS ClearanceCount,
+    STUFF((
+      SELECT ', ' + ISNULL(C2.Name,'')
+      FROM ACVSCore.Access.Clearance C2
+      WHERE C2.ObjectID = D.ObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceNames,
+    STUFF((
+      SELECT ', ' + ISNULL(C2.FriendlyName,'')
+      FROM ACVSCore.Access.Clearance C2
+      WHERE C2.ObjectID = D.ObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceFriendlyNames,
+    STUFF((
+      SELECT '; ' + ISNULL(C2.Description,'')
+      FROM ACVSCore.Access.Clearance C2
+      WHERE C2.ObjectID = D.ObjectID
+      FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceDescriptions,
+    (SELECT MAX(C3.LastModifiedTime) FROM ACVSCore.Access.Clearance C3 WHERE C3.ObjectID = D.ObjectID) AS LatestClearanceTime,
+    (SELECT TOP(1) C4.LastModifiedByID FROM ACVSCore.Access.Clearance C4 WHERE C4.ObjectID = D.ObjectID ORDER BY C4.LastModifiedTime DESC) AS LastModifiedByID
+) agg
+LEFT JOIN ACVSCore.Access.Personnel P ON P.ObjectID = agg.LastModifiedByID
+ORDER BY D.Name;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now i have run below Query since we got clerance details Wrong ..
 select * from ACVSCore.Access.Clearance
 use this database
