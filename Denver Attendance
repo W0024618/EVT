@@ -1,3 +1,241 @@
+USE [ACVSUJournal_00010021];
+GO
+SET NOCOUNT ON;
+
+-- Temp table to accumulate results from multiple possible mapping patterns
+IF OBJECT_ID('tempdb..#DoorClearances') IS NOT NULL DROP TABLE #DoorClearances;
+
+CREATE TABLE #DoorClearances (
+    DoorObjectID BIGINT,
+    ClearanceCount INT,
+    ClearanceNames NVARCHAR(MAX),
+    ClearanceDescriptions NVARCHAR(MAX),
+    LatestClearanceTime DATETIME2,
+    LastModifiedByID BIGINT
+);
+
+---------------------------------------------------------------------
+-- 1) Direct mapping: Clearance.ObjectID = Door.ObjectID
+--    (safe to run because Clearance and Door exist in your DB)
+---------------------------------------------------------------------
+IF OBJECT_ID('ACVSCore.Access.Clearance','U') IS NOT NULL
+AND OBJECT_ID('ACVSCore.Access.Door','U') IS NOT NULL
+BEGIN
+    INSERT INTO #DoorClearances (DoorObjectID, ClearanceCount, ClearanceNames, ClearanceDescriptions, LatestClearanceTime, LastModifiedByID)
+    SELECT
+      D.ObjectID AS DoorObjectID,
+      COUNT(C.ObjectID) AS ClearanceCount,
+      STUFF((
+        SELECT ', ' + ISNULL(C2.Name,'')
+        FROM ACVSCore.Access.Clearance C2
+        WHERE C2.ObjectID = D.ObjectID
+        FOR XML PATH(''), TYPE
+      ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceNames,
+      STUFF((
+        SELECT '; ' + ISNULL(C2.Description,'')
+        FROM ACVSCore.Access.Clearance C2
+        WHERE C2.ObjectID = D.ObjectID
+        FOR XML PATH(''), TYPE
+      ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceDescriptions,
+      (SELECT TOP(1) C3.LastModifiedTime
+       FROM ACVSCore.Access.Clearance C3
+       WHERE C3.ObjectID = D.ObjectID
+       ORDER BY C3.LastModifiedTime DESC) AS LatestClearanceTime,
+      (SELECT TOP(1) C4.LastModifiedByID
+       FROM ACVSCore.Access.Clearance C4
+       WHERE C4.ObjectID = D.ObjectID
+       ORDER BY C4.LastModifiedTime DESC) AS LastModifiedByID
+    FROM ACVSCore.Access.Door D
+    LEFT JOIN ACVSCore.Access.Clearance C
+      ON C.ObjectID = D.ObjectID
+    GROUP BY D.ObjectID;
+END
+
+---------------------------------------------------------------------
+-- 2) Pair table pattern: ACVSCore.Access.<Something> with columns DoorID and ClearanceID
+--    (e.g. DoorClearancePair or similarly named table)
+--    We check for a table that has both columns and then use it.
+---------------------------------------------------------------------
+DECLARE @pairTableName SYSNAME = NULL;
+
+SELECT TOP(1) @pairTableName = QUOTENAME(s.name) + '.' + QUOTENAME(t.name)
+FROM sys.schemas s
+JOIN sys.tables t ON t.schema_id = s.schema_id
+JOIN sys.columns c1 ON c1.object_id = t.object_id AND LOWER(c1.name) IN ('doorid','door_id')
+JOIN sys.columns c2 ON c2.object_id = t.object_id AND LOWER(c2.name) IN ('clearanceid','clearance_id')
+WHERE LOWER(s.name) = 'access' AND LOWER(s.name) IS NOT NULL
+  AND (t.name LIKE '%door%clear%' OR t.name LIKE '%clear%pair%' OR t.name LIKE '%clear%door%' OR t.name LIKE '%clearance%pair%');
+
+-- If not found in Access schema, search all schemas
+IF @pairTableName IS NULL
+BEGIN
+    SELECT TOP(1) @pairTableName = QUOTENAME(s.name) + '.' + QUOTENAME(t.name)
+    FROM sys.schemas s
+    JOIN sys.tables t ON t.schema_id = s.schema_id
+    JOIN sys.columns c1 ON c1.object_id = t.object_id AND LOWER(c1.name) IN ('doorid','door_id')
+    JOIN sys.columns c2 ON c2.object_id = t.object_id AND LOWER(c2.name) IN ('clearanceid','clearance_id')
+    WHERE t.name LIKE '%door%clear%' OR t.name LIKE '%clear%pair%' OR t.name LIKE '%clear%door%' OR t.name LIKE '%clearance%pair%';
+END
+
+IF @pairTableName IS NOT NULL
+BEGIN
+    DECLARE @sql NVARCHAR(MAX) = N'
+    INSERT INTO #DoorClearances (DoorObjectID, ClearanceCount, ClearanceNames, ClearanceDescriptions, LatestClearanceTime, LastModifiedByID)
+    SELECT
+      D.ObjectID AS DoorObjectID,
+      COUNT(C2.ObjectID) AS ClearanceCount,
+      STUFF((
+        SELECT '', '' + ISNULL(C3.Name,'''')
+        FROM ' + @pairTableName + ' P
+        INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = P.ClearanceID
+        WHERE P.DoorID = D.ObjectID
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''') AS ClearanceNames,
+      STUFF((
+        SELECT ''; '' + ISNULL(C3.Description,'''')
+        FROM ' + @pairTableName + ' P2
+        INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = P2.ClearanceID
+        WHERE P2.DoorID = D.ObjectID
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''') AS ClearanceDescriptions,
+      (SELECT TOP(1) C4.LastModifiedTime
+       FROM ' + @pairTableName + ' P3
+       INNER JOIN ACVSCore.Access.Clearance C4 ON C4.ObjectID = P3.ClearanceID
+       WHERE P3.DoorID = D.ObjectID
+       ORDER BY C4.LastModifiedTime DESC) AS LatestClearanceTime,
+      (SELECT TOP(1) C5.LastModifiedByID
+       FROM ' + @pairTableName + ' P4
+       INNER JOIN ACVSCore.Access.Clearance C5 ON C5.ObjectID = P4.ClearanceID
+       WHERE P4.DoorID = D.ObjectID
+       ORDER BY C5.LastModifiedTime DESC) AS LastModifiedByID
+    FROM ACVSCore.Access.Door D
+    LEFT JOIN ' + @pairTableName + ' P_all ON P_all.DoorID = D.ObjectID
+    LEFT JOIN ACVSCore.Access.Clearance C ON C.ObjectID = P_all.ClearanceID
+    GROUP BY D.ObjectID;
+    ';
+
+    EXEC sp_executesql @sql;
+END
+
+---------------------------------------------------------------------
+-- 3) Generic association table pattern (common names: Association, Associations, ObjectAssociation)
+--    We look for a table that has columns like ParentObjectID/ChildObjectID (or parent_id/child_id)
+---------------------------------------------------------------------
+DECLARE @assocTableName SYSNAME = NULL;
+
+SELECT TOP(1) @assocTableName = QUOTENAME(s.name) + '.' + QUOTENAME(t.name)
+FROM sys.schemas s
+JOIN sys.tables t ON t.schema_id = s.schema_id
+JOIN sys.columns pc ON pc.object_id = t.object_id AND LOWER(pc.name) IN ('parentobjectid','parentid','parent_object_id')
+JOIN sys.columns cc ON cc.object_id = t.object_id AND LOWER(cc.name) IN ('childobjectid','childid','child_object_id')
+WHERE t.name LIKE '%assoc%' OR t.name LIKE '%association%' OR t.name LIKE '%link%';
+
+IF @assocTableName IS NOT NULL
+BEGIN
+    DECLARE @sql2 NVARCHAR(MAX) = N'
+    INSERT INTO #DoorClearances (DoorObjectID, ClearanceCount, ClearanceNames, ClearanceDescriptions, LatestClearanceTime, LastModifiedByID)
+    SELECT
+      D.ObjectID AS DoorObjectID,
+      COUNT(C2.ObjectID) AS ClearanceCount,
+      STUFF((
+        SELECT '', '' + ISNULL(C3.Name,'''')
+        FROM ' + @assocTableName + ' A
+        INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = A.ChildObjectID
+        WHERE A.ParentObjectID = D.ObjectID
+          AND (A.ChildObjectType IS NULL OR A.ChildObjectType = ''Clearance'')
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''') AS ClearanceNames,
+      STUFF((
+        SELECT ''; '' + ISNULL(C3.Description,'''')
+        FROM ' + @assocTableName + ' A2
+        INNER JOIN ACVSCore.Access.Clearance C3 ON C3.ObjectID = A2.ChildObjectID
+        WHERE A2.ParentObjectID = D.ObjectID
+          AND (A2.ChildObjectType IS NULL OR A2.ChildObjectType = ''Clearance'')
+        FOR XML PATH(''''), TYPE
+      ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''') AS ClearanceDescriptions,
+      (SELECT TOP(1) C4.LastModifiedTime
+       FROM ' + @assocTableName + ' A3
+       INNER JOIN ACVSCore.Access.Clearance C4 ON C4.ObjectID = A3.ChildObjectID
+       WHERE A3.ParentObjectID = D.ObjectID
+         AND (A3.ChildObjectType IS NULL OR A3.ChildObjectType = ''Clearance'')
+       ORDER BY C4.LastModifiedTime DESC) AS LatestClearanceTime,
+      (SELECT TOP(1) C5.LastModifiedByID
+       FROM ' + @assocTableName + ' A4
+       INNER JOIN ACVSCore.Access.Clearance C5 ON C5.ObjectID = A4.ChildObjectID
+       WHERE A4.ParentObjectID = D.ObjectID
+         AND (A4.ChildObjectType IS NULL OR A4.ChildObjectType = ''Clearance'')
+       ORDER BY C5.LastModifiedTime DESC) AS LastModifiedByID
+    FROM ACVSCore.Access.Door D
+    LEFT JOIN ' + @assocTableName + ' A_all ON A_all.ParentObjectID = D.ObjectID
+    LEFT JOIN ACVSCore.Access.Clearance C_all ON C_all.ObjectID = A_all.ChildObjectID
+    GROUP BY D.ObjectID;
+    ';
+
+    EXEC sp_executesql @sql2;
+END
+
+---------------------------------------------------------------------
+-- Final result: list all doors and show aggregated clearance info (one row per door)
+---------------------------------------------------------------------
+SELECT
+  D.ObjectID                AS DoorObjectID,
+  D.Name                    AS DoorName,
+  D.GUID                    AS DoorGUID,
+  D.ControllerID            AS ControllerID,
+  DC.ClearanceCount         AS [Clearance Count],
+  DC.ClearanceNames         AS [Clearance Details],
+  DC.ClearanceDescriptions  AS [Clearance Descriptions],
+  DC.LatestClearanceTime    AS [Last Modified Time],
+  COALESCE(P.Name, CAST(DC.LastModifiedByID AS NVARCHAR(30))) AS [Last Modified By]
+FROM ACVSCore.Access.Door D
+LEFT JOIN (
+    -- collapse duplicates if multiple methods found the same DoorObjectID
+    SELECT DoorObjectID,
+           MAX(ClearanceCount) AS ClearanceCount,
+           STUFF((
+             SELECT '; ' + ISNULL(t2.ClearanceNames,'')
+             FROM #DoorClearances t2
+             WHERE t2.DoorObjectID = t.DoorObjectID
+             FOR XML PATH(''), TYPE
+           ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceNames,
+           STUFF((
+             SELECT '||' + ISNULL(t2.ClearanceDescriptions,'')
+             FROM #DoorClearances t2
+             WHERE t2.DoorObjectID = t.DoorObjectID
+             FOR XML PATH(''), TYPE
+           ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ClearanceDescriptions,
+           MAX(LatestClearanceTime) AS LatestClearanceTime,
+           MAX(LastModifiedByID) AS LastModifiedByID
+    FROM #DoorClearances t
+    GROUP BY DoorObjectID
+) DC ON DC.DoorObjectID = D.ObjectID
+LEFT JOIN ACVSCore.Access.Personnel P
+  ON P.ObjectID = DC.LastModifiedByID
+ORDER BY D.Name;
+
+-- cleanup
+DROP TABLE #DoorClearances;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I have run each Query We got diffrent diffrent errors now check all Query Carefully and build one correct Query ..
 
 
