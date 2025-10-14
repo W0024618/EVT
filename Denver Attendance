@@ -1,3 +1,186 @@
+/* Combined Headcount - updated with Denver / PrimaryLocation HQ filter
+   - EmployeeName (ObjectName1), DoorName (ObjectName2), PrimaryLocation (Text5)
+   - Filter PersonnelType to Employee OR Terminated Personnel (case-insensitive)
+   - Location filter: LogicalLocation = 'Denver' OR (PrimaryLocation contains 'denver' AND contains 'hq')
+   - Add additional DB names to @DBList if you want to scan more DBs
+*/
+
+SET NOCOUNT ON;
+GO
+
+DECLARE @targetDate DATE = '2025-09-02';  -- adjust as required
+
+-- ---------- List of databases (add more if needed) ----------
+DECLARE @DBList TABLE (db SYSNAME);
+INSERT INTO @DBList (db) VALUES
+ ('ACVSUJournal_00010021');  -- add other ACVSUJournal_* DB names here as additional rows
+
+-- ---------- Combined list of PartitionName2 values you care about (kept for earlier broad filtering if needed) ----------
+DECLARE @PartitionList NVARCHAR(MAX) =
+    '''LT.Vilnius'',''AUT.Vienna'',''IE.DUblin'',''DU.Abu Dhab'',''ES.Madrid'',''IT.Rome'',''MA.Casablanca'',''RU.Moscow'',''UK.London'','
+  + '''APAC.Default'',''IN.HYD'',''JP.Tokyo'',''PH.Manila'',''MY.Kuala Lumpur'','
+  + '''AR.Cordoba'',''BR.Sao Paulo'',''CR.Costa Rica Partition'',''MX.Mexico City'',''PA.Panama City'',''PE.Lima''';
+
+-- ---------- Drop temp table if left over ----------
+IF OBJECT_ID('tempdb..#CombinedEmployeeData') IS NOT NULL
+    DROP TABLE #CombinedEmployeeData;
+
+-- Create temp table explicitly
+CREATE TABLE #CombinedEmployeeData (
+    SourceDB SYSNAME,
+    ObjectName1 NVARCHAR(255),   -- EmployeeName source
+    ObjectName2 NVARCHAR(255),   -- DoorName source
+    EmployeeID NVARCHAR(200),
+    PersonnelTypeID INT,
+    PersonnelTypeName NVARCHAR(255),
+    Text5 NVARCHAR(255),         -- PrimaryLocation source
+    PartitionName2 NVARCHAR(255),
+    LocaleMessageTime DATETIME2,
+    MessageType NVARCHAR(100),
+    EmployeeIdentity NVARCHAR(200),
+    CardNumber NVARCHAR(200),
+    LogicalLocation NVARCHAR(255)
+);
+
+-- ---------- Build dynamic SQL that inserts from each DB ----------
+DECLARE @sql NVARCHAR(MAX) = N'';
+DECLARE @db SYSNAME;
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+    SELECT db FROM @DBList;
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = @sql + N'
+    INSERT INTO #CombinedEmployeeData (
+        SourceDB, ObjectName1, ObjectName2, EmployeeID, PersonnelTypeID, PersonnelTypeName,
+        Text5, PartitionName2, LocaleMessageTime, MessageType, EmployeeIdentity, CardNumber, LogicalLocation
+    )
+    SELECT
+        N' + QUOTENAME(@db,'''') + N' AS SourceDB,
+        t1.[ObjectName1],
+        t1.[ObjectName2],
+        CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+        t2.[PersonnelTypeID],
+        t3.[Name] AS PersonnelTypeName,
+        t2.[Text5],
+        t1.[PartitionName2],
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        t1.[MessageType],
+        CAST(t1.ObjectIdentity1 AS NVARCHAR(200)) AS EmployeeIdentity,
+        NULL AS CardNumber,
+        CASE
+            WHEN t1.[ObjectName2] LIKE ''%HQ%'' THEN ''Denver''
+            WHEN t1.[ObjectName2] LIKE ''%Austin%'' THEN ''Austin''
+            WHEN t1.[ObjectName2] LIKE ''%Miami%'' THEN ''Miami''
+            WHEN t1.[ObjectName2] LIKE ''%NYC%'' THEN ''New York''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PI%'' THEN ''Taguig City''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PH%'' THEN ''Quezon City''
+            WHEN t1.[ObjectName2] LIKE ''%PUN%'' THEN ''Pune''
+            WHEN t1.[ObjectName2] LIKE ''%HYD%'' THEN ''Hyderabad''
+            ELSE t1.[PartitionName2]
+        END AS LogicalLocation
+    FROM ' + QUOTENAME(@db) + N'.dbo.ACVSUJournalLog AS t1
+    INNER JOIN [ACVSCore].[Access].[Personnel] AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+    INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3
+        ON t2.PersonnelTypeID = t3.ObjectID
+    WHERE
+        t1.MessageType = ''CardAdmitted''
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = ' + QUOTENAME(CONVERT(NVARCHAR(10), @targetDate, 120),'''') + N'
+        AND (
+            t1.PartitionName2 IN (' + @PartitionList + N')
+            OR t1.ObjectName2 LIKE ''%HQ%'' OR t1.ObjectName2 LIKE ''%Austin%'' OR t1.ObjectName2 LIKE ''%Miami%'' OR t1.ObjectName2 LIKE ''%NYC%'' 
+            OR t1.ObjectName2 LIKE ''APAC_PI%'' OR t1.ObjectName2 LIKE ''APAC_PH%'' OR t1.ObjectName2 LIKE ''%PUN%'' OR t1.ObjectName2 LIKE ''%HYD%''
+        );
+    ';
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+-- Execute the dynamic insert SQL
+EXEC sp_executesql @sql;
+
+-- ---------- De-duplicate & pick latest swipe per person per date ----------
+;WITH LatestPerPerson AS (
+    SELECT
+        SourceDB,
+        ObjectName1,
+        ObjectName2,
+        EmployeeID,
+        PersonnelTypeID,
+        PersonnelTypeName,
+        Text5,
+        PartitionName2,
+        LocaleMessageTime,
+        MessageType,
+        EmployeeIdentity,
+        CardNumber,
+        LogicalLocation,
+        CONVERT(DATE, LocaleMessageTime) AS [DateOnly],
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+              COALESCE(NULLIF(EmployeeIdentity, ''), NULLIF(EmployeeID, ''), ObjectName1),
+              CONVERT(DATE, LocaleMessageTime)
+            ORDER BY LocaleMessageTime DESC
+        ) AS rn
+    FROM #CombinedEmployeeData
+)
+SELECT
+    SourceDB,
+    ObjectName1    AS EmployeeName,
+    ObjectName2    AS DoorName,
+    PersonnelTypeName AS PersonnelType,
+    EmployeeID,
+    Text5          AS PrimaryLocation,
+    PartitionName2,
+    LogicalLocation,
+    MessageType,
+    [DateOnly]     AS [Date],
+    LocaleMessageTime
+FROM LatestPerPerson
+WHERE rn = 1
+    -- Personnel type filter (case-insensitive): keep only Employee and Terminated Personnel
+    AND LOWER(RTRIM(LTRIM(PersonnelTypeName))) IN ('employee','terminated personnel')
+    -- LOCATION filter: either logical 'Denver' OR PrimaryLocation contains both 'denver' and 'hq' (case-insensitive)
+    AND (
+         LogicalLocation = 'Denver'
+         OR (
+             Text5 IS NOT NULL
+             AND LOWER(Text5) LIKE '%denver%'
+             AND LOWER(Text5) LIKE '%hq%'         -- covers 'WU HQ', 'WU-HQ', 'HQ', etc.
+         )
+    )
+ORDER BY LogicalLocation, PersonnelTypeName, ObjectName1;
+
+-- cleanup
+IF OBJECT_ID('tempdb..#CombinedEmployeeData') IS NOT NULL
+    DROP TABLE #CombinedEmployeeData;
+
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now Add one more Filters 
 we need only Employee and Terminated Personnel	
 Where LogicalLocation is Denver or PrimaryLocation is like Denver - WU HQ or Denver, CO. USA - WU HQ or  Denver, CO. USA - WU HQ Work from home 
