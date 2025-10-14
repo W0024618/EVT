@@ -1,3 +1,205 @@
+/* Combined Headcount - single query across multiple ACVSUJournal_* databases
+   - Replace the @DB list entries with your actual 21 database names if different.
+   - Adjust @targetDate as needed.
+   - This script builds a combined UNION of each DB's ACVSUJournalLog table,
+     dedups rows per person/date (latest swipe), and returns rows for the
+     partitions / logical locations you care about.
+*/
+
+SET NOCOUNT ON;
+GO
+
+DECLARE @targetDate DATE = '2025-06-26';  -- adjust as required
+
+-- ---------- List of databases (21 entries). Replace these with your real DB names ----------
+DECLARE @DBList TABLE (db SYSNAME);
+INSERT INTO @DBList (db) VALUES
+ ('ACVSUJournal_00010021'),
+ ('ACVSUJournal_00010022'),
+ ('ACVSUJournal_00010023'),
+ ('ACVSUJournal_00010024'),
+ ('ACVSUJournal_00010025'),
+ ('ACVSUJournal_00010026'),
+ ('ACVSUJournal_00010027'),
+ ('ACVSUJournal_00010028'),
+ ('ACVSUJournal_00010029'),
+ ('ACVSUJournal_00011024'),
+ ('ACVSUJournal_00011025'),
+ ('ACVSUJournal_00011026'),
+ ('ACVSUJournal_00011027'),
+ ('ACVSUJournal_00011028'),
+ ('ACVSUJournal_00011029'),
+ ('ACVSUJournal_00012001'),
+ ('ACVSUJournal_00012002'),
+ ('ACVSUJournal_00012003'),
+ ('ACVSUJournal_00012004'),
+ ('ACVSUJournal_00012005'),
+ ('ACVSUJournal_00012006');
+
+-- ---------- Combined list of PartitionName2 values you care about ----------
+-- (merged from your per-region queries; add/remove as required)
+DECLARE @PartitionList NVARCHAR(MAX) =
+    '''LT.Vilnius'',''AUT.Vienna'',''IE.DUblin'',''DU.Abu Dhab'',''ES.Madrid'',''IT.Rome'',''MA.Casablanca'',''RU.Moscow'',''UK.London'','
+  + '''APAC.Default'',''IN.HYD'',''JP.Tokyo'',''PH.Manila'',''MY.Kuala Lumpur'','
+  + '''AR.Cordoba'',''BR.Sao Paulo'',''CR.Costa Rica Partition'',''MX.Mexico City'',''PA.Panama City'',''PE.Lima'','
+  + '''APAC.Default''';  -- you can extend this list
+
+-- ---------- Drop temp table if left over ----------
+IF OBJECT_ID('tempdb..#CombinedEmployeeData') IS NOT NULL
+    DROP TABLE #CombinedEmployeeData;
+
+-- We'll create the temp table explicitly once (avoids SELECT INTO duplicate-create problems)
+CREATE TABLE #CombinedEmployeeData (
+    SourceDB SYSNAME,
+    ObjectName1 NVARCHAR(255),
+    ObjectName2 NVARCHAR(255),
+    EmployeeID NVARCHAR(200),
+    PersonnelTypeID INT,
+    PersonnelTypeName NVARCHAR(255),
+    Text5 NVARCHAR(255),
+    PartitionName2 NVARCHAR(255),
+    LocaleMessageTime DATETIME2,
+    MessageType NVARCHAR(100),
+    EmployeeIdentity NVARCHAR(200),
+    CardNumber NVARCHAR(200),
+    LogicalLocation NVARCHAR(255)
+);
+
+-- ---------- Build dynamic SQL that UNIONs across each DB in @DBList ----------
+DECLARE @sql NVARCHAR(MAX) = N'';
+DECLARE @db SYSNAME;
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+    SELECT db FROM @DBList;
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    /*
+      Template: query each DB's dbo.ACVSUJournalLog (t1) joined to ACVSCore..Personnel (t2)
+      and ACVSCore..PersonnelType (t3). Filter early by MessageType and target date to reduce data.
+      Use QUOTENAME(@db) to safely reference the DB.
+    */
+    SET @sql = @sql + N'
+    INSERT INTO #CombinedEmployeeData (
+        SourceDB, ObjectName1, ObjectName2, EmployeeID, PersonnelTypeID, PersonnelTypeName,
+        Text5, PartitionName2, LocaleMessageTime, MessageType, EmployeeIdentity, CardNumber, LogicalLocation
+    )
+    SELECT
+        N' + QUOTENAME(@db,'''') + N' AS SourceDB,
+        t1.[ObjectName1],
+        t1.[ObjectName2],
+        CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+        t2.[PersonnelTypeID],
+        t3.[Name] AS PersonnelTypeName,
+        t2.[Text5],
+        t1.[PartitionName2],
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        t1.[MessageType],
+        CAST(t1.ObjectIdentity1 AS NVARCHAR(200)) AS EmployeeIdentity,
+        -- try to extract card/chuid if present in XML shred (common fields may vary) else null
+        NULL AS CardNumber,
+        -- derive logical location primarily from ObjectName2 (door) falling back to PartitionName2
+        CASE
+            WHEN t1.[ObjectName2] LIKE ''%HQ%'' THEN ''Denver''
+            WHEN t1.[ObjectName2] LIKE ''%Austin%'' THEN ''Austin''
+            WHEN t1.[ObjectName2] LIKE ''%Miami%'' THEN ''Miami''
+            WHEN t1.[ObjectName2] LIKE ''%NYC%'' THEN ''New York''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PI%'' THEN ''Taguig City''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PH%'' THEN ''Quezon City''
+            WHEN t1.[ObjectName2] LIKE ''%PUN%'' THEN ''Pune''
+            WHEN t1.[ObjectName2] LIKE ''%HYD%'' THEN ''Hyderabad''
+            ELSE t1.[PartitionName2]
+        END AS LogicalLocation
+    FROM ' + QUOTENAME(@db) + N'.dbo.ACVSUJournalLog AS t1
+    INNER JOIN [ACVSCore].[Access].[Personnel] AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+    INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3
+        ON t2.PersonnelTypeID = t3.ObjectID
+    WHERE
+        t1.MessageType = ''CardAdmitted''
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = ' + QUOTENAME(CONVERT(NVARCHAR(10), @targetDate, 120),'''') + N'
+        AND (
+            t1.PartitionName2 IN (' + @PartitionList + N')
+            OR t1.ObjectName2 LIKE ''%HQ%'' OR t1.ObjectName2 LIKE ''%Austin%'' OR t1.ObjectName2 LIKE ''%Miami%'' OR t1.ObjectName2 LIKE ''%NYC%'' 
+            OR t1.ObjectName2 LIKE ''APAC_PI%'' OR t1.ObjectName2 LIKE ''APAC_PH%'' OR t1.ObjectName2 LIKE ''%PUN%'' OR t1.ObjectName2 LIKE ''%HYD%''
+        );
+    ';
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+-- Execute the dynamic insert SQL
+EXEC sp_executesql @sql;
+
+-- ---------- De-duplicate & pick latest swipe per person per date ----------
+;WITH LatestPerPerson AS (
+    SELECT
+        SourceDB,
+        ObjectName1,
+        ObjectName2,
+        EmployeeID,
+        PersonnelTypeID,
+        PersonnelTypeName,
+        Text5,
+        PartitionName2,
+        LocaleMessageTime,
+        MessageType,
+        EmployeeIdentity,
+        CardNumber,
+        LogicalLocation,
+        CONVERT(DATE, LocaleMessageTime) AS [DateOnly],
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+              -- prefer a stable person identifier: EmployeeIdentity (GUID) else EmployeeID else ObjectName1
+              COALESCE(NULLIF(EmployeeIdentity, ''), NULLIF(EmployeeID, ''), ObjectName1),
+              CONVERT(DATE, LocaleMessageTime)
+            ORDER BY LocaleMessageTime DESC
+        ) AS rn
+    FROM #CombinedEmployeeData
+)
+SELECT
+    SourceDB,
+    ObjectName1,
+    ObjectName2,
+    PersonnelTypeName AS [PersonnelType],
+    EmployeeID,
+    Text5,
+    PartitionName2,
+    LogicalLocation,
+    MessageType,
+    [DateOnly] AS [Date],
+    LocaleMessageTime
+FROM LatestPerPerson
+WHERE rn = 1
+    -- final filter: keep records in partitions / logical locations you care about
+    AND (
+         PartitionName2 IN ('LT.Vilnius','AUT.Vienna','IE.DUblin','DU.Abu Dhab','ES.Madrid','IT.Rome','MA.Casablanca','RU.Moscow','UK.London',
+                            'APAC.Default','IN.HYD','JP.Tokyo','PH.Manila','MY.Kuala Lumpur',
+                            'AR.Cordoba','BR.Sao Paulo','CR.Costa Rica Partition','MX.Mexico City','PA.Panama City','PE.Lima')
+      OR LogicalLocation IN ('Denver','Austin','Miami','New York','Taguig City','Quezon City','Pune','Hyderabad')
+    )
+ORDER BY LogicalLocation, PersonnelTypeName, ObjectName1;
+
+-- cleanup
+IF OBJECT_ID('tempdb..#CombinedEmployeeData') IS NOT NULL
+    DROP TABLE #CombinedEmployeeData;
+
+GO
+
+
+
+
+
+
+
+
+
 Now red below all APAC EMEA LACA , NAMER HeadCount Query carefully and build single Headcount Query use 21 database and add all region and Location in one Query ...
 
 for all Query mention Common database use [ACVSUJournal_00010021]
