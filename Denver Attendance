@@ -1,3 +1,161 @@
+@app.get("/api/reports/denver-attendance")
+@app.get("/reports/denver-attendance")  # alias (helps when proxy isn't configured)
+async def api_denver_attendance(
+    year: Optional[int] = Query(None, description="Year (e.g. 2025)"),
+    month: Optional[int] = Query(None, description="Month 1..12"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD (optional alternative)"),
+    refresh: bool = Query(False, description="If true, do not use cache (not implemented)"),
+):
+    """
+    Generate Denver Monthly Attendance Excel report (returns file).
+    Provide either year+month OR from_date+to_date (YYYY-MM-DD).
+    If neither provided, defaults to previous month relative to Asia/Kolkata.
+    """
+    request_id = uuid.uuid4().hex[:8]
+    logger.info("[%s] denver-attendance request START year=%s month=%s from_date=%s to_date=%s refresh=%s",
+                request_id, year, month, from_date, to_date, refresh)
+    try:
+        # robust import: try normal import, then file-based fallback
+        denver_mod = None
+        try:
+            denver_mod = importlib.import_module("denverAttendance")
+            logger.debug("[%s] Imported denverAttendance via normal import", request_id)
+        except Exception as imp_exc:
+            logger.warning("[%s] Normal import of denverAttendance failed: %s. Attempting file-based import...", request_id, str(imp_exc))
+            try:
+                # try to import from same directory as app.py
+                candidate = Path(__file__).resolve().parent / "denverAttendance.py"
+                if candidate.exists():
+                    spec = importlib.util.spec_from_file_location("denverAttendance", str(candidate))
+                    denver_mod = importlib.util.module_from_spec(spec)
+                    if spec and spec.loader:
+                        spec.loader.exec_module(denver_mod)
+                        logger.debug("[%s] Imported denverAttendance from file %s", request_id, candidate)
+                else:
+                    # last-ditch: look up module path in sys.path
+                    denver_mod = importlib.import_module("denverAttendance")
+            except Exception as ex2:
+                logger.exception("[%s] Failed to import denverAttendance (both normal and file fallback)", request_id)
+                raise HTTPException(status_code=500, detail=f"denverAttendance import failed: {ex2}")
+
+        # compute date range
+        tz = ZoneInfo("Asia/Kolkata")
+        today = datetime.now(tz).date()
+
+        if from_date and to_date:
+            try:
+                s = datetime.strptime(str(from_date)[:10], "%Y-%m-%d").date()
+                e = datetime.strptime(str(to_date)[:10], "%Y-%m-%d").date()
+            except Exception:
+                logger.error("[%s] Invalid from_date/to_date format: %s / %s", request_id, from_date, to_date)
+                raise HTTPException(status_code=400, detail="Invalid from_date/to_date format. Use YYYY-MM-DD")
+            start_date, end_date = s, e
+        else:
+            if year is not None and month is not None:
+                # if module provides helper use it; else fallback compute
+                if hasattr(denver_mod, "_month_date_range"):
+                    try:
+                        start_date, end_date = denver_mod._month_date_range(int(year), int(month))
+                    except Exception:
+                        logger.exception("[%s] denver_mod._month_date_range threw an error, falling back to manual compute", request_id)
+                        start_date = date(int(year), int(month), 1)
+                        if int(month) == 12:
+                            end_date = date(int(year) + 1, 1, 1) - timedelta(days=1)
+                        else:
+                            end_date = date(int(year), int(month) + 1, 1) - timedelta(days=1)
+                else:
+                    start_date = date(int(year), int(month), 1)
+                    if int(month) == 12:
+                        end_date = date(int(year) + 1, 1, 1) - timedelta(days=1)
+                    else:
+                        end_date = date(int(year), int(month) + 1, 1) - timedelta(days=1)
+            else:
+                # default: previous month
+                prev_month_end = (today.replace(day=1) - timedelta(days=1))
+                if hasattr(denver_mod, "_month_date_range"):
+                    try:
+                        start_date, end_date = denver_mod._month_date_range(prev_month_end.year, prev_month_end.month)
+                    except Exception:
+                        start_date = prev_month_end.replace(day=1)
+                        end_date = prev_month_end
+                else:
+                    start_date = prev_month_end.replace(day=1)
+                    end_date = prev_month_end
+
+        logger.info("[%s] denver-attendance will generate for %s -> %s", request_id, start_date.isoformat(), end_date.isoformat())
+
+        outdir = str(OUTPUT_DIR)
+        try:
+            # call generator
+            path = denver_mod.generate_monthly_denver_report(
+                start_date=start_date,
+                end_date=end_date,
+                outdir=outdir,
+                city_filter="Denver",
+                region="namer"
+            )
+        except TypeError:
+            # fallback call-signature support (older code paths)
+            try:
+                path = denver_mod.generate_monthly_denver_report(year=getattr(start_date, 'year', None),
+                                                                 month=getattr(start_date, 'month', None),
+                                                                 outdir=outdir,
+                                                                 city_filter="Denver",
+                                                                 region="namer")
+            except Exception as e:
+                logger.exception("[%s] denverAttendance.generate_monthly_denver_report TypeError fallback failed", request_id)
+                raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+        except Exception as e:
+            logger.exception("[%s] denverAttendance generator failed", request_id)
+            raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+
+        if not path:
+            logger.error("[%s] Report generation returned empty path", request_id)
+            raise HTTPException(status_code=500, detail="Report generation failed (no path returned)")
+
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            logger.error("[%s] Generated file not found at %s", request_id, p)
+            raise HTTPException(status_code=500, detail="Generated file not found")
+
+        logger.info("[%s] denver-attendance generated file %s; returning to client", request_id, p.name)
+        return FileResponse(
+            str(p),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=p.name
+        )
+
+    except HTTPException:
+        # FastAPI will handle this; ensure we log
+        logger.exception("[%s] api_denver_attendance HTTPException raised", request_id)
+        raise
+    except Exception as e:
+        logger.exception("[%s] api_denver_attendance unknown failure", request_id)
+        raise HTTPException(status_code=500, detail=f"denver attendance error: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 now as per denverAttendance.py update Denver attendance Api endpoint when http://localhost:8000/api/reports/denver-attendance?year=2025&month=9
 we hit this APi in Backend console not display any request so Update Api endPoint carefully and fix the issue ..
 
