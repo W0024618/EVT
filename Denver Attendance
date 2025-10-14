@@ -1,3 +1,677 @@
+
+"""
+Generate Denver Monthly Attendance Excel report.
+
+Usage:
+    from denverAttendance import generate_monthly_denver_report
+    path = generate_monthly_denver_report(year=2025, month=9, outdir='/path/to/output', city_filter='Denver')
+Notes:
+    - This version uses presence-based logic for Denver: **no duration/sessionization**.
+      It treats a person as present on a date if there is at least one Denver swipe for that person (GUID preferred).
+    - Keeps report format (Summary / Attendance / DurationsRaw) compatible with the previous output.
+    - DaysGe8 is set equal to DaysPresent because duration is not computed here. You can replace
+      that heuristic later with a custom rule (e.g., morning+evening swipe => full day).
+"""
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import pandas as pd
+import logging
+import re
+import importlib
+import importlib.util
+import os
+from pathlib import Path
+from typing import Optional, Tuple, Dict
+
+# ODBC driver fallback (mirrors duration_report's default)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+duration_report = None
+try:
+    # normal import first (works when module path is set)
+    import duration_report as _dr  # type: ignore
+    duration_report = _dr
+except Exception:
+    # fallback: try to load duration_report.py from same directory as this file
+    try:
+        candidate = Path(__file__).resolve().parent / "duration_report.py"
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location("duration_report", str(candidate))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                duration_report = mod
+    except Exception:
+        duration_report = None
+
+def _get_db_conn_for_region(region_key: str):
+    """
+    Return a pyodbc connection for the given region.
+    Preference order:
+      1) duration_report.get_connection(region_key) if available
+      2) build connection from duration_report.REGION_CONFIG if present
+    Raises RuntimeError if pyodbc not available or region config missing.
+    """
+    try:
+        if duration_report is not None and hasattr(duration_report, "get_connection"):
+            return duration_report.get_connection(region_key)
+    except Exception:
+        # fall through to fallback builder
+        pass
+
+    # fallback builder: look for REGION_CONFIG dict in duration_report module
+    rcfgs = getattr(duration_report, "REGION_CONFIG", None) if duration_report is not None else None
+    if not rcfgs or region_key not in rcfgs:
+        raise RuntimeError("No REGION_CONFIG available and duration_report.get_connection not found.")
+
+    rc = rcfgs[region_key]
+    try:
+        import pyodbc
+    except Exception:
+        raise RuntimeError("pyodbc is not installed/available; cannot open DB connection from denverAttendance.py")
+
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+
+logger = logging.getLogger("denverAttendance")
+
+# Import duration_report (must be importable in same package/dir)
+try:
+    import duration_report
+except Exception:
+    duration_report = None
+
+
+def _month_date_range(year: int, month: int) -> Tuple[date, date]:
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year, month + 1, 1) - timedelta(days=1)
+    else:
+        end = date(year, month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def _to_date(v):
+    if v is None:
+        return None
+    if isinstance(v, date):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    try:
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    except Exception:
+        try:
+            return pd.to_datetime(v).date()
+        except Exception:
+            return None
+
+
+def _find_active_employee_file() -> Optional[Path]:
+    """
+    Search common locations for canonical active_employee file saved by the upload endpoint.
+    Looks for names like active_employee(.xlsx|.xls|.csv) and active_employee_*.*
+    """
+    candidates = []
+    # candidate directories
+    cand_dirs = [
+        Path.cwd(),
+        Path.cwd() / "data",
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent / "data",
+    ]
+    seen = set()
+    for d in cand_dirs:
+        try:
+            if not d.exists():
+                continue
+            for pattern in ("active_employee.*", "active_employees.*", "active_employee_*.*"):
+                for p in d.glob(pattern):
+                    if p.is_file() and p not in seen:
+                        candidates.append(p)
+                        seen.add(p)
+        except Exception:
+            continue
+    # prefer xlsx/xls then csv
+    for ext in (".xlsx", ".xls"):
+        for p in candidates:
+            if p.suffix.lower() == ext:
+                return p
+    for p in candidates:
+        if p.suffix.lower() == ".csv":
+            return p
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _load_active_employees_df() -> Optional[pd.DataFrame]:
+    p = _find_active_employee_file()
+    if not p:
+        return None
+    try:
+        if p.suffix.lower() in (".xlsx", ".xls"):
+            df = pd.read_excel(p, dtype=str)
+        else:
+            df = pd.read_csv(p, dtype=str)
+        # normalize column names (strip, keep original as well)
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+        return df
+    except Exception:
+        logger.exception("Failed to load active employee file %s", p)
+        return None
+
+
+def _pick_first_column_match(df: pd.DataFrame, candidates):
+    """
+    Given a df and list of candidate column-names (strings or regex patterns),
+    return first matching actual column name from df.columns (case-insensitive).
+    """
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if not cand:
+            continue
+        lc = cand.lower()
+        # exact try
+        if lc in lower_map:
+            return lower_map[lc]
+        # fuzzy contains
+        for c in cols:
+            if lc in c.lower():
+                return c
+        # regex style
+        try:
+            rx = re.compile(cand, re.I)
+            for c in cols:
+                if rx.search(c):
+                    return c
+        except Exception:
+            pass
+    return None
+
+
+def _build_enrichment_map(active_df: pd.DataFrame) -> Dict[str, Dict]:
+    """
+    Build lookup maps keyed by EmployeeID (preferred) and also by FullName fallback.
+    Returns dict: { "__id__": {id:rec}, "__name__": {lowername:rec} }
+    """
+    out = {"__id__": {}, "__name__": {}}
+    if active_df is None or active_df.empty:
+        return out
+
+    id_col = _pick_first_column_match(active_df, ["Employee ID", "EmployeeID", "EmployeeId", "Text12", "employeeid"])
+    full_name_col = _pick_first_column_match(active_df, ["Full Name", "FullName", "Full_Name", "Full name", "FullName"])
+    if not full_name_col:
+        first_c = _pick_first_column_match(active_df, ["First Name", "FirstName", "First"])
+        last_c = _pick_first_column_match(active_df, ["Last Name", "LastName", "Last"])
+        if first_c and last_c:
+            active_df["__full_name__"] = (
+                active_df[first_c].fillna("").astype(str).str.strip()
+                + " "
+                + active_df[last_c].fillna("").astype(str).str.strip()
+            )
+            full_name_col = "__full_name__"
+
+    business_col = _pick_first_column_match(active_df, ["Business Title", "Business_Title", "Job Title", "JobTitle", "BusinessTitle"])
+    manager_col = _pick_first_column_match(active_df, ["Manager Name", "Manager_Name", "Manager", "Manager's Name", "ManagerName"])
+    n1_col = _pick_first_column_match(active_df, ["N1_Sup_Organization", "Reporting Level 1 Name", "Reporting Level 1", "Supervisory Organization", "SupervisoryOrganization"])
+    loc_col = _pick_first_column_match(active_df, ["Location Description", "Location_Description", "Location Description", "Location"])
+    status_col = _pick_first_column_match(active_df, ["Current Status", "Current_Status", "Employee Status", "Status"])
+    hire_col = _pick_first_column_match(active_df, ["Hire Date", "Hire_Date", "HireDate", "Hire date"])
+
+    for idx, row in active_df.iterrows():
+        try:
+            rec = {}
+            if id_col:
+                eid = row.get(id_col)
+                if pd.notna(eid):
+                    eid = str(eid).strip()
+                else:
+                    eid = None
+            else:
+                eid = None
+            if full_name_col:
+                fname = row.get(full_name_col)
+                fname = None if pd.isna(fname) else str(fname).strip()
+            else:
+                fname = None
+
+            rec["Business_Title"] = None if business_col is None or pd.isna(row.get(business_col)) else str(row.get(business_col)).strip()
+            rec["Manager_Name"] = None if manager_col is None or pd.isna(row.get(manager_col)) else str(row.get(manager_col)).strip()
+            rec["N1_Sup_Organization"] = None if n1_col is None or pd.isna(row.get(n1_col)) else str(row.get(n1_col)).strip()
+            rec["Location_Description"] = None if loc_col is None or pd.isna(row.get(loc_col)) else str(row.get(loc_col)).strip()
+            rec["Current_Status"] = None if status_col is None or pd.isna(row.get(status_col)) else str(row.get(status_col)).strip()
+            rec["Hire_Date"] = None if hire_col is None or pd.isna(row.get(hire_col)) else _to_date(row.get(hire_col))
+            rec["Full_Name"] = fname
+            rec["EmployeeID"] = eid
+
+            if eid:
+                out["__id__"][str(eid).strip()] = rec
+            if fname:
+                out["__name__"][fname.strip().lower()] = rec
+        except Exception:
+            continue
+    return out
+
+
+def _date_label_safe(d: date) -> str:
+    # cross platform single-digit day formatting: "1-Jan-25"
+    try:
+        return d.strftime("%-d-%b-%y")
+    except Exception:
+        s = d.strftime("%d-%b-%y")
+        if s.startswith("0"):
+            s = s[1:]
+        return s
+
+
+# keep alias for callers that might use _date_label
+_date_label = _date_label_safe
+
+
+def generate_monthly_denver_report(year: int = None, month: int = None, start_date: date = None, end_date: date = None,
+                                   outdir: str = None, city_filter: str = "Denver", region: str = "namer") -> str:
+    """
+    Generate the Denver monthly attendance report Excel file.
+    Accepts either year+month or start_date+end_date. Returns path to the xlsx file.
+
+    IMPORTANT: function is defensive — if duration_report is not importable it will
+    write a diagnostic Excel file rather than crashing the process (prevents empty responses).
+    """
+    # Accept either start/end or year/month
+    if start_date is not None or end_date is not None:
+        start_date = _to_date(start_date)
+        end_date = _to_date(end_date)
+
+    if (start_date is None or end_date is None):
+        if year is None or month is None:
+            raise ValueError("Either (year and month) or (start_date and end_date) must be provided")
+        start_date, end_date = _month_date_range(int(year), int(month))
+
+    # canonical month-range label used for filename; set early so all exit paths have it
+    mon_label = f"{start_date.strftime('%Y%m')}_{end_date.strftime('%Y%m')}"
+
+    if not outdir:
+        outdir = Path.cwd() / "output"
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # build full date list
+    current = start_date
+    dates = []
+    while current <= end_date:
+        dates.append(current)
+        current = current + timedelta(days=1)
+
+    if not dates:
+        raise ValueError("Empty date range")
+
+    # If duration_report module missing, write diagnostic Excel and return
+    if duration_report is None:
+        filename = outdir / f"denver_attendance_{mon_label}.xlsx"
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                pd.DataFrame([{
+                    "Error": "duration_report module not importable on server",
+                    "Note": "Ensure duration_report.py is available and importable in the backend package directory."
+                }]).to_excel(writer, sheet_name="Summary", index=False)
+            logger.error("duration_report module missing; wrote diagnostic file %s", filename)
+            return str(filename)
+        except Exception:
+            logger.exception("Failed to write diagnostic Excel when duration_report missing")
+            raise
+
+    # helper: decide if a swipe row is a Denver visit based on Door/PartitionName2/PrimaryLocation
+    def _is_denver_visit_row(row) -> bool:
+        try:
+            door = (row.get("Door") or "") if isinstance(row, dict) else (row.get("Door") if "Door" in row else "")
+            partition = (row.get("PartitionName2") or "") if isinstance(row, dict) else (row.get("PartitionName2") if "PartitionName2" in row else "")
+            prim = (row.get("PrimaryLocation") or "") if isinstance(row, dict) else (row.get("PrimaryLocation") if "PrimaryLocation" in row else "")
+            s = " ".join([str(door), str(partition), str(prim)]).lower()
+            # match common patterns/keywords
+            keywords = ["denver", "hq", " us.co.obs", "co.denver"]
+            for kw in keywords:
+                if kw.strip() and kw in s:
+                    return True
+            # also allow "denver -" or "denver " occurrences
+            if "denver" in s:
+                return True
+            return False
+        except Exception:
+            return False
+
+    # ----------------------------------------------------------------
+    # NEW: collect unique DENVER swipes (one row per person per date).
+    # No duration/sessionization — we mark presence=1 if any Denver swipe exists.
+    # ----------------------------------------------------------------
+    all_rows = []
+
+    # regions to scan for supplemental door-based visits
+    regions_to_scan = list(getattr(duration_report, "REGION_CONFIG", {}).keys()) if getattr(duration_report, "REGION_CONFIG", None) else ["apac", "emea", "laca", "namer"]
+
+    def _make_person_uid_row(r):
+        # prefer explicit GUID/EmployeeIdentity when present; fallback to EmployeeID|CardNumber|EmployeeName
+        try:
+            eid = r.get("EmployeeIdentity") or r.get("PersonGUID") or r.get("EmployeeIdentity")
+            if pd.notna(eid) and str(eid).strip():
+                return str(eid).strip()
+        except Exception:
+            pass
+        parts = []
+        for k in ("EmployeeID", "CardNumber", "EmployeeName"):
+            try:
+                v = r.get(k)
+                if pd.notna(v) and str(v).strip():
+                    parts.append(str(v).strip())
+            except Exception:
+                continue
+        return "|".join(parts) or None
+
+    for d in dates:
+        for r in regions_to_scan:
+            try:
+                swipes = duration_report.fetch_swipes_for_region(r, d)
+            except Exception:
+                logger.exception("fetch_swipes_for_region failed for region %s date %s", r, d)
+                swipes = pd.DataFrame()
+
+            if swipes is None or swipes.empty:
+                continue
+
+            # ensure columns exist expected by _is_denver_visit_row and mapping below
+            for c in ("Door", "PartitionName2", "PrimaryLocation", "EmployeeName", "EmployeeIdentity", "EmployeeID", "CardNumber", "PersonnelTypeName", "PersonnelType", "MessageType"):
+                if c not in swipes.columns:
+                    swipes[c] = None
+
+            try:
+                mask = swipes.apply(lambda row: _is_denver_visit_row(row), axis=1)
+                denver_swipes = swipes[mask].copy()
+            except Exception:
+                denver_swipes = swipes.copy()
+
+            if denver_swipes is None or denver_swipes.empty:
+                continue
+
+            # normalize timestamp -> date (defensive)
+            try:
+                denver_swipes["LocaleMessageTime"] = pd.to_datetime(denver_swipes.get("LocaleMessageTime"), errors="coerce")
+            except Exception:
+                denver_swipes["LocaleMessageTime"] = None
+            denver_swipes["Date"] = denver_swipes["LocaleMessageTime"].dt.date.fillna(d)
+
+            # compute person_uid (prefer EmployeeIdentity/GUID)
+            denver_swipes["person_uid"] = denver_swipes.apply(lambda row: _make_person_uid_row(row), axis=1)
+
+            # drop swipes without a person identifier
+            denver_swipes = denver_swipes[denver_swipes["person_uid"].notna()].copy()
+            if denver_swipes.empty:
+                continue
+
+            # keep only first unique swipe per person per date (unique GUID behavior requested)
+            denver_unique = denver_swipes.drop_duplicates(subset=["person_uid", "Date"], keep="first")
+
+            # append simplified rows
+            for _, srow in denver_unique.iterrows():
+                all_rows.append({
+                    "person_uid": _make_person_uid_row(srow),
+                    "EmployeeName": srow.get("EmployeeName") if pd.notna(srow.get("EmployeeName")) else None,
+                    "EmployeeID": srow.get("EmployeeID") if pd.notna(srow.get("EmployeeID")) else None,
+                    "PersonnelType": srow.get("PersonnelTypeName") if pd.notna(srow.get("PersonnelTypeName")) else (srow.get("PersonnelType") if pd.notna(srow.get("PersonnelType")) else None),
+                    "CardNumber": srow.get("CardNumber") if pd.notna(srow.get("CardNumber")) else None,
+                    "PartitionName2": srow.get("PartitionName2") if pd.notna(srow.get("PartitionName2")) else None,
+                    "PrimaryLocation": srow.get("PrimaryLocation") if pd.notna(srow.get("PrimaryLocation")) else None,
+                    "Date": srow.get("Date") if not pd.isna(srow.get("Date")) else d,
+                    "Presence": 1
+                })
+
+    # build df_all as one row per person per date (presence)
+    if not all_rows:
+        filename = outdir / f"denver_attendance_{mon_label}.xlsx"
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                pd.DataFrame([{"Note": f"No attendance swipes found for {start_date.isoformat()} -> {end_date.isoformat()} (Denver logic: unique-guid presence)"}]).to_excel(writer, sheet_name="Summary", index=False)
+            return str(filename)
+        except Exception:
+            logger.exception("Failed to write 'no attendance' Excel")
+            raise
+
+    df_all = pd.DataFrame(all_rows)
+
+    # ensure Date is date-typed
+    try:
+        df_all["Date"] = pd.to_datetime(df_all["Date"]).dt.date
+    except Exception:
+        df_all["Date"] = df_all["Date"].apply(lambda x: _to_date(x) or start_date)
+
+    # Filter: keep only Employees and Terminated Personnel (defensive)
+    def _is_employee_or_terminated(v):
+        try:
+            if v is None:
+                return False
+            s = str(v).strip().lower()
+            if "employee" in s:
+                return True
+            if "terminated" in s:
+                return True
+            return False
+        except Exception:
+            return False
+
+    try:
+        df_all = df_all[df_all["PersonnelType"].apply(_is_employee_or_terminated)].copy()
+    except Exception:
+        logger.exception("PersonnelType filtering failed; continuing without PersonnelType filter")
+
+    # Build presence pivot: index person_uid, columns Date -> Presence(1)
+    try:
+        pivot_secs = df_all.pivot_table(index="person_uid", columns="Date", values="Presence", aggfunc="first").fillna(0)
+    except Exception:
+        pivot_secs = pd.DataFrame(index=df_all["person_uid"].unique())
+
+    # ensure all requested dates present in pivot (fill 0)
+    for d in dates:
+        if d not in pivot_secs.columns:
+            pivot_secs[d] = 0
+    try:
+        pivot_secs = pivot_secs.reindex(sorted(pivot_secs.columns), axis=1)
+    except Exception:
+        pass
+
+    # Representative meta (first values) for each person
+    try:
+        agg_first = df_all.groupby("person_uid", sort=False).agg({
+            "EmployeeName": "first",
+            "EmployeeID": "first",
+            "PersonnelType": "first",
+            "CardNumber": "first",
+            "PartitionName2": "first",
+            "PrimaryLocation": "first"
+        })
+    except Exception:
+        agg_first = pd.DataFrame(index=pivot_secs.index)
+
+    # Days present: count days where presence == 1
+    try:
+        days_present = (pivot_secs.astype(float) > 0).sum(axis=1)
+    except Exception:
+        days_present = pd.Series(0, index=pivot_secs.index)
+
+    # NOTE: we no longer have durations, so DaysGe8 (>=8h) cannot be computed.
+    # To preserve report columns/format, set DaysGe8 == DaysPresent (conservative presence-as-day).
+    days_ge8 = days_present.copy()
+    days_in_range = len(dates)
+
+    agg_first = agg_first.rename(columns={"EmployeeName": "EmployeeName", "EmployeeID": "EmployeeID"})
+    agg_first["DaysPresent"] = days_present.fillna(0).astype(int)
+    agg_first["DaysGe8"] = days_ge8.fillna(0).astype(int)
+    agg_first["DaysInMonth"] = int(days_in_range)
+
+    # Build enrichment map
+    active_df = _load_active_employees_df()
+    enrichment = _build_enrichment_map(active_df) if active_df is not None else {"__id__": {}, "__name__": {}}
+
+    # Build Summary DataFrame
+    summary_rows = []
+    try:
+        # ensure we iterate in stable order
+        for uid, meta in agg_first.reset_index().set_index("person_uid").to_dict(orient="index").items():
+            try:
+                empid = meta.get("EmployeeID") or ""
+                empname = meta.get("EmployeeName") or ""
+                personnel_type = meta.get("PersonnelType") or ""
+                days_present_val = int(meta.get("DaysPresent") or 0)
+                enrich_rec = None
+                if empid and str(empid).strip() in enrichment.get("__id__", {}):
+                    enrich_rec = enrichment["__id__"].get(str(empid).strip())
+                elif empname and str(empname).strip().lower() in enrichment.get("__name__", {}):
+                    enrich_rec = enrichment["__name__"].get(str(empname).strip().lower())
+
+                business = enrich_rec.get("Business_Title") if enrich_rec else None
+                manager = enrich_rec.get("Manager_Name") if enrich_rec else None
+                n1_org = enrich_rec.get("N1_Sup_Organization") if enrich_rec else None
+                loc_desc = enrich_rec.get("Location_Description") if enrich_rec else None
+                current_status = enrich_rec.get("Current_Status") if enrich_rec else None
+                hire_date = enrich_rec.get("Hire_Date") if enrich_rec else None
+
+                row = {
+                    "Employee ID": empid,
+                    "Full_Name": empname,
+                    "Personnel Type": personnel_type,
+                    "Business_Title": business,
+                    "Manager_Name": manager,
+                    "N1_Sup_Organization": n1_org,
+                    "Location_Description": loc_desc or meta.get("PrimaryLocation"),
+                    "Current_Status": current_status,
+                    "Report Start Date": start_date.isoformat(),
+                    "Report End Date": end_date.isoformat(),
+                    "Hire_Date": hire_date.isoformat() if isinstance(hire_date, (date, datetime)) else (hire_date if hire_date else None),
+                    "Actual_No_Of_Days_Attended": days_present_val
+                }
+                summary_rows.append(row)
+            except Exception:
+                logger.exception("Failed building summary row for uid=%s", uid)
+                continue
+    except Exception:
+        logger.exception("Failed iterating agg_first to build summary rows")
+
+    summary_df = pd.DataFrame(summary_rows, columns=[
+        "Employee ID", "Full_Name", "Personnel Type", "Business_Title", "Manager_Name", "N1_Sup_Organization",
+        "Location_Description", "Current_Status", "Report Start Date", "Report End Date", "Hire_Date", "Actual_No_Of_Days_Attended"
+    ])
+
+    # Build Attendance sheet: presence (1/0)
+    presence_df = pivot_secs.copy()
+    try:
+        presence_df = presence_df.applymap(lambda v: 1 if (pd.notna(v) and float(v) > 0) else 0)
+    except Exception:
+        # fallback: try elementwise conversion
+        for c in presence_df.columns:
+            presence_df[c] = presence_df[c].apply(lambda v: 1 if (pd.notna(v) and (float(v) if str(v).strip() else 0) > 0) else 0)
+
+    # align order and index with agg_first
+    try:
+        presence_df = presence_df.reindex(agg_first.index)
+    except Exception:
+        pass
+
+    # rename date columns to required format (e.g. 1-Jan-25)
+    try:
+        date_labels = [_date_label_safe(d) for d in presence_df.columns]
+        col_map = dict(zip(presence_df.columns, date_labels))
+        presence_df.columns = [col_map[c] for c in presence_df.columns]
+    except Exception:
+        # leave columns as-is on failure
+        pass
+
+    # compute month groups
+    month_groups = {}
+    for d in dates:
+        mon_label_short = d.strftime("%b")
+        lbl = _date_label_safe(d)
+        month_groups.setdefault(mon_label_short, []).append(lbl)
+
+    # For final attendance frame, create index columns Emp ID and Emp Name
+    att_index = pd.DataFrame({
+        "Emp ID": agg_first["EmployeeID"].fillna("").astype(str),
+        "Emp Name": agg_first["EmployeeName"].fillna("").astype(str)
+    }, index=presence_df.index)
+
+    attendance_df = pd.concat([att_index.reset_index(drop=True), presence_df.reset_index(drop=True)], axis=1)
+
+    # add monthly totals columns
+    for mon, cols in month_groups.items():
+        try:
+            attendance_df[f"{mon} Total"] = attendance_df[cols].sum(axis=1).astype(int)
+        except Exception:
+            attendance_df[f"{mon} Total"] = 0
+
+    # Save to Excel
+    filename = outdir / f"denver_attendance_{mon_label}.xlsx"
+    try:
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Summary sheet
+            try:
+                summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            except Exception:
+                # if summary write fails, at least write a minimal summary
+                pd.DataFrame([{"Note": "Failed to write full Summary; see logs"}]).to_excel(writer, sheet_name="Summary", index=False)
+
+            # Attendance sheet
+            try:
+                date_col_order = [_date_label_safe(d) for d in sorted(dates)]
+                month_totals_order = [f"{m} Total" for m in sorted(month_groups.keys(), key=lambda m: datetime.strptime(m, "%b").month)]
+                attendance_cols = ["Emp ID", "Emp Name"] + date_col_order + month_totals_order
+                attendance_cols = [c for c in attendance_cols if c in attendance_df.columns]
+                attendance_df.to_excel(writer, sheet_name="Attendance", index=False, columns=attendance_cols)
+            except Exception:
+                # fallback: write entire attendance_df without re-ordering
+                try:
+                    attendance_df.to_excel(writer, sheet_name="Attendance", index=False)
+                except Exception:
+                    logger.exception("Failed to write Attendance sheet")
+
+            # DurationsRaw (optional) -> write presence raw rows to help debugging
+            try:
+                cols = ["person_uid", "Date", "Presence"] if set(["person_uid", "Date", "Presence"]).issubset(df_all.columns) else [c for c in ("person_uid", "Date") if c in df_all.columns]
+                tidy = df_all[cols].copy() if cols else pd.DataFrame()
+                if not tidy.empty:
+                    tidy = tidy.rename(columns={"person_uid": "PersonUID"})
+                    tidy = tidy.sort_values(["PersonUID", "Date"])
+                    tidy.to_excel(writer, sheet_name="DurationsRaw", index=False)
+            except Exception:
+                logger.debug("Could not write DurationsRaw sheet (non-fatal)", exc_info=True)
+        logger.info("Wrote Denver attendance report to %s", filename)
+    except Exception:
+        logger.exception("Failed writing Excel report to %s", filename)
+        raise
+
+    return str(filename)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i have Review issue since APi not get any responce ..
 For Denver Attendance dont use Duration logic ..
 make new logic for Denver Attendance ..
