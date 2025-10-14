@@ -1,3 +1,486 @@
+"""
+Denver attendance report (presence-only).
+Simplified and focussed:
+ - Queries 2 DBs (configurable) - last 4 originally requested
+ - Date range: 2025-01-01 -> today (unless caller provides start_date/end_date)
+ - Filters PersonnelType to Employee OR Terminated Personnel
+ - LogicalLocation = 'Denver' (door contains HQ mapping) OR PrimaryLocation contains both 'denver' and 'hq'
+ - Outputs Excel with Summary and Attendance sheets as requested.
+Requirements:
+ - Python 3.8+
+ - pandas, pyodbc, openpyxl or xlsxwriter (for Excel)
+ - Environment variables for DB connection:
+     DB_SERVER, DB_USER, DB_PASSWORD
+ - Optional active employee file in cwd or ./data named like active_employee.* for enrichment
+"""
+
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import os
+import pandas as pd
+import logging
+import pyodbc
+import re
+import sqlalchemy
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from urllib.parse import quote_plus
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger("attendance_app")
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# -----------------------------
+# Database credentials (fallbacks)
+# -----------------------------
+DB_SERVER = os.getenv("DB_SERVER", "SRVWUDEN0890V")
+DB_USER = os.getenv("DB_USER", "GSOC_Test")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Westernuniongsoc@2025")
+
+# List of DBs to scan (adjust as needed)
+DB_LIST = [
+    "ACVSUJournal_00010021",
+    "ACVSUJournal_00010020",
+]
+
+SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+    -- safe XML extraction: only attempt .value if TRY_CAST returns non-null
+    CASE
+      WHEN t_xml.XmlMessage IS NULL THEN NULL
+      WHEN TRY_CAST(t_xml.XmlMessage AS XML) IS NULL THEN NULL
+      ELSE TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)')
+    END AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    CAST(t1.ObjectIdentity1 AS NVARCHAR(200)) AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t2.Text5 AS PrimaryLocation,
+    CASE
+        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
+        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
+        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
+        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
+        WHEN t1.[ObjectName2] LIKE 'APAC_PI%' THEN 'Taguig City'
+        WHEN t1.[ObjectName2] LIKE 'APAC_PH%' THEN 'Quezon City'
+        WHEN t1.[ObjectName2] LIKE '%PUN%' THEN 'Pune'
+        WHEN t1.[ObjectName2] LIKE '%HYD%' THEN 'Hyderabad'
+        ELSE t1.[PartitionName2]
+    END AS LogicalLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml ON t1.XmlGUID = t_xml.GUID
+WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+    AND LOWER(LTRIM(RTRIM(t3.[Name]))) IN ('employee','terminated personnel')
+    AND (
+        t1.[ObjectName2] LIKE '%HQ%'
+        OR (t2.Text5 IS NOT NULL AND LOWER(t2.Text5) LIKE '%denver%' AND LOWER(t2.Text5) LIKE '%hq%')
+    )
+"""
+
+# ---------- helpers for active employee enrichment ----------
+def _find_active_employee_file() -> Optional[Path]:
+    candidates = [
+        Path.cwd(),
+        Path.cwd() / "data",
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent / "data",
+    ]
+    for d in candidates:
+        try:
+            if not d.exists():
+                continue
+            for pattern in ("active_employee.*", "active_employees.*", "active_employee_*.*"):
+                for p in d.glob(pattern):
+                    if p.is_file():
+                        return p
+        except Exception:
+            continue
+    return None
+
+def _load_active_employees_df() -> Optional[pd.DataFrame]:
+    p = _find_active_employee_file()
+    if not p:
+        return None
+    try:
+        if p.suffix.lower() in (".xlsx", ".xls"):
+            return pd.read_excel(p, dtype=str)
+        return pd.read_csv(p, dtype=str)
+    except Exception:
+        logger.exception("Failed to load active employee file %s", p)
+        return None
+
+def _build_enrichment_map(active_df: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    out = {"__id__": {}, "__name__": {}}
+    if active_df is None or active_df.empty:
+        return out
+    def pick(cols):
+        for c in cols:
+            for cc in active_df.columns:
+                if cc.strip().lower() == c.strip().lower():
+                    return cc
+        return None
+    id_col = pick(["Employee ID", "EmployeeID", "Text12", "employeeid"])
+    full_name_col = pick(["Full Name", "FullName", "Full_Name", "Name"])
+    business_col = pick(["Business Title", "Business_Title", "Job Title", "JobTitle"])
+    manager_col = pick(["Manager Name", "Manager_Name", "Manager"])
+    n1_col = pick(["N1_Sup_Organization", "Reporting Level 1 Name", "Reporting Level 1"])
+    loc_col = pick(["Location Description", "Location_Description", "Location"])
+    status_col = pick(["Current Status", "Current_Status", "Employee Status", "Status"])
+    hire_col = pick(["Hire Date", "Hire_Date", "HireDate"])
+    for _, row in active_df.iterrows():
+        eid = None
+        if id_col:
+            v = row.get(id_col)
+            if pd.notna(v):
+                eid = str(v).strip()
+        name = None
+        if full_name_col:
+            v = row.get(full_name_col)
+            if pd.notna(v):
+                name = str(v).strip()
+        rec = {
+            "Business_Title": None if business_col is None else (str(row.get(business_col)).strip() if pd.notna(row.get(business_col)) else None),
+            "Manager_Name": None if manager_col is None else (str(row.get(manager_col)).strip() if pd.notna(row.get(manager_col)) else None),
+            "N1_Sup_Organization": None if n1_col is None else (str(row.get(n1_col)).strip() if pd.notna(row.get(n1_col)) else None),
+            "Location_Description": None if loc_col is None else (str(row.get(loc_col)).strip() if pd.notna(row.get(loc_col)) else None),
+            "Current_Status": None if status_col is None else (str(row.get(status_col)).strip() if pd.notna(row.get(status_col)) else None),
+            "Hire_Date": None if hire_col is None else (str(row.get(hire_col)).strip() if pd.notna(row.get(hire_col)) else None),
+            "Full_Name": name,
+            "EmployeeID": eid
+        }
+        if eid:
+            out["__id__"][eid] = rec
+        if name:
+            out["__name__"][name.strip().lower()] = rec
+    return out
+
+# ---------- DB fetch ----------
+def _get_engine(database: str) -> Engine:
+    if not DB_SERVER or not DB_USER or DB_PASSWORD is None:
+        raise RuntimeError("Please set DB_SERVER, DB_USER and DB_PASSWORD environment variables for DB connection.")
+    odbc_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={database};"
+        f"UID={DB_USER};"
+        f"PWD={DB_PASSWORD};"
+        "TrustServerCertificate=Yes;Connection Timeout=30;"
+    )
+    quoted = quote_plus(odbc_str)
+    url = f"mssql+pyodbc:///?odbc_connect={quoted}"
+    engine = create_engine(url, pool_pre_ping=True, fast_executemany=True)
+    return engine
+
+def _fetch_swipes_between(start_date: date, end_date: date) -> pd.DataFrame:
+    start_s = start_date.strftime("%Y-%m-%d")
+    end_s = end_date.strftime("%Y-%m-%d")
+    frames = []
+    for db in DB_LIST:
+        sql = SQL_TEMPLATE.format(db=db, start=start_s, end=end_s)
+        try:
+            engine = _get_engine(db)
+        except Exception as e:
+            logger.exception("Failed to build engine for %s: %s", db, e)
+            continue
+
+        try:
+            with engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            if df is None or df.empty:
+                logger.info("No rows returned for DB %s (range %s -> %s)", db, start_s, end_s)
+            else:
+                df["SourceDB"] = db
+                frames.append(df)
+        except Exception as e:
+            safe_sql_snippet = (sql[:1000] + '...') if len(sql) > 1000 else sql
+            logger.exception("Failed to execute denver SQL on %s. SQL (first 1000 chars):\n%s\nError: %s", db, safe_sql_snippet, e)
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out.columns = [c.strip() for c in out.columns]
+    out["LocaleMessageTime"] = pd.to_datetime(out.get("LocaleMessageTime"), errors="coerce")
+    return out
+
+# ---------- main generator ----------
+def generate_monthly_denver_report(start_date: date = None, end_date: date = None, outdir: str = None) -> str:
+    if start_date is None:
+        start_date = date(2025, 1, 1)
+    if end_date is None:
+        end_date = datetime.now().date()
+
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date[:10], "%Y-%m-%d").date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
+
+    swipes = _fetch_swipes_between(start_date, end_date)
+    if swipes is None or swipes.empty:
+
+        outdir = Path(outdir or Path.cwd() / "output")
+        outdir.mkdir(parents=True, exist_ok=True)
+        fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        note = pd.DataFrame([{"Note": f"No Denver swipe records found for range {start_date} -> {end_date}"}])
+        try:
+            note.to_excel(fname, index=False, sheet_name="Summary")
+            return str(fname)
+        except Exception:
+            note.to_csv(fname.with_suffix(".csv"), index=False)
+            return str(fname.with_suffix(".csv"))
+
+
+    # ensure needed columns exist
+    for c in ["EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "PrimaryLocation", "LogicalLocation"]:
+        if c not in swipes.columns:
+            swipes[c] = None
+
+    swipes["DateOnly"] = swipes["LocaleMessageTime"].dt.date.fillna(pd.NaT)
+
+    def person_key(row):
+        if pd.notna(row.get("EmployeeIdentity")) and str(row.get("EmployeeIdentity")).strip():
+            return str(row.get("EmployeeIdentity")).strip()
+        for k in ("EmployeeID", "CardNumber", "EmployeeName"):
+            v = row.get(k)
+            if pd.notna(v) and str(v).strip():
+                return str(v).strip()
+        return None
+
+    swipes["person_uid"] = swipes.apply(person_key, axis=1)
+    swipes = swipes[swipes["person_uid"].notna()].copy()
+
+    swipes["DateOnly"] = swipes["DateOnly"].fillna(swipes["LocaleMessageTime"].dt.date)
+
+    swipes = swipes[swipes["PersonnelTypeName"].astype(str).str.strip().str.lower().isin(["employee", "terminated personnel"])].copy()
+
+    def is_denver_row(r):
+        if str(r.get("LogicalLocation")).strip().lower() == "denver":
+            return True
+        prim = str(r.get("PrimaryLocation") or "").lower()
+        if "denver" in prim and "hq" in prim:
+            return True
+        return False
+
+    swipes = swipes[swipes.apply(is_denver_row, axis=1)].copy()
+
+    if swipes.empty:
+        outdir = Path(outdir or Path.cwd() / "output")
+        outdir.mkdir(parents=True, exist_ok=True)
+        fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        pd.DataFrame([{"Note": "No denver swipes after filtering."}]).to_excel(fname, index=False)
+        return str(fname)
+
+    swipes = swipes.sort_values(["person_uid", "DateOnly", "LocaleMessageTime"], ascending=[True, True, False])
+    swipes = swipes.drop_duplicates(subset=["person_uid", "DateOnly"], keep="first")
+
+    days = []
+    cur = start_date
+    while cur <= end_date:
+        days.append(cur)
+        cur += timedelta(days=1)
+
+    presence = pd.DataFrame(0, index=sorted(swipes["person_uid"].unique()), columns=days)
+    for _, r in swipes.iterrows():
+        uid = r["person_uid"]
+        d = r["DateOnly"]
+        if pd.isna(d):
+            continue
+        # ensure d is a date object (it should be)
+        presence.at[uid, d] = 1
+
+    meta = swipes.groupby("person_uid", as_index=True).agg({
+        "EmployeeName": "first",
+        "EmployeeID": "first",
+        "PersonnelTypeName": "first",
+        "CardNumber": "first",
+        "PartitionName2": "first",
+        "PrimaryLocation": "first"
+    })
+
+    active_df = _load_active_employees_df()
+    enrichment = _build_enrichment_map(active_df) if active_df is not None else {"__id__": {}, "__name__": {}}
+
+    summary_rows = []
+    for uid, row in meta.reset_index().set_index("person_uid").to_dict(orient="index").items():
+        empid = row.get("EmployeeID") or ""
+        empname = row.get("EmployeeName") or ""
+        personnel_type = row.get("PersonnelTypeName") or ""
+        enrich = None
+        if empid and empid in enrichment.get("__id__", {}):
+            enrich = enrichment["__id__"].get(empid)
+        elif empname and empname.strip().lower() in enrichment.get("__name__", {}):
+            enrich = enrichment["__name__"].get(empname.strip().lower())
+
+        business = enrich.get("Business_Title") if enrich else None
+        manager = enrich.get("Manager_Name") if enrich else None
+        n1 = enrich.get("N1_Sup_Organization") if enrich else None
+        loc_desc = enrich.get("Location_Description") if enrich else row.get("PrimaryLocation")
+        current_status = enrich.get("Current_Status") if enrich else None
+        hire_date = enrich.get("Hire_Date") if enrich else None
+
+        days_present = int(presence.loc[uid].sum()) if uid in presence.index else 0
+
+        summary_rows.append({
+            "Employee ID": empid,
+            "Full_Name": empname,
+            "Personnel Type": personnel_type,
+            "Business_Title": business,
+            "Manager_Name": manager,
+            "N1_Sup_Organization": n1,
+            "Location_Description": loc_desc,
+            "Current_Status": current_status,
+            "Report Start Date": start_date.strftime("%d-%m-%Y"),
+            "Report End Date": end_date.strftime("%d-%m-%Y"),
+            "Hire_Date": hire_date,
+            "Actual_No_Of_Days_Attended": days_present
+        })
+
+    summary_df = pd.DataFrame(summary_rows, columns=[
+        "Employee ID", "Full_Name", "Personnel Type", "Business_Title", "Manager_Name", "N1_Sup_Organization",
+        "Location_Description", "Current_Status", "Report Start Date", "Report End Date", "Hire_Date", "Actual_No_Of_Days_Attended"
+    ])
+
+    # build Attendance sheet
+    attendance = presence.copy()
+    attendance.index.name = "person_uid"
+    info = meta[["EmployeeID", "EmployeeName"]].rename(columns={"EmployeeID": "Emp ID", "EmployeeName": "Emp Name"})
+    attendance = info.join(attendance, how="right").reset_index(drop=True)
+
+    # Build attendance_df from scratch in chronological order
+    ordered_days = days  # list of date objects
+
+    rows = []
+    for uid in sorted(meta.index):
+        empid = meta.loc[uid, "EmployeeID"]
+        empname = meta.loc[uid, "EmployeeName"]
+        row = {"Emp ID": empid, "Emp Name": empname}
+        for d in ordered_days:
+            key = d.strftime("%Y-%m-%d")
+            value = int(presence.at[uid, d]) if (uid in presence.index and d in presence.columns) else 0
+            row[key] = value
+        rows.append(row)
+
+    attendance_df = pd.DataFrame(rows)
+
+    # compute monthly totals (group by month)
+    months = {}
+    for d in ordered_days:
+        mon_key = d.strftime("%b-%Y")
+        months.setdefault(mon_key, []).append(d.strftime("%Y-%m-%d"))
+
+    for mon, cols in months.items():
+        col_label = datetime.strptime(cols[0], "%Y-%m-%d").strftime("%b") + " Total"
+        attendance_df[col_label] = attendance_df[cols].sum(axis=1).astype(int)
+
+    attendance_df["Grand Total"] = attendance_df[[c for c in attendance_df.columns if re.search(r"Total$", c)]].sum(axis=1).astype(int)
+
+    # rename daily columns to user-visible labels without leading zero day (portable)
+    rename_map = {}
+    for d in ordered_days:
+        iso = d.strftime("%Y-%m-%d")
+        visible = f"{d.day}-{d.strftime('%b-%y')}"
+        rename_map[iso] = visible
+
+    attendance_df = attendance_df.rename(columns=rename_map)
+
+    monthly_totals = [datetime.strptime(cols[0], "%Y-%m-%d").strftime("%b") + " Total" for cols in months.values()]
+    final_cols = ["Emp ID", "Emp Name"] + [f"{d.day}-{d.strftime('%b-%y')}" for d in ordered_days] + monthly_totals + ["Grand Total"]
+    final_cols = [c for c in final_cols if c in attendance_df.columns]
+    attendance_df = attendance_df[final_cols]
+
+    # --- Safe atomic write: write to tmp file then replace ---
+    outdir = Path(outdir or Path.cwd() / "output")
+    outdir.mkdir(parents=True, exist_ok=True)
+    fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    tmp_fname = fname.with_suffix(fname.suffix + ".tmp")
+
+    # Helper that attempts to save to temporary file and then atomically move into place
+    def _safe_write_excel(tmp_path: Path, final_path: Path, summary_df, attendance_df):
+        try:
+            # try openpyxl
+            with pd.ExcelWriter(str(tmp_path), engine="openpyxl") as writer:
+                summary_df.to_excel(writer, index=False, sheet_name="Summary")
+                attendance_df.to_excel(writer, index=False, sheet_name="Attendance")
+        except Exception:
+            # fallback to xlsxwriter
+            with pd.ExcelWriter(str(tmp_path), engine="xlsxwriter") as writer:
+                summary_df.to_excel(writer, index=False, sheet_name="Summary")
+                attendance_df.to_excel(writer, index=False, sheet_name="Attendance")
+        # ensure file is flushed/closed by context manager, then atomically replace
+        try:
+            os.replace(str(tmp_path), str(final_path))
+        except Exception:
+            # if replace fails, try remove final and rename
+            try:
+                if final_path.exists():
+                    final_path.unlink()
+                tmp_path.rename(final_path)
+            except Exception as e:
+                logger.exception("Failed to atomically move tmp file into place: %s", e)
+                raise
+
+    try:
+        _safe_write_excel(tmp_fname, fname, summary_df, attendance_df)
+        logger.info("Denver report written to %s", fname)
+        return str(fname)
+    except Exception:
+        # If Excel writing failed for any reason, fallback to CSV file
+        try:
+            csvf_tmp = fname.with_suffix(".csv.tmp")
+            csvf = fname.with_suffix(".csv")
+            attendance_df.to_csv(csvf_tmp, index=False)
+            os.replace(str(csvf_tmp), str(csvf))
+            logger.info("Denver CSV fallback written to %s", csvf)
+            return str(csvf)
+        except Exception:
+            # last-resort: write a tiny note file
+            note_path = fname.with_suffix(".txt")
+            try:
+                with note_path.open("w", encoding="utf-8") as fh:
+                    fh.write("Failed to write Excel/CSV for Denver report.")
+            except Exception:
+                pass
+            return str(note_path)
+
+
+# CLI convenience
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", default="2025-01-01")
+    parser.add_argument("--end", default=None)
+    parser.add_argument("--outdir", default="./output")
+    args = parser.parse_args()
+    start = datetime.strptime(args.start[:10], "%Y-%m-%d").date()
+    end = datetime.strptime(args.end[:10], "%Y-%m-%d").date() if args.end else datetime.now().date()
+    path = generate_monthly_denver_report(start_date=start, end_date=end, outdir=args.outdir)
+    print("Report written to:", path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # denverAttendance.py
 """
