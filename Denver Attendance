@@ -1,3 +1,500 @@
+# denverAttendance.py
+import os
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import pandas as pd
+import logging
+import re
+
+# DB / ODBC envs (unchanged)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+DB_SERVER = os.getenv("DB_SERVER", "SRVWUDEN0890V")
+DB_USER = os.getenv("DB_USER", "GSOC_Test")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Westernuniongsoc@2025")
+
+DB_LIST = [
+    "ACVSUJournal_00010021",
+    "ACVSUJournal_00010020",
+    "ACVSUJournal_00010019",
+]
+
+SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+    t3.[Name] AS PersonnelTypeName,
+    CAST(t1.ObjectIdentity1 AS NVARCHAR(200)) AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t2.Text5 AS PrimaryLocation,
+    CASE
+        WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
+        WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
+        WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
+        WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
+        WHEN t1.[ObjectName2] LIKE 'APAC_PI%' THEN 'Taguig City'
+        WHEN t1.[ObjectName2] LIKE 'APAC_PH%' THEN 'Quezon City'
+        WHEN t1.[ObjectName2] LIKE '%PUN%' THEN 'Pune'
+        WHEN t1.[ObjectName2] LIKE '%HYD%' THEN 'Hyderabad'
+        ELSE t1.[PartitionName2]
+    END AS LogicalLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+    AND (
+        t1.[ObjectName2] LIKE '%HQ%'
+        OR (t2.Text5 IS NOT NULL AND LOWER(t2.Text5) LIKE '%denver%' AND LOWER(t2.Text5) LIKE '%hq%')
+        OR t1.[PartitionName2] = 'Denver'
+    )
+    AND LOWER(LTRIM(RTRIM(t3.[Name]))) IN ('employee','terminated personnel')
+"""
+
+# minimal imports for DB engine
+def _get_engine(database: str):
+    from sqlalchemy import create_engine
+    from urllib.parse import quote_plus
+    odbc_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={database};"
+        f"UID={DB_USER};"
+        f"PWD={DB_PASSWORD};"
+        "TrustServerCertificate=Yes;Connection Timeout=30;"
+    )
+    quoted = quote_plus(odbc_str)
+    url = f"mssql+pyodbc:///?odbc_connect={quoted}"
+    return create_engine(url, pool_pre_ping=True, fast_executemany=True)
+
+def _fetch_swipes_between(start_date: date, end_date: date) -> pd.DataFrame:
+    start_s = start_date.strftime("%Y-%m-%d")
+    end_s = end_date.strftime("%Y-%m-%d")
+    frames = []
+    for db in DB_LIST:
+        sql = SQL_TEMPLATE.format(db=db, start=start_s, end=end_s)
+        try:
+            engine = _get_engine(db)
+            with engine.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            if df is None or df.empty:
+                continue
+            df["SourceDB"] = db
+            frames.append(df)
+        except Exception:
+            # keep silent — caller will get empty DataFrame if nothing returned
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out.columns = [c.strip() for c in out.columns]
+    out["LocaleMessageTime"] = pd.to_datetime(out.get("LocaleMessageTime"), errors="coerce")
+    return out
+
+def generate_monthly_denver_report(start_date: date = None, end_date: date = None, outdir: str = None) -> str:
+    if start_date is None:
+        start_date = date(2025, 1, 1)
+    if end_date is None:
+        end_date = datetime.now().date()
+
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date[:10], "%Y-%m-%d").date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
+
+    swipes = _fetch_swipes_between(start_date, end_date)
+
+    # If empty -> write a small note file (unchanged behavior)
+    if swipes is None or swipes.empty:
+        outdir = Path(outdir or Path.cwd() / "output")
+        outdir.mkdir(parents=True, exist_ok=True)
+        fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        pd.DataFrame([{"Note": f"No Denver swipe records found for range {start_date} -> {end_date}"}]).to_excel(fname, index=False, sheet_name="Summary")
+        return str(fname)
+
+    # Ensure columns exist
+    for c in ["EmployeeName", "Door", "EmployeeID", "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "PrimaryLocation", "LogicalLocation"]:
+        if c not in swipes.columns:
+            swipes[c] = None
+
+    # --- Deduplication EXACT to SQL CTE: COALESCE(NULLIF(EmployeeIdentity,''), NULLIF(EmployeeID,''), ObjectName1) ---
+    swipes["DateOnly"] = swipes["LocaleMessageTime"].dt.date.fillna(pd.NaT)
+
+    def _norm_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == "" or s.lower() in ("nan", "none", "null", "na"):
+            return None
+        return s
+
+    def _build_dedupe_key(row):
+        for col in ("EmployeeIdentity", "EmployeeID", "EmployeeName"):
+            v = _norm_str(row.get(col))
+            if v:
+                return v
+        return None
+
+    swipes["dedupe_key"] = swipes.apply(_build_dedupe_key, axis=1)
+    swipes = swipes[swipes["dedupe_key"].notna()].copy()
+
+    # Defensive personnel type filter (SQL already applied)
+    swipes = swipes[swipes["PersonnelTypeName"].astype(str).str.strip().str.lower().isin(["employee", "terminated personnel"])].copy()
+
+    # Defensive LogicalLocation filter (SQL already applied)
+    def _is_denver_row(r):
+        loc = _norm_str(r.get("LogicalLocation"))
+        if loc and loc.lower() == "denver":
+            return True
+        prim = _norm_str(r.get("PrimaryLocation")) or ""
+        prim = prim.lower()
+        return ("denver" in prim) and ("hq" in prim)
+    swipes = swipes[swipes.apply(_is_denver_row, axis=1)].copy()
+
+    if swipes.empty:
+        outdir = Path(outdir or Path.cwd() / "output")
+        outdir.mkdir(parents=True, exist_ok=True)
+        fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        pd.DataFrame([{"Note": "No denver swipes after filtering."}]).to_excel(fname, index=False)
+        return str(fname)
+
+    # Mirror SQL ROW_NUMBER ordering: latest per dedupe_key per date
+    swipes = swipes.sort_values(["dedupe_key", "DateOnly", "LocaleMessageTime"], ascending=[True, True, False])
+    swipes = swipes.drop_duplicates(subset=["dedupe_key", "DateOnly"], keep="first")
+
+    # meta grouped by dedupe_key (first)
+    meta = swipes.groupby("dedupe_key", as_index=True).agg({
+        "EmployeeName": "first",
+        "EmployeeID": "first",
+        "PersonnelTypeName": "first",
+        "PrimaryLocation": "first",
+        "PartitionName2": "first"
+    })
+
+    # build ordered list of days (chronological)
+    ordered_days = []
+    cur = start_date
+    while cur <= end_date:
+        ordered_days.append(cur)
+        cur += timedelta(days=1)
+
+    # presence matrix (index aligned to meta.index to avoid extra stray rows)
+    presence = pd.DataFrame(0, index=sorted(meta.index), columns=[d.strftime("%Y-%m-%d") for d in ordered_days])
+    for _, r in swipes.iterrows():
+        uid = r["dedupe_key"]
+        d = r["DateOnly"]
+        if pd.isna(d):
+            continue
+        iso = d.strftime("%Y-%m-%d")
+        if uid in presence.index and iso in presence.columns:
+            presence.at[uid, iso] = 1
+
+    # Build attendance rows (one row per dedupe_key)
+    rows = []
+    for uid in sorted(meta.index):
+        empid = meta.loc[uid, "EmployeeID"]
+        empname = meta.loc[uid, "EmployeeName"]
+        row = {"Emp ID": empid, "Emp Name": empname}
+        for iso in presence.columns:
+            row[iso] = int(presence.at[uid, iso])
+        rows.append(row)
+
+    attendance_df = pd.DataFrame(rows)
+
+    # monthly groups (in chronological order)
+    months = {}
+    month_order = []
+    for d in ordered_days:
+        mon = d.strftime("%b-%Y")  # e.g. Jan-2025
+        if mon not in months:
+            months[mon] = []
+            month_order.append(mon)
+        months[mon].append(d.strftime("%Y-%m-%d"))
+
+    # Add monthly total columns (placed after that month's days)
+    # We'll create final order of columns: Emp ID, Emp Name, [Jan days], "Jan Total", [Feb days], "Feb Total", ..., "Grand Total"
+    visible_day_cols = []
+    final_col_order = ["Emp ID", "Emp Name"]
+    for mon in month_order:
+        day_isos = months[mon]
+        visible_day_cols.extend(day_isos)
+        final_col_order.extend(day_isos)
+        final_col_order.append(mon.split("-")[0] + " Total")  # e.g. "Jan Total"
+
+    final_col_order.append("Grand Total")
+
+    # Compute monthly totals & grand total as new columns in attendance_df
+    for mon in month_order:
+        day_isos = months[mon]
+        col_label = mon.split("-")[0] + " Total"
+        attendance_df[col_label] = attendance_df[day_isos].sum(axis=1).astype(int)
+
+    attendance_df["Grand Total"] = attendance_df[[d for d in presence.columns]].sum(axis=1).astype(int)
+
+    # Reorder columns to final_col_order (filter to existing)
+    final_cols_filtered = [c for c in final_col_order if c in attendance_df.columns]
+    attendance_df = attendance_df[final_cols_filtered]
+
+    # Build totals row (single bottom row labelled "Total")
+    totals_row = {}
+    totals_row["Emp ID"] = ""
+    totals_row["Emp Name"] = "Total"
+    # daily sums
+    for col in [c for c in attendance_df.columns if re.match(r"\d{4}-\d{2}-\d{2}", c)]:
+        totals_row[col] = int(attendance_df[col].sum())
+    # monthly totals
+    for mon in month_order:
+        col_label = mon.split("-")[0] + " Total"
+        if col_label in attendance_df.columns:
+            totals_row[col_label] = int(attendance_df[col_label].sum())
+    # grand total sum
+    totals_row["Grand Total"] = int(attendance_df["Grand Total"].sum())
+
+    # prepare final dataframe to write: employee rows + one totals row
+    out_df = pd.concat([attendance_df, pd.DataFrame([totals_row])], ignore_index=True, sort=False)
+
+    # rename daily headers to desired visible format e.g. "Wed, 1 January, 2025"
+    visible_name_map = {}
+    for iso in [c for c in out_df.columns if re.match(r"\d{4}-\d{2}-\d{2}", c)]:
+        d = datetime.strptime(iso, "%Y-%m-%d").date()
+        weekday_abbr = d.strftime("%a")
+        # day without leading zero:
+        visible = f"{weekday_abbr}, {d.day} {d.strftime('%B')}, {d.year}"
+        visible_name_map[iso] = visible
+
+    out_df = out_df.rename(columns=visible_name_map)
+
+    # Recompute final column order with visible names and month totals
+    visible_day_cols_renamed = [visible_name_map[iso] for iso in [c for c in presence.columns]]
+    final_cols = ["Emp ID", "Emp Name"]
+    for mon in month_order:
+        for iso in months[mon]:
+            final_cols.append(visible_name_map[iso])
+        final_cols.append(mon.split("-")[0] + " Total")
+    final_cols.append("Grand Total")
+    final_cols = [c for c in final_cols if c in out_df.columns]
+
+    out_df = out_df[final_cols]
+
+    # --- Write Excel with openpyxl and apply formatting as requested ---
+    outdir = Path(outdir or Path.cwd() / "output")
+    outdir.mkdir(parents=True, exist_ok=True)
+    fname = outdir / f"denver_attendance_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    tmp_fname = fname.with_suffix(".tmp")
+
+    try:
+        # first write basic DataFrame to tmp file using openpyxl writer
+        with pd.ExcelWriter(str(tmp_fname), engine="openpyxl", mode="w") as writer:
+            # Summary sheet (if you want, you can keep it; here we write a minimal summary)
+            # Build a small summary dataframe
+            summary_df = pd.DataFrame({
+                "Report Start Date": [start_date.strftime("%Y-%m-%d")],
+                "Report End Date": [end_date.strftime("%Y-%m-%d")],
+                "Total unique employees": [len(attendance_df)]
+            })
+            summary_df.to_excel(writer, index=False, sheet_name="Summary")
+            out_df.to_excel(writer, index=False, sheet_name="Attendance")
+
+        # now open and style with openpyxl
+        import openpyxl
+        from openpyxl.utils import get_column_letter
+        from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
+
+        wb = openpyxl.load_workbook(str(tmp_fname))
+        ws = wb["Attendance"]
+
+        # hide gridlines
+        try:
+            ws.sheet_view.showGridLines = False
+        except Exception:
+            pass
+
+        # styles
+        header_font = Font(bold=True)
+        header_fill = PatternFill(fill_type="solid", start_color="87CEEB", end_color="87CEEB")  # sky-blue
+        center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thick_side = Side(border_style="thick", color="000000")
+        thin_side = Side(border_style="thin", color="000000")
+        thick_border = Border(left=thick_side, right=thick_side, top=thick_side, bottom=thick_side)
+
+        present_fill = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")  # light green
+        absent_fill = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")   # light red
+        weekend_fill = PatternFill(fill_type="solid", start_color="FCE4D6", end_color="FCE4D6")  # light peach (weekend)
+        month_total_fill = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")  # light yellow
+        totals_row_fill = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")  # same light yellow
+
+        # Determine used range
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        # Apply header formatting (row 1)
+        for col_idx in range(1, max_col + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            # give thin border for header too
+            cell.border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+        # Determine which columns are weekend columns (after header rename)
+        # Build mapping header_text -> column index
+        header_texts = [ws.cell(row=1, column=c).value for c in range(1, max_col + 1)]
+        weekend_col_idxs = set()
+        date_col_iso_map = {}  # visible header -> iso date (for easier logic)
+        for c_idx, header_text in enumerate(header_texts, start=1):
+            # detect visible date format like "Wed, 1 January, 2025"
+            if isinstance(header_text, str):
+                # attempt parse: last part contains year, and a month name, we can attempt to map back
+                m = re.match(r"^[A-Za-z]{3},\s+(\d{1,2})\s+([A-Za-z]+),\s+(\d{4})$", header_text)
+                if m:
+                    day = int(m.group(1))
+                    monname = m.group(2)
+                    year = int(m.group(3))
+                    # try to reconstruct date object by searching ordered_days
+                    for d in ordered_days:
+                        if d.day == day and d.strftime("%B") == monname and d.year == year:
+                            if d.weekday() in (5, 6):  # Saturday=5, Sunday=6
+                                weekend_col_idxs.add(c_idx)
+                            # map visible -> iso
+                            date_col_iso_map[header_text] = d.strftime("%Y-%m-%d")
+                            break
+
+        # Apply cell-by-cell styles:
+        for r in range(2, max_row + 1):  # data rows + totals row included
+            for c in range(1, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                # center align everything
+                cell.alignment = center_align
+                # apply border
+                cell.border = thick_border
+
+                # Identify totals-row (last row) to color it yellow
+                if r == max_row:
+                    # totals row formatting
+                    cell.fill = totals_row_fill
+                    cell.font = Font(bold=True)
+                    continue
+
+                # Month-total columns: their header endswith " Total"
+                header_val = ws.cell(row=1, column=c).value
+                if isinstance(header_val, str) and header_val.strip().endswith("Total"):
+                    cell.fill = month_total_fill
+                    continue
+
+                # weekend column highlight
+                if c in weekend_col_idxs:
+                    # keep weekend highlight but apply absent/present override below for data cells
+                    # only apply if cell value not 1 (present) to keep present green
+                    try:
+                        v = cell.value
+                        if v == 1 or v == "1":
+                            cell.fill = present_fill
+                        elif v == 0 or v == "0":
+                            cell.fill = absent_fill
+                        else:
+                            # non numeric: still mark weekend background
+                            cell.fill = weekend_fill
+                    except Exception:
+                        cell.fill = weekend_fill
+                    continue
+
+                # Regular data cells (present / absent)
+                try:
+                    v = cell.value
+                    if v == 1 or v == "1":
+                        cell.fill = present_fill
+                    elif v == 0 or v == "0":
+                        cell.fill = absent_fill
+                    # else: leave default
+                except Exception:
+                    pass
+
+        # auto-fit column widths (simple heuristic)
+        for col_idx in range(1, max_col + 1):
+            col_letter = get_column_letter(col_idx)
+            max_length = 0
+            for row in range(1, max_row + 1):
+                cell = ws.cell(row=row, column=col_idx)
+                if cell.value is None:
+                    continue
+                # get length of string representation
+                l = len(str(cell.value))
+                if l > max_length:
+                    max_length = l
+            # set width (padding)
+            ws.column_dimensions[col_letter].width = max(10, max_length + 3)
+
+        # Save styled workbook back to tmp file
+        wb.save(str(tmp_fname))
+
+        # atomic replace
+        try:
+            os.replace(str(tmp_fname), str(fname))
+        except Exception:
+            # fallback rename
+            try:
+                if fname.exists():
+                    fname.unlink()
+                Path(tmp_fname).rename(fname)
+            except Exception as e:
+                raise
+
+        return str(fname)
+
+    except Exception as e:
+        # fallback: write CSV to ensure user has outputs
+        try:
+            csvf = fname.with_suffix(".csv")
+            out_df.to_csv(csvf, index=False)
+            return str(csvf)
+        except Exception:
+            # last resort: write a small error file
+            errf = fname.with_suffix(".txt")
+            try:
+                with open(errf, "w", encoding="utf-8") as fh:
+                    fh.write("Failed to create Excel/CSV report: " + str(e))
+            except Exception:
+                pass
+            return str(errf)
+
+
+# CLI convenience (unchanged)
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", default="2025-01-01")
+    parser.add_argument("--end", default=None)
+    parser.add_argument("--outdir", default="./output")
+    args = parser.parse_args()
+    start = datetime.strptime(args.start[:10], "%Y-%m-%d").date()
+    end = datetime.strptime(args.end[:10], "%Y-%m-%d").date() if args.end else datetime.now().date()
+    path = generate_monthly_denver_report(start_date=start, end_date=end, outdir=args.outdir)
+    print("Report written to:", path)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 this Code gave me Correct output so Dont make any unnecessary changes.
 Now Currently We got Output like ...
 
