@@ -1,3 +1,318 @@
+-- Admitted swipes: CardAdmitted
+SET NOCOUNT ON;
+GO
+
+DECLARE @StartDate DATE = '2025-09-01';      -- report start (1 Sep 2025)
+DECLARE @EndDate   DATE = CONVERT(DATE, GETDATE());  -- report end = today
+
+-- ---------- List of databases (add all 21 ACVSUJournal_* DBs here) ----------
+DECLARE @DBList TABLE (db SYSNAME);
+INSERT INTO @DBList (db) VALUES
+ ('ACVSUJournal_00010021');  -- add remaining DB names, one row per DB
+
+-- ---------- temporary table to collect all rows ----------
+IF OBJECT_ID('tempdb..#AllAdmittedSwipes') IS NOT NULL DROP TABLE #AllAdmittedSwipes;
+CREATE TABLE #AllAdmittedSwipes (
+    SourceDB SYSNAME,
+    LocaleMessageTime DATETIME2,
+    DateOnly DATE,
+    EmployeeName NVARCHAR(255),
+    EmployeeID NVARCHAR(200),
+    PersonnelTypeName NVARCHAR(255),
+    DoorName NVARCHAR(255),
+    PartitionName2 NVARCHAR(255),
+    LogicalLocation NVARCHAR(255),
+    MessageType NVARCHAR(100),
+    SwipeCardObjectID NVARCHAR(200),
+    SwipeCardNumber NVARCHAR(200),
+    Profile_Disabled BIT,
+    Active_Card_Numbers NVARCHAR(MAX),
+    Deactive_Card_Numbers NVARCHAR(MAX)
+);
+
+-- ---------- build and run dynamic SQL to pull from each DB ----------
+DECLARE @sql NVARCHAR(MAX) = N'';
+DECLARE @db SYSNAME;
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+    SELECT db FROM @DBList;
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = @sql + N'
+    INSERT INTO #AllAdmittedSwipes (
+        SourceDB, LocaleMessageTime, DateOnly, EmployeeName, EmployeeID, PersonnelTypeName,
+        DoorName, PartitionName2, LogicalLocation, MessageType, SwipeCardObjectID, SwipeCardNumber,
+        Profile_Disabled, Active_Card_Numbers, Deactive_Card_Numbers
+    )
+    SELECT
+        N' + QUOTENAME(@db,'''') + N' AS SourceDB,
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS DateOnly,
+        t1.[ObjectName1] AS EmployeeName,
+        CASE WHEN t2.[Int1] IS NULL OR t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+        t3.[Name] AS PersonnelTypeName,
+        t1.[ObjectName2] AS DoorName,
+        t1.[PartitionName2],
+        CASE
+            WHEN t1.[ObjectName2] LIKE ''%HQ%'' THEN ''Denver''
+            WHEN t1.[ObjectName2] LIKE ''%Austin%'' THEN ''Austin''
+            WHEN t1.[ObjectName2] LIKE ''%Miami%'' THEN ''Miami''
+            WHEN t1.[ObjectName2] LIKE ''%NYC%'' THEN ''New York''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PI%'' THEN ''Taguig City''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PH%'' THEN ''Quezon City''
+            WHEN t1.[ObjectName2] LIKE ''%PUN%'' THEN ''Pune''
+            WHEN t1.[ObjectName2] LIKE ''%HYD%'' THEN ''Hyderabad''
+            ELSE t1.[PartitionName2]
+        END AS LogicalLocation,
+        t1.[MessageType],
+        CAST(t1.ObjectIdentity2 AS NVARCHAR(200)) AS SwipeCardObjectID,
+        COALESCE(ac.CardNumber, CAST(t1.ObjectIdentity2 AS NVARCHAR(200))) AS SwipeCardNumber,
+        t2.Disabled AS Profile_Disabled,
+        -- Active card numbers (concatenate)
+        ISNULL(
+          STUFF((
+            SELECT ', ' + COALESCE(CAST(ac2.CardNumber AS NVARCHAR(100)), CAST(ac2.ObjectID AS NVARCHAR(100)))
+            FROM ACVSCore.Access.Credential ac2
+            WHERE ac2.Name = t2.Name
+              AND (
+                (ac2.ExpirationDateTime IS NULL OR ac2.ExpirationDateTime >= GETDATE())
+                AND (ac2.Disabled IS NULL OR ac2.Disabled = 0)
+                AND (ac2.Lost IS NULL OR ac2.Lost = 0)
+                AND (ac2.Stolen IS NULL OR ac2.Stolen = 0)
+              )
+            FOR XML PATH(''''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, ''), '''') AS Active_Card_Numbers,
+        -- Deactive card numbers
+        ISNULL(
+          STUFF((
+            SELECT ', ' + COALESCE(CAST(ac3.CardNumber AS NVARCHAR(100)), CAST(ac3.ObjectID AS NVARCHAR(100)))
+            FROM ACVSCore.Access.Credential ac3
+            WHERE ac3.Name = t2.Name
+              AND NOT (
+                (ac3.ExpirationDateTime IS NULL OR ac3.ExpirationDateTime >= GETDATE())
+                AND (ac3.Disabled IS NULL OR ac3.Disabled = 0)
+                AND (ac3.Lost IS NULL OR ac3.Lost = 0)
+                AND (ac3.Stolen IS NULL OR ac3.Stolen = 0)
+              )
+            FOR XML PATH(''''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, ''), '''') AS Deactive_Card_Numbers
+    FROM ' + QUOTENAME(@db) + N'.dbo.ACVSUJournalLog AS t1
+    LEFT JOIN ACVSCore.Access.Personnel AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+    LEFT JOIN ACVSCore.Access.PersonnelType AS t3
+        ON t2.PersonnelTypeID = t3.ObjectID
+    LEFT JOIN ACVSCore.Access.Credential ac
+        ON TRY_CAST(t1.ObjectIdentity2 AS NVARCHAR(200)) = CAST(ac.ObjectID AS NVARCHAR(200))
+    WHERE
+        t1.MessageType = ''CardAdmitted''
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN ' + QUOTENAME(CONVERT(NVARCHAR(10), @StartDate, 120),'''') + N' AND ' + QUOTENAME(CONVERT(NVARCHAR(10), @EndDate, 120),'''') + N'
+        AND LOWER(RTRIM(LTRIM(ISNULL(t3.[Name],'''')))) IN (''employee'',''terminated personnel'');
+    ';
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+-- Execute dynamic SQL
+EXEC sp_executesql @sql;
+
+-- Final output: all admitted swipe records
+SELECT
+    SourceDB,
+    DateOnly AS [Date],
+    LocaleMessageTime AS [SwipeTime],
+    EmployeeName,
+    EmployeeID,
+    PersonnelTypeName,
+    DoorName,
+    PartitionName2 AS PartitionName,
+    LogicalLocation,
+    MessageType,
+    SwipeCardObjectID,
+    SwipeCardNumber AS [CardNumberUsedOnSwipe],
+    Profile_Disabled,
+    Active_Card_Numbers AS [Active card number],
+    Deactive_Card_Numbers AS [Deactive card number]
+FROM #AllAdmittedSwipes
+ORDER BY SourceDB, LocaleMessageTime;
+
+-- cleanup
+IF OBJECT_ID('tempdb..#AllAdmittedSwipes') IS NOT NULL DROP TABLE #AllAdmittedSwipes;
+GO
+
+
+
+
+
+
+
+
+
+-- Rejected/Denied swipes: CardRejected / CardDenied
+SET NOCOUNT ON;
+GO
+
+DECLARE @StartDate DATE = '2025-09-01';      -- report start
+DECLARE @EndDate   DATE = CONVERT(DATE, GETDATE());  -- report end = today
+
+DECLARE @DBList TABLE (db SYSNAME);
+INSERT INTO @DBList (db) VALUES
+ ('ACVSUJournal_00010021');  -- add remaining DB names, one row per DB
+
+IF OBJECT_ID('tempdb..#AllRejectedSwipes') IS NOT NULL DROP TABLE #AllRejectedSwipes;
+CREATE TABLE #AllRejectedSwipes (
+    SourceDB SYSNAME,
+    LocaleMessageTime DATETIME2,
+    DateOnly DATE,
+    EmployeeName NVARCHAR(255),
+    EmployeeID NVARCHAR(200),
+    PersonnelTypeName NVARCHAR(255),
+    DoorName NVARCHAR(255),
+    PartitionName2 NVARCHAR(255),
+    LogicalLocation NVARCHAR(255),
+    MessageType NVARCHAR(100),
+    SwipeCardObjectID NVARCHAR(200),
+    SwipeCardNumber NVARCHAR(200),
+    Profile_Disabled BIT,
+    Active_Card_Numbers NVARCHAR(MAX),
+    Deactive_Card_Numbers NVARCHAR(MAX)
+);
+
+DECLARE @sql NVARCHAR(MAX) = N'';
+DECLARE @db SYSNAME;
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+    SELECT db FROM @DBList;
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = @sql + N'
+    INSERT INTO #AllRejectedSwipes (
+        SourceDB, LocaleMessageTime, DateOnly, EmployeeName, EmployeeID, PersonnelTypeName,
+        DoorName, PartitionName2, LogicalLocation, MessageType, SwipeCardObjectID, SwipeCardNumber,
+        Profile_Disabled, Active_Card_Numbers, Deactive_Card_Numbers
+    )
+    SELECT
+        N' + QUOTENAME(@db,'''') + N' AS SourceDB,
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS DateOnly,
+        t1.[ObjectName1] AS EmployeeName,
+        CASE WHEN t2.[Int1] IS NULL OR t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR(200)) END AS EmployeeID,
+        t3.[Name] AS PersonnelTypeName,
+        t1.[ObjectName2] AS DoorName,
+        t1.[PartitionName2],
+        CASE
+            WHEN t1.[ObjectName2] LIKE ''%HQ%'' THEN ''Denver''
+            WHEN t1.[ObjectName2] LIKE ''%Austin%'' THEN ''Austin''
+            WHEN t1.[ObjectName2] LIKE ''%Miami%'' THEN ''Miami''
+            WHEN t1.[ObjectName2] LIKE ''%NYC%'' THEN ''New York''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PI%'' THEN ''Taguig City''
+            WHEN t1.[ObjectName2] LIKE ''APAC_PH%'' THEN ''Quezon City''
+            WHEN t1.[ObjectName2] LIKE ''%PUN%'' THEN ''Pune''
+            WHEN t1.[ObjectName2] LIKE ''%HYD%'' THEN ''Hyderabad''
+            ELSE t1.[PartitionName2]
+        END AS LogicalLocation,
+        t1.[MessageType],
+        CAST(t1.ObjectIdentity2 AS NVARCHAR(200)) AS SwipeCardObjectID,
+        COALESCE(ac.CardNumber, CAST(t1.ObjectIdentity2 AS NVARCHAR(200))) AS SwipeCardNumber,
+        t2.Disabled AS Profile_Disabled,
+        ISNULL(
+          STUFF((
+            SELECT ', ' + COALESCE(CAST(ac2.CardNumber AS NVARCHAR(100)), CAST(ac2.ObjectID AS NVARCHAR(100)))
+            FROM ACVSCore.Access.Credential ac2
+            WHERE ac2.Name = t2.Name
+              AND (
+                (ac2.ExpirationDateTime IS NULL OR ac2.ExpirationDateTime >= GETDATE())
+                AND (ac2.Disabled IS NULL OR ac2.Disabled = 0)
+                AND (ac2.Lost IS NULL OR ac2.Lost = 0)
+                AND (ac2.Stolen IS NULL OR ac2.Stolen = 0)
+              )
+            FOR XML PATH(''''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, ''), '''') AS Active_Card_Numbers,
+        ISNULL(
+          STUFF((
+            SELECT ', ' + COALESCE(CAST(ac3.CardNumber AS NVARCHAR(100)), CAST(ac3.ObjectID AS NVARCHAR(100)))
+            FROM ACVSCore.Access.Credential ac3
+            WHERE ac3.Name = t2.Name
+              AND NOT (
+                (ac3.ExpirationDateTime IS NULL OR ac3.ExpirationDateTime >= GETDATE())
+                AND (ac3.Disabled IS NULL OR ac3.Disabled = 0)
+                AND (ac3.Lost IS NULL OR ac3.Lost = 0)
+                AND (ac3.Stolen IS NULL OR ac3.Stolen = 0)
+              )
+            FOR XML PATH(''''), TYPE
+          ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, ''), '''') AS Deactive_Card_Numbers
+    FROM ' + QUOTENAME(@db) + N'.dbo.ACVSUJournalLog AS t1
+    LEFT JOIN ACVSCore.Access.Personnel AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+    LEFT JOIN ACVSCore.Access.PersonnelType AS t3
+        ON t2.PersonnelTypeID = t3.ObjectID
+    LEFT JOIN ACVSCore.Access.Credential ac
+        ON TRY_CAST(t1.ObjectIdentity2 AS NVARCHAR(200)) = CAST(ac.ObjectID AS NVARCHAR(200))
+    WHERE
+        t1.MessageType IN (''CardRejected'', ''CardDenied'')
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN ' + QUOTENAME(CONVERT(NVARCHAR(10), @StartDate, 120),'''') + N' AND ' + QUOTENAME(CONVERT(NVARCHAR(10), @EndDate, 120),'''') + N'
+        AND LOWER(RTRIM(LTRIM(ISNULL(t3.[Name],'''')))) IN (''employee'',''terminated personnel'');
+    ';
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+EXEC sp_executesql @sql;
+
+SELECT
+    SourceDB,
+    DateOnly AS [Date],
+    LocaleMessageTime AS [SwipeTime],
+    EmployeeName,
+    EmployeeID,
+    PersonnelTypeName,
+    DoorName,
+    PartitionName2 AS PartitionName,
+    LogicalLocation,
+    MessageType,
+    SwipeCardObjectID,
+    SwipeCardNumber AS [CardNumberUsedOnSwipe],
+    Profile_Disabled,
+    Active_Card_Numbers AS [Active card number],
+    Deactive_Card_Numbers AS [Deactive card number]
+FROM #AllRejectedSwipes
+ORDER BY SourceDB, LocaleMessageTime;
+
+IF OBJECT_ID('tempdb..#AllRejectedSwipes') IS NOT NULL DROP TABLE #AllRejectedSwipes;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now Remove all Filter We need Details like 
 Run repoet from 1 sep to today i need both Admited and rejected data for Employee Build Query for Admited and 2nd for Rejected...
 Where display 
