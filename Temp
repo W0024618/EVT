@@ -1,1988 +1,498 @@
+# duration_report.py
+"""
+Duration report module (standalone).
 
+- Fetches swipe logs from ACVSUJournal DBs via pyodbc.
+- Computes daily durations per person (sessionization logic retained).
+- Writes CSVs and returns in-memory pandas DataFrames for programmatic use.
 
+Save this as duration_report.py and import from your app.
+"""
+from __future__ import annotations
 
-//1 Main File 
-// frontend/src/pages/DurationPage.jsx
-import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
-import { useAuth } from "../context/AuthContext";
+import argparse
+import logging
+import os
+import re
+import warnings
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from typing import Optional, List, Dict, Any
 
-import axios from "axios";
-import {
-  Box,
-  Grid,
-  Paper,
-  Typography,
-  TextField,
-  Button,
-  Table,
-  TableHead,
-  TableRow,
-  TableCell,
-  TableBody,
-  TableContainer,
-  CircularProgress,
-  IconButton,
-  Tooltip,
-  Card,
-  CardContent,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  Divider,
-  MenuItem,
-  Select,
-  FormControl,
-  InputLabel,
-  InputAdornment,
-} from "@mui/material";
-import DateRangeIcon from "@mui/icons-material/DateRange";
-import SearchIcon from "@mui/icons-material/Search";
-import DownloadIcon from "@mui/icons-material/CloudDownload";
-import ClearIcon from "@mui/icons-material/Clear";
-import VisibilityIcon from "@mui/icons-material/Visibility";
+import pandas as pd
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE ||
-  import.meta.env.REACT_APP_API_BASE ||
-  "http://localhost:8000";
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
 
-const REGIONS = [
-  { value: "apac", label: "APAC" },
-  { value: "emea", label: "EMEA" },
-  { value: "laca", label: "LACA" },
-  { value: "namer", label: "NAMER" },
-];
+# ODBC driver name (override with environment variable if needed)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
 
-function secondsToHMS(s) {
-  // Robust conversion of seconds to H:MM:SS.
-  // Accepts number or numeric string. Returns empty string for null/invalid inputs.
-  if (s == null || s === "") return "";
-  const n = Number(s);
-  if (!Number.isFinite(n)) return "";
-  const totalSec = Math.max(0, Math.floor(n));
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const sec = totalSec % 60;
-  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-}
-
-function isoToDDMMYYYY(iso) {
-  // Convert ISO date (YYYY-MM-DD or full ISO) to DD-MM-YYYY.
-  if (!iso && iso !== 0) return iso;
-  try {
-    // If already looks like YYYY-MM-DD, ensure we use UTC to avoid TZ shifts.
-    const isoStr = String(iso);
-    const date = isoStr.includes("T") ? new Date(isoStr) : new Date(`${isoStr}T00:00:00Z`);
-    if (Number.isNaN(date.getTime())) return iso;
-    const dd = String(date.getUTCDate()).padStart(2, "0");
-    const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
-    const yyyy = date.getUTCFullYear();
-    return `${dd}-${mm}-${yyyy}`;
-  } catch {
-    return iso;
-  }
-}
-
-function isoToLongDateNoCommas(iso) {
-  // Convert ISO date to "Mon DD-MM-YYYY" (weekday short) without commas.
-  if (!iso && iso !== 0) return iso;
-  try {
-    const isoStr = String(iso);
-    const date = isoStr.includes("T") ? new Date(isoStr) : new Date(`${isoStr}T00:00:00Z`);
-    if (Number.isNaN(date.getTime())) return iso;
-    // weekday short using locale
-    const weekday = date.toLocaleDateString(undefined, { weekday: "short" });
-    const day = String(date.getUTCDate()).padStart(2, "0");
-    const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-    const year = date.getUTCFullYear();
-    return `${weekday} ${day}-${month}-${year}`;
-  } catch {
-    return iso;
-  }
-}
-
-const SWIPE_DIFF_RED_THRESHOLD = 6 * 3600;
-
-export default function DurationPage() {
-  const [region, setRegion] = useState("apac");
-  const auth = useAuth();
-
-  const [city, setCity] = useState("");
-  const [citiesForRegion, setCitiesForRegion] = useState([]);
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-  const [singleDate, setSingleDate] = useState("");
-  const [useRange, setUseRange] = useState(true);
-
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const [searchEmployeeId, setSearchEmployeeId] = useState("");
-  const [searchEmployeeName, setSearchEmployeeName] = useState("");
-  const [searchCardNumber, setSearchCardNumber] = useState("");
-
-  const [swipeDialogOpen, setSwipeDialogOpen] = useState(false);
-  const [selectedEmployee, setSelectedEmployee] = useState(null);
-  const [selectedSwipes, setSelectedSwipes] = useState([]);
-
-  const [overrideDate, setOverrideDate] = useState("");
-  const [overrideStartIndex, setOverrideStartIndex] = useState(null);
-  const [overrideEndIndex, setOverrideEndIndex] = useState(null);
-  const [overrideReason, setOverrideReason] = useState("");
-  const [overrideApplying, setOverrideApplying] = useState(false);
-
-  const startDateRef = useRef(null);
-  const endDateRef = useRef(null);
-  const singleDateRef = useRef(null);
-
-  const tableSx = {
-    "& th, & td": { border: "1px solid rgba(0,0,0,0.12)" },
-    "& thead th": { backgroundColor: "#32a8ed", fontWeight: 900, fontSize: "16px" },
-    "& tbody tr": { backgroundColor: "transparent" },
-    "& tbody tr:hover": { backgroundColor: "rgba(255, 204, 0, 0.12)" },
-  };
-
-  const dialogTableSx = {
-    "& th, & td": { border: "1px solid rgba(0,0,0,0.12)" },
-    "& thead th": { backgroundColor: "#32a8ed", fontWeight: 700 },
-    "& tbody tr:hover": { backgroundColor: "rgba(255, 204, 0, 0.08)" },
-  };
-
-  const openNativeDatePicker = (ref) => {
-    // Try cross-browser approach: prefer showPicker (Safari/Chromium recent) else focus.
-    if (!ref || !ref.current) return;
-    try {
-      if (typeof ref.current.showPicker === "function") {
-        ref.current.showPicker();
-      } else {
-        ref.current.focus();
-      }
-    } catch (e) {
-      try {
-        ref.current.focus();
-      } catch {
-        // ignore
-      }
-    }
-  };
-
-  useEffect(() => {
-
- async function fetchCities() {
-      // reset list but preserve any typed city until we know the server list
-      setCitiesForRegion([]);
-      // DO NOT forcibly clear the typed/selected city here (previous code did setCity("") which erased user input)
-
-      if (!auth.hasPermission(['headcount', `headcount.${region}`, 'global_access'])) {
-        setError(`Access denied to ${region.toUpperCase()} locations`);
-        return;
-      } else {
-        setError("");
-      }
-
-      try {
-        const res = await axios.get(`${API_BASE}/duration/cities`, {
-          params: { region },
-          timeout: 20000,
-        });
-        const cities = res.data?.cities || [];
-        setCitiesForRegion(cities);
-
-        // Auto-select sensible default only if city not already set by user
-        setCity((prev) => {
-          if (prev && prev !== "") return prev; // preserve typed/selected city
-          if (cities && cities.length > 0) return cities[0];
-          return ""; // leave blank if none
-        });
-      } catch (err) {
-        console.warn("Failed to fetch cities list:", err?.message || err);
-        setCitiesForRegion([]);
-        // keep existing city value (do not nuke user input)
-      }
-    }
-
-
-    fetchCities();
-  }, [region]);
-
-
-  const searchDebounceRef = useRef(null);
-const fetchDurations = useCallback(
-    async (opts = {}) => {
-      setError("");
-      // keep existing data visible while loading to avoid UI blanking
-      setLoading(true);
-      // DO NOT setData(null) here — keeps table while we load a new dataset
-
-      try {
-        const params = {};
-
-        if (useRange && startDate && endDate) {
-          params.start_date = startDate;
-          params.end_date = endDate;
-        } else if (!useRange && singleDate) {
-          params.date = singleDate;
-        } else {
-          if (singleDate) params.date = singleDate;
-        }
-
-        if (region) params.regions = region;
-        if (city) params.city = city;
-
-        if (searchEmployeeId) params.employee_id = searchEmployeeId;
-        if (searchEmployeeName) params.employee_name = searchEmployeeName;
-        if (searchCardNumber) params.card_number = searchCardNumber;
-
-        // keep long timeout for heavy queries; but UI won't block
-        const timeout = opts.timeout || 1200000;
-
-        const res = await axios.get(`${API_BASE}/duration`, {
-          params,
-          timeout,
-        });
-        setData(res.data);
-      } catch (err) {
-        console.error(err);
-        setError(err?.response?.data?.detail || err.message || "Failed to fetch duration data");
-      } finally {
-        setLoading(false);
-      }
+# Put your region configuration here
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 5,
+        "partitions": [
+            "APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur","IN.HYD"
+        ]
     },
-    [useRange, startDate, endDate, singleDate, region, city, searchEmployeeId, searchEmployeeName, searchCardNumber]
-  );
-
-
-
-// debounce search fields to call server-side search (500ms)
-// If we already have `data` for the selected region, prefer instant client-side filtering.
-// When there's no data yet (first load or after clearing), call the server (debounced).
-const prevSearchRef = useRef({ emp: "", name: "", card: "" });
-
-useEffect(() => {
-  // clear any pending timer
-  if (searchDebounceRef.current) {
-    clearTimeout(searchDebounceRef.current);
-    searchDebounceRef.current = null;
-  }
-
-  const empQ = (searchEmployeeId || "").trim();
-  const nameQ = (searchEmployeeName || "").trim();
-  const cardQ = (searchCardNumber || "").trim();
-
-  const hadAnyBefore = !!(prevSearchRef.current.emp || prevSearchRef.current.name || prevSearchRef.current.card);
-  const hasAnyNow = !!(empQ || nameQ || cardQ);
-
-  // If user cleared queries (was non-empty, now empty) -> fetch full dataset once
-  if (!hasAnyNow && hadAnyBefore) {
-    fetchDurations();
-    prevSearchRef.current = { emp: empQ, name: nameQ, card: cardQ };
-    return;
-  }
-
-  // If there are queries now:
-  if (hasAnyNow) {
-    // If we already have the dataset for this region client-side, DO NOT call server:
-    // rely on client-side filtering (filteredRows) for instant results.
-    const haveClientData =
-      data &&
-      data.regions &&
-      data.regions[region] &&
-      Array.isArray(data.regions[region].employees) &&
-      data.regions[region].employees.length > 0;
-
-    if (haveClientData) {
-      // update prev snapshot and do local filtering only (no network call)
-      prevSearchRef.current = { emp: empQ, name: nameQ, card: cardQ };
-      return;
-    }
-
-    // otherwise (no client data) debounce a server-side fetch
-    searchDebounceRef.current = setTimeout(() => {
-      fetchDurations();
-    }, 500);
-  }
-
-  // update previous search snapshot
-  prevSearchRef.current = { emp: empQ, name: nameQ, card: cardQ };
-
-  return () => {
-    if (searchDebounceRef.current) {
-      clearTimeout(searchDebounceRef.current);
-      searchDebounceRef.current = null;
-    }
-  };
-}, [searchEmployeeId, searchEmployeeName, searchCardNumber, fetchDurations, data, region]);
-
-
-  const fetchAndMergeEmployee = useCallback(
-    async ({ employeeId, person_uid } = {}) => {
-      if (!employeeId && !person_uid) return;
-      try {
-        const params = {};
-        if (useRange && startDate && endDate) {
-          params.start_date = startDate;
-          params.end_date = endDate;
-        } else if (!useRange && singleDate) {
-          params.date = singleDate;
-        } else {
-          if (singleDate) params.date = singleDate;
-        }
-        params.regions = region;
-        if (employeeId) params.employee_id = employeeId;
-        if (!employeeId && person_uid) {
-          params.employee_name = person_uid;
-        }
-        params.sample_rows = 0;
-        const res = await axios.get(`${API_BASE}/duration`, { params, timeout: 120000 });
-        const resp = res.data;
-        if (!resp || !resp.regions || !resp.regions[region]) {
-          return;
-        }
-        const newRegionObj = resp.regions[region];
-        const fetchedEmployees = newRegionObj.employees || [];
-
-        setData((prev) => {
-          try {
-            if (!prev) {
-              return resp;
-            }
-            const next = { ...prev, regions: { ...(prev.regions || {}) } };
-            const prevRegion = (prev.regions || {})[region] || { dates: [], employees: [], swipes_by_date: {} };
-            const mergedRegion = {
-              ...prevRegion,
-              dates: newRegionObj.dates || prevRegion.dates,
-              date_rows: newRegionObj.date_rows || prevRegion.date_rows,
-              swipes_by_date: { ...(prevRegion.swipes_by_date || {}), ...(newRegionObj.swipes_by_date || {}) },
-            };
-
-            const prevEmployees = Array.isArray(prevRegion.employees) ? [...prevRegion.employees] : [];
-            fetchedEmployees.forEach((fe) => {
-              const idx = prevEmployees.findIndex((p) => {
-                if (p.person_uid && fe.person_uid) return p.person_uid === fe.person_uid;
-                if (p.EmployeeID && fe.EmployeeID) return String(p.EmployeeID) === String(fe.EmployeeID);
-                return false;
-              });
-              if (idx >= 0) {
-                prevEmployees[idx] = fe;
-              } else {
-                prevEmployees.push(fe);
-              }
-            });
-
-            mergedRegion.employees = prevEmployees;
-            next.regions[region] = mergedRegion;
-            return next;
-          } catch (e) {
-            console.error("Failed to merge employee data:", e);
-            return resp;
-          }
-        });
-      } catch (err) {
-        console.error("fetchAndMergeEmployee failed:", err);
-      }
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "database": "ACVSUJournal_00011028",
+        "last_n_databases": 5,
+        "partitions": [
+            "LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid",
+            "IT.Rome", "MA.Casablanca", "RU.Moscow", "UK.London"
+        ]
     },
-    [region, startDate, endDate, singleDate, useRange]
-  );
-
-  const regionObj = useMemo(() => {
-    if (!data || !region) return null;
-    return data.regions?.[region] || null;
-  }, [data, region]);
-
-  const computeWeekStarts = (datesIso) => {
-    if (!datesIso || datesIso.length === 0) return [];
-    // produce week starts (Monday) in YYYY-MM-DD format
-    const weekStartSet = new Set();
-    datesIso.forEach((d) => {
-      try {
-        const dt = new Date(d.includes("T") ? d : `${d}T00:00:00Z`);
-        if (Number.isNaN(dt.getTime())) return;
-        // get weekday 0(Sun)-6(Sat) in UTC
-        const day = dt.getUTCDay();
-        // compute ISO Monday-based week start: (day + 6) % 7 => days since Monday
-        const diff = (day + 6) % 7;
-        const monday = new Date(dt);
-        monday.setUTCDate(dt.getUTCDate() - diff);
-        weekStartSet.add(monday.toISOString().slice(0, 10));
-      } catch {
-        // ignore invalid
-      }
-    });
-    return Array.from(weekStartSet).sort();
-  };
-
-  const quote = (s) => {
-    // Escape double-quotes and wrap in quotes for CSV safety.
-    const str = s == null ? "" : String(s);
-    const escaped = str.replace(/"/g, '""');
-    return `"${escaped}"`;
-  };
-
-  const exportSummaryCsv = () => {
-    if (!regionObj) return;
-    const dates = regionObj.dates || [];
-    const rows = regionObj.employees || [];
-
-    const header = ["EmployeeID", "EmployeeName", "TotalSecondsPresentInRange", "DominantCategory", "ComplianceSummary", ...dates.map((d) => d)];
-    const csvRows = [header.map((h) => quote(h)).join(",")];
-
-    rows.forEach((r) => {
-      const complianceText = r.compliance?.month_summary || "";
-      const complianceCell = `${complianceText}`; // not adding leading apostrophe purposely
-      const row = [
-        quote(r.EmployeeID || ""),
-        quote(r.EmployeeName || ""),
-        r.total_seconds_present_in_range ?? "",
-        quote(r.duration_categories?.dominant_category || ""),
-        quote(complianceCell),
-        ...dates.map((d) => quote(r.durations?.[d] ?? "")),
-      ];
-      csvRows.push(row.join(","));
-    });
-
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const filename = `duration_summary_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-  // Helper to generate array of ISO date strings (YYYY-MM-DD) inclusive between start and end (UTC)
-  const generateDatesBetween = (startISO, endISO) => {
-    const out = [];
-    try {
-      const s = new Date(`${startISO}T00:00:00Z`);
-      const e = new Date(`${endISO}T00:00:00Z`);
-      if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return out;
-      let cur = new Date(s);
-      while (cur.getTime() <= e.getTime()) {
-        out.push(cur.toISOString().slice(0, 10));
-        cur.setUTCDate(cur.getUTCDate() + 1);
-      }
-    } catch {
-      // ignore
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 5,
+        "partitions": [
+            "AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City",
+            "PA.Panama City", "PE.Lima"
+        ]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "database": "ACVSUJournal_00010029",
+        "last_n_databases": 5,
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
     }
-    return out;
-  };
-
-  // parse "H:MM:SS" or "HH:MM:SS" or "MM:SS" or "0" into seconds. Returns null if unparsable.
-  const parseDurationStringToSeconds = (s) => {
-    if (s == null || s === "") return null;
-    const str = String(s).trim();
-    if (str === "0") return 0;
-    const parts = str.split(":").map((p) => p.trim());
-    if (parts.length === 1) {
-      const n = Number(parts[0]);
-      return Number.isFinite(n) ? n : null;
-    }
-    // support m:ss or h:mm:ss
-    let seconds = 0;
-    try {
-      if (parts.length === 2) {
-        const m = Number(parts[0]) || 0;
-        const ss = Number(parts[1]) || 0;
-        seconds = m * 60 + ss;
-      } else if (parts.length === 3) {
-        const h = Number(parts[0]) || 0;
-        const m = Number(parts[1]) || 0;
-        const ss = Number(parts[2]) || 0;
-        seconds = h * 3600 + m * 60 + ss;
-      } else {
-        return null;
-      }
-      return Number.isFinite(seconds) ? seconds : null;
-    } catch {
-      return null;
-    }
-  };
-
-
-
-
-  // const exportReportCsv = () => {
-  //   if (!regionObj) return;
-
-  //   // Determine exact dates to export based on user's inputs (singleDate or start/end)
-  //   let datesFiltered = [];
-  //   if (!useRange && singleDate) {
-  //     datesFiltered = [singleDate];
-  //   } else if (useRange && startDate && endDate) {
-  //     datesFiltered = generateDatesBetween(startDate, endDate);
-  //   } else if (singleDate) {
-  //     // fallback if singleDate is present even though useRange may be true
-  //     datesFiltered = [singleDate];
-  //   } else {
-  //     // final fallback - use whatever dates are present in the server response
-  //     datesFiltered = Array.isArray(regionObj.dates) ? [...regionObj.dates] : [];
-  //   }
-
-  //   // If still empty, abort
-  //   if (!datesFiltered || datesFiltered.length === 0) {
-  //     alert("No dates available for export.");
-  //     return;
-  //   }
-
-  //   // Compute week starts only based on the filtered dates (fixes 1-week rendering as 2 weeks)
-  //   const weekStarts = computeWeekStarts(datesFiltered);
-
-  //   const isSingleDayExport = datesFiltered.length === 1;
-  //   const singleIso = isSingleDayExport ? datesFiltered[0] : null;
-
-  //   // Build headers conditionally:
-  //   // For range: base + perDay + perWeek + Dominant + ComplianceSummary
-  //   // For single day: base + perDay + Dominant (no week-compliance, no ComplianceSummary)
-  //   const baseHeader = ["Sr.No", "EmployeeID", "EmployeeName", "CardNumber", "PersonnelType", "PartitionName2", "TotalSecondsPresentInRange"];
-  //   const perDayHeaders = datesFiltered.map((iso) => isoToLongDateNoCommas(iso));
-  //   const perWeekHeaders = weekStarts.map((ws) => `Week compliance ${ws}`);
-
-  //   let header = [];
-  //   if (isSingleDayExport) {
-  //     header = [...baseHeader, ...perDayHeaders, "DominantCategory"];
-  //     // ComplianceSummary and week compliance removed for single-day export
-  //   } else {
-  //     header = [...baseHeader, ...perDayHeaders, ...perWeekHeaders, "DominantCategory", "ComplianceSummary"];
-  //   }
-
-  //   // Build HTML table (Excel-friendly) with inline styles: thick outer border, all borders, bold header, center alignment
-  //   const tableStyle = `
-  //     border-collapse: collapse;
-  //     border: 3px solid #000; 
-  //     text-align: center;
-  //     font-family: Arial, Helvetica, sans-serif;
-  //   `;
-  //   // Header style: yellow background requested
-  //   const thStyle = `
-  //     border: 2px solid #000;
-  //     padding: 6px;
-  //     font-weight: bold;
-  //     text-align: center;
-  //     vertical-align: middle;
-  //     background-color: #fff59d;
-  //   `;
-  //   const tdStyle = `
-  //     border: 1px solid #000;
-  //     padding: 5px;
-  //     text-align: center;
-  //     vertical-align: middle;
-  //   `;
-
-  //   // Helper to get numeric seconds for an employee on given iso date (tries multiple sources)
-  //   const getSecondsForIso = (r, iso) => {
-  //     // 1) check durations_seconds map if available
-  //     if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso)) {
-  //       const val = r.durations_seconds[iso];
-  //       const n = Number(val);
-  //       if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
-  //     }
-
-  //     // 2) check compliance weeks entries (if present)
-  //     // find which week start contains iso (from weekStarts)
-  //     for (let ws of weekStarts) {
-  //       const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-  //       if (wk && wk.dates && Object.prototype.hasOwnProperty.call(wk.dates, iso)) {
-  //         const sec = wk.dates[iso];
-  //         const n = Number(sec);
-  //         if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
-  //       }
-  //     }
-
-  //     // 3) check durations string map if available (H:MM:SS etc)
-  //     if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso)) {
-  //       const ds = r.durations[iso];
-  //       const parsed = parseDurationStringToSeconds(ds);
-  //       if (parsed != null) return Math.max(0, Math.floor(parsed));
-  //     }
-
-  //     // 4) As last resort, if durations entry equals exactly "0"
-  //     if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && String(r.durations[iso]).trim() === "0") {
-  //       return 0;
-  //     }
-
-  //     // unknown
-  //     return null;
-  //   };
-
-  //   let html = `<html><head><meta charset="UTF-8"></head><body><table style="${tableStyle}">`;
-
-  //   // Header row
-  //   html += "<thead><tr>";
-  //   header.forEach((h) => {
-  //     html += `<th style="${thStyle}">${String(h).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</th>`;
-  //   });
-  //   html += "</tr></thead>";
-
-  //   // Body rows: one per employee, but for single-day we filter out zero-duration employees
-  //   html += "<tbody>";
-  //   const rows = regionObj.employees || [];
-  //   let exportedCount = 0;
-  //   for (let idx = 0; idx < rows.length; idx++) {
-  //     const r = rows[idx];
-
-  //     // For single day: determine numeric seconds for that employee on the single date
-  //     if (isSingleDayExport) {
-  //       const secs = getSecondsForIso(r, singleIso);
-  //       // If we can determine it's zero (0), strictly skip this employee
-  //       if (secs === 0) {
-  //         continue;
-  //       }
-  //       // If secs === null, continue to include (we cannot determine 0), because requirement says "Remove only 0 from single day"
-  //     }
-
-  //     // build row content
-  //     exportedCount += 1;
-  //     const srNo = exportedCount;
-  //     const employeeId = r.EmployeeID ?? "";
-  //     const employeeName = r.EmployeeName ?? "";
-  //     const cardNumber = r.CardNumber ?? "";
-  //     const personnelType = r.PersonnelType ?? r.PersonnelTypeName ?? "";
-  //     const partition = r.PartitionName2 ?? "";
-  //     const totalSeconds = r.total_seconds_present_in_range ?? "";
-
-  //     // per day values (for the filtered dates)
-  //     const perDayVals = datesFiltered.map((iso) => {
-  //       // Try compliance weeks first for matching seconds, else durations, else durations_seconds fallback
-  //       const wkStartForIso = (() => {
-  //         for (let ws of weekStarts) {
-  //           const wsDate = new Date(ws + "T00:00:00Z");
-  //           const curDate = new Date(iso + "T00:00:00Z");
-  //           if (curDate >= wsDate && curDate < new Date(wsDate.getTime() + 7 * 24 * 3600 * 1000)) {
-  //             return ws;
-  //           }
-  //         }
-  //         return null;
-  //       })();
-
-  //       let outVal = "0";
-
-  //       if (wkStartForIso && r.compliance && r.compliance.weeks && r.compliance.weeks[wkStartForIso] && r.compliance.weeks[wkStartForIso].dates && Object.prototype.hasOwnProperty.call(r.compliance.weeks[wkStartForIso].dates, iso)) {
-  //         const secs = r.compliance.weeks[wkStartForIso].dates[iso];
-  //         if (secs !== null && secs !== undefined) {
-  //           outVal = r.durations && r.durations[iso] ? r.durations[iso] : secondsToHMS(secs);
-  //         } else {
-  //           outVal = "0";
-  //         }
-  //       } else if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && r.durations[iso]) {
-  //         outVal = r.durations[iso];
-  //       } else if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso) && r.durations_seconds[iso]) {
-  //         outVal = secondsToHMS(r.durations_seconds[iso]);
-  //       } else {
-  //         outVal = "0";
-  //       }
-
-  //       return outVal;
-  //     });
-
-  //     const perWeekVals = weekStarts.map((ws) => {
-  //       const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-  //       return wk && wk.compliant ? "Yes" : "No";
-  //     });
-
-  //     const complianceText = r.compliance?.month_summary || "";
-
-  //     html += "<tr>";
-  //     // base columns
-  //     html += `<td style="${tdStyle}">${srNo}</td>`;
-  //     html += `<td style="${tdStyle}">${String(employeeId).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     html += `<td style="${tdStyle}">${String(employeeName).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     html += `<td style="${tdStyle}">${String(cardNumber).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     html += `<td style="${tdStyle}">${String(personnelType).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     html += `<td style="${tdStyle}">${String(partition).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     html += `<td style="${tdStyle}">${totalSeconds}</td>`;
-
-  //     // per-day
-  //     perDayVals.forEach((v) => {
-  //       html += `<td style="${tdStyle}">${String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     });
-
-  //     // per-week (only for range exports)
-  //     if (!isSingleDayExport) {
-  //       perWeekVals.forEach((v) => {
-  //         html += `<td style="${tdStyle}">${String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //       });
-  //     }
-
-  //     // dominant and optional compliance summary
-  //     html += `<td style="${tdStyle}">${String(r.duration_categories?.dominant_category || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-
-  //     if (!isSingleDayExport) {
-  //       html += `<td style="${tdStyle}">${String(complianceText).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-  //     }
-
-  //     html += "</tr>";
-  //   }
-
-  //   html += "</tbody></table></body></html>";
-
-  //   // Create blob and download as .xls (Excel will open the HTML and preserve styling)
-  //   const blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8;" });
-  //   const url = URL.createObjectURL(blob);
-  //   const a = document.createElement("a");
-  //   a.href = url;
-  //   const filename = `duration_report_${region}_${datesFiltered[0] || ""}_to_${datesFiltered[datesFiltered.length - 1] || ""}.xls`;
-  //   a.download = filename;
-  //   document.body.appendChild(a);
-  //   a.click();
-  //   a.remove();
-  //   URL.revokeObjectURL(url);
-  // };
-
-
-
-const exportReportCsv = () => {
-  if (!regionObj) return;
-
-  // Determine exact dates to export based on user's inputs (singleDate or start/end)
-  let datesFiltered = [];
-  if (!useRange && singleDate) {
-    datesFiltered = [singleDate];
-  } else if (useRange && startDate && endDate) {
-    datesFiltered = generateDatesBetween(startDate, endDate);
-  } else if (singleDate) {
-    // fallback if singleDate is present even though useRange may be true
-    datesFiltered = [singleDate];
-  } else {
-    // final fallback - use whatever dates are present in the server response
-    datesFiltered = Array.isArray(regionObj.dates) ? [...regionObj.dates] : [];
-  }
-
-  // If still empty, abort
-  if (!datesFiltered || datesFiltered.length === 0) {
-    alert("No dates available for export.");
-    return;
-  }
-
-  // Compute week starts only based on the filtered dates (fixes 1-week rendering as 2 weeks)
-  const weekStarts = computeWeekStarts(datesFiltered);
-
-  const isSingleDayExport = datesFiltered.length === 1;
-  const singleIso = isSingleDayExport ? datesFiltered[0] : null;
-
-  // Build headers conditionally:
-  // For range: base + perDay + perWeek + Dominant + Compliance (weeks met/total)
-  // For single day: base + perDay + Dominant (no week-compliance, no ComplianceSummary)
-  const baseHeader = ["Sr.No", "EmployeeID", "EmployeeName", "CardNumber", "PersonnelType", "PartitionName2", "TotalSecondsPresentInRange"];
-  const perDayHeaders = datesFiltered.map((iso) => isoToLongDateNoCommas(iso));
-  const perWeekHeaders = weekStarts.map((ws) => `Week compliance ${ws}`);
-
-  let header = [];
-  if (isSingleDayExport) {
-    header = [...baseHeader, ...perDayHeaders, "DominantCategory"];
-    // ComplianceSummary and week compliance removed for single-day export
-  } else {
-    header = [...baseHeader, ...perDayHeaders, ...perWeekHeaders, "DominantCategory", "Compliance (weeks met/total)"];
-  }
-
-  // Build HTML table (Excel-friendly) with inline styles: thick outer border, all borders, bold header, center alignment
-  const tableStyle = `
-    border-collapse: collapse;
-    border: 3px solid #000; 
-    text-align: center;
-    font-family: Arial, Helvetica, sans-serif;
-  `;
-  // Header style: yellow background requested
-  const thStyle = `
-    border: 2px solid #000;
-    padding: 6px;
-    font-weight: bold;
-    text-align: center;
-    vertical-align: middle;
-    background-color: #fff59d;
-  `;
-  const tdStyle = `
-    border: 1px solid #000;
-    padding: 5px;
-    text-align: center;
-    vertical-align: middle;
-  `;
-
-  // Helper to get numeric seconds for an employee on given iso date (tries multiple sources)
-  const getSecondsForIso = (r, iso) => {
-    // 1) check durations_seconds map if available
-    if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso)) {
-      const val = r.durations_seconds[iso];
-      const n = Number(val);
-      if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
-    }
-
-    // 2) check compliance weeks entries (if present)
-    // find which week start contains iso (from weekStarts)
-    for (let ws of weekStarts) {
-      const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-      if (wk && wk.dates && Object.prototype.hasOwnProperty.call(wk.dates, iso)) {
-        const sec = wk.dates[iso];
-        const n = Number(sec);
-        if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
-      }
-    }
-
-    // 3) check durations string map if available (H:MM:SS etc)
-    if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso)) {
-      const ds = r.durations[iso];
-      const parsed = parseDurationStringToSeconds(ds);
-      if (parsed != null) return Math.max(0, Math.floor(parsed));
-    }
-
-    // 4) As last resort, if durations entry equals exactly "0"
-    if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && String(r.durations[iso]).trim() === "0") {
-      return 0;
-    }
-
-    // unknown
-    return null;
-  };
-
-  // row height style (apply to header row and every body row)
-  const trRowHeightStyle = `height:22px;`;
-
-  let html = `<html><head><meta charset="UTF-8"></head><body><table style="${tableStyle}">`;
-
-  // Header row (with height 22)
-  html += `<thead><tr style="${trRowHeightStyle}">`;
-  header.forEach((h) => {
-    html += `<th style="${thStyle}">${String(h).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</th>`;
-  });
-  html += "</tr></thead>";
-
-  // Body rows: one per employee, but for single-day we filter out zero-duration employees
-  html += "<tbody>";
-  const rows = regionObj.employees || [];
-  let exportedCount = 0;
-  for (let idx = 0; idx < rows.length; idx++) {
-    const r = rows[idx];
-
-    // For single day: determine numeric seconds for that employee on the single date
-    if (isSingleDayExport) {
-      const secs = getSecondsForIso(r, singleIso);
-      // If we can determine it's zero (0), strictly skip this employee
-      if (secs === 0) {
-        continue;
-      }
-      // If secs === null, continue to include (we cannot determine 0), because requirement says "Remove only 0 from single day"
-    }
-
-    // build row content
-    exportedCount += 1;
-    const srNo = exportedCount;
-    const employeeId = r.EmployeeID ?? "";
-    const employeeName = r.EmployeeName ?? "";
-    const cardNumber = r.CardNumber ?? "";
-    const personnelType = r.PersonnelType ?? r.PersonnelTypeName ?? "";
-    const partition = r.PartitionName2 ?? "";
-    const totalSeconds = r.total_seconds_present_in_range ?? "";
-
-    // per day values (for the filtered dates)
-    const perDayVals = datesFiltered.map((iso) => {
-      // Try compliance weeks first for matching seconds, else durations, else durations_seconds fallback
-      const wkStartForIso = (() => {
-        for (let ws of weekStarts) {
-          const wsDate = new Date(ws + "T00:00:00Z");
-          const curDate = new Date(iso + "T00:00:00Z");
-          if (curDate >= wsDate && curDate < new Date(wsDate.getTime() + 7 * 24 * 3600 * 1000)) {
-            return ws;
-          }
-        }
-        return null;
-      })();
-
-      let outVal = "0";
-
-      if (wkStartForIso && r.compliance && r.compliance.weeks && r.compliance.weeks[wkStartForIso] && r.compliance.weeks[wkStartForIso].dates && Object.prototype.hasOwnProperty.call(r.compliance.weeks[wkStartForIso].dates, iso)) {
-        const secs = r.compliance.weeks[wkStartForIso].dates[iso];
-        if (secs !== null && secs !== undefined) {
-          outVal = r.durations && r.durations[iso] ? r.durations[iso] : secondsToHMS(secs);
-        } else {
-          outVal = "0";
-        }
-      } else if (r.durations && Object.prototype.hasOwnProperty.call(r.durations, iso) && r.durations[iso]) {
-        outVal = r.durations[iso];
-      } else if (r.durations_seconds && Object.prototype.hasOwnProperty.call(r.durations_seconds, iso) && r.durations_seconds[iso]) {
-        outVal = secondsToHMS(r.durations_seconds[iso]);
-      } else {
-        outVal = "0";
-      }
-
-      return outVal;
-    });
-
-    // per-week Yes/No values (for week columns)
-    const perWeekVals = weekStarts.map((ws) => {
-      const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-      return wk && wk.compliant ? "Yes" : "No";
-    });
-
-    // compute compliance summary as X/Y (weeks met / total weeks)
-    let complianceWeeksMet = 0;
-    for (let ws of weekStarts) {
-      const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-      if (wk && wk.compliant) complianceWeeksMet += 1;
-    }
-    const complianceSummaryCell = `${complianceWeeksMet}/${weekStarts.length}`;
-
-    html += `<tr style="${trRowHeightStyle}">`;
-    // base columns
-    html += `<td style="${tdStyle}">${srNo}</td>`;
-    html += `<td style="${tdStyle}">${String(employeeId).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    html += `<td style="${tdStyle}">${String(employeeName).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    html += `<td style="${tdStyle}">${String(cardNumber).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    html += `<td style="${tdStyle}">${String(personnelType).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    html += `<td style="${tdStyle}">${String(partition).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    html += `<td style="${tdStyle}">${totalSeconds}</td>`;
-
-    // per-day
-    perDayVals.forEach((v) => {
-      html += `<td style="${tdStyle}">${String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    });
-
-    // per-week (only for range exports)
-    if (!isSingleDayExport) {
-      perWeekVals.forEach((v) => {
-        html += `<td style="${tdStyle}">${String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-      });
-    }
-
-    // dominant
-    html += `<td style="${tdStyle}">${String(r.duration_categories?.dominant_category || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-
-    // compliance summary (X/Y) for range exports
-    if (!isSingleDayExport) {
-      html += `<td style="${tdStyle}">${String(complianceSummaryCell).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
-    }
-
-    html += "</tr>";
-  }
-
-  html += "</tbody></table></body></html>";
-
-  // Create blob and download as .xls (Excel will open the HTML and preserve styling)
-  const blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  const filename = `duration_report_${region}_${datesFiltered[0] || ""}_to_${datesFiltered[datesFiltered.length - 1] || ""}.xls`;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-};
-
-
-
-
-  const exportSwipesCsv = () => {
-    if (!regionObj) return;
-    const swipesByDate = regionObj.swipes_by_date || {};
-    const rows = [];
-    Object.entries(swipesByDate).forEach(([d, arr]) => {
-      arr.forEach((s) => {
-        rows.push({
-          Date: d,
-          LocaleMessageTime: s.LocaleMessageTime || "",
-          Swipe_Time: s.Swipe_Time || "",
-          EmployeeID: s.EmployeeID || "",
-          PersonGUID: s.PersonGUID || "",
-          ObjectName1: s.ObjectName1 || "",
-          Door: s.Door || "",
-          PersonnelType: s.PersonnelType || "",
-          CardNumber: s.CardNumber || "",
-          PrimaryLocation: s.PrimaryLocation || s.Text5 || "",
-          PartitionName2: s.PartitionName2 || "",
-          AdmitCode: s.AdmitCode || "",
-          Direction: s.Direction || "",
-          CompanyName: s.CompanyName || "",
-        });
-      });
-    });
-
-    if (rows.length === 0) {
-      alert("No swipe rows available for current selection to export.");
-      return;
-    }
-
-    const headers = [
-      "Date",
-      "LocaleMessageTime",
-      "Swipe_Time",
-      "EmployeeID",
-      "PersonGUID",
-      "ObjectName1",
-      "Door",
-      "PersonnelType",
-      "CardNumber",
-      "PrimaryLocation",
-      "PartitionName2",
-      "AdmitCode",
-      "Direction",
-      "CompanyName",
-    ];
-    const csvRows = [headers.map((h) => quote(h)).join(",")];
-    rows.forEach((r) => {
-      const line = headers.map((h) => quote(r[h] ?? "")).join(",");
-      csvRows.push(line);
-    });
-
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const filename = `swipes_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-  const exportSelectedEmployeeSwipes = () => {
-    if (!selectedSwipes || selectedSwipes.length === 0) {
-      alert("No swipe records to export for selected employee.");
-      return;
-    }
-    const headers = [
-      "Date",
-      "LocaleMessageTime",
-      "Swipe_Time",
-      "EmployeeID",
-      "PersonGUID",
-      "ObjectName1",
-      "Door",
-      "PersonnelType",
-      "CardNumber",
-      "PrimaryLocation",
-      "PartitionName2",
-      "AdmitCode",
-      "Direction",
-      "CompanyName",
-      "DiffSeconds",
-      "DiffHHMMSS"
-    ];
-    const csvRows = [headers.map((h) => quote(h)).join(",")];
-    selectedSwipes.forEach((s) => {
-      const obj = { ...s };
-      const line = headers.map((h) => quote(obj[h] ?? "")).join(",");
-      csvRows.push(line);
-    });
-    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const empId = selectedEmployee?.EmployeeID || "employee";
-    const filename = `swipes_${empId}_${region}_${data?.start_date || ""}_to_${data?.end_date || ""}.csv`;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-
-
-  // const getFilteredRows = useCallback(() => {
-  //   if (!regionObj) return [];
-  //   const rows = regionObj.employees || [];
-  //   return rows.filter((r) => {
-  //     const matchesEmployeeId = !searchEmployeeId || String(r.EmployeeID || "").toLowerCase().includes(searchEmployeeId.toLowerCase());
-  //     const matchesName = !searchEmployeeName || String(r.EmployeeName || "").toLowerCase().includes(searchEmployeeName.toLowerCase());
-  //     const matchesCard = !searchCardNumber || String(r.CardNumber || "").toLowerCase().includes(searchCardNumber.toLowerCase());
-  //     return matchesEmployeeId && matchesName && matchesCard;
-  //   });
-  // }, [regionObj, searchEmployeeId, searchEmployeeName, searchCardNumber]);
-
-
- const filteredRows = useMemo(() => {
-    if (!regionObj) return [];
-    const rows = regionObj.employees || [];
-
-    const empIdQ = (searchEmployeeId || "").trim().toLowerCase();
-    const nameQ = (searchEmployeeName || "").trim().toLowerCase();
-    const cardQ = (searchCardNumber || "").trim().toLowerCase();
-
-    if (!empIdQ && !nameQ && !cardQ) {
-      return rows;
-    }
-
-    return rows.filter((r) => {
-      const matchesEmployeeId = !empIdQ || String(r.EmployeeID || "").toLowerCase().includes(empIdQ);
-      const matchesName = !nameQ || String(r.EmployeeName || "").toLowerCase().includes(nameQ);
-      const matchesCard = !cardQ || String(r.CardNumber || "").toLowerCase().includes(cardQ);
-      return matchesEmployeeId && matchesName && matchesCard;
-    });
-  }, [regionObj, searchEmployeeId, searchEmployeeName, searchCardNumber]);
-
-
-
-
-  const openSwipeDialogFor = (emp) => {
-    setSelectedEmployee(emp);
-    const swipesByDate = regionObj?.swipes_by_date || {};
-    const matches = [];
-    Object.entries(swipesByDate).forEach(([d, arr]) => {
-      arr.forEach((s) => {
-        const matchByEmployeeId = emp.EmployeeID && s.EmployeeID && String(s.EmployeeID) === String(emp.EmployeeID);
-        const matchByCard = emp.CardNumber && s.CardNumber && String(s.CardNumber) === String(emp.CardNumber);
-        const matchByPersonGuid = emp.person_uid && s.PersonGUID && String(s.PersonGUID) === String(emp.person_uid);
-        if (matchByEmployeeId || matchByCard || matchByPersonGuid) {
-          matches.push({ ...s, Date: d });
-        }
-      });
-    });
-    matches.sort((a, b) => {
-      const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
-      const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
-      return ta - tb;
-    });
-
-    const withDiffs = matches.map((row, idx, arr) => {
-      let diffSeconds = null;
-      if (idx === 0) {
-        diffSeconds = null;
-      } else {
-        const cur = row.LocaleMessageTime ? new Date(row.LocaleMessageTime).getTime() : null;
-        const prev = arr[idx - 1].LocaleMessageTime ? new Date(arr[idx - 1].LocaleMessageTime).getTime() : null;
-        if (cur != null && prev != null) {
-          diffSeconds = Math.max(0, Math.floor((cur - prev) / 1000));
-        } else {
-          diffSeconds = null;
-        }
-      }
-      return {
-        ...row,
-        DiffSeconds: diffSeconds,
-        DiffHHMMSS: diffSeconds != null ? secondsToHMS(diffSeconds) : "-",
-      };
-    });
-
-    setSelectedSwipes(withDiffs);
-
-    const distinctDates = Array.from(new Set(withDiffs.map((m) => m.Date))).sort();
-    setOverrideDate(distinctDates.length > 0 ? distinctDates[0] : "");
-    setOverrideStartIndex(null);
-    setOverrideEndIndex(null);
-    setOverrideReason("");
-    setSwipeDialogOpen(true);
-  };
-
-  const computeOverrideDurationSeconds = () => {
-    if (!selectedSwipes || selectedSwipes.length === 0) return 0;
-    if (overrideStartIndex == null || overrideEndIndex == null) return 0;
-    const sIdx = Math.min(overrideStartIndex, overrideEndIndex);
-    const eIdx = Math.max(overrideStartIndex, overrideEndIndex);
-    const s = selectedSwipes[sIdx];
-    const e = selectedSwipes[eIdx];
-    if (!s || !e) return 0;
-    const sa = s.LocaleMessageTime ? new Date(s.LocaleMessageTime).getTime() : (s.Swipe_Time ? new Date(s.Swipe_Time).getTime() : null);
-    const eb = e.LocaleMessageTime ? new Date(e.LocaleMessageTime).getTime() : (e.Swipe_Time ? new Date(e.Swipe_Time).getTime() : null);
-    if (sa == null || eb == null) return 0;
-    return Math.max(0, Math.floor((eb - sa) / 1000));
-  };
-
-  const applyOverride = async () => {
-    if (!selectedEmployee) return;
-    if (!overrideDate) {
-      alert("Please select a date for the override.");
-      return;
-    }
-    if (overrideStartIndex == null || overrideEndIndex == null) {
-      alert("Please select both start and end swipe entries.");
-      return;
-    }
-    const sIdx = Math.min(overrideStartIndex, overrideEndIndex);
-    const eIdx = Math.max(overrideStartIndex, overrideEndIndex);
-    const s = selectedSwipes[sIdx];
-    const e = selectedSwipes[eIdx];
-    if (!s || !e) {
-      alert("Invalid swipe selection.");
-      return;
-    }
-    const start_ts = s.LocaleMessageTime || s.Swipe_Time;
-    const end_ts = e.LocaleMessageTime || e.Swipe_Time;
-    if (!start_ts || !end_ts) {
-      alert("Selected swipe rows do not have timestamps.");
-      return;
-    }
-    const seconds = computeOverrideDurationSeconds();
-    if (seconds <= 0) {
-      if (!window.confirm("Computed duration is 0. Do you still want to apply the override?")) {
-        return;
-      }
-    }
-
-    if (!auth.hasPermission(['headcount', `headcount.${region}`, 'global_access'])) {
-      alert(`Access denied to apply overrides for ${region.toUpperCase()}`);
-      return;
-    }
-    setOverrideApplying(true);
-
-    try {
-      await axios.post(`${API_BASE}/duration/override`, {
-        region,
-        person_uid: selectedEmployee.person_uid,
-        date: overrideDate,
-        start_ts: start_ts,
-        end_ts: end_ts,
-        reason: overrideReason,
-        user: "frontend_user"
-      }, { timeout: 30000 });
-
-      await fetchAndMergeEmployee({ employeeId: selectedEmployee.EmployeeID, person_uid: selectedEmployee.person_uid });
-
-      setSwipeDialogOpen(false);
-      alert("Override applied — updated employee refreshed.");
-    } catch (err) {
-      console.error("Failed to apply override:", err);
-      alert("Failed to apply override: " + (err?.response?.data?.detail || err.message || "unknown"));
-    } finally {
-      setOverrideApplying(false);
-    }
-  };
-
-  const renderSwipeSelectionControls = () => {
-    if (!selectedSwipes || selectedSwipes.length === 0) return null;
-
-    const distinctDates = Array.from(new Set(selectedSwipes.map((m) => m.Date))).sort();
-    const swipesAll = selectedSwipes;
-
-    return (
-      <Box sx={{ mt: 2 }}>
-        <Grid container spacing={2} alignItems="center">
-          <Grid item xs={12} md={4}>
-            <FormControl fullWidth size="small">
-              <InputLabel id="override-date-label">Date</InputLabel>
-              <Select
-                labelId="override-date-label"
-                label="Date"
-                value={overrideDate}
-                onChange={(e) => {
-                  setOverrideDate(e.target.value);
-                  setOverrideStartIndex(null);
-                  setOverrideEndIndex(null);
-                }}
-                sx={{ color: 'black' }}
-              >
-                {distinctDates.map((d) => (
-                  <MenuItem key={d} value={d}>{isoToDDMMYYYY(d)}</MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-          </Grid>
-
-          <Grid item xs={12} md={4}>
-            <FormControl fullWidth size="small">
-              <InputLabel id="override-start-label">Start swipe</InputLabel>
-              <Select
-                labelId="override-start-label"
-                label="Start swipe"
-                value={overrideStartIndex == null ? "" : overrideStartIndex}
-                onChange={(e) => {
-                  const val = e.target.value === "" ? null : Number(e.target.value);
-                  setOverrideStartIndex(val);
-                  if (val !== null && selectedSwipes[val] && selectedSwipes[val].Date) {
-                    setOverrideDate(selectedSwipes[val].Date);
-                  }
-                }}
-                sx={{ color: 'black' }}
-              >
-                <MenuItem value=""><em>None</em></MenuItem>
-                {swipesAll.map((s, idx) => {
-                  const timeLabel = s.LocaleMessageTime ? new Date(s.LocaleMessageTime).toLocaleString() : s.Swipe_Time;
-                  return (
-                    <MenuItem key={`start-${idx}`} value={idx}>
-                      {s.Date} — {timeLabel} {s.Door ? `— ${s.Door}` : ""}
-                    </MenuItem>
-                  );
-                })}
-              </Select>
-            </FormControl>
-          </Grid>
-
-          <Grid item xs={12} md={4}>
-            <FormControl fullWidth size="small">
-              <InputLabel id="override-end-label">End swipe</InputLabel>
-              <Select
-                labelId="override-end-label"
-                label="End swipe"
-                value={overrideEndIndex == null ? "" : overrideEndIndex}
-                onChange={(e) => {
-                  const val = e.target.value === "" ? null : Number(e.target.value);
-                  setOverrideEndIndex(val);
-                  if (val !== null && (!overrideDate || overrideDate === "") && selectedSwipes[val] && selectedSwipes[val].Date) {
-                    setOverrideDate(selectedSwipes[val].Date);
-                  }
-                }}
-                sx={{ color: 'black' }}
-              >
-                <MenuItem value=""><em>None</em></MenuItem>
-                {swipesAll.map((s, idx) => {
-                  const timeLabel = s.LocaleMessageTime ? new Date(s.LocaleMessageTime).toLocaleString() : s.Swipe_Time;
-                  return (
-                    <MenuItem key={`end-${idx}`} value={idx}>
-                      {s.Date} — {timeLabel} {s.Door ? `— ${s.Door}` : ""}
-                    </MenuItem>
-                  );
-                })}
-              </Select>
-            </FormControl>
-          </Grid>
-
-          <Grid item xs={12}>
-            <TextField
-              fullWidth
-              size="small"
-              label="Reason (optional)"
-              value={overrideReason}
-              onChange={(e) => setOverrideReason(e.target.value)}
-              sx={{
-                "& .MuiInputBase-input": {
-                  color: "black",   // text color
-                },
-
-              }}
-            />
-          </Grid>
-
-          <Grid item xs={12} sx={{ display: "flex", gap: 1, justifyContent: "flex-end" }}>
-            <Button
-              variant="contained"
-              onClick={applyOverride}
-              disabled={overrideApplying || !overrideDate || overrideStartIndex == null || overrideEndIndex == null}
-            >
-              {overrideApplying ? "Applying..." : `Apply Override (${secondsToHMS(computeOverrideDurationSeconds())})`}
-            </Button>
-          </Grid>
-        </Grid>
-
-        <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
-          Tip: start and end swipe selectors now include all swipe records for this employee across the selected range — you can pick start on one date and end on another.
-        </Typography>
-      </Box>
-    );
-  };
-
-  const renderTable = () => {
-    if (!regionObj) return <Typography>No data for selected region.</Typography>;
-
-    const dates = regionObj.dates || [];
-    // const rows = getFilteredRows();
-    const rows = filteredRows;
-
-    const weekStarts = computeWeekStarts(dates);
-
-    return (
-      <TableContainer component={Paper} sx={{ mt: 2, width: "100%", overflowX: "auto", boxShadow: 2, backgroundColor: "#2a82bd", color: "#000" }}>
-        <Table size="small" stickyHeader sx={tableSx}>
-          <TableHead>
-            <TableRow sx={{ backgroundColor: "#e3f2fd", color: "#000" }}>
-              <TableCell><b>Sr.No</b></TableCell>
-              <TableCell><b>EmployeeID</b></TableCell>
-              <TableCell><b>EmployeeName</b></TableCell>
-              <TableCell><b>CardNumber</b></TableCell>
-              <TableCell><b>PersonnelType</b></TableCell>
-              <TableCell><b>PartitionName2</b></TableCell>
-              <TableCell align="right"><b>Total (hh:mm:ss)</b></TableCell>
-              {dates.map((d) => (
-                <TableCell key={d} align="center"><b>{isoToDDMMYYYY(d)}</b></TableCell>
-              ))}
-              {weekStarts.map((ws) => (
-                <TableCell key={ws} align="center"><b>{`Week ${ws} compliant`}</b></TableCell>
-              ))}
-              <TableCell align="center"><b>Dominant Category</b></TableCell>
-              <TableCell align="center"><b>Compliance (weeks met/total)</b></TableCell>
-              <TableCell align="center"><b>View</b></TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {rows.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={9 + (regionObj.dates || []).length + weekStarts.length} align="center">No employees in the response.</TableCell>
-              </TableRow>
-            ) : (
-              rows.map((r, idx) => (
-                <TableRow key={r.person_uid || `${r.EmployeeID}-${r.EmployeeName}`} sx={{ backgroundColor: "#e3f2fd", color: "#000" }}>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{idx + 1}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{r.EmployeeID || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{r.EmployeeName || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{r.CardNumber || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{r.PersonnelType || r.PersonnelTypeName || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }}>{r.PartitionName2 || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="right">{secondsToHMS(r.total_seconds_present_in_range)}</TableCell>
-                  {dates.map((d) => (
-                    <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} key={d} align="center">{r.durations?.[d] ?? "-"}</TableCell>
-                  ))}
-                  {weekStarts.map((ws) => {
-                    const wk = r.compliance && r.compliance.weeks ? r.compliance.weeks[ws] : null;
-                    return <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} key={ws} align="center">{wk && wk.compliant ? "Yes" : "No"}</TableCell>;
-                  })}
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="center">
-                    {r.duration_categories?.dominant_category || "-"}
-                    {r.duration_categories?.red_flag > 0 ? " ⚠️" : ""}
-                  </TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="center">{r.compliance?.month_summary || "-"}</TableCell>
-                  <TableCell sx={{ backgroundColor: "#FFF", color: "#000", fontWeight: "700" }} align="center">
-                    <Tooltip title="View swipe records for this employee">
-                      <Button size="small" variant="outlined" startIcon={<VisibilityIcon />} onClick={() => openSwipeDialogFor(r)} sx={{ backgroundColor: "#32a8ed", color: "#000" }} >
-                        Viewe
-                      </Button>
-                    </Tooltip>
-                  </TableCell>
-                </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </TableContainer>
-    );
-  };
-
-  return (
-    <Box
-      sx={{
-        p: 3,
-        width: "100%",
-        maxWidth: "100vw",
-        boxSizing: "border-box",
-        background: "linear-gradient(to right, #f5f7fa, #e6ebf3)",
-        minHeight: "100vh",
-      }}
-    >
-      <Box sx={{ display: "flex", justifyContent: "center", mb: 2 }}>
-
-
-        <Box
-          sx={{
-            border: "2px solid  #218dcc",
-            background: "#1c95c9",
-            borderRadius: 2,
-            px: 3,
-            py: 1.2,
-            width: { xs: "100%", sm: "70%", md: "100%" },
-            textAlign: "center",
-            boxShadow: 3,
-          }}
-        >
-          <Typography
-            variant="h4"
-            gutterBottom
-            sx={{
-              background: "#fff", // gradient text
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-              fontWeight: "bold",
-              display: "inline-block",
-              paddingBottom: "6px",
-              borderBottom: "3px solid rgba(240, 221, 12, 0.9)", // lighter border
-              textShadow: "1px 1px 3px rgba(0,0,0,0.15)", // soft glow
-              letterSpacing: "0.5px",
-            }}
-          >
-            Duration Reports with Compliance & Category
-          </Typography>
-        </Box>
-
-      </Box>
-
-      <Grid container spacing={2} sx={{ backgroundColor: "#ffffff" }}>
-
-        <Grid item xs={12} sx={{ backgroundColor: "#ffffff", color: "#e02500" }}>
-
-          <Card
-            elevation={4}
-            sx={{
-              // background: "linear-gradient(145deg, #fffbe6, #fff9db)",
-              background: "linear-gradient(145deg, #fff, #ffff)",
-              border: "1px solid rgb(10, 90, 136)",
-              borderRadius: 3,
-              p: 2,
-              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-            }}
-          >
-            <CardContent>
-              <Grid container spacing={3} alignItems="center">
-                {/* Region */}
-                <Grid item xs={12} md={2}>
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="region-select-label" sx={{ color: "#000" }}>Region</InputLabel>
-                    <Select
-                      labelId="region-select-label"
-                      value={region}
-                      onChange={(e) => setRegion(e.target.value)}
-                      sx={{ bgcolor: "#fff", borderRadius: 1, color: "#000" }}
-                    >
-                      {REGIONS.map((r) => (
-                        <MenuItem key={r.value} value={r.value}>
-                          {r.label}
-                        </MenuItem>
-                      ))}
-                    </Select>
-                  </FormControl>
-                </Grid>
-
-                {/* City */}
-                <Grid item xs={12} md={3}>
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="city-select-label" sx={{ color: "#000" }}>City / Partition</InputLabel>
-                    <Select
-                      labelId="city-select-label"
-                      value={city}
-                      onChange={(e) => setCity(e.target.value)}
-                      renderValue={(v) => v || ""}
-                      sx={{
-                        borderRadius: 1,
-                        backgroundColor: "#f9f9f9", // box background
-                        color: "#0000", // text color
-                        "& .MuiSelect-icon": { color: "#222" }, // dropdown arrow
-                        "& .MuiOutlinedInput-notchedOutline": {
-
-                        },
-                        "& .MuiInputLabel-root": {
-                          fontSize: "17px",
-                          color: "black",
-                        },
-
-
-                      }}
-                    >
-                      <MenuItem value="">
-                        <em>All</em>
-                      </MenuItem>
-                      {citiesForRegion?.length > 0 ? (
-                        citiesForRegion.map((c, idx) => (
-                          <MenuItem key={idx} value={c}>
-                            {c}
-                          </MenuItem>
-                        ))
-                      ) : (
-                        <MenuItem disabled value="">
-                          No predefined cities (type manually below)
-                        </MenuItem>
-                      )}
-                    </Select>
-                  </FormControl>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    placeholder="Or type manually"
-                    value={city}
-                    onChange={(e) => setCity(e.target.value)}
-                    sx={{
-                      mt: 1,
-                      borderRadius: 1,
-                      "& .MuiInputBase-input": {
-                        color: "#000", // input text
-                        backgroundColor: "#f9f9f9", // input background
-                      },
-
-                      "&:hover .MuiOutlinedInput-notchedOutline": {
-                        borderColor: "#1976d2",
-                      },
-
-                    }}
-                  />
-                </Grid>
-
-                {/* NEW: Toggle + Run/Clear controls (visible) */}
-                <Grid item xs={12} md={4} sx={{ display: "flex", gap: 1, alignItems: "center", justifyContent: { xs: "flex-start", md: "flex-end" } }}>
-                  <Button
-                    startIcon={<DateRangeIcon />}
-                    variant={useRange ? "contained" : "outlined"}
-                    onClick={() => setUseRange(true)}
-                    color="warning"
-                    size="medium"
-                  >
-                    Range
-                  </Button>
-                  <Button
-                    startIcon={<DateRangeIcon />}
-                    variant={!useRange ? "contained" : "outlined"}
-                    onClick={() => setUseRange(false)}
-                    color="warning"
-                    size="medium"
-                  >
-                    Single Day
-                  </Button>
-
-                  <Button
-                    variant="contained"
-                    startIcon={<SearchIcon />}
-                    onClick={() => fetchDurations()}
-                    disabled={loading}
-                    color="primary"
-                    size="medium"
-                  >
-                    {loading ? "Loading..." : "Run"}
-                  </Button>
-
-                  <Button
-                    variant="outlined"
-                    startIcon={<ClearIcon />}
-                    onClick={() => {
-                      setStartDate("");
-                      setEndDate("");
-                      setSingleDate("");
-                      setCity("");
-                      setData(null);
-                      setError("");
-                      setSearchEmployeeId("");
-                      setSearchEmployeeName("");
-                      setSearchCardNumber("");
-                    }}
-                    size="medium"
-                    sx={{ color: "black", borderColor: "#1976d2", }}
-                  >
-                    Clear
-                  </Button>
-                </Grid>
-
-                {/* Date Pickers */}
-                {useRange ? (
-                  <>
-                    <Grid item xs={12} md={3}>
-                      <TextField
-                        label="Start Date"
-                        type="date"
-                        fullWidth
-                        size="small"
-                        value={startDate}
-                        onChange={(e) => setStartDate(e.target.value)}
-                        inputRef={startDateRef}
-                        InputLabelProps={{ shrink: true }}
-                        InputProps={{
-                          sx: { color: "#000" },
-                          endAdornment: (
-                            <InputAdornment position="end">
-                              <IconButton
-                                size="small"
-                                onClick={() => openNativeDatePicker(startDateRef)}
-                                sx={{ color: "#e6c200" }}
-                              >
-                                <DateRangeIcon />
-                              </IconButton>
-                            </InputAdornment>
-                          ),
-                        }}
-                        sx={{
-                          bgcolor: "#fff",
-                          borderRadius: 1,
-                          color: "#000",
-                          "& .MuiInputLabel-root": {
-                            color: "#000", // <-- label color
-                            fontWeight: "bold",
-                          },
-
-                        }}
-                      />
-                    </Grid>
-                    <Grid item xs={12} md={3}>
-                      <TextField
-                        label="End Date"
-                        type="date"
-                        fullWidth
-                        size="small"
-                        value={endDate}
-                        onChange={(e) => setEndDate(e.target.value)}
-                        inputRef={endDateRef}
-                        InputLabelProps={{ shrink: true }}
-                        InputProps={{
-                          sx: { color: "#000" },
-                          endAdornment: (
-                            <InputAdornment position="end">
-                              <IconButton
-                                size="small"
-                                onClick={() => openNativeDatePicker(endDateRef)}
-                                sx={{ color: "#e6c200" }}
-                              >
-                                <DateRangeIcon />
-                              </IconButton>
-                            </InputAdornment>
-                          ),
-                        }}
-                        sx={{
-                          bgcolor: "#fff",
-                          borderRadius: 1,
-                          color: "#000",
-                          "& .MuiInputLabel-root": {
-                            color: "#000", // <-- label color
-                            fontWeight: "bold",
-                          },
-
-                        }}
-                      />
-                    </Grid>
-                  </>
-                ) : (
-                  <Grid item xs={12} md={3}>
-                    <TextField
-                      label="Date"
-                      type="date"
-                      fullWidth
-                      size="small"
-                      value={singleDate}
-                      onChange={(e) => setSingleDate(e.target.value)}
-                      inputRef={singleDateRef}
-                      InputLabelProps={{ shrink: true }}
-                      InputProps={{
-                        sx: { color: "#000" },
-                        endAdornment: (
-                          <InputAdornment position="end">
-                            <IconButton
-                              size="small"
-                              onClick={() => openNativeDatePicker(singleDateRef)}
-                              sx={{ color: "#e6c200" }}
-                            >
-                              <DateRangeIcon />
-                            </IconButton>
-                          </InputAdornment>
-                        ),
-                      }}
-                      sx={{
-                        bgcolor: "#fff",
-                        borderRadius: 1,
-                        color: "#000",
-                        "& .MuiInputLabel-root": {
-                          color: "#000", // <-- label color
-                          fontWeight: "bold",
-                        },
-
-                      }}
-                    />
-                  </Grid>
-                )}
-
-                {/* Search Fields - adjusted md sizes to accommodate export buttons on same row */}
-                <Grid item xs={12} md={3}>
-                  <TextField
-                    fullWidth
-                    label="Search Employee ID"
-                    value={searchEmployeeId}
-                    onChange={(e) => setSearchEmployeeId(e.target.value)}
-                    size="small"
-                    helperText="Type an ID and click Run"
-                    sx={{
-                      borderRadius: 1,
-                      "& .MuiInputBase-input": {
-                        color: "black", // Text color
-                        backgroundColor: "white",
-                        fontSize: "18px",
-                      },
-                      "& .MuiInputLabel-root": {
-                        fontSize: "17px",
-                        color: "black",
-                      },
-                      "& .MuiFormHelperText-root": {
-                        color: "red", // Helper text color
-                      },
-                    }}
-                  />
-                </Grid>
-
-                <Grid item xs={12} md={3}>
-                  <TextField
-                    fullWidth
-                    label="Search Employee Name"
-                    value={searchEmployeeName}
-                    onChange={(e) => setSearchEmployeeName(e.target.value)}
-                    size="small"
-                    helperText="Type name and click Run"
-                    sx={{
-                      borderRadius: 1,
-                      "& .MuiInputBase-input": {
-                        color: "black", // Text color
-                        backgroundColor: "white",
-                        fontSize: "18px",
-                      },
-                      "& .MuiInputLabel-root": {
-                        fontSize: "17px",
-                        color: "black",
-                      },
-                      "& .MuiFormHelperText-root": {
-                        color: "red", // Helper text color
-                      },
-                    }}
-                  />
-                </Grid>
-
-                <Grid item xs={12} md={3}>
-                  <TextField
-                    fullWidth
-                    label="Search Card Number"
-                    value={searchCardNumber}
-                    onChange={(e) => setSearchCardNumber(e.target.value)}
-                    size="small"
-                    helperText="Search by card number"
-                    sx={{
-                      borderRadius: 1,
-                      "& .MuiInputBase-input": {
-                        color: "black", // Text color
-                        backgroundColor: "white",
-                        fontSize: "18px",
-                      },
-                      "& .MuiInputLabel-root": {
-                        fontSize: "17px",
-                        color: "black",
-                      },
-                      "& .MuiFormHelperText-root": {
-                        color: "red", // Helper text color
-                      },
-                    }}
-                  />
-                </Grid>
-
-                {/* NEW: Export buttons placed to the right of Search Card Number */}
-                <Grid item xs={12} md={3} sx={{ display: "flex", alignItems: "center", justifyContent: { xs: "flex-start", md: "flex-end" } }}>
-                  <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                    <Tooltip title="Export summary CSV">
-                      <span>
-                        <Button
-                          onClick={exportSummaryCsv}
-                          startIcon={<DownloadIcon />}
-                          variant="outlined"
-                          disabled={!data || !regionObj}
-                          size="small"
-                        >
-                          Summary
-                        </Button>
-                      </span>
-                    </Tooltip>
-
-                    <Tooltip title="Export detailed report CSV">
-                      <span>
-                        <Button
-                          onClick={exportReportCsv}
-                          startIcon={<DownloadIcon />}
-                          variant="contained"
-                          color="primary"
-                          disabled={!data || !regionObj}
-                          size="small"
-                        >
-                          Export Report
-                        </Button>
-                      </span>
-                    </Tooltip>
-
-                    <Tooltip title="Export all swipes CSV">
-                      <span>
-                        <Button
-                          onClick={exportSwipesCsv}
-                          startIcon={<DownloadIcon />}
-                          variant="outlined"
-                          disabled={!data || !regionObj}
-                          size="small"
-                        >
-                          Swipes
-                        </Button>
-                      </span>
-                    </Tooltip>
-                  </Box>
-                </Grid>
-
-              </Grid>
-            </CardContent>
-          </Card>
-
-        </Grid>
-
-        <Grid item xs={12}>
-          <Paper
-            elevation={3}
-            sx={{
-              padding: 2,
-              marginBottom: 3,
-              borderRadius: 3,
-              backgroundColor: "#ffffff",
-              boxShadow: "0px 2px 8px rgba(0,0,0,0.06)",
-              color: "#000"
-            }}
-          >
-            <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-                {data ? `Showing ${region.toUpperCase()} — ${data.start_date} → ${data.end_date}` : "No results yet"}
-              </Typography>
-
-              {/* Top-right export buttons removed — they now live beside Search Card Number */}
-            </Box>
-
-            {loading && (
-              <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
-                <CircularProgress />
-              </Box>
-            )}
-
-            {error && (
-              <Typography color="error" sx={{ mt: 2 }}>
-                {error}
-              </Typography>
-            )}
-
-            {!loading && !error && (
-              <Box sx={{ mt: 2 }}>
-                {renderTable()}
-              </Box>
-            )}
-          </Paper>
-        </Grid>
-      </Grid>
-
-      <Dialog open={swipeDialogOpen} onClose={() => setSwipeDialogOpen(false)} fullWidth maxWidth="xl" sx={{ backgroundColor: "#dfe4f2", color: "#000" }}>
-        <DialogTitle sx={{ backgroundColor: "#dfe4f2", color: "#000" }}>
-          Swipe records for: {selectedEmployee ? `${selectedEmployee.EmployeeID || ""} — ${selectedEmployee.EmployeeName || ""}` : ""}
-        </DialogTitle>
-        <DialogContent dividers sx={{ backgroundColor: "#fff", color: "#000" }}>
-          {selectedSwipes.length === 0 ? (
-            <Typography>No swipe records found for this employee in the selected range.</Typography>
-          ) : (
-            <>
-              <Table size="small" sx={dialogTableSx} >
-                <TableHead>
-                  <TableRow sx={{ backgroundColor: "#e3f2fd", color: "#000" }} >
-                    <TableCell><b>Date</b></TableCell>
-                    <TableCell><b>Time (local)</b></TableCell>
-                    <TableCell><b>Diff (hh:mm:ss)</b></TableCell>
-                    <TableCell><b>Door</b></TableCell>
-                    <TableCell><b>Direction</b></TableCell>
-                    <TableCell><b>CardNumber</b></TableCell>
-                    <TableCell><b>PersonnelType</b></TableCell>
-                    <TableCell><b>Partition</b></TableCell>
-                    <TableCell><b>PrimaryLocation</b></TableCell>
-                    <TableCell><b>Company</b></TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {selectedSwipes.map((s, i) => {
-                    const isLargeGap = s.DiffSeconds != null && s.DiffSeconds > SWIPE_DIFF_RED_THRESHOLD;
-                    return (
-                      <TableRow key={i} sx={isLargeGap ? { backgroundColor: "rgba(204, 199, 199, 0.08)" } : {}}>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.Date}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.Swipe_Time ?? (s.LocaleMessageTime ? new Date(s.LocaleMessageTime).toLocaleString() : "-")}</TableCell>
-                        <TableCell sx={isLargeGap ? { color: "red", fontWeight: 700, backgroundColor: "#FFF", } : { backgroundColor: "#FFF", color: "#000" }}>{s.DiffHHMMSS ?? "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.Door || s.ObjectName1 || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.Direction || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.CardNumber || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.PersonnelType || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.PartitionName2 || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.PrimaryLocation || s.Text5 || "-"}</TableCell>
-                        <TableCell sx={{ backgroundColor: "#FFF", color: "#000" }}>{s.CompanyName || "-"}</TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-
-              {renderSwipeSelectionControls()}
-            </>
-          )}
-        </DialogContent>
-        <Divider />
-        <Box sx={{ p: 1, display: "flex", justifyContent: "flex-end", gap: 1, color: "#000", backgroundColor: "#FFF" }} >
-          <Button onClick={() => exportSelectedEmployeeSwipes()} disabled={!selectedSwipes || selectedSwipes.length === 0} sx={{ backgroundColor: "#32a8ed", color: "#000",border: "1px solid rgba(0,0,0,0.12)" }}>Export Swipes</Button>
-          <Button onClick={() => setSwipeDialogOpen(false)} sx={{ backgroundColor: "#fa1d00", color: "#000",border: "1px solid rgba(0,0,0,0.12)" }}>Close</Button>
-        </Box>
-      </Dialog>
-    </Box>
-  );
 }
+
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t2.[Int1] = 0 THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+INNER JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+
+# ----- helpers for DB discovery & SQL building -----
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+# ----- DB connection & fetch -----
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={rc['database']};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Returns DataFrame with columns:
+    EmployeeName, Door, EmployeeID, CardNumber, PersonnelTypeName, EmployeeIdentity,
+    PartitionName2, LocaleMessageTime, MessageType, Direction, CompanyName, PrimaryLocation
+    """
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "CardNumber", "PersonnelTypeName", "EmployeeIdentity",
+        "PartitionName2", "LocaleMessageTime", "MessageType", "Direction", "CompanyName", "PrimaryLocation"
+    ]
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = get_connection(region_key)
+    try:
+        # suppress the pandas UserWarning about DBAPI2 objects vs SQLAlchemy connectables to reduce log spam
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
+            df = pd.read_sql(sql, conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    return df[cols]
+
+# ----- compute durations -----
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # remove obvious duplicates
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    df["person_uid"] = df.apply(make_person_uid, axis=1)
+    df = df[df["person_uid"].notna()].copy()
+
+    # Rewritten aggregation using groupby.agg for speed and to avoid FutureWarning.
+    try:
+        df = df.sort_values("LocaleMessageTime")
+        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
+            FirstSwipe=("LocaleMessageTime", "first"),
+            LastSwipe=("LocaleMessageTime", "last"),
+            FirstDoor=("Door", "first"),
+            LastDoor=("Door", "last"),
+            CountSwipes=("LocaleMessageTime", "count"),
+            EmployeeIdentity=("EmployeeIdentity", "first"),
+            EmployeeID=("EmployeeID", "first"),
+            EmployeeName=("EmployeeName", "first"),
+            CardNumber=("CardNumber", "first"),
+            PersonnelTypeName=("PersonnelTypeName", "first"),
+            PartitionName2=("PartitionName2", "first"),
+            CompanyName=("CompanyName", "first"),
+            PrimaryLocation=("PrimaryLocation", "first"),
+            FirstDirection=("Direction", "first"),
+            LastDirection=("Direction", "last")
+        ).reset_index()
+    except Exception:
+        # fallback to safer (but slower) apply-based aggregation
+        def agg_for_group(g):
+            g_sorted = g.sort_values("LocaleMessageTime")
+            first = g_sorted.iloc[0]
+            last = g_sorted.iloc[-1]
+            first_dir = first.get("Direction")
+            last_dir = last.get("Direction")
+            return pd.Series({
+                "person_uid": first["person_uid"],
+                "EmployeeIdentity": first.get("EmployeeIdentity"),
+                "EmployeeID": first.get("EmployeeID"),
+                "EmployeeName": first.get("EmployeeName"),
+                "CardNumber": first.get("CardNumber"),
+                "Date": first["Date"],
+                "FirstSwipe": first["LocaleMessageTime"],
+                "LastSwipe": last["LocaleMessageTime"],
+                "FirstDoor": first.get("Door"),
+                "LastDoor": last.get("Door"),
+                "CountSwipes": int(len(g_sorted)),
+                "PersonnelTypeName": first.get("PersonnelTypeName"),
+                "PartitionName2": first.get("PartitionName2"),
+                "CompanyName": first.get("CompanyName"),
+                "PrimaryLocation": first.get("PrimaryLocation"),
+                "FirstDirection": first_dir,
+                "LastDirection": last_dir
+            })
+        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(
+        lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s >= 0 else None
+    )
+
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    return grouped[out_cols]
+
+# ----- categorization helper -----
+def categorize_seconds(s: Optional[int]) -> str:
+    """
+    Category labels (used when secs present > 0):
+      - "0-30m"      -> 0 .. 1800 (inclusive)
+      - "30m-2h"     -> 1801 .. 7200
+      - "2h-6h"      -> 7201 .. 21600
+      - "6h-8h"      -> 21601 .. 28800
+      - "8h+"        -> >= 28800
+    """
+    try:
+        if s is None or s <= 0:
+            return "0-30m"
+        s = int(s)
+        if s <= 1800:
+            return "0-30m"
+        if s <= 7200:
+            return "30m-2h"
+        if s <= 21600:
+            return "2h-6h"
+        if s < 28800:
+            return "6h-8h"
+        return "8h+"
+    except Exception:
+        return "0-30m"
+
+# ----- main runner (per date) -----
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Compute durations + swipes for provided regions on target_date.
+    Returns results dict: { region_key: {"swipes": DataFrame, "durations": DataFrame}, ... }
+    Also writes CSVs to outdir: <region>_duration_YYYYMMDD.csv and <region>_swipes_YYYYMMDD.csv
+    """
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        # optional city filter
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+            else:
+                logging.debug("City filter provided but no matching columns to filter on for region %s", r)
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+
+    return results
+
+# ----- CLI -----
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate daily duration reports from ACVSUJournal swipe logs.")
+    p.add_argument("--date", "-d", help="Target date (YYYY-MM-DD). Defaults to today in Asia/Kolkata", default=None)
+    p.add_argument("--regions", "-r", help="Comma-separated regions (apac,emea,laca,namer). Default: all",
+                   default="apac,emea,laca,namer")
+    p.add_argument("--outdir", "-o", help="Output directory for CSVs", default="./duration_reports")
+    p.add_argument("--city", help="Optional city/location filter (e.g. Pune)", default=None)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        tz = ZoneInfo("Asia/Kolkata")
+        target_date = datetime.now(tz).date()
+
+    regions = [x.strip().lower() for x in args.regions.split(",") if x.strip()]
+    outdir = args.outdir
+
+    logging.info("Generating duration reports for date %s and regions: %s", target_date, regions)
+    results = run_for_date(target_date, regions, outdir, city=args.city)
+
+    for r, obj in results.items():
+        dur = obj.get("durations")
+        logging.info("Region %s: %d persons with computed durations", r, len(dur) if dur is not None else 0)
+    logging.info("Completed. CSVs are in %s", Path(outdir).absolute())
+
+
 
