@@ -1,3 +1,215 @@
+// backend/config/dbConfig.js
+import sql from 'mssql';
+
+// shared options
+const commonOpts = {
+  options: {
+    encrypt: true,
+    trustServerCertificate: true
+  },
+  requestTimeout: 300000,
+  connectionTimeout: 30000,
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
+};
+
+// NOTE:
+// - All regions now point to the requested current DB (ACVSUJournal_00010022),
+//   server SRVWUDEN0890V and password Westernuniongsoc@2025.
+// - The existing parseDbWithNumericSuffix/getRegionDbNames logic remains and will
+//   derive prior numeric-suffixed DB names automatically (last-n) based on the
+//   numeric suffix of the configured database name.
+
+const regions = {
+  apac: {
+    user: 'GSOC_Test',
+    password: 'Westernuniongsoc@2025',
+    server: 'SRVWUDEN0890V',
+    database: 'ACVSUJournal_00010022',
+    ...commonOpts
+  },
+  emea: {
+    user: 'GSOC_Test',
+    password: 'Westernuniongsoc@2025',
+    server: 'SRVWUDEN0890V',
+    database: 'ACVSUJournal_00010022',
+    ...commonOpts
+  },
+  laca: {
+    user: 'GSOC_Test',
+    password: 'Westernuniongsoc@2025',
+    server: 'SRVWUDEN0890V',
+    database: 'ACVSUJournal_00010022',
+    ...commonOpts
+  },
+  namer: {
+    user: 'GSOC_Test',
+    password: 'Westernuniongsoc@2025',
+    server: 'SRVWUDEN0890V',
+    database: 'ACVSUJournal_00010022',
+    ...commonOpts
+  }
+};
+
+// cache of connected pools by key: `${regionKey}_${database}`
+const pools = {};
+
+/**
+ * Parse DB name for trailing numeric suffix: "<base>_<digits>"
+ */
+function parseDbWithNumericSuffix(dbName) {
+  if (!dbName || typeof dbName !== 'string') return null;
+  const m = dbName.match(/^(.*?_)(\d+)$/);
+  if (!m) return null;
+  const base = m[1];
+  const numStr = m[2];
+  const num = parseInt(numStr, 10);
+  return { base, num, width: numStr.length };
+}
+
+function buildDbName(parsed, targetNum) {
+  const padded = String(targetNum).padStart(parsed.width, '0');
+  return `${parsed.base}${padded}`;
+}
+
+/**
+ * Create/return (cached) a connected pool for the supplied region config object,
+ * overriding the database name if overrideDatabase is provided.
+ */
+async function ensurePoolForDatabase(regionKey, cfg, overrideDatabase) {
+  const dbName = overrideDatabase || cfg.database;
+  const cacheKey = `${regionKey}_${dbName}`;
+  if (pools[cacheKey]) {
+    try {
+      // if pool exists but marked disconnected, attempt reconnect
+      if (pools[cacheKey]._connected === false) {
+        pools[cacheKey] = await new sql.ConnectionPool({ ...cfg, database: dbName }).connect();
+      }
+      return pools[cacheKey];
+    } catch (e) {
+      delete pools[cacheKey];
+    }
+  }
+
+  const poolCfg = { ...cfg, database: dbName };
+  const pool = await new sql.ConnectionPool(poolCfg).connect();
+  pools[cacheKey] = pool;
+  return pool;
+}
+
+/**
+ * Backwards-compatible: return pool for configured (primary) DB for regionKey.
+ */
+export async function getPool(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) throw new Error(`Unknown region: ${regionKey}`);
+  return ensurePoolForDatabase(key, cfg, cfg.database);
+}
+
+/**
+ * Return list of candidate DB NAMES for a region (primary, primary-1, ..., up to maxBackups)
+ * This function does NOT create connections; it's cheap and deterministic.
+ *
+ * @param {string} regionKey
+ * @param {number} maxBackups  how many previous DBs to include (default 4)
+ * @returns {string[]} array of database names (primary first)
+ */
+export function getRegionDbNames(regionKey, maxBackups = 4) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) throw new Error(`Unknown region: ${regionKey}`);
+
+  const parsed = parseDbWithNumericSuffix(cfg.database);
+  if (!parsed) {
+    return [cfg.database];
+  }
+
+  const nums = [];
+  for (let i = 0; i <= maxBackups; i++) {
+    const n = parsed.num - i;
+    if (n > 0) nums.push(n);
+  }
+  const dbNames = nums.map(n => buildDbName(parsed, n));
+  return dbNames;
+}
+
+/**
+ * Connect (sequentially) to the given dbNames for the region and return the pools.
+ * This connects only to the requested dbNames and caches them.
+ *
+ * @param {string} regionKey
+ * @param {string[]} dbNames
+ * @returns {Promise<sql.ConnectionPool[]>}
+ */
+export async function getPoolsForDbNames(regionKey, dbNames = []) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) throw new Error(`Unknown region: ${regionKey}`);
+
+  const createdPools = [];
+  for (const db of dbNames) {
+    try {
+      const p = await ensurePoolForDatabase(key, cfg, db);
+      createdPools.push(p);
+    } catch (err) {
+      // compact log only
+      // eslint-disable-next-line no-console
+      console.warn(`Failed to connect to ${db} for region ${key}:`, err && err.message ? err.message : String(err));
+    }
+  }
+
+  // If nothing connected, fallback to primary configured DB (ensured)
+  if (createdPools.length === 0) {
+    const primary = await ensurePoolForDatabase(key, cfg, cfg.database);
+    return [primary];
+  }
+  return createdPools;
+}
+
+/**
+ * Old function signature: returns pools for primary + previous 4 (but does NOT eagerly connect them).
+ * For backwards compatibility - we connect only to primary and return [primary] (to avoid accidental heavy connects).
+ * If caller actually needs multiple pools they should call getRegionDbNames + getPoolsForDbNames to control which DBs to open.
+ */
+export async function getRegionPools(regionKey) {
+  // For safety and backwards compatibility we only return primary pool here.
+  // New code should use getRegionDbNames + getPoolsForDbNames to control which DBs to open.
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) throw new Error(`Unknown region: ${regionKey}`);
+  const primary = await ensurePoolForDatabase(key, cfg, cfg.database);
+  return [primary];
+}
+
+/**
+ * Convenience: returns the first available pool among primary db (backwards-compatible).
+ */
+export async function getAnyPool(regionKey) {
+  const arr = await getRegionPools(regionKey);
+  if (arr && arr.length) return arr[0];
+  return getPool(regionKey);
+}
+
+export { sql, regions };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check below both file carefully and i want to update database name and Server name and Password for below all database 
 
 Use Current database name for all ..
