@@ -1,1844 +1,8 @@
-export async function rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter = 'all' }) {
-  if (!region) throw new Error('region required');
-  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+Good Now Working Perfect now just want to update logic only for Time Duration Export ...
+Add all Thick outside border for all sheet .and dont autosize column and rows 
 
-  const pool = await getPool(region);
-  const request = pool.request();
-  request.timeout = 10 * 60 * 1000; // 10 minutes
 
-  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
-  request.input('location', sql.NVarChar(200), locationParam);
-  request.input('startDate', sql.Date, startDate);
-  request.input('endDate', sql.Date, endDate);
-  request.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
-
-  const query = `/* same query used in rawReport - kept identical */ ...`; // no change, omitted here for brevity
-
-  const filename = `Raw_${region}_${startDate.replace(/-/g,'')}_to_${endDate.replace(/-/g,'')}.xlsx`;
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Cache-Control', 'no-cache');
-
-  // create streaming workbook with styles enabled
-  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: true, useStyles: true });
-
-  // configuration
-  const MAX_ROWS_PER_SHEET = 700000;
-
-  // Build headers depending on admitFilter (server will still filter data by admitFilter)
-  let headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
-  const admit = 'AdmitCode';
-  const rej = 'Rejection_Type';
-  const tail = ['Direction','Door'];
-
-  const af = (String(admitFilter || 'all')).toLowerCase();
-  if (af === 'admit') {
-    headers = headers.concat([admit, ...tail]);
-  } else if (af === 'reject') {
-    headers = headers.concat([...tail, rej]);
-  } else {
-    headers = headers.concat([admit, ...tail, rej]);
-  }
-
-  // column widths map aligned to headers above (fallback widths)
-  const defaultWidths = {
-    LocaleMessageTime: 22, DateOnly: 12, Swipe_Time: 12, EmployeeID: 15,
-    ObjectName1: 30, PersonnelType: 18, location: 18, CardNumber: 20,
-    AdmitCode: 14, Direction: 10, Door: 22, Rejection_Type: 22
-  };
-
-  // helpers
-  const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  function humanMonthNameFromKey(key) {
-    if (!key || key === 'unknown') return 'Unknown';
-    const [y,m] = key.split('-');
-    const mm = parseInt(m,10);
-    const mon = MONTH_ABBR[mm - 1] || m;
-    return `${mon}-${y}`;
-  }
-
-  let currentMonthKey = null;
-  let worksheet = null;
-  let sheetIndexForMonth = {};
-
-  // create footer row to provide thick bottom border for streaming sheets
-  function addFooterRowForOutsideBorder(ws, headersLen) {
-    // create an empty footer row; top border on footer -> acts as bottom border of table
-    const footerValues = new Array(headersLen).fill('');
-    const footer = ws.addRow(footerValues);
-    const lastColIndex = headersLen;
-    footer.eachCell((cell, colNumber) => {
-      // top border thick to form bottom outside border
-      const border = {
-        top: { style: 'thick' },
-        left: colNumber === 1 ? { style: 'thick' } : (cell.border && cell.border.left ? cell.border.left : { style: 'thin' }),
-        right: colNumber === lastColIndex ? { style: 'thick' } : (cell.border && cell.border.right ? cell.border.right : { style: 'thin' }),
-        bottom: { style: 'thin' }
-      };
-      cell.border = border;
-      // fill/align blank footer consistently
-      cell.alignment = { horizontal: 'center', vertical: 'middle' };
-    });
-    footer.commit();
-  }
-
-  function createWorksheetFor(monthKey) {
-    sheetIndexForMonth[monthKey] = (sheetIndexForMonth[monthKey] || 0) + 1;
-    const part = sheetIndexForMonth[monthKey];
-    const human = humanMonthNameFromKey(monthKey);
-    const name = part === 1 ? `${human} Sheet 1` : `${human} Sheet ${part}`;
-
-    const ws = workbook.addWorksheet(name);
-
-    // Set reasonable column widths up-front (do NOT use `header:` in columns — that can create an auto-header)
-    ws.columns = headers.map(h => ({ key: h, width: defaultWidths[h] || 18 }));
-
-    // write header row explicitly and style it (only one header row)
-    const headerRow = ws.addRow(headers);
-
-    // style header: bold, center alignment for all except Door (left)
-    const doorIndex = headers.indexOf('Door') + 1; // 1-based
-    headerRow.eachCell((cell, colNumber) => {
-      cell.font = { bold: true };
-      cell.alignment = { horizontal: (colNumber === doorIndex ? 'left' : 'center'), vertical: 'middle' };
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFCCE8FF' } };
-      // thick border on the full header row (top + left/right)
-      cell.border = {
-        top: { style: 'thick' },
-        left: (colNumber === 1) ? { style: 'thick' } : { style: 'thin' },
-        bottom: { style: 'thin' },
-        right: (colNumber === headers.length) ? { style: 'thick' } : { style: 'thin' }
-      };
-    });
-    headerRow.commit();
-
-    ws.__written = 1;
-    return ws;
-  }
-
-  function monthKeyForRow(row) {
-    try {
-      const iso = row.LocaleMessageTime || row.DateOnly;
-      if (iso) {
-        const d = new Date(iso);
-        if (!isNaN(d.getTime())) {
-          const y = d.getUTCFullYear();
-          const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-          return `${y}-${m}`;
-        }
-      }
-    } catch (e) { /* ignore */ }
-    return 'unknown';
-  }
-
-  // safe commit helper
-  let committed = false;
-  async function safeCommit() {
-    if (committed) return;
-    committed = true;
-    try {
-      await workbook.commit();
-    } catch (e) {
-      console.error('safeCommit: workbook.commit failed', e);
-    }
-  }
-
-  request.stream = true;
-
-  request.on('error', async (err) => {
-    console.error('SQL stream error', err);
-    try { await safeCommit(); } catch (e) {}
-    try { res.end(); } catch (e) {}
-  });
-
-  request.on('row', (row) => {
-    const monthKey = monthKeyForRow(row);
-    // rotate/create sheet if needed
-    if (!worksheet || monthKey !== currentMonthKey || (worksheet.__written >= MAX_ROWS_PER_SHEET)) {
-      // if we already have a worksheet, add a footer row to create thick bottom border, then commit it
-      if (worksheet) {
-        try {
-          addFooterRowForOutsideBorder(worksheet, headers.length);
-        } catch (e) { /* ignore footer errors */ }
-        try { worksheet.commit(); } catch (e) { /* ignore commit error */ }
-      }
-      currentMonthKey = monthKey;
-      worksheet = createWorksheetFor(monthKey);
-    }
-
-    // Build row values; prefer Date objects for date/time columns where possible
-    let localeDate = null;
-    if (row.LocaleMessageTime) {
-      localeDate = (row.LocaleMessageTime instanceof Date) ? row.LocaleMessageTime : new Date(row.LocaleMessageTime);
-      if (isNaN(localeDate.getTime())) localeDate = null;
-    }
-    let dateOnlyDate = null;
-    if (row.DateOnly) {
-      const d = new Date(row.DateOnly);
-      if (!isNaN(d.getTime())) dateOnlyDate = d;
-    }
-    let swipeDate = null;
-    if (row.Swipe_Time) {
-      if (row.Swipe_Time instanceof Date && !isNaN(row.Swipe_Time.getTime())) swipeDate = row.Swipe_Time;
-      else {
-        const t = String(row.Swipe_Time || '').trim();
-        if (t) {
-          const parts = t.split(':').map(p => parseInt(p || '0', 10));
-          if (parts.length >= 2) swipeDate = new Date(Date.UTC(1970,0,1, parts[0], parts[1], parts[2]||0));
-        }
-      }
-    }
-
-    // Compose row values in same order as headers array (dynamically)
-    const fullObj = {
-      LocaleMessageTime: localeDate || (row.LocaleMessageTime || ''),
-      DateOnly: dateOnlyDate || (row.DateOnly || ''),
-      Swipe_Time: swipeDate || (row.Swipe_Time || ''),
-      EmployeeID: row.EmployeeID || '',
-      ObjectName1: row.ObjectName1 || '',
-      PersonnelType: row.PersonnelType || '',
-      location: row.location || '',
-      CardNumber: row.CardNumber || '',
-      AdmitCode: row.AdmitCode || '',
-      Direction: row.Direction || '',
-      Door: row.Door || '',
-      Rejection_Type: row.Rejection_Type || ''
-    };
-    const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
-
-    // Add row and style cells
-    const wrow = worksheet.addRow(rowVals);
-
-    try {
-      // column-based formatting: header & data alignment rules (Door left, rest center)
-      const doorIndex = headers.indexOf('Door') + 1; // 1-based index for Door if present
-      for (let ci = 1; ci <= headers.length; ci++) {
-        const cell = wrow.getCell(ci);
-        // date/time number formats
-        const headerName = headers[ci - 1];
-        if (headerName === 'LocaleMessageTime' && localeDate) {
-          cell.numFmt = 'dd-mmm-yyyy h:mm:ss AM/PM';
-        } else if (headerName === 'DateOnly' && dateOnlyDate) {
-          cell.numFmt = 'dd-mmm-yy';
-        } else if (headerName === 'Swipe_Time' && swipeDate) {
-          cell.numFmt = 'h:mm:ss AM/PM';
-        }
-        // alignment: Door left, others center
-        const horizontal = (ci === doorIndex) ? 'left' : 'center';
-        cell.alignment = { vertical: 'middle', horizontal };
-
-        // border: top/bottom thin by default, left thick for first col, right thick for last col
-        const border = {
-          top: { style: 'thin' },
-          bottom: { style: 'thin' },
-          left: (ci === 1) ? { style: 'thick' } : { style: 'thin' },
-          right: (ci === headers.length) ? { style: 'thick' } : { style: 'thin' }
-        };
-        cell.border = border;
-      }
-    } catch (e) {
-      console.warn('row styling warning', e && e.message ? e.message : e);
-    }
-
-    wrow.commit();
-    worksheet.__written++;
-  });
-
-  request.on('done', async () => {
-    try {
-      if (worksheet) {
-        // add footer row with top thick to act as bottom border
-        try { addFooterRowForOutsideBorder(worksheet, headers.length); } catch (e) { /* ignore */ }
-        try { worksheet.commit(); } catch (e) { /* ignore */ }
-      }
-      await safeCommit();
-    } catch (err) {
-      console.error('Workbook commit error', err);
-    } finally {
-      try { res.end(); } catch (e) {}
-    }
-  });
-
-  // trigger the streaming query
-  request.query(query).catch(async (err) => {
-    console.error('request.query failed', err);
-    try { await safeCommit(); } catch (e) {}
-    try { res.end(); } catch (e) {}
-  });
-}
-
-
-
-
-
-
-
-
-
-const generateRawExcel = async (rows, opts = {}) => {
-  const formatTimeFromSwipe = (swipeIso) => {
-    if (!swipeIso) return '';
-    const dt = new Date(swipeIso);
-    if (!isNaN(dt.getTime())) {
-      return formatTimeFromServerISO(swipeIso);
-    }
-    const parts = ('' + swipeIso).split(':').map(p => parseInt(p || 0, 10));
-    const hh = parts[0] || 0;
-    const mm = parts[1] || 0;
-    const ss = parts[2] || 0;
-    const ampm = hh >= 12 ? 'PM' : 'AM';
-    const hh12 = ((hh + 11) % 12) + 1;
-    return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
-  };
-
-  const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase();
-
-  const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
-  const admitCol = 'AdmitCode';
-  const rejCol = 'Rejection_Type';
-  const tailCols = ['Direction','Door'];
-
-  let headers = [...baseHeaders];
-  if (admitFilter === 'all') {
-    headers.push(admitCol, ...tailCols, rejCol);
-  } else if (admitFilter === 'admit') {
-    headers.push(admitCol, ...tailCols);
-  } else if (admitFilter === 'reject') {
-    headers.push(...tailCols, rejCol);
-  } else {
-    headers.push(admitCol, ...tailCols, rejCol);
-  }
-
-  const wb = new ExcelJS.Workbook();
-  const MAX_ROWS_PER_SHEET = 700000;
-  const AUTOSIZE_LIMIT = 20000;
-
-  // helper to split by month (same as existing)
-  const monthKeyForRow = (r) => {
-    try {
-      const iso = getServerISO(r);
-      if (iso) {
-        const d = new Date(iso);
-        if (!isNaN(d.getTime())) {
-          const y = d.getUTCFullYear();
-          const m = pad2(d.getUTCMonth() + 1);
-          return `${y}-${m}`;
-        }
-      }
-      if (r.DateOnly) {
-        const dt = isoDateOnlyToLocalDate(r.DateOnly);
-        if (dt) {
-          const y = dt.getFullYear();
-          const m = pad2(dt.getMonth() + 1);
-          return `${y}-${m}`;
-        }
-      }
-    } catch (e) { /* ignore */ }
-    return 'unknown';
-  };
-
-  let rowsByMonth = {};
-  if (Array.isArray(rows) && rows.length) {
-    rows.forEach(r => {
-      const key = monthKeyForRow(r);
-      rowsByMonth[key] = rowsByMonth[key] || [];
-      rowsByMonth[key].push(r);
-    });
-  } else {
-    rowsByMonth['empty'] = [];
-  }
-
-  // Decide whether to split by month — keep original logic
-  let shouldSplitByMonth = false;
-  try {
-    if (opts.from && opts.to) {
-      const f = new Date(opts.from);
-      const t = new Date(opts.to);
-      if (!isNaN(f.getTime()) && !isNaN(t.getTime())) {
-        const monthSpan = (t.getFullYear() - f.getFullYear()) * 12 + (t.getMonth() - f.getMonth());
-        if (monthSpan >= 1) shouldSplitByMonth = true;
-      }
-    }
-  } catch (e) { /* ignore */ }
-  if ((Array.isArray(rows) && rows.length > MAX_ROWS_PER_SHEET)) shouldSplitByMonth = true;
-
-  // helper to style header and apply thick outside border after writing data
-  function applyHeaderAndBorders(ws, headerRowIndex = 1) {
-    const doorCol = headers.indexOf('Door') + 1; // 1-based
-    // style header row (headerRowIndex)
-    const headerRow = ws.getRow(headerRowIndex);
-    headerRow.eachCell((cell, idx) => {
-      cell.font = { bold: true };
-      cell.alignment = { horizontal: (idx === doorCol ? 'left' : 'center'), vertical: 'middle' };
-      cell.fill = HEADER_FILL;
-      // top thick and left/right thick edges handled below when we do outside border
-    });
-    // ensure thin border for all inner cells, then add thick outside border afterwards
-    ws.eachRow((row, rIdx) => {
-      row.eachCell((cell, cIdx) => {
-        // skip header for alignment only; borders we'll set here
-        cell.border = THIN_BORDER;
-        // alignment: Door left, others center
-        if (!cell.alignment) cell.alignment = { vertical: 'middle', horizontal: (cIdx === doorCol ? 'left' : 'center') };
-      });
-    });
-
-    // Now apply thick outside border for header+data
-    const firstDataRow = headerRowIndex;
-    const lastDataRow = ws.lastRow ? ws.lastRow.number : headerRowIndex;
-    const firstCol = 1;
-    const lastCol = headers.length;
-
-    for (let r = firstDataRow; r <= lastDataRow; r++) {
-      for (let c = firstCol; c <= lastCol; c++) {
-        const cell = ws.getCell(r, c);
-        const border = {
-          top: (r === firstDataRow) ? { style: 'thick' } : (cell.border && cell.border.top ? cell.border.top : { style: 'thin' }),
-          bottom: (r === lastDataRow) ? { style: 'thick' } : (cell.border && cell.border.bottom ? cell.border.bottom : { style: 'thin' }),
-          left: (c === firstCol) ? { style: 'thick' } : (cell.border && cell.border.left ? cell.border.left : { style: 'thin' }),
-          right: (c === lastCol) ? { style: 'thick' } : (cell.border && cell.border.right ? cell.border.right : { style: 'thin' })
-        };
-        cell.border = border;
-      }
-    }
-  }
-
-  // Create sheets either single Raw or per month
-  const monthKeys = shouldSplitByMonth ? Object.keys(rowsByMonth).sort() : ['all'];
-  if (!shouldSplitByMonth) {
-    // all rows into a single sheet (or empty header if no rows)
-    const allRows = Array.isArray(rows) ? rows : [];
-    const parts = Math.max(1, Math.ceil(allRows.length / MAX_ROWS_PER_SHEET));
-    for (let p = 0; p < parts; p++) {
-      const chunk = allRows.slice(p * MAX_ROWS_PER_SHEET, (p + 1) * MAX_ROWS_PER_SHEET);
-      const wsName = (parts === 1) ? 'Raw' : `Raw Sheet ${p + 1}`;
-      const ws = wb.addWorksheet(wsName);
-      hideGridLines(ws);
-
-      // add header explicitly
-      const hdr = ws.addRow(headers);
-      applyHeaderStyles(hdr); // this reuses your helper to set header font/fill/alignment center; we'll override final borders later
-
-      // add all rows
-      chunk.forEach(r => {
-        const iso = getServerISO(r);
-        const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
-        const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
-        const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
-        const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
-        const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
-
-        const fullObj = {
-          LocaleMessageTime: localeMsgFormatted,
-          DateOnly: dateOnlyFormatted,
-          Swipe_Time: swipeTimeFormatted,
-          EmployeeID: r.EmployeeID || '',
-          ObjectName1: r.ObjectName1 || '',
-          PersonnelType: r.PersonnelType || '',
-          location: r.location || '',
-          CardNumber: r.CardNumber || '',
-          AdmitCode: r.AdmitCode || r.Messagetype || '',
-          Direction: r.Direction || r.Swipe || '',
-          Door: r.Door || r.ObjectName2 || '',
-          Rejection_Type: r.Rejection_Type || ''
-        };
-
-        const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
-        const added = ws.addRow(rowVals);
-        // set row cell defaults; we'll finalize outside border later
-        added.eachCell(c => {
-          c.border = THIN_BORDER;
-          c.alignment = { vertical: 'middle', horizontal: 'left' }; // default; will be overridden by applyHeaderAndBorders
-        });
-      });
-
-      // autosize if small
-      if (allRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
-
-      // finalize header alignment & thick outside border
-      applyHeaderAndBorders(ws, 1);
-    }
-  } else {
-    // split by month keys
-    const sortedKeys = Object.keys(rowsByMonth).sort();
-    sortedKeys.forEach(monthKey => {
-      const mrows = rowsByMonth[monthKey] || [];
-      const humanMonth = (monthKey === 'unknown') ? 'Unknown' : (() => {
-        const [y,m] = monthKey.split('-'); const mm = parseInt(m,10);
-        const monName = MONTH_ABBR[mm-1] || m;
-        return `${monName}-${y}`;
-      })();
-
-      for (let i = 0; i < mrows.length; i += MAX_ROWS_PER_SHEET) {
-        const chunk = mrows.slice(i, i + MAX_ROWS_PER_SHEET);
-        const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
-        const sheetName = (part === 1) ? `${humanMonth} Sheet 1` : `${humanMonth} Sheet ${part}`;
-        const ws = wb.addWorksheet(sheetName);
-        hideGridLines(ws);
-
-        const hdr = ws.addRow(headers);
-        applyHeaderStyles(hdr);
-
-        chunk.forEach(r => {
-          const iso = getServerISO(r);
-          const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
-          const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
-          const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
-          const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
-          const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
-
-          const fullObj = {
-            LocaleMessageTime: localeMsgFormatted,
-            DateOnly: dateOnlyFormatted,
-            Swipe_Time: swipeTimeFormatted,
-            EmployeeID: r.EmployeeID || '',
-            ObjectName1: r.ObjectName1 || '',
-            PersonnelType: r.PersonnelType || '',
-            location: r.location || '',
-            CardNumber: r.CardNumber || '',
-            AdmitCode: r.AdmitCode || r.Messagetype || '',
-            Direction: r.Direction || r.Swipe || '',
-            Door: r.Door || r.ObjectName2 || '',
-            Rejection_Type: r.Rejection_Type || ''
-          };
-
-          const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
-          const added = ws.addRow(rowVals);
-          added.eachCell(c => {
-            c.border = THIN_BORDER;
-            c.alignment = { vertical: 'middle', horizontal: 'left' };
-          });
-        });
-
-        if (mrows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
-
-        applyHeaderAndBorders(ws, 1);
-      }
-    });
-  }
-
-  const filename = buildRawFileName(opts);
-  try {
-    const buf = await wb.xlsx.writeBuffer();
-    const blob = new Blob([buf], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = filename;
-    link.click();
-  } catch (err) {
-    console.error('generateRawExcel writeBuffer error', err);
-    try {
-      const fallbackWb = new ExcelJS.Workbook();
-      const ws = fallbackWb.addWorksheet('Export_Failed');
-      ws.getCell('A1').value = 'Export failed because the result set is too large for browser export.';
-      ws.getCell('A2').value = 'Please reduce the date range (choose 1 month or less) or filter by location/employee and try again.';
-      const buf2 = await fallbackWb.xlsx.writeBuffer();
-      const blob2 = new Blob([buf2], { type: 'application/vnd.openxmlformats-officedocument-spreadsheetml.sheet' });
-      const link2 = document.createElement('a');
-      link2.href = URL.createObjectURL(blob2);
-      link2.download = filename.replace('.xlsx', '_FAILED.xlsx');
-      link2.click();
-    } catch (e) {
-      alert('Failed to generate raw export: ' + (e && e.message ? e.message : String(e)));
-    }
-  }
-};
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Now there is Export function need to fix
-
-When Export report Header look like 
-
-LocaleMessageTime	DateOnly	Swipe_Time	EmployeeID	ObjectName1	PersonnelType	location	CardNumber	AdmitCode	Direction	Door	Rejection_Type
-LocaleMessageTime	DateOnly	Swipe_Time	EmployeeID	ObjectName1	PersonnelType	location	CardNumber	AdmitCode	Direction	Door	Rejection_Type
-
-1 st one is no background no bold ...no Formatting 
-
-2nd one is Correct ..
-add Formatting like keep only door name align left align . remening all Columns keep Center Align 
-and 
-From frontend When select Admit .. then dont export Rejection_Type Column 
-when reject select then dont export AdmitCode column 
-only export both when select all 
-add All thick outside border for all Excel sheet carefully...
-and remove one header There are 2 Header 2 display remove 1 st header row where excel formating is blank
-
-alos 
-
-
-//C:\Users\W0024618\Desktop\global-page\backend\services\reportService.js
-
- import { getPool, sql } from '../config/dbConfig.js';
- 
-
-import ExcelJS from 'exceljs';
-
-
-
-export async function listLocations(region) {
-  if (!region) throw new Error('region required');
-  const pool = await getPool(region);
-  const req = pool.request();
-  // get distinct PartitionName2 values
-  const q = `SELECT DISTINCT PartitionName2 FROM ACVSUJournalLog WHERE PartitionName2 IS NOT NULL ORDER BY PartitionName2`;
-  const { recordset } = await req.query(q);
-  return (recordset || []).map(r => r.PartitionName2).filter(Boolean);
-}
-
-/**
- * Search employees by name or employee id fragment
- * q: search string (partial), region: region key for getPool
- */
-export async function searchEmployees(region = 'emea', q = '') {
-  const pool = await getPool(region);
-  const req = pool.request();
-  const like = `%${q}%`;
-  req.input('q', sql.NVarChar(200), like);
-
-  // search common personnel name field (Text1) and numeric EmployeeID (Int1) and Text12 (contractor id)
-  const query = `
-    SELECT TOP (200)
-      CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR(50)) END AS EmployeeID,
-      ISNULL(t2.Text1, '') AS Name
-    FROM ACVSCore.Access.Personnel AS t2
-    LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-    WHERE (t2.Text1 LIKE @q) OR (CAST(t2.Int1 AS NVARCHAR(50)) LIKE @q) OR (t2.Text12 LIKE @q)
-    ORDER BY t2.Text1;
-  `;
-  const { recordset } = await req.query(query);
-  return (recordset || []).map(r => ({ EmployeeID: r.EmployeeID, Name: r.Name }));
-}
-
-
-
-// export async function rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter = 'all' }) {
-//   if (!region) throw new Error('region required');
-//   if (!startDate || !endDate) throw new Error('startDate and endDate required');
-
-//   const pool = await getPool(region);
-//   const request = pool.request();
-//   // allow long running query on server side
-//   request.timeout = 10 * 60 * 1000; // 10 minutes (adjust as needed)
-
-//   // Accept NULL for location => all partitions
-//   const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
-//   request.input('location', sql.NVarChar(200), locationParam);
-//   request.input('startDate', sql.Date, startDate);
-//   request.input('endDate', sql.Date, endDate);
-//   request.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
-
-//   // --- FULL SQL (same as rawReport) ---
-//   const query = `
-// WITH CombinedQuery AS(
-//   SELECT 
-//      DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-//      t1.ObjectName1,
-//      t1.PartitionName2       AS location,
-//      t5_card.CardNumber,
-//      t5_admit.value          AS AdmitCode,
-//      t5_dir.value            AS Direction,
-//      t1.ObjectName2          AS Door,
-//      t5_rej.value            AS Rejection_Type,
-//      CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
-//           THEN t2.Text12
-//           ELSE CAST(t2.Int1 AS NVARCHAR)
-//      END                       AS EmployeeID,
-//      t3.Name                  AS PersonnelType,
-//      t1.MessageType,
-//      t1.XmlGUID
-//   FROM ACVSUJournalLog AS t1
-//   LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
-//   LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
-//   LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
-//     ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
-//   LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
-//     ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
-//   LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
-//   LEFT JOIN (
-//     SELECT GUID, [value]
-//     FROM ACVSUJournalLogxmlShred
-//     WHERE [Name] IN ('Card','CHUID')
-//   ) AS SCard ON t1.XmlGUID = SCard.GUID
-//   OUTER APPLY (
-//     SELECT COALESCE(
-//       TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
-//       TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
-//       SCard.[value]
-//     ) AS CardNumber
-//   ) AS t5_card
-//   LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
-//     ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-//   WHERE
-//     -- message types we consider
-//     t1.MessageType IN ('CardAdmitted' , 'CardRejected')
-//     -- location optional filter
-//     AND (@location IS NULL OR t1.PartitionName2 = @location)
-//     -- admit/reject filter: 'all' | 'admit' | 'reject' (case-insensitive)
-//     AND (
-//       UPPER(ISNULL(@admitFilter,'all')) = 'ALL'
-//       OR (UPPER(@admitFilter) = 'ADMIT'  AND t1.MessageType = 'CardAdmitted')
-//       OR (UPPER(@admitFilter) = 'REJECT' AND t1.MessageType = 'CardRejected')
-//     )
-//     AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
-// )
-// SELECT
-//   LocaleMessageTime,
-//   CONVERT(date,    LocaleMessageTime) AS DateOnly,
-//   CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
-//   EmployeeID,
-//   ObjectName1,
-//   PersonnelType,
-//   location,
-//   CardNumber,
-//   AdmitCode,
-//   Direction,
-//   Door,
-//   Rejection_Type
-// FROM CombinedQuery
-// ORDER BY LocaleMessageTime ASC;
-// `;
-
-//   // Prepare response headers for streaming xlsx
-//   const filename = `Raw_${region}_${startDate.replace(/-/g,'')}_to_${endDate.replace(/-/g,'')}.xlsx`;
-//   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-//   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-//   res.setHeader('Cache-Control', 'no-cache');
-
-//   // Workbook writer streams directly to res
-//   const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: true, useStyles: true });
-
-//   // We'll split into sheets by year-month (YYYY-MM). Track sheet state.
-//   let currentMonthKey = null;
-//   let worksheet = null;
-//   let sheetIndexForMonth = {}; // track part numbers per month if > max per sheet
-//   const MAX_ROWS_PER_SHEET = 700000; // server-side sheet chunk size (adjust if needed)
-//   const headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber','AdmitCode','Direction','Door','Rejection_Type'];
-
-//   // helper to format human sheet name from monthKey
-//   const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-//   function humanMonthNameFromKey(key) {
-//     if (!key || key === 'unknown') return 'Unknown';
-//     const [y,m] = key.split('-');
-//     const mm = parseInt(m,10);
-//     const mon = MONTH_ABBR[mm - 1] || m;
-//     return `${mon}-${y}`;
-//   }
-
-//   // helper to create a new worksheet for given monthKey (and part number)
-//   function createWorksheetFor(monthKey) {
-//     sheetIndexForMonth[monthKey] = (sheetIndexForMonth[monthKey] || 0) + 1;
-//     const part = sheetIndexForMonth[monthKey];
-//     const human = humanMonthNameFromKey(monthKey);
-//     const name = part === 1 ? `${human} Sheet 1` : `${human} Sheet ${part}`;
-//     const ws = workbook.addWorksheet(name);
-//     // write header row
-//     const headerRow = ws.addRow(headers);
-//     headerRow.commit();
-//     // return ws and current row count (we don't rely on ws.rowCount in streaming mode)
-//     ws.__written = 1; // we track number of rows added to decide when to rotate sheets
-//     return ws;
-//   }
-
-//   // extract month key from row values (row.LocaleMessageTime or DateOnly)
-//   function monthKeyForRow(row) {
-//     try {
-//       const iso = row.LocaleMessageTime || row.DateOnly;
-//       if (iso) {
-//         const d = new Date(iso);
-//         if (!isNaN(d.getTime())) {
-//           const y = d.getUTCFullYear();
-//           const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-//           return `${y}-${m}`;
-//         }
-//       }
-//     } catch (e) { /* ignore */ }
-//     return 'unknown';
-//   }
-
-//   // enable streaming on request
-//   request.stream = true;
-
-//   // safe commit helper to avoid calling workbook.commit() multiple times
-//   let committed = false;
-//   async function safeCommit() {
-//     if (committed) return;
-//     committed = true;
-//     try {
-//       await workbook.commit();
-//     } catch (e) {
-//       console.error('safeCommit: workbook.commit failed', e);
-//     }
-//   }
-
-//   // hook up streaming events
-//   request.on('error', async (err) => {
-//     console.error('SQL stream error', err);
-//     // finalize workbook once and end response
-//     try {
-//       await safeCommit();
-//     } catch (e) { /* already logged inside safeCommit */ }
-//     try { res.end(); } catch (e) { /* ignore */ }
-//   });
-
-//   request.on('row', (row) => {
-//     // determine which sheet to write to
-//     const monthKey = monthKeyForRow(row);
-//     if (!worksheet || monthKey !== currentMonthKey || (worksheet.__written >= MAX_ROWS_PER_SHEET)) {
-//       // rotate / create new sheet
-//       if (worksheet) {
-//         try { worksheet.commit(); } catch (e) { /* ignore */ }
-//       }
-//       currentMonthKey = monthKey;
-//       worksheet = createWorksheetFor(monthKey);
-//     }
-
-//     // create row values in same header order
-//     const rowVals = [
-//       row.LocaleMessageTime || '',
-//       row.DateOnly || '',
-//       row.Swipe_Time || '',
-//       row.EmployeeID || '',
-//       row.ObjectName1 || '',
-//       row.PersonnelType || '',
-//       row.location || '',
-//       row.CardNumber || '',
-//       row.AdmitCode || '',
-//       row.Direction || '',
-//       row.Door || '',
-//       row.Rejection_Type || ''
-//     ];
-//     const wrow = worksheet.addRow(rowVals);
-//     wrow.commit();
-//     worksheet.__written++;
-//   });
-
-//   request.on('done', async () => {
-//     try {
-//       if (worksheet) {
-//         try { worksheet.commit(); } catch (e) { /* ignore */ }
-//       }
-//       await safeCommit(); // finalizes workbook and flushes to res
-//     } catch (err) {
-//       console.error('Workbook commit error', err);
-//     } finally {
-//       try { res.end(); } catch (e) {}
-//     }
-//   });
-
-//   // finally execute the query (this starts the streaming)
-//   request.query(query).catch(async (err) => {
-//     console.error('request.query failed', err);
-//     // ensure workbook/res closed once
-//     try { await safeCommit(); } catch (e) {}
-//     try { res.end(); } catch (e) {}
-//   });
-// }
-
-
-
-export async function rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter = 'all' }) {
-  if (!region) throw new Error('region required');
-  if (!startDate || !endDate) throw new Error('startDate and endDate required');
-
-  const pool = await getPool(region);
-  const request = pool.request();
-  request.timeout = 10 * 60 * 1000; // 10 minutes
-
-  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
-  request.input('location', sql.NVarChar(200), locationParam);
-  request.input('startDate', sql.Date, startDate);
-  request.input('endDate', sql.Date, endDate);
-  request.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
-
-  const query = `
-  /* same query used in rawReport - kept identical */
-  WITH CombinedQuery AS(
-    SELECT 
-       DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-       t1.ObjectName1,
-       t1.PartitionName2       AS location,
-       t5_card.CardNumber,
-       t5_admit.value          AS AdmitCode,
-       t5_dir.value            AS Direction,
-       t1.ObjectName2          AS Door,
-       t5_rej.value            AS Rejection_Type,
-       CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
-            THEN t2.Text12
-            ELSE CAST(t2.Int1 AS NVARCHAR)
-       END                       AS EmployeeID,
-       t3.Name                  AS PersonnelType,
-       t1.MessageType,
-       t1.XmlGUID
-    FROM ACVSUJournalLog AS t1
-    LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
-    LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
-    LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
-      ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
-    LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
-      ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
-    LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
-    LEFT JOIN (
-      SELECT GUID, [value]
-      FROM ACVSUJournalLogxmlShred
-      WHERE [Name] IN ('Card','CHUID')
-    ) AS SCard ON t1.XmlGUID = SCard.GUID
-    OUTER APPLY (
-      SELECT COALESCE(
-        TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
-        TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
-        SCard.[value]
-      ) AS CardNumber
-    ) AS t5_card
-    LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
-      ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-    WHERE
-      t1.MessageType IN ('CardAdmitted' , 'CardRejected')
-      AND (@location IS NULL OR t1.PartitionName2 = @location)
-      AND (
-        UPPER(ISNULL(@admitFilter,'all')) = 'ALL'
-        OR (UPPER(@admitFilter) = 'ADMIT'  AND t1.MessageType = 'CardAdmitted')
-        OR (UPPER(@admitFilter) = 'REJECT' AND t1.MessageType = 'CardRejected')
-      )
-      AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
-  )
-  SELECT
-    LocaleMessageTime,
-    CONVERT(date,    LocaleMessageTime) AS DateOnly,
-    CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
-    EmployeeID,
-    ObjectName1,
-    PersonnelType,
-    location,
-    CardNumber,
-    AdmitCode,
-    Direction,
-    Door,
-    Rejection_Type
-  FROM CombinedQuery
-  ORDER BY LocaleMessageTime ASC;
-  `;
-
-  const filename = `Raw_${region}_${startDate.replace(/-/g,'')}_to_${endDate.replace(/-/g,'')}.xlsx`;
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Cache-Control', 'no-cache');
-
-  // create streaming workbook with styles enabled
-  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: true, useStyles: true });
-
-  // configuration
-  const MAX_ROWS_PER_SHEET = 700000;
-  const headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber','AdmitCode','Direction','Door','Rejection_Type'];
-
-  // helpers
-  const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  function humanMonthNameFromKey(key) {
-    if (!key || key === 'unknown') return 'Unknown';
-    const [y,m] = key.split('-');
-    const mm = parseInt(m,10);
-    const mon = MONTH_ABBR[mm - 1] || m;
-    return `${mon}-${y}`;
-  }
-
-  let currentMonthKey = null;
-  let worksheet = null;
-  let sheetIndexForMonth = {};
-
-  function createWorksheetFor(monthKey) {
-    sheetIndexForMonth[monthKey] = (sheetIndexForMonth[monthKey] || 0) + 1;
-    const part = sheetIndexForMonth[monthKey];
-    const human = humanMonthNameFromKey(monthKey);
-    const name = part === 1 ? `${human} Sheet 1` : `${human} Sheet ${part}`;
-
-    const ws = workbook.addWorksheet(name);
-
-    // Set reasonable column widths up-front (helps Excel layout)
-    ws.columns = [
-      { header: headers[0], key: headers[0], width: 22 }, // LocaleMessageTime
-      { header: headers[1], key: headers[1], width: 12 }, // DateOnly
-      { header: headers[2], key: headers[2], width: 12 }, // Swipe_Time
-      { header: headers[3], key: headers[3], width: 15 }, // EmployeeID
-      { header: headers[4], key: headers[4], width: 30 }, // ObjectName1
-      { header: headers[5], key: headers[5], width: 18 }, // PersonnelType
-      { header: headers[6], key: headers[6], width: 18 }, // location
-      { header: headers[7], key: headers[7], width: 20 }, // CardNumber
-      { header: headers[8], key: headers[8], width: 14 }, // AdmitCode
-      { header: headers[9], key: headers[9], width: 10 }, // Direction
-      { header: headers[10], key: headers[10], width: 22 }, // Door
-      { header: headers[11], key: headers[11], width: 22 }  // Rejection_Type
-    ];
-
-    // header row: add then style before commit
-    const headerRow = ws.addRow(headers);
-    // style header
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true };
-      cell.alignment = { horizontal: 'center', vertical: 'middle' };
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFCCE8FF' } };
-      cell.border = { top: { style: 'thick' }, left: { style: 'thick' }, bottom: { style: 'thick' }, right: { style: 'thick' } };
-    });
-    headerRow.commit();
-
-    // track rows written to this worksheet (streaming writer does not expose rowCount reliably)
-    ws.__written = 1;
-    return ws;
-  }
-
-  function monthKeyForRow(row) {
-    try {
-      const iso = row.LocaleMessageTime || row.DateOnly;
-      if (iso) {
-        const d = new Date(iso);
-        if (!isNaN(d.getTime())) {
-          const y = d.getUTCFullYear();
-          const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-          return `${y}-${m}`;
-        }
-      }
-    } catch (e) { /* ignore */ }
-    return 'unknown';
-  }
-
-  // safe commit helper
-  let committed = false;
-  async function safeCommit() {
-    if (committed) return;
-    committed = true;
-    try {
-      await workbook.commit();
-    } catch (e) {
-      console.error('safeCommit: workbook.commit failed', e);
-    }
-  }
-
-  // handle SQL stream events
-  request.stream = true;
-
-  request.on('error', async (err) => {
-    console.error('SQL stream error', err);
-    try { await safeCommit(); } catch (e) {}
-    try { res.end(); } catch (e) {}
-  });
-
-  request.on('row', (row) => {
-    // rotate/create sheet if needed
-    const monthKey = monthKeyForRow(row);
-    if (!worksheet || monthKey !== currentMonthKey || (worksheet.__written >= MAX_ROWS_PER_SHEET)) {
-      if (worksheet) {
-        try { worksheet.commit(); } catch (e) { /* ignore */ }
-      }
-      currentMonthKey = monthKey;
-      worksheet = createWorksheetFor(monthKey);
-    }
-
-    // Build cell values — prefer LocaleMessageTime (full datetime)
-    // Coerce LocaleMessageTime to JS Date if present
-    let localeDate = null;
-    if (row.LocaleMessageTime) {
-      localeDate = (row.LocaleMessageTime instanceof Date) ? row.LocaleMessageTime : new Date(row.LocaleMessageTime);
-      if (isNaN(localeDate.getTime())) localeDate = null;
-    }
-    // fallback: if DateOnly exists and Swipe_Time exists, build a composite date for the swipe
-    let dateOnlyDate = null;
-    if (localeDate) {
-      dateOnlyDate = new Date(Date.UTC(localeDate.getUTCFullYear(), localeDate.getUTCMonth(), localeDate.getUTCDate()));
-    } else if (row.DateOnly) {
-      const d = new Date(row.DateOnly);
-      if (!isNaN(d.getTime())) dateOnlyDate = d;
-    }
-
-    let swipeDate = null;
-    if (localeDate) {
-      // use full datetime for swipe too — formatting will display only time
-      swipeDate = new Date(localeDate.getTime());
-    } else if (row.Swipe_Time) {
-      // Swipe_Time might be string 'HH:mm:ss' or a Date at epoch 1970; try to parse
-      if (row.Swipe_Time instanceof Date && !isNaN(row.Swipe_Time.getTime())) {
-        swipeDate = new Date(row.Swipe_Time.getTime());
-      } else {
-        // parse time string (assume HH:mm:ss)
-        const t = String(row.Swipe_Time).trim();
-        const parts = t.split(':').map(p => parseInt(p || '0', 10));
-        if (parts.length >= 2) {
-          // create a Date on 1970-01-01 UTC with that time (Excel will display time only via numFmt)
-          swipeDate = new Date(Date.UTC(1970, 0, 1, parts[0], parts[1], parts[2] || 0));
-        }
-      }
-    }
-
-    // Compose row values; for date/time columns use JS Date objects where possible
-    const rowVals = [
-      localeDate || (row.LocaleMessageTime || ''), // LocaleMessageTime (prefer Date)
-      dateOnlyDate || (row.DateOnly || ''),        // DateOnly (prefer Date)
-      swipeDate || (row.Swipe_Time || ''),         // Swipe_Time (prefer Date)
-      row.EmployeeID || '',
-      row.ObjectName1 || '',
-      row.PersonnelType || '',
-      row.location || '',
-      row.CardNumber || '',
-      row.AdmitCode || '',
-      row.Direction || '',
-      row.Door || '',
-      row.Rejection_Type || ''
-    ];
-
-    const wrow = worksheet.addRow(rowVals);
-
-    // Apply formatting & styling to the row's cells (columns indexes are 1-based)
-    try {
-      // LocaleMessageTime -> full datetime format
-      if (localeDate) {
-        const c = wrow.getCell(1);
-        c.numFmt = 'dd-mmm-yyyy h:mm:ss AM/PM';
-        c.alignment = { vertical: 'middle', horizontal: 'left' };
-      }
-
-      // DateOnly -> date-only format
-      if (dateOnlyDate) {
-        const c2 = wrow.getCell(2);
-        c2.numFmt = 'dd-mmm-yy';
-        c2.alignment = { vertical: 'middle', horizontal: 'center' };
-      }
-
-      // Swipe_Time -> time-only format as requested
-      if (swipeDate) {
-        const c3 = wrow.getCell(3);
-        c3.numFmt = 'h:mm:ss AM/PM';
-        c3.alignment = { vertical: 'middle', horizontal: 'center' };
-      }
-
-      // other cells: thin border + left alignment (you can tweak)
-      for (let ci = 4; ci <= headers.length; ci++) {
-        const cell = wrow.getCell(ci);
-        if (!cell.alignment) cell.alignment = { vertical: 'middle', horizontal: 'left' };
-      }
-
-      // apply thin border to all cells in this row (helps readability)
-      wrow.eachCell((cell) => {
-        if (!cell.border) cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
-      });
-    } catch (e) {
-      // styling in streaming mode can occasionally throw for certain edge cases; log and continue
-      console.warn('row styling warning', e && e.message ? e.message : e);
-    }
-
-    wrow.commit();
-    worksheet.__written++;
-  });
-
-  request.on('done', async () => {
-    try {
-      if (worksheet) {
-        try { worksheet.commit(); } catch (e) { /* ignore */ }
-      }
-      await safeCommit();
-    } catch (err) {
-      console.error('Workbook commit error', err);
-    } finally {
-      try { res.end(); } catch (e) {}
-    }
-  });
-
-  // trigger the streaming query
-  request.query(query).catch(async (err) => {
-    console.error('request.query failed', err);
-    try { await safeCommit(); } catch (e) {}
-    try { res.end(); } catch (e) {}
-  });
-}
-
-
-
-
-
-export async function rejectionReport(region, { startDate, endDate, location } = {}) {
-  if (!region) throw new Error('region required');
-  if (!startDate || !endDate) throw new Error('startDate and endDate required');
-
-  // const pool = await getPool(region);
-  // const req = pool.request();
-
-   const pool = await getPool(region);
-  const req = pool.request();
-  // increase timeout for this request (ms) — set to 5 minutes
-  req.timeout = 300000;
-
-
-  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
-
-  req.input('location', sql.NVarChar(200), locationParam);
-  req.input('startDate', sql.Date, startDate);
-  req.input('endDate', sql.Date, endDate);
-
-  const query = `
-WITH CombinedQuery AS(
-  SELECT 
-     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-     t1.ObjectName1,
-     t1.PartitionName2       AS location,
-     t5_card.CardNumber,
-     t5_admit.value          AS AdmitCode,
-     t5_dir.value            AS Direction,
-     t1.ObjectName2          AS Door,
-     t5_rej.value            AS Rejection_Type,
-     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
-          THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-     END                       AS EmployeeID,
-     t3.Name                  AS PersonnelType,
-     t1.MessageType,
-     t1.XmlGUID
-  FROM ACVSUJournalLog AS t1
-  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
-  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
-  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
-    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
-  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
-  LEFT JOIN (
-    SELECT GUID, [value]
-    FROM ACVSUJournalLogxmlShred
-    WHERE [Name] IN ('Card','CHUID')
-  ) AS SCard ON t1.XmlGUID = SCard.GUID
-  OUTER APPLY (
-    SELECT COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
-      SCard.[value]
-    ) AS CardNumber
-  ) AS t5_card
-  LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
-    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-  WHERE
-    t1.MessageType = 'CardRejected'
-    AND (@location IS NULL OR t1.PartitionName2 = @location)
-    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
-),
-Unified AS (
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Lost'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Clearance'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type IN ('CardDisabled','Disabled')
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Stolen'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'Expired'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'PIN'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'UnknownCard'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'SiteCode'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'NotActivated'
-  UNION ALL
-  SELECT * FROM CombinedQuery WHERE Rejection_Type = 'FacilityCode'
-)
-SELECT
-  LocaleMessageTime,
-  CONVERT(date,    LocaleMessageTime) AS DateOnly,
-  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type
-FROM Unified
-ORDER BY LocaleMessageTime DESC;
-`;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-// // backend/services/reportService.js
-export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
-  const pool = await getPool('emea');
-  const req  = pool.request();
-
-  req.input('fromDate', sql.Date, from);
-  req.input('toDate',   sql.Date, to);
-  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
-  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
-
-  const query = `
-
-  -- expects parameters: @fromDate (DATE), @toDate (DATE), @employees (NVARCHAR(MAX) | NULL)
-DECLARE @empCSV NVARCHAR(MAX) = @employees;
-
-;WITH EmpList AS (
-  SELECT LTRIM(RTRIM(value)) AS emp
-  FROM STRING_SPLIT(ISNULL(@empCSV,''), ',')
-  WHERE LTRIM(RTRIM(value)) <> ''
-)
-
--- Raw rows: compute LocaleMessageTime once and use OUTER APPLY to avoid duplicate shreddes
-, RawSwipes AS (
-  SELECT
-    t1.ObjectName1,
-    t1.ObjectName2,
-    t1.MessageType,
-    t2.Text12       AS EmployeeID,
-    CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID,
-    t3.Name         AS PersonnelType,
-    t1.PartitionName2 AS PartitionName2,
-
-    -- compute local wall-clock once (DO NOT change sign here; using your -1 * MessageLocaleOffset)
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-
-    -- direction/value picked by OUTER APPLY (single row)
-    CASE
-      WHEN dir.Value = 'InDirection'  THEN 'IN'
-      WHEN dir.Value = 'OutDirection' THEN 'OUT'
-      ELSE 'Unknown'
-    END AS Swipe,
-
-    card.Value AS CardNumber
-  FROM ACVSUJournal_00011028.dbo.ACVSUJournalLog AS t1
-  INNER JOIN ACVSCore.Access.Personnel     AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-  INNER JOIN ACVSCore.Access.PersonnelType AS t3
-    ON t2.PersonnelTypeId = t3.ObjectID
-
-  -- pick at most one direction shred row (InDirection/OutDirection)
-  OUTER APPLY (
-    SELECT TOP (1) s.Value
-    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
-    WHERE s.GUID = t1.XmlGUID
-      AND s.Value IN ('InDirection','OutDirection')
-  ) AS dir
-
-  -- pick at most one numeric card value (exclude direction values, ensure numeric)
-  OUTER APPLY (
-    SELECT TOP (1) s.Value
-    FROM ACVSUJournal_00011028.dbo.ACVSUJournalLogxmlShred AS s
-    WHERE s.GUID = t1.XmlGUID
-      AND s.Value NOT IN ('InDirection','OutDirection')
-      AND s.Value NOT LIKE '%[^0-9]%'
-      AND s.Value IS NOT NULL
-      AND LTRIM(RTRIM(s.Value)) <> ''
-  ) AS card
-)
-
--- Strict time window: >= 08:00 on @fromDate, and < 08:00 on @toDate
-, Windowed AS (
-  SELECT *
-  FROM RawSwipes
-  WHERE
-    LocaleMessageTime >= DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
-    -- NOTE: removed extra DATEADD(DAY,1,...) — upper bound should be < toDate 08:00
-    AND LocaleMessageTime <  DATEADD(HOUR, 8, CAST(@toDate AS DATETIME))
-    AND Swipe IN ('IN','OUT') -- only real swipes
-)
-
--- final projection + optional employee filter (supports CSV of names or IDs)
-SELECT
-  ObjectName1,
-  ObjectName2,
-  PersonnelType,
-  EmployeeID,
-  NumericEmployeeID,
-  -- alias PartitionName2 -> location so frontend sees r.location
-  PartitionName2 AS location,
-  -- alias MessageType -> Messagetype so frontend sees r.Messagetype
-  MessageType AS Messagetype,
-  Swipe,
-  CardNumber,
-  LocaleMessageTime
-FROM Windowed w
-WHERE
-  (
-    @empCSV IS NULL
-    OR LTRIM(RTRIM(@empCSV)) = ''
-    OR EXISTS (
-      SELECT 1
-      FROM EmpList e
-      WHERE
-        e.emp = LTRIM(RTRIM(w.ObjectName1))
-        OR e.emp = w.EmployeeID
-        OR e.emp = w.NumericEmployeeID
-    )
-  )
-ORDER BY LocaleMessageTime;
-
-`;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-
-
-
-
-
-/**
- * In-vs-Out Report (parameterized) — groups by employee & month
- */
-export async function inOutReport(region, { year, month, doors }) {
- // const pool = await getPool(region);
-  // const req  = pool.request();
-
-    const pool = await getPool(region);
-  const req = pool.request();
-  // increase timeout for this request (ms) — set to 5 minutes
-  req.timeout = 300000;
-
-
-  req.input('TargetYear',  sql.Int, year);
-  req.input('TargetMonth', sql.Int, month);
-  doors.forEach((d, i) => req.input(`door${i}`, sql.NVarChar, d));
-  const doorList = doors.map((_, i) => `@door${i}`).join(',');
-
-  const query = `
-WITH CombinedQuery AS (
-  SELECT
-    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-    t1.ObjectName1,
-    t1.PartitionName2    AS location,
-    t5_card.CardNumber,
-    t5_dir.value         AS Direction,
-    CASE
-      WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-      ELSE CAST(t2.Int1 AS NVARCHAR)
-    END                    AS EmployeeID,
-    t3.Name               AS PersonnelType
-  FROM ACVSUJournalLog AS t1
-  LEFT JOIN ACVSCore.Access.Personnel     AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-  LEFT JOIN ACVSCore.Access.PersonnelType AS t3
-    ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN ACVSUJournalLogxmlShred AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID
-    AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournalLogxml AS t_xml
-    ON t1.XmlGUID = t_xml.GUID
-  LEFT JOIN (
-    SELECT GUID, [value]
-    FROM ACVSUJournalLogxmlShred
-    WHERE [Name] IN ('Card','CHUID')
-  ) AS SCard
-    ON t1.XmlGUID = SCard.GUID
-  OUTER APPLY (
-    SELECT COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
-      SCard.[value]
-    ) AS CardNumber
-  ) AS t5_card
-  WHERE
-    YEAR(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetYear
-    AND MONTH(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetMonth
-    AND t1.ObjectName2 IN (${doorList})
-)
-SELECT
-  FORMAT(LocaleMessageTime,'yyyy-MM')    AS Month,
-  ObjectName1                           AS EmployeeName,
-  EmployeeID,
-  PersonnelType,
-  location,
-  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)  AS In_Count,
-  SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS Out_Count,
-  COUNT(*)                                                 AS TotalSwipes,
-  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)
-  - SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS InOut_Difference
-FROM CombinedQuery
-GROUP BY FORMAT(LocaleMessageTime,'yyyy-MM'),
-         ObjectName1, EmployeeID, PersonnelType, location
-ORDER BY Month DESC, EmployeeName;
-`;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-
-
-/**
- * Time Duration Report (parameterized by region, partition, startDate)
- */
-export async function timeDurationReport(region, { partition = 'Default', startDate }) {
-  // const pool = await getPool(region);
-  // const req  = pool.request();
-
-    const pool = await getPool(region);
- const req = pool.request();
- // increase timeout for this request (ms) — set to 5 minutes
-  req.timeout = 300000;
-
-
-  // bind inputs
-  const fullPartition = `${region.toUpperCase()}.${partition}`;
-  req.input('partition', sql.NVarChar, fullPartition);
-  req.input('startDate', sql.Date, startDate);
-
-  const query = `
-
-SELECT 
-    t1.[ObjectName1],
-    t1.[ObjectName2],
-    t1.[PartitionName2],
-    CASE
-        WHEN t2.[Int1] = 0 THEN t2.[Text12]
-        ELSE CAST(t2.[Int1] AS NVARCHAR)
-    END AS EmployeeID,
-    t3.[Name] AS PersonnelType,
-    t2.text5,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-    DATEADD(HOUR, -2, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS AdjustedMessageTime
-INTO 
-    #CombinedEmployeeData
-FROM 
-    [ACVSUJournal_00010029].[dbo].[ACVSUJournalLog] AS t1
-INNER JOIN 
-    [ACVSCore].[Access].[Personnel] AS t2
-    ON t1.ObjectIdentity1 = t2.GUID
-INNER JOIN 
-    [ACVSCore].[Access].[PersonnelType] AS t3
-    ON t2.[PersonnelTypeId] = t3.[ObjectID];
-
--- Step 2: Daily duration per employee
-WITH DailyDurations AS (
-    SELECT 
-        [ObjectName1],
-        PersonnelType,
-        EmployeeID,
-        [PartitionName2],
-        text5,
-        CONVERT(DATE, AdjustedMessageTime) AS ShiftedDate,
-        DATEPART(WEEK, AdjustedMessageTime) AS WeekNumber,
-        DATEPART(YEAR, AdjustedMessageTime) AS YearNumber,
-        MIN(LocaleMessageTime) AS FirstSwipeTime,
-        MAX(LocaleMessageTime) AS LastSwipeTime,
-        DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) AS DurationMinutes,
-        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) / 60 AS NVARCHAR), 2)
-        + ':' +
-        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) % 60 AS NVARCHAR), 2) AS DurationHHMM,
-        CASE 
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 5 THEN '<5mins'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 10 THEN '<10mins'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 20 THEN '<20mins'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 30 THEN '<30mins'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 60 THEN '<1hr'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 120 THEN 'Less than <2hrs'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 180 THEN 'Less than <3hrs'
-            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 240 THEN 'Less than <4hrs'
-            ELSE '4+ hrs'
-        END AS TimeDiffCategory
-    FROM 
-        #CombinedEmployeeData
-
-
-
-  WHERE CONVERT(DATE, AdjustedMessageTime) >= @startDate
-
-   AND [PartitionName2] = 'APAC.Default'
-        AND PersonnelType IN ('Employee', 'Terminated Personnel')
-    GROUP BY 
-        [ObjectName1], EmployeeID, PersonnelType, text5, [PartitionName2],
-        CONVERT(DATE, AdjustedMessageTime),
-        DATEPART(WEEK, AdjustedMessageTime),
-        DATEPART(YEAR, AdjustedMessageTime)
-),
-
--- Step 3: Weekly summary
-WeeklySummary AS (
-    SELECT 
-        EmployeeID,
-        [ObjectName1],
-        PersonnelType,
-        text5,
-        [PartitionName2],
-        YearNumber,
-        WeekNumber,
-        COUNT(DISTINCT ShiftedDate) AS DaysPresentInWeek,
-        SUM(CASE WHEN DurationMinutes < 240 THEN 1 ELSE 0 END) AS ViolationDaysInWeek
-    FROM 
-        DailyDurations
-    GROUP BY 
-        EmployeeID, [ObjectName1], PersonnelType, text5, [PartitionName2], YearNumber, WeekNumber
-)
-
--- Step 4: Final output with daily duration, category, and defaulter flag
-SELECT 
-    dd.EmployeeID,
-    dd.ObjectName1,
-    dd.PersonnelType,
-    dd.text5,
-    dd.PartitionName2,
-    dd.YearNumber,
-    dd.WeekNumber,
-    dd.ShiftedDate,
-    dd.FirstSwipeTime,
-    dd.LastSwipeTime,
-    dd.DurationHHMM,
-    dd.TimeDiffCategory,
-    ws.DaysPresentInWeek,
-    ws.ViolationDaysInWeek,
-    (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) AS CleanDaysInWeek,
-    CASE
-        WHEN (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) < 3 THEN 'Yes'
-        ELSE 'No'
-    END AS Defaulter
-FROM 
-    DailyDurations dd
-JOIN 
-    WeeklySummary ws
-    ON dd.EmployeeID = ws.EmployeeID
-    AND dd.WeekNumber = ws.WeekNumber
-    AND dd.YearNumber = ws.YearNumber
-ORDER BY 
-    dd.YearNumber DESC, dd.WeekNumber DESC, dd.EmployeeID, dd.ShiftedDate;
-  `;
-
-  const { recordset } = await req.query(query);
-  return recordset;
-}
-
-
-//EUROC 
-
-
-
-
-export async function eurocAdmitRejectionReport(region, { reportDate }) {
-  // const pool = await getPool(region);
-  // const req  = pool.request();
-
-    const pool = await getPool(region);
-  const req = pool.request();
-  // increase timeout for this request (ms) — set to 5 minutes
-  req.timeout = 300000;
-
-
-  // enforce location LT.Vilnius (as requested)
-  req.input('location', sql.NVarChar, 'LT.Vilnius');
-  // reportDate should be YYYY-MM-DD or Date — bind as sql.Date
-  req.input('reportDate', sql.Date, reportDate);
-
-  const query = `
-/*
-  Approach:
-  1) Build CombinedQuery as a CTE and SELECT INTO #Combined (materialize)
-  2) Build #Admits (with ROW_NUMBER) and #Rejections from #Combined
-  3) Return three resultsets: admits (rn=1), rejections (all), summary (counts)
-*/
-
-WITH CombinedQuery AS(
-  SELECT 
-     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-     t1.ObjectName1,
-     t1.PartitionName2       AS location,
-     t5_card.CardNumber,
-     t5_admit.value          AS AdmitCode,
-     t5_dir.value            AS Direction,
-     t1.ObjectName2          AS Door,
-     t5_rej.value            AS Rejection_Type,
-     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
-          THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-     END                       AS EmployeeID,
-     t3.Name                  AS PersonnelType,
-     t1.MessageType,
-     t1.XmlGUID
-  FROM ACVSUJournalLog AS t1
-  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
-  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
-  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_admit
-    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
-  LEFT JOIN ACVSUJournalLogxmlShred       AS t5_dir
-    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
-  LEFT JOIN ACVSUJournalLogxml             AS t_xml ON t1.XmlGUID = t_xml.GUID
-  LEFT JOIN (
-    SELECT GUID, [value]
-    FROM ACVSUJournalLogxmlShred
-    WHERE [Name] IN ('Card','CHUID')
-  ) AS SCard ON t1.XmlGUID = SCard.GUID
-  OUTER APPLY (
-    SELECT COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
-      SCard.[value]
-    ) AS CardNumber
-  ) AS t5_card
-  LEFT JOIN ACVSUJournalLogxmlShred AS t5_rej
-    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-  WHERE
-    t1.MessageType IN ('CardAdmitted' , 'CardRejected')
-    AND t1.PartitionName2 = @location
-    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @reportDate
-)
-
--- materialize CombinedQuery into a temp table
-SELECT
-  LocaleMessageTime,
-  CONVERT(date, LocaleMessageTime) AS DateOnly,
-  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type,
-  MessageType
-INTO #Combined
-FROM CombinedQuery;
-
--- create admits with row number (first admit per employee)
-SELECT
-  LocaleMessageTime,
-  DateOnly,
-  Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type,
-  ROW_NUMBER() OVER (PARTITION BY ISNULL(EmployeeID, CardNumber) ORDER BY LocaleMessageTime ASC) AS rn
-INTO #Admits
-FROM #Combined
-WHERE MessageType = 'CardAdmitted'
-  AND PersonnelType IN('Employee', 'Terminated Personnel');
-
--- create rejections (all)
-SELECT
-  LocaleMessageTime,
-  DateOnly,
-  Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type
-INTO #Rejections
-FROM #Combined
-WHERE MessageType = 'CardRejected';
-
--- resultset 1: admits (only rn = 1)
-SELECT
-  LocaleMessageTime,
-  DateOnly,
-  Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type
-FROM #Admits
-WHERE rn = 1
-ORDER BY LocaleMessageTime ASC;
-
--- resultset 2: rejections (all)
-SELECT
-  LocaleMessageTime,
-  DateOnly,
-  Swipe_Time,
-  EmployeeID,
-  ObjectName1,
-  PersonnelType,
-  location,
-  CardNumber,
-  AdmitCode,
-  Direction,
-  Door,
-  Rejection_Type
-FROM #Rejections
-ORDER BY LocaleMessageTime ASC;
-
--- resultset 3: summary counts by Rejection_Type
-SELECT
-  ISNULL(Rejection_Type, 'Unknown') AS Rejection_Type,
-  COUNT(*) AS CountVal
-FROM #Rejections
-GROUP BY ISNULL(Rejection_Type, 'Unknown')
-ORDER BY CountVal DESC;
-
--- cleanup temp tables (optional — they scope to the session and will go away automatically,
--- but good practice to drop)
-DROP TABLE IF EXISTS #Admits;
-DROP TABLE IF EXISTS #Rejections;
-DROP TABLE IF EXISTS #Combined;
-`;
-
-  const result = await req.query(query);
-  // result.recordsets is an array of resultsets
-  const recordsets = result.recordsets || [];
-  const admitRows = (recordsets[0] || []).map(r => ({
-    LocaleMessageTime: r.LocaleMessageTime,
-    DateOnly: r.DateOnly,
-    Swipe_Time: r.Swipe_Time,
-    ObjectName1: r.ObjectName1,
-    EmployeeID: r.EmployeeID,
-    PersonnelType: r.PersonnelType,
-    CardNumber: r.CardNumber,
-    Door: r.Door,
-    location: r.location,
-    Direction: r.Direction
-  }));
-  const rejectRows = (recordsets[1] || []).map(r => ({
-    LocaleMessageTime: r.LocaleMessageTime,
-    DateOnly: r.DateOnly,
-    Swipe_Time: r.Swipe_Time,
-    ObjectName1: r.ObjectName1,
-    EmployeeID: r.EmployeeID,
-    PersonnelType: r.PersonnelType,
-    CardNumber: r.CardNumber,
-    Rejection_Type: r.Rejection_Type,
-    Door: r.Door,
-    location: r.location,
-    Direction: r.Direction
-  }));
-  const summaryRows = (recordsets[2] || []).map(r => ({ Rejection_Type: r.Rejection_Type, Count: r.CountVal }));
-
-  return { admit: admitRows, rejection: rejectRows, summary: summaryRows };
-}
-
-
-
-
-
-
-
-
-
-
+only update two thing in Time duration 
 
 
 // C:\Users\W0024618\Desktop\global-page\frontend\src\pages\ReportsPage.jsx
@@ -2665,8 +829,266 @@ const generateRejectionExcel = async data => {
 //   };
 
 
+// const generateRawExcel = async (rows, opts = {}) => {
+//   // local helper to format Swipe times (kept from original)
+//   const formatTimeFromSwipe = (swipeIso) => {
+//     if (!swipeIso) return '';
+//     const dt = new Date(swipeIso);
+//     if (!isNaN(dt.getTime())) {
+//       return formatTimeFromServerISO(swipeIso);
+//     }
+//     const parts = ('' + swipeIso).split(':').map(p => parseInt(p || 0, 10));
+//     const hh = parts[0] || 0;
+//     const mm = parts[1] || 0;
+//     const ss = parts[2] || 0;
+//     const ampm = hh >= 12 ? 'PM' : 'AM';
+//     const hh12 = ((hh + 11) % 12) + 1;
+//     return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
+//   };
+
+//   const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase();
+
+//   const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
+//   const admitCol = 'AdmitCode';
+//   const rejCol = 'Rejection_Type';
+//   const tailCols = ['Direction','Door'];
+
+//   let headers = [...baseHeaders];
+//   if (admitFilter === 'all') {
+//     headers.push(admitCol, ...tailCols, rejCol);
+//   } else if (admitFilter === 'admit') {
+//     headers.push(admitCol, ...tailCols);
+//   } else if (admitFilter === 'reject') {
+//     headers.push(...tailCols, rejCol);
+//   } else {
+//     headers.push(admitCol, ...tailCols, rejCol);
+//   }
+
+//   // If no rows, still create a single workbook with header row
+//   const wb = new ExcelJS.Workbook();
+
+//   // Safety/config
+//   const MAX_ROWS_PER_SHEET = 700000; // adjust to taste; keeps sheets reasonable in browser
+//   const AUTOSIZE_LIMIT = 20000; // only autosize columns if total rows < this (keeps memory down)
+
+//   // Helper: obtain year-month key for a row (e.g. "2025-01") or 'unknown'
+//   const monthKeyForRow = (r) => {
+//     try {
+//       const iso = getServerISO(r);
+//       if (iso) {
+//         const d = new Date(iso);
+//         if (!isNaN(d.getTime())) {
+//           const y = d.getUTCFullYear();
+//           const m = pad2(d.getUTCMonth() + 1);
+//           return `${y}-${m}`;
+//         }
+//       }
+//       if (r.DateOnly) {
+//         const dt = isoDateOnlyToLocalDate(r.DateOnly);
+//         if (dt) {
+//           const y = dt.getFullYear();
+//           const m = pad2(dt.getMonth() + 1);
+//           return `${y}-${m}`;
+//         }
+//       }
+//     } catch (e) { /* ignore */ }
+//     return 'unknown';
+//   };
+
+//   // Build map monthKey -> rows
+//   let rowsByMonth = {};
+//   if (Array.isArray(rows) && rows.length) {
+//     rows.forEach(r => {
+//       const key = monthKeyForRow(r);
+//       rowsByMonth[key] = rowsByMonth[key] || [];
+//       rowsByMonth[key].push(r);
+//     });
+//   } else {
+//     rowsByMonth['empty'] = [];
+//   }
+
+//   // If opts.from / opts.to indicate a single-month selection we might still have mixed month values from data;
+//   // but user requested splitting by month when range > 1 month — detect that:
+//   let shouldSplitByMonth = false;
+//   try {
+//     if (opts.from && opts.to) {
+//       const f = new Date(opts.from);
+//       const t = new Date(opts.to);
+//       if (!isNaN(f.getTime()) && !isNaN(t.getTime())) {
+//         // If more than 31 days or different month/year -> split by month
+//         const monthSpan = (t.getFullYear() - f.getFullYear()) * 12 + (t.getMonth() - f.getMonth());
+//         if (monthSpan >= 1) shouldSplitByMonth = true;
+//       }
+//     }
+//   } catch (e) { /* ignore */ }
+
+//   // Also force split if data huge
+//   if ((Array.isArray(rows) && rows.length > MAX_ROWS_PER_SHEET)) shouldSplitByMonth = true;
+
+//   // If not splitting by month, put everything into a single "Raw" sheet but still chunk by MAX_ROWS_PER_SHEET
+//   if (!shouldSplitByMonth) {
+//     // We'll create a single 'Raw' sheet and chunk into multiple "Raw Sheet 1/2/..." only if large.
+//     const allRows = Array.isArray(rows) ? rows : [];
+//     if (!allRows.length) {
+//       const ws = wb.addWorksheet('Raw');
+//       hideGridLines(ws);
+//       const hdr = ws.addRow(headers);
+//       applyHeaderStyles(hdr);
+//     } else {
+//       // chunk
+//       for (let i = 0; i < allRows.length; i += MAX_ROWS_PER_SHEET) {
+//         const chunk = allRows.slice(i, i + MAX_ROWS_PER_SHEET);
+//         const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
+//         const sheetName = (part === 1) ? 'Raw' : `Raw Sheet ${part}`;
+//         const ws = wb.addWorksheet(sheetName);
+//         hideGridLines(ws);
+//         const hdr = ws.addRow(headers);
+//         applyHeaderStyles(hdr);
+
+//         chunk.forEach(r => {
+//           const iso = getServerISO(r);
+//           const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
+//           const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
+//           const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+//           const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+//           const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+//           const fullObj = {
+//             LocaleMessageTime: localeMsgFormatted,
+//             DateOnly: dateOnlyFormatted,
+//             Swipe_Time: swipeTimeFormatted,
+//             EmployeeID: r.EmployeeID || '',
+//             ObjectName1: r.ObjectName1 || '',
+//             PersonnelType: r.PersonnelType || '',
+//             location: r.location || '',
+//             CardNumber: r.CardNumber || '',
+//             AdmitCode: r.AdmitCode || r.Messagetype || '',
+//             Direction: r.Direction || r.Swipe || '',
+//             Door: r.Door || r.ObjectName2 || '',
+//             Rejection_Type: r.Rejection_Type || ''
+//           };
+
+//           const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
+//           const added = ws.addRow(rowVals);
+//           added.eachCell(c => {
+//             c.border = THIN_BORDER;
+//             c.alignment = { vertical: 'middle', horizontal: 'left' };
+//           });
+//         });
+
+//         // autosize only when small overall to avoid heavy memory use
+//         if (allRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+//       }
+//     }
+//   } else {
+//     // Split by monthKey (and chunk each month)
+//     const monthKeys = Object.keys(rowsByMonth).sort(); // e.g. ["2025-01","2025-02",...]
+//     monthKeys.forEach(monthKey => {
+//       const monthRows = rowsByMonth[monthKey] || [];
+//       if (!monthRows.length) {
+//         // still create an empty month sheet for completeness
+//         const human = monthKey === 'unknown' ? 'Unknown' : (() => {
+//           const [y,m] = monthKey.split('-');
+//           const mm = parseInt(m,10);
+//           const monName = MONTH_ABBR[mm-1] || m;
+//           return `${monName}-${y}`;
+//         })();
+//         const ws = wb.addWorksheet(`${human} Sheet 1`);
+//         hideGridLines(ws);
+//         const hdr = ws.addRow(headers);
+//         applyHeaderStyles(hdr);
+//         return;
+//       }
+
+//       // convert monthKey into a human name
+//       const humanMonth = (monthKey === 'unknown') ? 'Unknown' : (() => {
+//         const [y,m] = monthKey.split('-');
+//         const mm = parseInt(m,10);
+//         const monName = MONTH_ABBR[mm-1] || m;
+//         return `${monName}-${y}`;
+//       })();
+
+//       for (let i = 0; i < monthRows.length; i += MAX_ROWS_PER_SHEET) {
+//         const chunk = monthRows.slice(i, i + MAX_ROWS_PER_SHEET);
+//         const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
+//         const sheetName = (part === 1) ? `${humanMonth} Sheet 1` : `${humanMonth} Sheet ${part}`;
+//         const ws = wb.addWorksheet(sheetName);
+//         hideGridLines(ws);
+//         const hdr = ws.addRow(headers);
+//         applyHeaderStyles(hdr);
+
+//         chunk.forEach(r => {
+//           const iso = getServerISO(r);
+//           const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
+//           const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
+//           const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+//           const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+//           const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+//           const fullObj = {
+//             LocaleMessageTime: localeMsgFormatted,
+//             DateOnly: dateOnlyFormatted,
+//             Swipe_Time: swipeTimeFormatted,
+//             EmployeeID: r.EmployeeID || '',
+//             ObjectName1: r.ObjectName1 || '',
+//             PersonnelType: r.PersonnelType || '',
+//             location: r.location || '',
+//             CardNumber: r.CardNumber || '',
+//             AdmitCode: r.AdmitCode || r.Messagetype || '',
+//             Direction: r.Direction || r.Swipe || '',
+//             Door: r.Door || r.ObjectName2 || '',
+//             Rejection_Type: r.Rejection_Type || ''
+//           };
+
+//           const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
+//           const added = ws.addRow(rowVals);
+//           added.eachCell(c => {
+//             c.border = THIN_BORDER;
+//             c.alignment = { vertical: 'middle', horizontal: 'left' };
+//           });
+//         });
+
+//         // autosize only when this month chunk is reasonably small
+//         if (monthRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+//       }
+//     });
+//   }
+
+//   // finalize filename & download
+//   const filename = buildRawFileName(opts);
+//   try {
+//     const buf = await wb.xlsx.writeBuffer();
+//     const blob = new Blob([buf], {
+//       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+//     });
+//     const link = document.createElement('a');
+//     link.href = URL.createObjectURL(blob);
+//     link.download = filename;
+//     link.click();
+//   } catch (err) {
+//     // If writeBuffer fails (memory/timeout), try a fallback: create a minimal "Too large" workbook message sheet
+//     console.error('generateRawExcel writeBuffer error', err);
+//     try {
+//       const fallbackWb = new ExcelJS.Workbook();
+//       const ws = fallbackWb.addWorksheet('Export_Failed');
+//       ws.getCell('A1').value = 'Export failed because the result set is too large for browser export.';
+//       ws.getCell('A2').value = 'Please reduce the date range (choose 1 month or less) or filter by location/employee and try again.';
+//       const buf2 = await fallbackWb.xlsx.writeBuffer();
+//       const blob2 = new Blob([buf2], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+//       const link2 = document.createElement('a');
+//       link2.href = URL.createObjectURL(blob2);
+//       link2.download = filename.replace('.xlsx', '_FAILED.xlsx');
+//       link2.click();
+//     } catch (e) {
+//       alert('Failed to generate raw export: ' + (e && e.message ? e.message : String(e)));
+//     }
+//   }
+// };
+
+
+
+
 const generateRawExcel = async (rows, opts = {}) => {
-  // local helper to format Swipe times (kept from original)
   const formatTimeFromSwipe = (swipeIso) => {
     if (!swipeIso) return '';
     const dt = new Date(swipeIso);
@@ -2700,14 +1122,11 @@ const generateRawExcel = async (rows, opts = {}) => {
     headers.push(admitCol, ...tailCols, rejCol);
   }
 
-  // If no rows, still create a single workbook with header row
   const wb = new ExcelJS.Workbook();
+  const MAX_ROWS_PER_SHEET = 700000;
+  const AUTOSIZE_LIMIT = 20000;
 
-  // Safety/config
-  const MAX_ROWS_PER_SHEET = 700000; // adjust to taste; keeps sheets reasonable in browser
-  const AUTOSIZE_LIMIT = 20000; // only autosize columns if total rows < this (keeps memory down)
-
-  // Helper: obtain year-month key for a row (e.g. "2025-01") or 'unknown'
+  // helper to split by month (same as existing)
   const monthKeyForRow = (r) => {
     try {
       const iso = getServerISO(r);
@@ -2731,7 +1150,6 @@ const generateRawExcel = async (rows, opts = {}) => {
     return 'unknown';
   };
 
-  // Build map monthKey -> rows
   let rowsByMonth = {};
   if (Array.isArray(rows) && rows.length) {
     rows.forEach(r => {
@@ -2743,113 +1161,134 @@ const generateRawExcel = async (rows, opts = {}) => {
     rowsByMonth['empty'] = [];
   }
 
-  // If opts.from / opts.to indicate a single-month selection we might still have mixed month values from data;
-  // but user requested splitting by month when range > 1 month — detect that:
+  // Decide whether to split by month — keep original logic
   let shouldSplitByMonth = false;
   try {
     if (opts.from && opts.to) {
       const f = new Date(opts.from);
       const t = new Date(opts.to);
       if (!isNaN(f.getTime()) && !isNaN(t.getTime())) {
-        // If more than 31 days or different month/year -> split by month
         const monthSpan = (t.getFullYear() - f.getFullYear()) * 12 + (t.getMonth() - f.getMonth());
         if (monthSpan >= 1) shouldSplitByMonth = true;
       }
     }
   } catch (e) { /* ignore */ }
-
-  // Also force split if data huge
   if ((Array.isArray(rows) && rows.length > MAX_ROWS_PER_SHEET)) shouldSplitByMonth = true;
 
-  // If not splitting by month, put everything into a single "Raw" sheet but still chunk by MAX_ROWS_PER_SHEET
-  if (!shouldSplitByMonth) {
-    // We'll create a single 'Raw' sheet and chunk into multiple "Raw Sheet 1/2/..." only if large.
-    const allRows = Array.isArray(rows) ? rows : [];
-    if (!allRows.length) {
-      const ws = wb.addWorksheet('Raw');
-      hideGridLines(ws);
-      const hdr = ws.addRow(headers);
-      applyHeaderStyles(hdr);
-    } else {
-      // chunk
-      for (let i = 0; i < allRows.length; i += MAX_ROWS_PER_SHEET) {
-        const chunk = allRows.slice(i, i + MAX_ROWS_PER_SHEET);
-        const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
-        const sheetName = (part === 1) ? 'Raw' : `Raw Sheet ${part}`;
-        const ws = wb.addWorksheet(sheetName);
-        hideGridLines(ws);
-        const hdr = ws.addRow(headers);
-        applyHeaderStyles(hdr);
+  // helper to style header and apply thick outside border after writing data
+  function applyHeaderAndBorders(ws, headerRowIndex = 1) {
+    const doorCol = headers.indexOf('Door') + 1; // 1-based
+    // style header row (headerRowIndex)
+    const headerRow = ws.getRow(headerRowIndex);
+    headerRow.eachCell((cell, idx) => {
+      cell.font = { bold: true };
+      cell.alignment = { horizontal: (idx === doorCol ? 'left' : 'center'), vertical: 'middle' };
+      cell.fill = HEADER_FILL;
+      // top thick and left/right thick edges handled below when we do outside border
+    });
+    // ensure thin border for all inner cells, then add thick outside border afterwards
+    ws.eachRow((row, rIdx) => {
+      row.eachCell((cell, cIdx) => {
+        // skip header for alignment only; borders we'll set here
+        cell.border = THIN_BORDER;
+        // alignment: Door left, others center
+        if (!cell.alignment) cell.alignment = { vertical: 'middle', horizontal: (cIdx === doorCol ? 'left' : 'center') };
+      });
+    });
 
-        chunk.forEach(r => {
-          const iso = getServerISO(r);
-          const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
-          const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
-          const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
-          const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
-          const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+    // Now apply thick outside border for header+data
+    const firstDataRow = headerRowIndex;
+    const lastDataRow = ws.lastRow ? ws.lastRow.number : headerRowIndex;
+    const firstCol = 1;
+    const lastCol = headers.length;
 
-          const fullObj = {
-            LocaleMessageTime: localeMsgFormatted,
-            DateOnly: dateOnlyFormatted,
-            Swipe_Time: swipeTimeFormatted,
-            EmployeeID: r.EmployeeID || '',
-            ObjectName1: r.ObjectName1 || '',
-            PersonnelType: r.PersonnelType || '',
-            location: r.location || '',
-            CardNumber: r.CardNumber || '',
-            AdmitCode: r.AdmitCode || r.Messagetype || '',
-            Direction: r.Direction || r.Swipe || '',
-            Door: r.Door || r.ObjectName2 || '',
-            Rejection_Type: r.Rejection_Type || ''
-          };
-
-          const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
-          const added = ws.addRow(rowVals);
-          added.eachCell(c => {
-            c.border = THIN_BORDER;
-            c.alignment = { vertical: 'middle', horizontal: 'left' };
-          });
-        });
-
-        // autosize only when small overall to avoid heavy memory use
-        if (allRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+    for (let r = firstDataRow; r <= lastDataRow; r++) {
+      for (let c = firstCol; c <= lastCol; c++) {
+        const cell = ws.getCell(r, c);
+        const border = {
+          top: (r === firstDataRow) ? { style: 'thick' } : (cell.border && cell.border.top ? cell.border.top : { style: 'thin' }),
+          bottom: (r === lastDataRow) ? { style: 'thick' } : (cell.border && cell.border.bottom ? cell.border.bottom : { style: 'thin' }),
+          left: (c === firstCol) ? { style: 'thick' } : (cell.border && cell.border.left ? cell.border.left : { style: 'thin' }),
+          right: (c === lastCol) ? { style: 'thick' } : (cell.border && cell.border.right ? cell.border.right : { style: 'thin' })
+        };
+        cell.border = border;
       }
     }
-  } else {
-    // Split by monthKey (and chunk each month)
-    const monthKeys = Object.keys(rowsByMonth).sort(); // e.g. ["2025-01","2025-02",...]
-    monthKeys.forEach(monthKey => {
-      const monthRows = rowsByMonth[monthKey] || [];
-      if (!monthRows.length) {
-        // still create an empty month sheet for completeness
-        const human = monthKey === 'unknown' ? 'Unknown' : (() => {
-          const [y,m] = monthKey.split('-');
-          const mm = parseInt(m,10);
-          const monName = MONTH_ABBR[mm-1] || m;
-          return `${monName}-${y}`;
-        })();
-        const ws = wb.addWorksheet(`${human} Sheet 1`);
-        hideGridLines(ws);
-        const hdr = ws.addRow(headers);
-        applyHeaderStyles(hdr);
-        return;
-      }
+  }
 
-      // convert monthKey into a human name
+  // Create sheets either single Raw or per month
+  const monthKeys = shouldSplitByMonth ? Object.keys(rowsByMonth).sort() : ['all'];
+  if (!shouldSplitByMonth) {
+    // all rows into a single sheet (or empty header if no rows)
+    const allRows = Array.isArray(rows) ? rows : [];
+    const parts = Math.max(1, Math.ceil(allRows.length / MAX_ROWS_PER_SHEET));
+    for (let p = 0; p < parts; p++) {
+      const chunk = allRows.slice(p * MAX_ROWS_PER_SHEET, (p + 1) * MAX_ROWS_PER_SHEET);
+      const wsName = (parts === 1) ? 'Raw' : `Raw Sheet ${p + 1}`;
+      const ws = wb.addWorksheet(wsName);
+      hideGridLines(ws);
+
+      // add header explicitly
+      const hdr = ws.addRow(headers);
+      applyHeaderStyles(hdr); // this reuses your helper to set header font/fill/alignment center; we'll override final borders later
+
+      // add all rows
+      chunk.forEach(r => {
+        const iso = getServerISO(r);
+        const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
+        const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
+        const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+        const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+        const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+        const fullObj = {
+          LocaleMessageTime: localeMsgFormatted,
+          DateOnly: dateOnlyFormatted,
+          Swipe_Time: swipeTimeFormatted,
+          EmployeeID: r.EmployeeID || '',
+          ObjectName1: r.ObjectName1 || '',
+          PersonnelType: r.PersonnelType || '',
+          location: r.location || '',
+          CardNumber: r.CardNumber || '',
+          AdmitCode: r.AdmitCode || r.Messagetype || '',
+          Direction: r.Direction || r.Swipe || '',
+          Door: r.Door || r.ObjectName2 || '',
+          Rejection_Type: r.Rejection_Type || ''
+        };
+
+        const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
+        const added = ws.addRow(rowVals);
+        // set row cell defaults; we'll finalize outside border later
+        added.eachCell(c => {
+          c.border = THIN_BORDER;
+          c.alignment = { vertical: 'middle', horizontal: 'left' }; // default; will be overridden by applyHeaderAndBorders
+        });
+      });
+
+      // autosize if small
+      if (allRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+
+      // finalize header alignment & thick outside border
+      applyHeaderAndBorders(ws, 1);
+    }
+  } else {
+    // split by month keys
+    const sortedKeys = Object.keys(rowsByMonth).sort();
+    sortedKeys.forEach(monthKey => {
+      const mrows = rowsByMonth[monthKey] || [];
       const humanMonth = (monthKey === 'unknown') ? 'Unknown' : (() => {
-        const [y,m] = monthKey.split('-');
-        const mm = parseInt(m,10);
+        const [y,m] = monthKey.split('-'); const mm = parseInt(m,10);
         const monName = MONTH_ABBR[mm-1] || m;
         return `${monName}-${y}`;
       })();
 
-      for (let i = 0; i < monthRows.length; i += MAX_ROWS_PER_SHEET) {
-        const chunk = monthRows.slice(i, i + MAX_ROWS_PER_SHEET);
+      for (let i = 0; i < mrows.length; i += MAX_ROWS_PER_SHEET) {
+        const chunk = mrows.slice(i, i + MAX_ROWS_PER_SHEET);
         const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
         const sheetName = (part === 1) ? `${humanMonth} Sheet 1` : `${humanMonth} Sheet ${part}`;
         const ws = wb.addWorksheet(sheetName);
         hideGridLines(ws);
+
         const hdr = ws.addRow(headers);
         applyHeaderStyles(hdr);
 
@@ -2884,13 +1323,13 @@ const generateRawExcel = async (rows, opts = {}) => {
           });
         });
 
-        // autosize only when this month chunk is reasonably small
-        if (monthRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+        if (mrows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+
+        applyHeaderAndBorders(ws, 1);
       }
     });
   }
 
-  // finalize filename & download
   const filename = buildRawFileName(opts);
   try {
     const buf = await wb.xlsx.writeBuffer();
@@ -2902,7 +1341,6 @@ const generateRawExcel = async (rows, opts = {}) => {
     link.download = filename;
     link.click();
   } catch (err) {
-    // If writeBuffer fails (memory/timeout), try a fallback: create a minimal "Too large" workbook message sheet
     console.error('generateRawExcel writeBuffer error', err);
     try {
       const fallbackWb = new ExcelJS.Workbook();
@@ -2910,7 +1348,7 @@ const generateRawExcel = async (rows, opts = {}) => {
       ws.getCell('A1').value = 'Export failed because the result set is too large for browser export.';
       ws.getCell('A2').value = 'Please reduce the date range (choose 1 month or less) or filter by location/employee and try again.';
       const buf2 = await fallbackWb.xlsx.writeBuffer();
-      const blob2 = new Blob([buf2], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const blob2 = new Blob([buf2], { type: 'application/vnd.openxmlformats-officedocument-spreadsheetml.sheet' });
       const link2 = document.createElement('a');
       link2.href = URL.createObjectURL(blob2);
       link2.download = filename.replace('.xlsx', '_FAILED.xlsx');
@@ -2920,7 +1358,6 @@ const generateRawExcel = async (rows, opts = {}) => {
     }
   }
 };
-
 
 
 
@@ -4171,9 +2608,4 @@ const resp = await axios.get('/api/reports/denver-attendance', {
     </LocalizationProvider>
   );
 }
-
-
-
-
-
 
