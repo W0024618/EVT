@@ -1,3 +1,275 @@
+const generateRawExcel = async (rows, opts = {}) => {
+  // local helper to format Swipe times (kept from original)
+  const formatTimeFromSwipe = (swipeIso) => {
+    if (!swipeIso) return '';
+    const dt = new Date(swipeIso);
+    if (!isNaN(dt.getTime())) {
+      return formatTimeFromServerISO(swipeIso);
+    }
+    const parts = ('' + swipeIso).split(':').map(p => parseInt(p || 0, 10));
+    const hh = parts[0] || 0;
+    const mm = parts[1] || 0;
+    const ss = parts[2] || 0;
+    const ampm = hh >= 12 ? 'PM' : 'AM';
+    const hh12 = ((hh + 11) % 12) + 1;
+    return `${hh12}:${pad2(mm)}:${pad2(ss)} ${ampm}`;
+  };
+
+  const admitFilter = (opts.rawAdmitFilter || 'all').toString().toLowerCase();
+
+  const baseHeaders = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber'];
+  const admitCol = 'AdmitCode';
+  const rejCol = 'Rejection_Type';
+  const tailCols = ['Direction','Door'];
+
+  let headers = [...baseHeaders];
+  if (admitFilter === 'all') {
+    headers.push(admitCol, ...tailCols, rejCol);
+  } else if (admitFilter === 'admit') {
+    headers.push(admitCol, ...tailCols);
+  } else if (admitFilter === 'reject') {
+    headers.push(...tailCols, rejCol);
+  } else {
+    headers.push(admitCol, ...tailCols, rejCol);
+  }
+
+  // If no rows, still create a single workbook with header row
+  const wb = new ExcelJS.Workbook();
+
+  // Safety/config
+  const MAX_ROWS_PER_SHEET = 100000; // adjust to taste; keeps sheets reasonable in browser
+  const AUTOSIZE_LIMIT = 20000; // only autosize columns if total rows < this (keeps memory down)
+
+  // Helper: obtain year-month key for a row (e.g. "2025-01") or 'unknown'
+  const monthKeyForRow = (r) => {
+    try {
+      const iso = getServerISO(r);
+      if (iso) {
+        const d = new Date(iso);
+        if (!isNaN(d.getTime())) {
+          const y = d.getUTCFullYear();
+          const m = pad2(d.getUTCMonth() + 1);
+          return `${y}-${m}`;
+        }
+      }
+      if (r.DateOnly) {
+        const dt = isoDateOnlyToLocalDate(r.DateOnly);
+        if (dt) {
+          const y = dt.getFullYear();
+          const m = pad2(dt.getMonth() + 1);
+          return `${y}-${m}`;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return 'unknown';
+  };
+
+  // Build map monthKey -> rows
+  let rowsByMonth = {};
+  if (Array.isArray(rows) && rows.length) {
+    rows.forEach(r => {
+      const key = monthKeyForRow(r);
+      rowsByMonth[key] = rowsByMonth[key] || [];
+      rowsByMonth[key].push(r);
+    });
+  } else {
+    rowsByMonth['empty'] = [];
+  }
+
+  // If opts.from / opts.to indicate a single-month selection we might still have mixed month values from data;
+  // but user requested splitting by month when range > 1 month — detect that:
+  let shouldSplitByMonth = false;
+  try {
+    if (opts.from && opts.to) {
+      const f = new Date(opts.from);
+      const t = new Date(opts.to);
+      if (!isNaN(f.getTime()) && !isNaN(t.getTime())) {
+        // If more than 31 days or different month/year -> split by month
+        const monthSpan = (t.getFullYear() - f.getFullYear()) * 12 + (t.getMonth() - f.getMonth());
+        if (monthSpan >= 1) shouldSplitByMonth = true;
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  // Also force split if data huge
+  if ((Array.isArray(rows) && rows.length > MAX_ROWS_PER_SHEET)) shouldSplitByMonth = true;
+
+  // If not splitting by month, put everything into a single "Raw" sheet but still chunk by MAX_ROWS_PER_SHEET
+  if (!shouldSplitByMonth) {
+    // We'll create a single 'Raw' sheet and chunk into multiple "Raw Sheet 1/2/..." only if large.
+    const allRows = Array.isArray(rows) ? rows : [];
+    if (!allRows.length) {
+      const ws = wb.addWorksheet('Raw');
+      hideGridLines(ws);
+      const hdr = ws.addRow(headers);
+      applyHeaderStyles(hdr);
+    } else {
+      // chunk
+      for (let i = 0; i < allRows.length; i += MAX_ROWS_PER_SHEET) {
+        const chunk = allRows.slice(i, i + MAX_ROWS_PER_SHEET);
+        const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
+        const sheetName = (part === 1) ? 'Raw' : `Raw Sheet ${part}`;
+        const ws = wb.addWorksheet(sheetName);
+        hideGridLines(ws);
+        const hdr = ws.addRow(headers);
+        applyHeaderStyles(hdr);
+
+        chunk.forEach(r => {
+          const iso = getServerISO(r);
+          const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
+          const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
+          const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+          const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+          const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+          const fullObj = {
+            LocaleMessageTime: localeMsgFormatted,
+            DateOnly: dateOnlyFormatted,
+            Swipe_Time: swipeTimeFormatted,
+            EmployeeID: r.EmployeeID || '',
+            ObjectName1: r.ObjectName1 || '',
+            PersonnelType: r.PersonnelType || '',
+            location: r.location || '',
+            CardNumber: r.CardNumber || '',
+            AdmitCode: r.AdmitCode || r.Messagetype || '',
+            Direction: r.Direction || r.Swipe || '',
+            Door: r.Door || r.ObjectName2 || '',
+            Rejection_Type: r.Rejection_Type || ''
+          };
+
+          const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
+          const added = ws.addRow(rowVals);
+          added.eachCell(c => {
+            c.border = THIN_BORDER;
+            c.alignment = { vertical: 'middle', horizontal: 'left' };
+          });
+        });
+
+        // autosize only when small overall to avoid heavy memory use
+        if (allRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+      }
+    }
+  } else {
+    // Split by monthKey (and chunk each month)
+    const monthKeys = Object.keys(rowsByMonth).sort(); // e.g. ["2025-01","2025-02",...]
+    monthKeys.forEach(monthKey => {
+      const monthRows = rowsByMonth[monthKey] || [];
+      if (!monthRows.length) {
+        // still create an empty month sheet for completeness
+        const human = monthKey === 'unknown' ? 'Unknown' : (() => {
+          const [y,m] = monthKey.split('-');
+          const mm = parseInt(m,10);
+          const monName = MONTH_ABBR[mm-1] || m;
+          return `${monName}-${y}`;
+        })();
+        const ws = wb.addWorksheet(`${human} Sheet 1`);
+        hideGridLines(ws);
+        const hdr = ws.addRow(headers);
+        applyHeaderStyles(hdr);
+        return;
+      }
+
+      // convert monthKey into a human name
+      const humanMonth = (monthKey === 'unknown') ? 'Unknown' : (() => {
+        const [y,m] = monthKey.split('-');
+        const mm = parseInt(m,10);
+        const monName = MONTH_ABBR[mm-1] || m;
+        return `${monName}-${y}`;
+      })();
+
+      for (let i = 0; i < monthRows.length; i += MAX_ROWS_PER_SHEET) {
+        const chunk = monthRows.slice(i, i + MAX_ROWS_PER_SHEET);
+        const part = Math.floor(i / MAX_ROWS_PER_SHEET) + 1;
+        const sheetName = (part === 1) ? `${humanMonth} Sheet 1` : `${humanMonth} Sheet ${part}`;
+        const ws = wb.addWorksheet(sheetName);
+        hideGridLines(ws);
+        const hdr = ws.addRow(headers);
+        applyHeaderStyles(hdr);
+
+        chunk.forEach(r => {
+          const iso = getServerISO(r);
+          const dateStr = iso ? formatDateFromServerISO(iso) : (r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '');
+          const timeStr = iso ? formatTimeFromServerISO(iso) : (r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '');
+          const localeMsgFormatted = iso ? `${dateStr} ${timeStr}` : (r.LocaleMessageTime || '');
+          const dateOnlyFormatted = r.DateOnly ? formatDateFromServerISO(r.DateOnly) : '';
+          const swipeTimeFormatted = r.Swipe_Time ? formatTimeFromSwipe(r.Swipe_Time) : '';
+
+          const fullObj = {
+            LocaleMessageTime: localeMsgFormatted,
+            DateOnly: dateOnlyFormatted,
+            Swipe_Time: swipeTimeFormatted,
+            EmployeeID: r.EmployeeID || '',
+            ObjectName1: r.ObjectName1 || '',
+            PersonnelType: r.PersonnelType || '',
+            location: r.location || '',
+            CardNumber: r.CardNumber || '',
+            AdmitCode: r.AdmitCode || r.Messagetype || '',
+            Direction: r.Direction || r.Swipe || '',
+            Door: r.Door || r.ObjectName2 || '',
+            Rejection_Type: r.Rejection_Type || ''
+          };
+
+          const rowVals = headers.map(h => (fullObj[h] !== undefined && fullObj[h] !== null) ? fullObj[h] : '');
+          const added = ws.addRow(rowVals);
+          added.eachCell(c => {
+            c.border = THIN_BORDER;
+            c.alignment = { vertical: 'middle', horizontal: 'left' };
+          });
+        });
+
+        // autosize only when this month chunk is reasonably small
+        if (monthRows.length < AUTOSIZE_LIMIT) autosizeColumns(ws);
+      }
+    });
+  }
+
+  // finalize filename & download
+  const filename = buildRawFileName(opts);
+  try {
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    link.click();
+  } catch (err) {
+    // If writeBuffer fails (memory/timeout), try a fallback: create a minimal "Too large" workbook message sheet
+    console.error('generateRawExcel writeBuffer error', err);
+    try {
+      const fallbackWb = new ExcelJS.Workbook();
+      const ws = fallbackWb.addWorksheet('Export_Failed');
+      ws.getCell('A1').value = 'Export failed because the result set is too large for browser export.';
+      ws.getCell('A2').value = 'Please reduce the date range (choose 1 month or less) or filter by location/employee and try again.';
+      const buf2 = await fallbackWb.xlsx.writeBuffer();
+      const blob2 = new Blob([buf2], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const link2 = document.createElement('a');
+      link2.href = URL.createObjectURL(blob2);
+      link2.download = filename.replace('.xlsx', '_FAILED.xlsx');
+      link2.click();
+    } catch (e) {
+      alert('Failed to generate raw export: ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Good Morning , Happy Diwali 
 Today i want to start from Report page..
 I just want to Update logic for Raw report when i run Query or when i try to pull report for APAC and month select jan to march ..
