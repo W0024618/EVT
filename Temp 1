@@ -1,3 +1,251 @@
+// reportService.js (top)
+import ExcelJS from 'exceljs';
+import sql from 'mssql'; // already used in your file
+import { getPool } from './dbPool'; // adjust to your actual pool helper import
+
+
+
+
+
+/**
+ * Stream raw report as an Excel file (multi-sheet split by month).
+ * Writes directly to res — does not load whole resultset into memory.
+ *
+ * Usage: call this from an Express route handler and do NOT also send other response content.
+ */
+export async function rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter = 'all' }) {
+  if (!region) throw new Error('region required');
+  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+
+  const pool = await getPool(region);
+  const request = pool.request();
+  // allow long running query on server side
+  request.timeout = 10 * 60 * 1000; // 10 minutes (adjust as needed)
+
+  // Accept NULL for location => all partitions
+  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
+  request.input('location', sql.NVarChar(200), locationParam);
+  request.input('startDate', sql.Date, startDate);
+  request.input('endDate', sql.Date, endDate);
+  request.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
+
+  // the same query you already have (kept identical)
+  const query = `...your existing SQL here...`; // replace with same query string you already use
+
+  // Prepare response headers for streaming xlsx
+  const filename = `Raw_${region}_${startDate.replace(/-/g,'')}_to_${endDate.replace(/-/g,'')}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-cache');
+
+  // Workbook writer streams directly to res
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: true, useStyles: true });
+
+  // We'll split into sheets by year-month (YYYY-MM). Track sheet state.
+  let currentMonthKey = null;
+  let worksheet = null;
+  let sheetIndexForMonth = {}; // track part numbers per month if > max per sheet
+  const MAX_ROWS_PER_SHEET = 100000; // server-side sheet chunk size (adjust if needed)
+  const headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','location','CardNumber','AdmitCode','Direction','Door','Rejection_Type'];
+
+  // helper to format human sheet name from monthKey
+  const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function humanMonthNameFromKey(key) {
+    if (!key || key === 'unknown') return 'Unknown';
+    const [y,m] = key.split('-');
+    const mm = parseInt(m,10);
+    const mon = MONTH_ABBR[mm - 1] || m;
+    return `${mon}-${y}`;
+  }
+
+  // helper to create a new worksheet for given monthKey (and part number)
+  function createWorksheetFor(monthKey) {
+    sheetIndexForMonth[monthKey] = (sheetIndexForMonth[monthKey] || 0) + 1;
+    const part = sheetIndexForMonth[monthKey];
+    const human = humanMonthNameFromKey(monthKey);
+    const name = part === 1 ? `${human} Sheet 1` : `${human} Sheet ${part}`;
+    const ws = workbook.addWorksheet(name);
+    // write header row
+    const headerRow = ws.addRow(headers);
+    headerRow.commit();
+    // return ws and current row count (we don't rely on ws.rowCount in streaming mode)
+    ws.__written = 1; // we track number of rows added to decide when to rotate sheets
+    return ws;
+  }
+
+  // extract month key from row values (row.LocaleMessageTime or DateOnly)
+  function monthKeyForRow(row) {
+    try {
+      const iso = row.LocaleMessageTime || row.DateOnly;
+      if (iso) {
+        const d = new Date(iso);
+        if (!isNaN(d.getTime())) {
+          const y = d.getUTCFullYear();
+          const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+          return `${y}-${m}`;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return 'unknown';
+  }
+
+  // enable streaming on request
+  request.stream = true;
+
+  // hook up streaming events
+  request.on('error', async (err) => {
+    console.error('SQL stream error', err);
+    try {
+      // abort workbook gracefully
+      await workbook.commit();
+    } catch (e) { /* ignore */ }
+    // ensure response ends
+    try { res.end(); } catch (e) {}
+  });
+
+  request.on('row', (row) => {
+    // determine which sheet to write to
+    const monthKey = monthKeyForRow(row);
+    if (!worksheet || monthKey !== currentMonthKey || (worksheet.__written >= MAX_ROWS_PER_SHEET)) {
+      // rotate / create new sheet
+      if (worksheet) {
+        worksheet.commit();
+      }
+      currentMonthKey = monthKey;
+      worksheet = createWorksheetFor(monthKey);
+    }
+
+    // create row values in same header order
+    const rowVals = [
+      row.LocaleMessageTime || '',
+      row.DateOnly || '',
+      row.Swipe_Time || '',
+      row.EmployeeID || '',
+      row.ObjectName1 || '',
+      row.PersonnelType || '',
+      row.location || '',
+      row.CardNumber || '',
+      row.AdmitCode || '',
+      row.Direction || '',
+      row.Door || '',
+      row.Rejection_Type || ''
+    ];
+    const wrow = worksheet.addRow(rowVals);
+    wrow.commit();
+    worksheet.__written++;
+  });
+
+  request.on('done', async () => {
+    try {
+      if (worksheet) worksheet.commit();
+      await workbook.commit(); // finalizes workbook and flushes to res
+    } catch (err) {
+      console.error('Workbook commit error', err);
+    } finally {
+      try { res.end(); } catch (e) {}
+    }
+  });
+
+  // finally execute the query (this starts the streaming)
+  request.query(query).catch(async (err) => {
+    console.error('request.query failed', err);
+    // ensure workbook/res closed
+    try { await workbook.commit(); } catch (e) {}
+    try { res.end(); } catch (e) {}
+  });
+}
+
+
+
+
+
+
+
+
+// reports.routes.js
+import express from 'express';
+import { rawReportStreamToResponse } from '../services/reportService'; // adjust path
+const router = express.Router();
+
+router.get('/raw-download', async (req, res) => {
+  try {
+    const region = req.query.region;
+    const startDate = req.query.startDate; // expect 'YYYY-MM-DD'
+    const endDate = req.query.endDate;
+    const location = req.query.location || null;
+    const admitFilter = req.query.admitFilter || 'all';
+
+    // Basic validation
+    if (!region || !startDate || !endDate) {
+      return res.status(400).json({ error: 'region, startDate and endDate required' });
+    }
+
+    // call streaming service — it writes directly to res and ends it
+    await rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter });
+  } catch (err) {
+    console.error('raw-download error', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to generate download' });
+    try { res.end(); } catch (e) {}
+  }
+});
+
+export default router;
+
+
+
+
+
+
+
+// inside handleGenerate when tab===1
+try {
+  setGeneratingMessage('Preparing raw export on server...');
+  setLoading(true);
+  const params = {
+    region,
+    startDate: toLocalYMD(new Date(from)),
+    endDate: toLocalYMD(new Date(to)),
+    admitFilter: rawAdmitFilter
+  };
+  if (selectedLocations && selectedLocations.length) params.location = selectedLocations.join(',');
+  const resp = await axios.get('/api/reports/raw-download', {
+    params,
+    responseType: 'blob',
+    timeout: 20 * 60 * 1000
+  });
+
+  // Pick filename from content-disposition if present
+  let filename = buildRawFileName({ region, from, to, rawAdmitFilter });
+  const cd = resp.headers['content-disposition'];
+  if (cd) {
+    const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
+    if (m && m[1]) filename = decodeURIComponent(m[1]);
+  }
+  const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+} catch (err) {
+  console.error('raw download failed', err);
+  alert('Failed to download raw report: ' + (err?.message || 'unknown error'));
+} finally {
+  setLoading(false);
+  setGeneratingMessage('');
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 When i Update export function we got error like 
 
 Aw Snaps 
