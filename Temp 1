@@ -1,3 +1,315 @@
+const handleGenerate = async () => {
+  const requirePermissionForTab = () => {
+    if (tab === 0) return ['gsoc_reports.daily_access', 'gsoc_reports'];
+    if (tab === 1) return ['gsoc_reports.raw', 'gsoc_reports'];
+    if (tab === 2) return ['gsoc_reports.rejection', 'gsoc_reports'];
+    if (tab === 3) return ['gsoc_reports.euroc', 'gsoc_reports'];
+    if (tab === 4) return ['gsoc_reports.time_duration', 'gsoc_reports'];
+    if (tab === 5) return ['headcount', `headcount.${region}`, 'global_access'];
+    if (tab === 6) return ['gsoc_reports.denver_monthly', 'gsoc_reports'];
+    return ['gsoc_reports'];
+  };
+
+  if (!auth.hasPermission(requirePermissionForTab())) {
+    alert('You do not have permission to generate this report.');
+    return;
+  }
+
+  const messages = {
+    0: 'Generating Daily Access report...',
+    1: 'Generating Raw report...',
+    2: 'Generating Rejection report...',
+    3: 'Generating EUROC Admit-Reject report...',
+    4: 'Generating Time Duration report...',
+    5: 'Opening HeadCount...',
+    6: 'Generating Denver Attendance report...'
+  };
+  setGeneratingMessage(messages[tab] || 'Generating report...');
+  setLoading(true);
+
+  try {
+    const baseParams = { region, location: location || undefined };
+
+    // ----- 0: Daily Access -----
+    if (tab === 0) {
+      const fromDateOnly = `${from.getFullYear()}-${pad2(from.getMonth() + 1)}-${pad2(from.getDate())}`;
+      const toDateOnly = `${to.getFullYear()}-${pad2(to.getMonth() + 1)}-${pad2(to.getDate())}`;
+
+      const params = {
+        ...baseParams,
+        from: fromDateOnly,
+        to: toDateOnly,
+        employees: selectedEmps.join(',')
+      };
+      const resp = await axios.get('/api/reports/daily-access', { params });
+      const rows = (resp.data && resp.data.data) || [];
+      await generateDailyAccessExcelFromRows(rows, { from: fromDateOnly, to: toDateOnly, selectedEmps, region });
+      return;
+    }
+
+    // ----- 1: Raw (UPDATED to use server-side streaming /raw-download) -----
+    if (tab === 1) {
+      // raw-download expects startDate/endDate as YYYY-MM-DD (use toLocalYMD)
+      const startDate = toLocalYMD(new Date(from));
+      const endDate = toLocalYMD(new Date(to));
+      const MULTI_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+      // collect requests to perform (we will download one blob per request)
+      const downloads = [];
+
+      const pushDownload = (regionParam, locationParam = undefined) => {
+        const params = { region: regionParam, startDate, endDate, admitFilter: rawAdmitFilter };
+        if (locationParam) params.location = locationParam;
+        downloads.push(params);
+      };
+
+      // build download jobs according to region/global and selectedLocations:
+      if (region === 'global') {
+        if (selectedLocations && selectedLocations.length) {
+          // group by region-key derived from location prefix (e.g. "US.Denver" -> "us")
+          const regionMap = {};
+          selectedLocations.forEach(loc => {
+            const parts = String(loc).split('.');
+            const rKey = (parts[0] || '').toString().toLowerCase();
+            regionMap[rKey] = regionMap[rKey] || [];
+            regionMap[rKey].push(loc);
+          });
+          Object.entries(regionMap).forEach(([rKey, locs]) => {
+            if (MULTI_REGIONS.includes(rKey)) {
+              // for known region key call raw-download once per location (keeps server filter narrow)
+              locs.forEach(loc => pushDownload(rKey, loc));
+            } else {
+              // unknown prefix -> call without region (backend may treat as partition)
+              locs.forEach(loc => pushDownload(undefined, loc));
+            }
+          });
+        } else {
+          // no specific locations => request each known region
+          MULTI_REGIONS.forEach(r => pushDownload(r));
+        }
+      } else {
+        // single region selected
+        if (selectedLocations && selectedLocations.length) {
+          selectedLocations.forEach(loc => pushDownload(region, loc));
+        } else {
+          pushDownload(region);
+        }
+      }
+
+      // If no downloads added (shouldn't happen), add current region
+      if (!downloads.length) pushDownload(region);
+
+      // perform the downloads sequentially to avoid overwhelming client/network
+      for (const params of downloads) {
+        try {
+          setGeneratingMessage(`Preparing server export for ${params.region || params.location || 'region'}...`);
+          const resp = await axios.get('/api/reports/raw-download', {
+            params,
+            responseType: 'blob',
+            timeout: 20 * 60 * 1000, // 20 minutes
+            headers: {
+              Accept: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream'
+            }
+          });
+
+          // determine filename
+          let filename = buildRawFileName({
+            region: params.region || 'RAW',
+            location: params.location || (Array.isArray(selectedLocations) ? selectedLocations.join(',') : location),
+            from,
+            to,
+            rawAdmitFilter
+          });
+
+          // prefer Content-Disposition if server provided it
+          const cd = resp.headers['content-disposition'];
+          if (cd) {
+            const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
+            if (m && m[1]) {
+              try { filename = decodeURIComponent(m[1]); } catch (e) { filename = m[1]; }
+            }
+          }
+
+          const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(blob);
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          // cleanup
+          setTimeout(() => {
+            URL.revokeObjectURL(link.href);
+            try { document.body.removeChild(link); } catch (e) {}
+          }, 5000);
+        } catch (err) {
+          console.error('raw download failed for params', params, err);
+          let msg = `Failed to download raw report for ${params.region || params.location || 'region'}`;
+          if (err?.response?.data) {
+            msg += `: ${err.response?.data?.detail || err.message || JSON.stringify(err.response.data)}`;
+          } else if (err?.message) {
+            msg += `: ${err.message}`;
+          }
+          // show error but continue with other downloads
+          alert(msg);
+        }
+      }
+
+      return;
+    }
+
+    // ----- 2: Rejection -----
+    if (tab === 2) {
+      const params = { ...baseParams, startDate: formatLocalDate(from), endDate: formatLocalDate(to, true) };
+      const resp = await axios.get('/api/reports/rejection', { params });
+      const startDate = new Date(from); startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(to); endDate.setHours(23, 59, 59, 999);
+      const rowsSrc = (resp.data && resp.data.data) || [];
+      const rows = rowsSrc.filter(r => {
+        const date = r.DateOnly ? isoDateOnlyToLocalDate(r.DateOnly) : new Date(r.LocaleMessageTime);
+        return date >= startDate && date <= endDate;
+      });
+      await generateRejectionExcel(rows);
+      return;
+    }
+
+    // ----- 3: EUROC Admit-Reject (single day) -----
+    if (tab === 3) {
+      if (region.toLowerCase() !== 'emea') {
+        alert('EUROC report is only available for region EMEA. Please select EMEA.');
+        return;
+      }
+      if (!from) {
+        alert('Please select a date (From) for EUROC report.');
+        return;
+      }
+
+      const dateParam = toLocalYMD(new Date(from));
+      const params = { region: 'emea', date: dateParam };
+      if (selectedLocations && selectedLocations.length) params.locations = selectedLocations.join(',');
+      const resp = await axios.get('/api/reports/euroc-admit-rejection', { params });
+      const { data } = resp.data || {};
+      // (existing EUROC generation code kept unchanged)
+      // ... (existing code block in your file to build EUROC excel) ...
+      // For brevity here, call same logic you already have (it lives in the file).
+      // (Assumes that block remains unchanged in your file.)
+      return;
+    }
+
+    // ----- 4: Time Duration -----
+    if (tab === 4) {
+      if (!from || !to) {
+        alert('Please select both Start Date and End Date for Time Duration report.');
+        return;
+      }
+      const startParam = toLocalYMD(new Date(from));
+      const endParam = toLocalYMD(new Date(to));
+      const params = {
+        region,
+        startDate: startParam,
+        endDate: endParam,
+        partition: location ? location.split('.').pop() : 'Default'
+      };
+      const resp = await axios.get('/api/reports/time-duration', { params });
+      await generateTimeDurationExcel(resp.data.data || []);
+      return;
+    }
+
+    // ----- 5: HeadCount / External navigation -----
+    if (tab === 5) {
+      const permCandidates = [`headcount.${region}`, 'headcount', 'global_access'];
+      if (!auth.hasPermission(permCandidates)) {
+        alert(`You do not have permission to view HeadCount for ${region.toUpperCase()}.`);
+        setLoading(false);
+        return;
+      }
+      // navigation code unchanged...
+      // (existing code in your file)
+      return;
+    }
+
+    // ----- 6: Denver Monthly -----
+    if (tab === 6) {
+      try {
+        let params = {};
+        if (from && to) {
+          params = { from_date: toLocalYMD(new Date(from)), to_date: toLocalYMD(new Date(to)) };
+        } else if (from) {
+          const d = new Date(from);
+          params = { year: d.getFullYear(), month: d.getMonth() + 1 };
+        } else {
+          const dt = new Date(); dt.setDate(1); dt.setHours(0,0,0,0); dt.setMonth(dt.getMonth() - 1);
+          params = { year: dt.getFullYear(), month: dt.getMonth() + 1 };
+        }
+
+        const resp = await axios.get('/api/reports/denver-attendance', {
+          params,
+          responseType: 'blob',
+          timeout: 20 * 60 * 1000,
+          headers: { Accept: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream' }
+        });
+
+        let filename = 'denver_attendance.xlsx';
+        if (params.from_date && params.to_date) filename = `denver_attendance_${params.from_date.replace(/-/g,'')}_to_${params.to_date.replace(/-/g,'')}.xlsx`;
+        else if (params.year && params.month) filename = `denver_attendance_${params.year}${String(params.month).padStart(2,'0')}.xlsx`;
+
+        const cd = resp.headers['content-disposition'];
+        if (cd) {
+          const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
+          if (m && m[1]) filename = decodeURIComponent(m[1]);
+        }
+
+        const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const link = document.createElement('a');
+        link.href = window.URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+      } catch (err) {
+        console.error('Denver attendance download error', err);
+        let msg = 'Failed to download Denver attendance report';
+        if (err?.response?.data) {
+          msg += `: ${err.response?.data?.detail || err.message || JSON.stringify(err.response.data)}`;
+        } else if (err?.message) {
+          msg += `: ${err.message}`;
+        }
+        alert(msg);
+      }
+      return;
+    }
+
+  } catch (err) {
+    console.error('handleGenerate error:', err);
+    let msg = 'Failed to generate report';
+    if (err?.response?.data) {
+      const d = err.response.data;
+      const serverMsg = (typeof d === 'string') ? d : (d.error || d.message || JSON.stringify(d));
+      msg += `: ${serverMsg}`;
+    } else if (err?.message) {
+      msg += `: ${err.message}`;
+    }
+    alert(msg);
+  } finally {
+    setLoading(false);
+    setGeneratingMessage('');
+  }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i have update backend services and router file as per above suggestion 
 i dont unferstand how to apply below 
 handleGetanrate finction in 
