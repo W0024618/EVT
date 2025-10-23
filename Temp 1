@@ -1,639 +1,9 @@
-# import_cameras.py (updated)
-# Usage:
-#  set env vars: DB_SERVER, DB_NAME, DB_USER, DB_PASS
-#  python import_cameras.py --excel "Camera-door_details-updated.xlsx" [--create-table]
-import os, argparse, pandas as pd, pyodbc, sys
+Lets check below error carefully and 
+Note - there is no Camera Details in database camera has diffrent platform Provided excel data is in our camera details We dont have camera database ...
 
-DDL_CREATE = """
-IF OBJECT_ID('dbo.cameras','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.cameras (
-    camera_id NVARCHAR(128) PRIMARY KEY,
-    camera_name NVARCHAR(256),
-    camera_type NVARCHAR(64),
-    ip_address NVARCHAR(128),
-    rtsp_url NVARCHAR(1024),
-    username NVARCHAR(128),
-    password NVARCHAR(256),
-    door_id NVARCHAR(128),
-    location NVARCHAR(256),
-    coverage_zone NVARCHAR(64),
-    resolution NVARCHAR(32),
-    fps FLOAT,
-    preferred BIT,
-    notes NVARCHAR(MAX),
-    created_at DATETIME2 DEFAULT SYSUTCDATETIME()
-  );
-END
-"""
 
-def select_driver():
-    drivers = [d for d in pyodbc.drivers() if d and 'ODBC Driver' in d]
-    if not drivers:
-        raise RuntimeError('No ODBC Driver found. Install "ODBC Driver 18 for SQL Server" or "ODBC Driver 17".')
-    return drivers[-1]
 
-def get_conn():
-    server = os.environ.get('DB_SERVER')
-    database = os.environ.get('DB_NAME')
-    user = os.environ.get('DB_USER')
-    password = os.environ.get('DB_PASS')
-    if not all([server,database,user,password]):
-        raise RuntimeError('Set DB_SERVER, DB_NAME, DB_USER, DB_PASS environment variables before running.')
-    driver = select_driver()
-    conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password};Encrypt=yes;TrustServerCertificate=yes;"
-    return pyodbc.connect(conn_str, timeout=30)
 
-def normalize_pref(v):
-    s = str(v).strip().lower()
-    if s in ('yes','true','1'): return 1
-    if s in ('no','false','0'): return 0
-    return None
-
-def main(excel_path, create_table=False):
-    if not os.path.exists(excel_path):
-        print("ERROR: Excel file not found:", excel_path); sys.exit(1)
-    df = pd.read_excel(excel_path, sheet_name='Cameras', dtype=str).fillna('')
-    conn = get_conn()
-    cur = conn.cursor()
-    if create_table:
-        print("Creating table dbo.cameras if it does not exist...")
-        cur.execute(DDL_CREATE)
-        conn.commit()
-        print("DDL executed.")
-    # Verify table exists before inserts
-    try:
-        cur.execute("SELECT TOP 1 camera_id FROM dbo.cameras")
-    except Exception as e:
-        print("ERROR: dbo.cameras not found or not accessible. Either run DDL in SSMS or run with --create-table. Detail:", e)
-        cur.close(); conn.close()
-        sys.exit(1)
-
-    sql = """INSERT INTO dbo.cameras
-      (camera_id,camera_name,camera_type,ip_address,rtsp_url,username,password,door_id,location,coverage_zone,resolution,fps,preferred,notes)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
-    rowcount = 0
-    for _, r in df.iterrows():
-        fps_raw = str(r.get('fps','')).strip()
-        fps_val = float(fps_raw) if fps_raw!='' else None
-        pref_val = normalize_pref(r.get('preferred',''))
-        params = (
-            str(r.get('camera_id','')).strip(),
-            str(r.get('camera_name','')).strip(),
-            str(r.get('camera_type','')).strip(),
-            str(r.get('ip_address','')).strip(),
-            str(r.get('rtsp_url','')).strip(),
-            str(r.get('username','')).strip(),
-            str(r.get('password','')).strip(),
-            str(r.get('door_id','')).strip(),
-            str(r.get('location','')).strip(),
-            str(r.get('coverage_zone','')).strip(),
-            str(r.get('resolution','')).strip(),
-            fps_val,
-            pref_val,
-            str(r.get('notes','')).strip()
-        )
-        try:
-            cur.execute(sql, params)
-            rowcount += 1
-        except pyodbc.IntegrityError as ie:
-            print("SKIP (primary key exists) camera_id=", params[0], ie)
-        except Exception as e:
-            print("ERROR inserting row:", params[0], e)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("Import complete. Rows inserted (attempted):", rowcount)
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--excel', default='Camera-door_details-updated.xlsx')
-    ap.add_argument('--create-table', action='store_true', help='Create dbo.cameras table if missing')
-    args = ap.parse_args()
-    main(args.excel, args.create_table)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# test_rtsp.py (ffmpeg backed, safe timeout)
-# Usage: python test_rtsp.py --excel Camera-door_details-updated.xlsx --timeout 8
-import argparse, subprocess, csv, shlex, os, sys
-import pandas as pd
-from pathlib import Path
-
-def ffmpeg_probe_frame(rtsp, out_image, timeout=8):
-    # Use -rtsp_transport tcp, take 1 frame, timeout (subprocess.run timeout)
-    cmd = ['ffmpeg','-rtsp_transport','tcp','-y','-i', rtsp, '-frames:v', '1', '-t', '5', out_image]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=timeout)
-        return os.path.exists(out_image)
-    except subprocess.CalledProcessError:
-        return False
-    except subprocess.TimeoutExpired:
-        return False
-    except FileNotFoundError:
-        print("ERROR: ffmpeg not found. Install ffmpeg and add to PATH: https://ffmpeg.org/download.html")
-        sys.exit(2)
-
-def main(excel, timeout):
-    if not Path(excel).exists():
-        print("Excel not found:", excel); return
-    df = pd.read_excel(excel, sheet_name='Cameras', dtype=str).fillna('')
-    results = []
-    out_csv = Path("rtsp_test_results.csv")
-    for i, r in df.iterrows():
-        cam = str(r.get('camera_id','')).strip()
-        rtsp = str(r.get('rtsp_url','')).strip()
-        if not rtsp:
-            results.append((cam, rtsp, 'NO_URL'))
-            continue
-        tmp_out = f"probe_{i}.jpg"
-        ok = ffmpeg_probe_frame(rtsp, tmp_out, timeout=timeout)
-        if ok and os.path.exists(tmp_out):
-            os.remove(tmp_out)
-            results.append((cam, rtsp, 'OK'))
-        else:
-            results.append((cam, rtsp, 'FAIL'))
-        # flush to CSV each iteration to avoid data loss on ctrl-c
-        pd.DataFrame(results, columns=['camera_id','rtsp_url','status']).to_csv(out_csv, index=False)
-    print("Finished. Results written to", out_csv)
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument('--excel', default='Camera-door_details-updated.xlsx')
-    p.add_argument('--timeout', type=int, default=8, help='timeout per RTSP probe (seconds)')
-    args = p.parse_args()
-    main(args.excel, args.timeout)
-
-
-
-
-
-
-
-
-
-# clip_extractor.py (updated)
-import argparse, subprocess, shutil, sys
-from pathlib import Path
-
-def find_ffmpeg():
-    ff = shutil.which('ffmpeg')
-    return ff
-
-def main(rtsp, out, pre=5, post=10):
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        print("ERROR: ffmpeg not found on PATH. Download from https://ffmpeg.org/download.html and add to PATH.")
-        sys.exit(1)
-    total = int(pre) + int(post)
-    cmd = [ffmpeg, '-rtsp_transport', 'tcp', '-y', '-i', rtsp, '-t', str(total), '-c', 'copy', out]
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd)
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument('--rtsp', required=True)
-    p.add_argument('--out', required=True)
-    p.add_argument('--pre', type=int, default=5)
-    p.add_argument('--post', type=int, default=10)
-    args = p.parse_args()
-    main(args.rtsp, args.out, args.pre, args.post)
-
-
-
-
-
-
-
-
-
-# from C:\projects\yolo_project\camera_files
-$uri='https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt'
-Invoke-WebRequest -Uri $uri -OutFile .\yolov8n.pt -UseBasicParsing -TimeoutSec 120
-
-
-
-
-
-# go to project root
-cd C:\projects\yolo_project
-Get-Location
-# list camera files
-Get-ChildItem .\camera_files
-
-
-
-
-# ensure venv active first
-.\.venv\Scripts\Activate.ps1
-
-# set environment variables for DB connection (choose correct server/db)
-$env:DB_SERVER = "SRVWUPNQ0986V"
-$env:DB_NAME   = "ACVSUJournal_00010030"
-$env:DB_USER   = "GSOC_Test"
-$env:DB_PASS   = "Westernccure@2025"
-
-# from camera_files folder:
-cd .\camera_files
-
-# run import with create-table (this will create dbo.cameras if permission allows)
-python import_cameras.py --excel "Camera-door_details-updated.xlsx" --create-table
-
-
-
-
-
-
-
-# ensure env vars still set (see B2)
-python import_cameras.py --excel "Camera-door_details-updated.xlsx"
-
-
-
-ffmpeg -version
-
-
-pip install pandas openpyxl pyodbc opencv-python-headless
-
-
-
-# sample usage - replace with real RTSP
-python clip_extractor.py --rtsp "rtsp://user:pass@10.0.0.5/stream" --out swipe_test.mp4 --pre 5 --post 10
-
-
-
-
-# example: after putting yolov8n.pt into C:\projects\yolo_project\camera_files
-python ..\yolo_infer.py --model .\yolov8n.pt --source .\swipe_test.mp4
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-(.venv) PS C:\projects\yolo_project> python fetch_swipes.py --region apac  --start 2025-10-20 --end 2025-10-23 --location "Pune" --filter ADMIT
-Done. Rows exported: 22399. CSV: swipe_results.csv. Images dir: images
-(.venv) PS C:\projects\yolo_project> cd camera_files
-(.venv) PS C:\projects\yolo_project\camera_files> # set DB env vars (example)
->> $env:DB_SERVER = "SRVWUPNQ0986V"    # choose appropriate server from your region
->> $env:DB_NAME   = "ACVSUJournal_00010030"
->> $env:DB_USER   = "GSOC_Test"
->> $env:DB_PASS   = "Westernccure@2025"
->> # then run
->> pip install pyodbc pandas openpyxl
->> python import_cameras.py --excel "Camera-door_details-updated.xlsx"
-Requirement already satisfied: pyodbc in c:\projects\yolo_project\.venv\lib\site-packages (5.3.0)
-Collecting pandas
-  Downloading pandas-2.3.3-cp313-cp313-win_amd64.whl.metadata (19 kB)
-Collecting openpyxl
-  Using cached openpyxl-3.1.5-py2.py3-none-any.whl.metadata (2.5 kB)
-Requirement already satisfied: numpy>=1.26.0 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.2.6)
-Requirement already satisfied: python-dateutil>=2.8.2 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.9.0.post0)
-Collecting pytz>=2020.1 (from pandas)
-  Using cached pytz-2025.2-py2.py3-none-any.whl.metadata (22 kB)
-Collecting tzdata>=2022.7 (from pandas)
-  Using cached tzdata-2025.2-py2.py3-none-any.whl.metadata (1.4 kB)
-Collecting et-xmlfile (from openpyxl)
-  Using cached et_xmlfile-2.0.0-py3-none-any.whl.metadata (2.7 kB)
-Requirement already satisfied: six>=1.5 in c:\projects\yolo_project\.venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
-Downloading pandas-2.3.3-cp313-cp313-win_amd64.whl (11.0 MB)
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11.0/11.0 MB 16.7 MB/s eta 0:00:00
-Using cached openpyxl-3.1.5-py2.py3-none-any.whl (250 kB)
-Using cached pytz-2025.2-py2.py3-none-any.whl (509 kB)
-Using cached tzdata-2025.2-py2.py3-none-any.whl (347 kB)
-Using cached et_xmlfile-2.0.0-py3-none-any.whl (18 kB)
-Installing collected packages: pytz, tzdata, et-xmlfile, pandas, openpyxl
-Successfully installed et-xmlfile-2.0.0 openpyxl-3.1.5 pandas-2.3.3 pytz-2025.2 tzdata-2025.2          
-
-[notice] A new release of pip is available: 25.1.1 -> 25.2
-[notice] To update, run: python.exe -m pip install --upgrade pip
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 68, in <module>
-    main(args.excel)
-    ~~~~^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 58, in main
-    cur.execute(sql, params)
-    ~~~~~~~~~~~^^^^^^^^^^^^^
-pyodbc.ProgrammingError: ('42S02', "[42S02] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid object name 'dbo.cameras'. (208) (SQLExecDirectW); [42S02] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Statement(s) could not be prepared. (8180)")
-(.venv) PS C:\projects\yolo_project\camera_files> pip install opencv-python-headless pandas openpyxl
-Requirement already satisfied: opencv-python-headless in c:\projects\yolo_project\.venv\lib\site-packages (4.12.0.88)
-Requirement already satisfied: pandas in c:\projects\yolo_project\.venv\lib\site-packages (2.3.3)
-Requirement already satisfied: openpyxl in c:\projects\yolo_project\.venv\lib\site-packages (3.1.5)    
-Requirement already satisfied: numpy<2.3.0,>=2 in c:\projects\yolo_project\.venv\lib\site-packages (from opencv-python-headless) (2.2.6)
-Requirement already satisfied: python-dateutil>=2.8.2 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.9.0.post0)
-Requirement already satisfied: pytz>=2020.1 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
-Requirement already satisfied: tzdata>=2022.7 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
-Requirement already satisfied: et-xmlfile in c:\projects\yolo_project\.venv\lib\site-packages (from openpyxl) (2.0.0)
-Requirement already satisfied: six>=1.5 in c:\projects\yolo_project\.venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
-
-[notice] A new release of pip is available: 25.1.1 -> 25.2
-[notice] To update, run: python.exe -m pip install --upgrade pip
-(.venv) PS C:\projects\yolo_project\camera_files> python test_rtsp.py --excel Camera-door_details-updated.xlsx
-[http @ 00000251d85333c0] Stream ends prematurely at 68852, should be 18446744073709551615
-[http @ 00000251d85333c0] Stream ends prematurely at 68852, should be 18446744073709551615
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 41, in <module>
-    main(args.excel)
-    ~~~~^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 29, in main
-    ok = try_open(rtsp, timeout=6)
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 12, in try_open
-    ret, frame = cap.read()
-                 ~~~~~~~~^^
-KeyboardInterrupt
-(.venv) PS C:\projects\yolo_project\camera_files> ^C
-(.venv) PS C:\projects\yolo_project\camera_files> ^C
-(.venv) PS C:\projects\yolo_project\camera_files> .\test_rtsp.ps1
-C:\projects\yolo_project\camera_files\test_rtsp.ps1 : door_camera_map_cleaned.csv not found. Export 
-Cameras sheet to this CSV.
-At line:1 char:1
-+ .\test_rtsp.ps1
-+ ~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
-    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,test_rtsp.ps1
-
-(.venv) PS C:\projects\yolo_project\camera_files> .\test_rtsp.ps1
-C:\projects\yolo_project\camera_files\test_rtsp.ps1 : door_camera_map_cleaned.csv not found. Export 
-Cameras sheet to this CSV.
-At line:1 char:1
-+ .\test_rtsp.ps1
-+ ~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
-    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,test_rtsp.ps1
-
-(.venv) PS C:\projects\yolo_project\camera_files> python test_rtsp.py --excel Camera-door_details-updated.xlsx
-[http @ 000001fdb37b33c0] Stream ends prematurely at 68852, should be 18446744073709551615
-[http @ 000001fdb37b33c0] Stream ends prematurely at 68852, should be 18446744073709551615
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 41, in <module>
-    main(args.excel)
-    ~~~~^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 29, in main
-    ok = try_open(rtsp, timeout=6)
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 12, in try_open
-    ret, frame = cap.read()
-                 ~~~~~~~~^^
-KeyboardInterrupt
-(.venv) PS C:\projects\yolo_project\camera_files> ^C
-(.venv) PS C:\projects\yolo_project\camera_files> ^C
-(.venv) PS C:\projects\yolo_project\camera_files> python yolo_infer.py --model .\yolov8n.pt --source .\swipe123_camA.mp4
-WARNING Download failure, retrying 1/3 https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt... <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Basic Constraints of CA cert not marked critical (_ssl.c:1028)>
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\yolo_infer.py", line 16, in <module>
-    main(args.model, args.source, args.conf, args.imgsz)
-    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\yolo_infer.py", line 6, in main
-    m = YOLO(model)
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\models\yolo\model.py", line 83, in
- __init__
-    super().__init__(model=model, task=task, verbose=verbose)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\engine\model.py", line 153, in __init__
-    self._load(model, task=task)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\engine\model.py", line 297, in _load
-    self.model, self.ckpt = load_checkpoint(weights)
-                            ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 1517, in load_checkpoint
-    ckpt, weight = torch_safe_load(weight)  # load ckpt
-                   ~~~~~~~~~~~~~~~^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 1464, in torch_safe_load
-    ckpt = torch_load(file, map_location="cpu")
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\utils\patches.py", line 120, in torch_load
-    return torch.load(*args, **kwargs)
-           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 1484, in load   
-    with _open_file_like(f, "rb") as opened_file:
-         ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 759, in _open_file_like
-    return _open_file(name_or_buffer, mode)
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 740, in __init__
-    super().__init__(open(name, mode))
-                     ~~~~^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: 'yolov8n.pt'
-(.venv) PS C:\projects\yolo_project\camera_files> python yolo_infer.py --model .\yolov8n.pt --source .\swipe123_camA.mp4
-WARNING Download failure, retrying 1/3 https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt... <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Basic Constraints of CA cert not marked critical (_ssl.c:1028)>
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-curl: (35) schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - The revocation function was unable to check revocation for the certificate.
-
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\yolo_infer.py", line 16, in <module>
-    main(args.model, args.source, args.conf, args.imgsz)
-    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\yolo_infer.py", line 6, in main
-    m = YOLO(model)
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\models\yolo\model.py", line 83, in
- __init__
-    super().__init__(model=model, task=task, verbose=verbose)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\engine\model.py", line 153, in __init__
-    self._load(model, task=task)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\engine\model.py", line 297, in _load
-    self.model, self.ckpt = load_checkpoint(weights)
-                            ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 1517, in load_checkpoint
-    ckpt, weight = torch_safe_load(weight)  # load ckpt
-                   ~~~~~~~~~~~~~~~^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 1464, in torch_safe_load
-    ckpt = torch_load(file, map_location="cpu")
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\ultralytics\utils\patches.py", line 120, in torch_load
-    return torch.load(*args, **kwargs)
-           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 1484, in load   
-    with _open_file_like(f, "rb") as opened_file:
-         ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 759, in _open_file_like
-    return _open_file(name_or_buffer, mode)
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 740, in __init__
-    super().__init__(open(name, mode))
-                     ~~~~^^^^^^^^^^^^
-FileNotFoundError: [Errno 2] No such file or directory: 'yolov8n.pt'
-(.venv) PS C:\projects\yolo_project\camera_files> mkdir C:\projects\yolo_project\camera_files
-mkdir : An item with the specified name C:\projects\yolo_project\camera_files already exists.
-At line:1 char:1
-+ mkdir C:\projects\yolo_project\camera_files
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ResourceExists: (C:\projects\yolo_project\camera_files:String) [New-Ite  
-   m], IOException
-    + FullyQualifiedErrorId : DirectoryExist,Microsoft.PowerShell.Commands.NewItemCommand
-
-(.venv) PS C:\projects\yolo_project\camera_files> ./yolo_project
-./yolo_project : The term './yolo_project' is not recognized as the name of a cmdlet, function, 
-script file, or operable program. Check the spelling of the name, or if a path was included, verify    
-that the path is correct and try again.
-At line:1 char:1
-+ ./yolo_project
-+ ~~~~~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (./yolo_project:String) [], CommandNotFoundException     
-    + FullyQualifiedErrorId : CommandNotFoundException
-
-(.venv) PS C:\projects\yolo_project\camera_files> ../
-../ : The term '../' is not recognized as the name of a cmdlet, function, script file, or operable 
-program. Check the spelling of the name, or if a path was included, verify that the path is correct    
-and try again.
-At line:1 char:1
-+ ../
-+ ~~~
-    + CategoryInfo          : ObjectNotFound: (../:String) [], CommandNotFoundException
-    + FullyQualifiedErrorId : CommandNotFoundException
-
-(.venv) PS C:\projects\yolo_project\camera_files> ../yolo_project
-../yolo_project : The term '../yolo_project' is not recognized as the name of a cmdlet, function, 
-script file, or operable program. Check the spelling of the name, or if a path was included, verify    
-that the path is correct and try again.
-At line:1 char:1
-+ ../yolo_project
-+ ~~~~~~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (../yolo_project:String) [], CommandNotFoundException    
-    + FullyQualifiedErrorId : CommandNotFoundException
-
-(.venv) PS C:\projects\yolo_project\camera_files> pip install pandas pyodbc openpyxl opencv-python-headless ultralytics
-Requirement already satisfied: pandas in c:\projects\yolo_project\.venv\lib\site-packages (2.3.3)
-Requirement already satisfied: pyodbc in c:\projects\yolo_project\.venv\lib\site-packages (5.3.0)
-Requirement already satisfied: openpyxl in c:\projects\yolo_project\.venv\lib\site-packages (3.1.5)    
-Requirement already satisfied: opencv-python-headless in c:\projects\yolo_project\.venv\lib\site-packages (4.12.0.88)
-Requirement already satisfied: ultralytics in c:\projects\yolo_project\.venv\lib\site-packages (8.3.220)
-Requirement already satisfied: numpy>=1.26.0 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.2.6)
-Requirement already satisfied: python-dateutil>=2.8.2 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.9.0.post0)
-Requirement already satisfied: pytz>=2020.1 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
-Requirement already satisfied: tzdata>=2022.7 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
-Requirement already satisfied: et-xmlfile in c:\projects\yolo_project\.venv\lib\site-packages (from openpyxl) (2.0.0)
-Requirement already satisfied: matplotlib>=3.3.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (3.10.7)
-Requirement already satisfied: opencv-python>=4.6.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (4.12.0.88)
-Requirement already satisfied: pillow>=7.1.2 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (11.3.0)
-Requirement already satisfied: pyyaml>=5.3.1 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (6.0.3)
-Requirement already satisfied: requests>=2.23.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (2.32.5)
-Requirement already satisfied: scipy>=1.4.1 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (1.16.2)
-Requirement already satisfied: torch>=1.8.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (2.9.0+cpu)
-Requirement already satisfied: torchvision>=0.9.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (0.24.0+cpu)
-Requirement already satisfied: psutil in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (7.1.1)
-Requirement already satisfied: polars in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (1.34.0)
-Requirement already satisfied: ultralytics-thop>=2.0.0 in c:\projects\yolo_project\.venv\lib\site-packages (from ultralytics) (2.0.17)
-Requirement already satisfied: contourpy>=1.0.1 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (1.3.3)
-Requirement already satisfied: cycler>=0.10 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (0.12.1)
-Requirement already satisfied: fonttools>=4.22.0 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (4.60.1)
-Requirement already satisfied: kiwisolver>=1.3.1 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (1.4.9)
-Requirement already satisfied: packaging>=20.0 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (25.0)
-Requirement already satisfied: pyparsing>=3 in c:\projects\yolo_project\.venv\lib\site-packages (from matplotlib>=3.3.0->ultralytics) (3.2.5)
-Requirement already satisfied: six>=1.5 in c:\projects\yolo_project\.venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
-Requirement already satisfied: charset_normalizer<4,>=2 in c:\projects\yolo_project\.venv\lib\site-packages (from requests>=2.23.0->ultralytics) (3.4.4)
-Requirement already satisfied: idna<4,>=2.5 in c:\projects\yolo_project\.venv\lib\site-packages (from requests>=2.23.0->ultralytics) (3.11)
-Requirement already satisfied: urllib3<3,>=1.21.1 in c:\projects\yolo_project\.venv\lib\site-packages (from requests>=2.23.0->ultralytics) (2.5.0)
-Requirement already satisfied: certifi>=2017.4.17 in c:\projects\yolo_project\.venv\lib\site-packages (from requests>=2.23.0->ultralytics) (2025.10.5)
-Requirement already satisfied: filelock in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (3.19.1)
-Requirement already satisfied: typing-extensions>=4.10.0 in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (4.15.0)
-Requirement already satisfied: sympy>=1.13.3 in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (1.14.0)
-Requirement already satisfied: networkx>=2.5.1 in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (3.5)
-Requirement already satisfied: jinja2 in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (3.1.6)
-Requirement already satisfied: fsspec>=0.8.5 in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (2025.9.0)
-Requirement already satisfied: setuptools in c:\projects\yolo_project\.venv\lib\site-packages (from torch>=1.8.0->ultralytics) (70.2.0)
-Requirement already satisfied: mpmath<1.4,>=1.1.0 in c:\projects\yolo_project\.venv\lib\site-packages (from sympy>=1.13.3->torch>=1.8.0->ultralytics) (1.3.0)
-Requirement already satisfied: MarkupSafe>=2.0 in c:\projects\yolo_project\.venv\lib\site-packages (from jinja2->torch>=1.8.0->ultralytics) (2.1.5)
-Requirement already satisfied: polars-runtime-32==1.34.0 in c:\projects\yolo_project\.venv\lib\site-packages (from polars->ultralytics) (1.34.0)
-
-[notice] A new release of pip is available: 25.1.1 -> 25.2
-[notice] To update, run: python.exe -m pip install --upgrade pip
-(.venv) PS C:\projects\yolo_project\camera_files> # set env vars to point to the target SQL Server (choose correct server/db)
->> $env:DB_SERVER = "SRVWUPNQ0986V"   # pick region server
->> $env:DB_NAME   = "ACVSUJournal_00010030"
->> $env:DB_USER   = "GSOC_Test"
->> $env:DB_PASS   = "Westernccure@2025"
->> cd .\camera_files
->> python import_cameras.py --excel "Camera-door_details-updated.xlsx"
-cd : Cannot find path 'C:\projects\yolo_project\camera_files\camera_files' because it does not exist.
-At line:6 char:1
-+ cd .\camera_files
-+ ~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (C:\projects\yol...es\camera_files:String) [Set-Locatio  
-   n], ItemNotFoundException
-    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.SetLocationCommand
-
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 68, in <module>
-    main(args.excel)
-    ~~~~^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 58, in main
-    cur.execute(sql, params)
-    ~~~~~~~~~~~^^^^^^^^^^^^^
-pyodbc.ProgrammingError: ('42S02', "[42S02] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid object name 'dbo.cameras'. (208) (SQLExecDirectW); [42S02] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Statement(s) could not be prepared. (8180)")
-(.venv) PS C:\projects\yolo_project\camera_files> cd .\camera_files
-cd : Cannot find path 'C:\projects\yolo_project\camera_files\camera_files' because it does not exist.
-At line:1 char:1
-+ cd .\camera_files
-+ ~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (C:\projects\yol...es\camera_files:String) [Set-Locatio  
-   n], ItemNotFoundException
-    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.SetLocationCommand
-
-(.venv) PS C:\projects\yolo_project\camera_files> python test_rtsp.py --excel "Camera-door_details-updated.xlsx"
-[http @ 000001abeaee33c0] Stream ends prematurely at 68852, should be 18446744073709551615
-[http @ 000001abeaee33c0] Stream ends prematurely at 68852, should be 18446744073709551615
-Traceback (most recent call last):
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 41, in <module>
-    main(args.excel)
-    ~~~~^^^^^^^^^^^^
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 29, in main
-    ok = try_open(rtsp, timeout=6)
-  File "C:\projects\yolo_project\camera_files\test_rtsp.py", line 12, in try_open
-    ret, frame = cap.read()
-                 ~~~~~~~~^^
-KeyboardInterrupt
-(.venv) PS C:\projects\yolo_project\camera_files> .\test_rtsp.ps1
-C:\projects\yolo_project\camera_files\test_rtsp.ps1 : door_camera_map_cleaned.csv not found. Export 
-Cameras sheet to this CSV.
-At line:1 char:1
-+ .\test_rtsp.ps1
-+ ~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
-    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,test_rtsp.ps1
-
-(.venv) PS C:\projects\yolo_project\camera_files> .\test_rtsp.ps1
->>
-C:\projects\yolo_project\camera_files\test_rtsp.ps1 : door_camera_map_cleaned.csv not found. Export 
-Cameras sheet to this CSV.
-At line:1 char:1
-+ .\test_rtsp.ps1
-+ ~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
-    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,test_rtsp.ps1
 
 (.venv) PS C:\projects\yolo_project\camera_files> python clip_extractor.py --rtsp "rtsp://user:pass@10.0.0.5/stream" --out swipe_test.mp4 --pre 5 --post 10
 Running: ffmpeg -rtsp_transport tcp -y -i rtsp://user:pass@10.0.0.5/stream -t 15 -c copy swipe_test.mp4
@@ -704,251 +74,120 @@ Traceback (most recent call last):
   File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 1484, in load   
     with _open_file_like(f, "rb") as opened_file:
          ~~~~~~~~~~~~~~~^^^^^^^^^
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 759, in _open_file_like
-    return _open_file(name_or_buffer, mode)
-  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 740, in __init__
+  File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 759, in _open_file_like                                                                                                    return _open_file(name_or_buffer, mode)                                                              File "C:\projects\yolo_project\.venv\Lib\site-packages\torch\serialization.py", line 740, in __init__
     super().__init__(open(name, mode))
                      ~~~~^^^^^^^^^^^^
 FileNotFoundError: [Errno 2] No such file or directory: 'yolov8n.pt'
+(.venv) PS C:\projects\yolo_project\camera_files> # from C:\projects\yolo_project\camera_files
+>> $uri='https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt'
+>> Invoke-WebRequest -Uri $uri -OutFile .\yolov8n.pt -UseBasicParsing -TimeoutSec 120
+(.venv) PS C:\projects\yolo_project\camera_files> # go to project root
+>> cd C:\projects\yolo_project
+>> Get-Location
+>> # list camera files
+>> Get-ChildItem .\camera_files
+>>
+
+Path
+----
+C:\projects\yolo_project
+
+LastWriteTime : 23-10-2025 17:52:59
+Length        : 16658
+Name          : Camera-door_details-updated.xlsx
+
+
+LastWriteTime : 23-10-2025 18:07:46
+Length        : 650
+Name          : camera_registry.sql
+
+
+LastWriteTime : 23-10-2025 19:07:28
+Length        : 930
+Name          : clip_extractor.py
+
+
+LastWriteTime : 23-10-2025 19:07:05
+Length        : 4412
+Name          : import_cameras.py
+
+
+LastWriteTime : 23-10-2025 18:40:21
+Length        : 621
+Name          : test_rtsp.ps1
+
+
+LastWriteTime : 23-10-2025 19:07:17
+Length        : 2201
+Name          : test_rtsp.py
+
+
+LastWriteTime : 23-10-2025 19:07:53
+Length        : 6549796
+Name          : yolov8n.pt
+
+
+LastWriteTime : 23-10-2025 18:43:07
+Length        : 647
+Name          : yolo_infer.py
+
+
+
+(.venv) PS C:\projects\yolo_project> # set environment variables for DB connection (choose correct server/db)
+>> $env:DB_SERVER = "SRVWUPNQ0986V"
+>> $env:DB_NAME   = "ACVSUJournal_00010030"
+>> $env:DB_USER   = "GSOC_Test"
+>> $env:DB_PASS   = "Westernccure@2025"
+>>
+>> # from camera_files folder:
+>> cd .\camera_files
+>>
+>> # run import with create-table (this will create dbo.cameras if permission allows)
+>> python import_cameras.py --excel "Camera-door_details-updated.xlsx" --create-table
+>>
+Creating table dbo.cameras if it does not exist...
+Traceback (most recent call last):
+  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 113, in <module>
+    main(args.excel, args.create_table)
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\projects\yolo_project\camera_files\import_cameras.py", line 61, in main
+    cur.execute(DDL_CREATE)
+    ~~~~~~~~~~~^^^^^^^^^^^^
+pyodbc.ProgrammingError: ('42000', "[42000] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]CREATE TABLE permission denied in database 'ACVSUJournal_00010030'. (262) (SQLExecDirectW)")
+(.venv) PS C:\projects\yolo_project\camera_files> python import_cameras.py --excel "Camera-door_details-updated.xlsx"
+>>
+ERROR: dbo.cameras not found or not accessible. Either run DDL in SSMS or run with --create-table. Detail: ('42S02', "[42S02] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid object name 'dbo.cameras'. (208) (SQLExecDirectW)")
+(.venv) PS C:\projects\yolo_project\camera_files> ffmpeg -version
+>>
+ffmpeg : The term 'ffmpeg' is not recognized as the name of a cmdlet, function, script file, or 
+operable program. Check the spelling of the name, or if a path was included, verify that the path is   
+correct and try again.
+At line:1 char:1
++ ffmpeg -version
++ ~~~~~~
+    + CategoryInfo          : ObjectNotFound: (ffmpeg:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(.venv) PS C:\projects\yolo_project\camera_files> pip install pandas openpyxl pyodbc opencv-python-headless
+>>
+Requirement already satisfied: pandas in c:\projects\yolo_project\.venv\lib\site-packages (2.3.3)
+Requirement already satisfied: openpyxl in c:\projects\yolo_project\.venv\lib\site-packages (3.1.5)
+Requirement already satisfied: pyodbc in c:\projects\yolo_project\.venv\lib\site-packages (5.3.0)      
+Requirement already satisfied: opencv-python-headless in c:\projects\yolo_project\.venv\lib\site-packages (4.12.0.88)
+Requirement already satisfied: numpy>=1.26.0 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.2.6)
+Requirement already satisfied: python-dateutil>=2.8.2 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2.9.0.post0)
+Requirement already satisfied: pytz>=2020.1 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
+Requirement already satisfied: tzdata>=2022.7 in c:\projects\yolo_project\.venv\lib\site-packages (from pandas) (2025.2)
+Requirement already satisfied: et-xmlfile in c:\projects\yolo_project\.venv\lib\site-packages (from openpyxl) (2.0.0)
+Requirement already satisfied: six>=1.5 in c:\projects\yolo_project\.venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
+
+[notice] A new release of pip is available: 25.1.1 -> 25.2
+[notice] To update, run: python.exe -m pip install --upgrade pip
+(.venv) PS C:\projects\yolo_project\camera_files> python clip_extractor.py --rtsp "rtsp://user:pass@10.0.0.5/stream" --out swipe_test.mp4 --pre 5 --post 10
+>>
+ERROR: ffmpeg not found on PATH. Download from https://ffmpeg.org/download.html and add to PATH.
+(.venv) PS C:\projects\yolo_project\camera_files> python ..\yolo_infer.py --model .\yolov8n.pt --source
+ .\swipe_test.mp4
+>>
+C:\projects\yolo_project\.venv\Scripts\python.exe: can't open file 'C:\\projects\\yolo_project\\yolo_infer.py': [Errno 2] No such file or directory
 (.venv) PS C:\projects\yolo_project\camera_files> 
-
-
-
-
-
-
-check above Console Details carefully and line by line and update each file carefully... check each file path ....
-
-
-C:\projects\yolo_project\camera_files\camera_registry.sql
-
-/* camera_registry.sql
-   Run this in SSMS (connected to the target database) once to create table.
-*/
-IF OBJECT_ID('dbo.cameras', 'U') IS NOT NULL
-  DROP TABLE dbo.cameras;
-GO
-
-CREATE TABLE dbo.cameras (
-  camera_id NVARCHAR(128) PRIMARY KEY,
-  camera_name NVARCHAR(256),
-  camera_type NVARCHAR(64),
-  ip_address NVARCHAR(128),
-  rtsp_url NVARCHAR(1024),
-  username NVARCHAR(128),
-  password NVARCHAR(256),
-  door_id NVARCHAR(128),
-  location NVARCHAR(256),
-  coverage_zone NVARCHAR(64),
-  resolution NVARCHAR(32),
-  fps FLOAT,
-  preferred BIT,
-  notes NVARCHAR(MAX),
-  created_at DATETIME2 DEFAULT SYSUTCDATETIME()
-);
-GO
-[]
-
-
-
-C:\projects\yolo_project\camera_files\clip_extractor.py
-
-
-# clip_extractor.py
-# Usage example:
-# python clip_extractor.py --rtsp "rtsp://user:pass@10.0.0.5/stream" --out swipe123_camA.mp4 --pre 5 --post 10
-import argparse, subprocess
-def main(rtsp, out, pre=5, post=10):
-    total = int(pre) + int(post)
-    # record for total seconds from live stream
-    cmd = ['ffmpeg','-rtsp_transport','tcp','-y','-i', rtsp, '-t', str(total), '-c','copy', out]
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd)
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument('--rtsp', required=True)
-    p.add_argument('--out', required=True)
-    p.add_argument('--pre', type=int, default=5)
-    p.add_argument('--post', type=int, default=10)
-    args = p.parse_args()
-    main(args.rtsp, args.out, args.pre, args.post)
-
-
-
-
-C:\projects\yolo_project\camera_files\import_cameras.py
-
-
-# import_cameras.py
-# Usage:
-# 1) set environment vars: DB_SERVER, DB_NAME, DB_USER, DB_PASS
-# 2) activate your venv with pyodbc installed
-# 3) python import_cameras.py --excel "Camera-door_details-updated.xlsx"
-import os, argparse, pandas as pd, pyodbc
-
-def select_driver():
-    drivers = [d for d in pyodbc.drivers() if d and 'ODBC Driver' in d]
-    if not drivers:
-        raise RuntimeError('No ODBC Driver found. Install "ODBC Driver 18 for SQL Server" or "ODBC Driver 17".')
-    return drivers[-1]
-
-def get_conn():
-    server = os.environ.get('DB_SERVER')
-    database = os.environ.get('DB_NAME')
-    user = os.environ.get('DB_USER')
-    password = os.environ.get('DB_PASS')
-    if not all([server,database,user,password]):
-        raise RuntimeError('Set DB_SERVER, DB_NAME, DB_USER, DB_PASS environment variables before running.')
-    driver = select_driver()
-    conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password};Encrypt=yes;TrustServerCertificate=yes;"
-    return pyodbc.connect(conn_str, timeout=30)
-
-def normalize_pref(v):
-    s = str(v).strip().lower()
-    if s in ('yes','true','1'): return 1
-    if s in ('no','false','0'): return 0
-    return None
-
-def main(excel_path):
-    df = pd.read_excel(excel_path, sheet_name='Cameras', dtype=str).fillna('')
-    conn = get_conn()
-    cur = conn.cursor()
-    sql = """INSERT INTO dbo.cameras
-      (camera_id,camera_name,camera_type,ip_address,rtsp_url,username,password,door_id,location,coverage_zone,resolution,fps,preferred,notes)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
-    for _, r in df.iterrows():
-        fps_raw = r.get('fps','').strip()
-        fps_val = float(fps_raw) if fps_raw!='' else None
-        pref_val = normalize_pref(r.get('preferred',''))
-        params = (
-            str(r.get('camera_id','')).strip(),
-            str(r.get('camera_name','')).strip(),
-            str(r.get('camera_type','')).strip(),
-            str(r.get('ip_address','')).strip(),
-            str(r.get('rtsp_url','')).strip(),
-            str(r.get('username','')).strip(),
-            str(r.get('password','')).strip(),
-            str(r.get('door_id','')).strip(),
-            str(r.get('location','')).strip(),
-            str(r.get('coverage_zone','')).strip(),
-            str(r.get('resolution','')).strip(),
-            fps_val,
-            pref_val,
-            str(r.get('notes','')).strip()
-        )
-        cur.execute(sql, params)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("Import complete.")
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--excel', default='Camera-door_details-updated.xlsx')
-    args = ap.parse_args()
-    main(args.excel)
-
-
-
-
-
-
-
-C:\projects\yolo_project\camera_files\test_rtsp.ps1
-
-# test_rtsp.ps1
-# Save Door_Camera_Map as CSV first (or use door_camera_map_cleaned.csv)
-$csv = "door_camera_map_cleaned.csv"
-if (-not (Test-Path $csv)) { Write-Error "$csv not found. Export Cameras sheet to this CSV."; exit 1 }
-$rows = Import-Csv $csv
-foreach ($r in $rows) {
-  $rtsp = $r.rtsp_url
-  $id = $r.camera_id
-  if (-not $rtsp) { Write-Host "$id - NO_URL"; continue }
-  $out = "$id-test.jpg"
-  ffmpeg -rtsp_transport tcp -y -i $rtsp -frames:v 1 -t 5 $out 2>$null
-  if (Test-Path $out) {
-    Write-Host "$id - OK (frame saved)"
-    Remove-Item $out
-  } else {
-    Write-Host "$id - FAIL"
-  }
-}
-
-
-
-
-
-C:\projects\yolo_project\camera_files\test_rtsp.py
-
-
-# test_rtsp.py
-# Usage: python test_rtsp.py --excel Camera-door_details-updated.xlsx
-import argparse, time, cv2, pandas as pd
-from pathlib import Path
-
-def try_open(url, timeout=6):
-    # use FFMPEG backend if available
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    start = time.time()
-    ok = False
-    while time.time() - start < timeout:
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            ok = True
-            break
-    cap.release()
-    return ok
-
-def main(excel):
-    df = pd.read_excel(excel, sheet_name='Cameras', dtype=str).fillna('')
-    results = []
-    for _, r in df.iterrows():
-        cam = r.get('camera_id','').strip()
-        rtsp = r.get('rtsp_url','').strip()
-        if not rtsp:
-            results.append((cam, rtsp, 'NO_URL'))
-            continue
-        try:
-            ok = try_open(rtsp, timeout=6)
-            results.append((cam, rtsp, 'OK' if ok else 'FAIL'))
-        except Exception as e:
-            results.append((cam, rtsp, f'ERROR:{e}'))
-    out = Path('rtsp_test_results.csv')
-    pd.DataFrame(results, columns=['camera_id','rtsp_url','status']).to_csv(out, index=False)
-    print('Finished. Results:', out)
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument('--excel', default='Camera-door_details-updated.xlsx')
-    args = p.parse_args()
-    main(args.excel)
-
-
-
-
-
-
-
-C:\projects\yolo_project\camera_files\yolo_infer.py
-
-
-
-# yolo_infer.py
-# Usage: python yolo_infer.py --model yolov8n.pt --source swipe123_camA.mp4
-from ultralytics import YOLO
-import argparse
-def main(model, source, conf=0.25, imgsz=640):
-    m = YOLO(model)
-    m.predict(source=source, conf=conf, imgsz=imgsz)
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--model', default='yolov8n.pt')
-    p.add_argument('--source', required=True)
-    p.add_argument('--conf', type=float, default=0.25)
-    p.add_argument('--imgsz', type=int, default=640)
-    args = p.parse_args()
-    main(args.model, args.source, args.conf, args.imgsz)
-
-
