@@ -1,3 +1,1317 @@
+// C:\Users\W0024618\Desktop\global-page\backend\config\dbConfig.js
+import sql from 'mssql';
+
+// shared options
+const commonOpts = {
+  options: {
+    encrypt: true,
+    trustServerCertificate: true
+  },
+  // increase timeouts (milliseconds)
+  requestTimeout: 300000,      // 5 minutes
+  connectionTimeout: 30000,    // 30 seconds
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
+};
+
+// lowercase keys only
+// NOTE: moved to `databases` array so we can reference previous/other ACVSUJournal DBs easily.
+const regions = {
+  apac: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUPNQ0986V',
+    // primary DB first; add previous/other ACVSUJournal DB names to this array as needed
+    databases: ['ACVSUJournal_00010030'],
+    ...commonOpts
+  },
+  emea: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUFRA0986V',
+    databases: ['ACVSUJournal_00011029'],
+    ...commonOpts
+  },
+  laca: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUSJO0986V',
+    databases: ['ACVSUJournal_00010030'],
+    ...commonOpts
+  },
+  namer: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUDEN0891V',
+    databases: ['ACVSUJournal_00010030'],
+    ...commonOpts
+  }
+};
+
+const pools = {};
+
+/**
+ * @param {string} regionKey  one of the keys in `regions`, case-insensitive
+ */
+export async function getPool(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) {
+    throw new Error(`Unknown region: ${regionKey}`);
+  }
+
+  // Use the first database in the array as the connection default (so queries without explicit db still work).
+  if (Array.isArray(cfg.databases) && cfg.databases.length) {
+    cfg.database = cfg.databases[0];
+  } else if (!cfg.database) {
+    // If no database specified, leave it alone (the server's default DB will be used).
+    cfg.database = undefined;
+  }
+
+  if (!pools[key]) {
+    pools[key] = await new sql.ConnectionPool(cfg).connect();
+  }
+  return pools[key];
+}
+
+/**
+ * Return array of database names configured for a region (always returns array).
+ * This is intentionally exported for other modules to dynamically build fully-qualified table references.
+ */
+export function getRegionDatabases(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) return [];
+  if (Array.isArray(cfg.databases) && cfg.databases.length) return cfg.databases.slice();
+  if (cfg.database) return [cfg.database];
+  return [];
+}
+
+/**
+ * Safe bracketed DB name for embedding into SQL identifiers.
+ */
+export function bracketDb(dbName) {
+  if (!dbName) return '';
+  // protect against accidental injection: remove closing bracket then bracket it
+  const safe = String(dbName).replace(/]/g, '');
+  return `[${safe}]`;
+}
+
+export { sql };
+
+
+
+
+
+
+
+
+
+
+
+// C:\Users\W0024618\Desktop\global-page\backend\services\reportService.js
+import { getPool, sql, getRegionDatabases, bracketDb } from '../config/dbConfig.js';
+import ExcelJS from 'exceljs';
+
+// helper: build SQL snippets (UNION ALL) for region for given table name
+function buildUnionForRegionTables(region, tableName) {
+  const dbs = getRegionDatabases(region);
+  if (!dbs || !dbs.length) {
+    // fallback to referencing the current DB default (no prefix)
+    return `SELECT * FROM ${tableName}`;
+  }
+  return dbs.map(db => `SELECT * FROM ${bracketDb(db)}.dbo.${tableName}`).join('\nUNION ALL\n');
+}
+
+// helper: produce initial CTE header for logs/shred/xml for given region
+function buildRegionCTEs(region) {
+  const logsUnion = buildUnionForRegionTables(region, 'ACVSUJournalLog');
+  const shredUnion = buildUnionForRegionTables(region, 'ACVSUJournalLogxmlShred');
+  const xmlUnion = buildUnionForRegionTables(region, 'ACVSUJournalLogxml');
+
+  // Return the CTEs (without the leading "WITH" — caller should attach as required).
+  const cte = [
+    `AllLogs AS (\n${logsUnion}\n)`,
+    `AllShred AS (\n${shredUnion}\n)`,
+    `AllXml AS (\n${xmlUnion}\n)`
+  ].join(',\n');
+  return cte;
+}
+
+// -------------------- listLocations --------------------
+export async function listLocations(region) {
+  if (!region) throw new Error('region required');
+  const pool = await getPool(region);
+  const req = pool.request();
+
+  if ((region || '').toLowerCase() === 'namer') {
+    const q = `
+      SELECT DISTINCT LogicalLocation
+      FROM (
+        SELECT
+          CASE
+            WHEN ObjectName2 LIKE '%HQ%' THEN 'Denver-HQ'
+            WHEN ObjectName2 LIKE '%Austin%' THEN 'Austin Texas'
+            WHEN ObjectName2 LIKE '%Miami%' THEN 'Miami'
+            WHEN ObjectName2 LIKE '%NYC%' THEN 'New York'
+            ELSE NULL
+          END AS LogicalLocation
+        FROM AllLogs
+        WHERE PartitionName2 IS NOT NULL
+      ) AS X
+      WHERE LogicalLocation IS NOT NULL
+      ORDER BY LogicalLocation;
+    `;
+
+    // Use dynamic CTEs so we select from all configured region DBs
+    const ctes = buildRegionCTEs(region);
+    const fullQuery = `WITH ${ctes}\n${q}`;
+    const { recordset } = await req.query(fullQuery);
+    return (recordset || []).map(r => r.LogicalLocation).filter(Boolean);
+  } else {
+    const q = `SELECT DISTINCT PartitionName2 FROM AllLogs WHERE PartitionName2 IS NOT NULL ORDER BY PartitionName2`;
+    const ctes = buildRegionCTEs(region);
+    const fullQuery = `WITH ${ctes}\n${q}`;
+    const { recordset } = await req.query(fullQuery);
+    return (recordset || []).map(r => r.PartitionName2).filter(Boolean);
+  }
+}
+
+// -------------------- searchEmployees --------------------
+export async function searchEmployees(region = 'emea', q = '') {
+  const pool = await getPool(region);
+  const req = pool.request();
+  const like = `%${q}%`;
+  req.input('q', sql.NVarChar(200), like);
+
+  const query = `
+    SELECT TOP (200)
+      CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR(50)) END AS EmployeeID,
+      ISNULL(t2.Text1, '') AS Name
+    FROM ACVSCore.Access.Personnel AS t2
+    LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+    WHERE (t2.Text1 LIKE @q) OR (CAST(t2.Int1 AS NVARCHAR(50)) LIKE @q) OR (t2.Text12 LIKE @q)
+    ORDER BY t2.Text1;
+  `;
+  const { recordset } = await req.query(query);
+  return (recordset || []).map(r => ({ EmployeeID: r.EmployeeID, Name: r.Name }));
+}
+
+// -------------------- rawReportStreamToResponse --------------------
+/**
+ * rawReportStreamToResponse
+ * - Inputs: region (JS param), startDate, endDate, location (friendly name or partition), admitFilter
+ * - NEW: accepts `employees` (CSV) param which filters rows by EmployeeID, Name or CardNumber
+ */
+export async function rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter = 'all', employees = null }) {
+  if (!region) throw new Error('region required');
+  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+
+  const pool = await getPool(region);
+  const request = pool.request();
+  request.timeout = 10 * 60 * 1000; // 10 minutes
+
+  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
+  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
+
+  request.input('location', sql.NVarChar(200), locationParam);
+  request.input('startDate', sql.Date, startDate);
+  request.input('endDate', sql.Date, endDate);
+  request.input('admitFilter', sql.NVarChar(20), String(admitFilter || 'all'));
+  request.input('regionKey', sql.NVarChar(50), String(region || ''));
+  request.input('employees', sql.NVarChar(sql.MAX), employeesParam);
+
+  // Build the CTEs for region so we use AllLogs / AllShred / AllXml which UNION across configured DBs
+  const regionCTEs = buildRegionCTEs(region);
+
+  const query = `
+  WITH ${regionCTEs},
+  CombinedQuery AS(
+    SELECT 
+       DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+       t1.ObjectName1,
+       t1.PartitionName2       AS PartitionName2,
+       t5_card.CardNumber,
+       t5_admit.value          AS AdmitCode,
+       t5_dir.value            AS Direction,
+       t1.ObjectName2          AS Door,
+       t5_rej.value            AS Rejection_Type,
+       CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+            THEN t2.Text12
+            ELSE CAST(t2.Int1 AS NVARCHAR)
+       END                       AS EmployeeID,
+       t3.Name                  AS PersonnelType,
+       t1.MessageType,
+       t1.XmlGUID,
+       CASE
+         WHEN (UPPER(ISNULL(@regionKey,'')) = 'NAMER' OR t1.PartitionName2 LIKE 'US.%' OR t1.PartitionName2 LIKE 'USA%')
+         THEN
+           CASE
+             WHEN t1.ObjectName2 LIKE '%HQ%' THEN 'Denver-HQ'
+             WHEN t1.ObjectName2 LIKE '%Austin%' THEN 'Austin Texas'
+             WHEN t1.ObjectName2 LIKE '%Miami%' THEN 'Miami'
+             WHEN t1.ObjectName2 LIKE '%NYC%' THEN 'New York'
+             ELSE t1.PartitionName2
+           END
+         WHEN (UPPER(ISNULL(@regionKey,'')) = 'APAC' OR t1.PartitionName2 LIKE 'APAC.%' OR t1.PartitionName2 LIKE 'APAC%')
+         THEN
+           CASE
+             WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+             WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+             WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+             WHEN t1.ObjectName2 LIKE '%HYD%' THEN 'Hyderabad'
+             ELSE t1.PartitionName2
+           END
+         ELSE t1.PartitionName2
+       END AS Location
+    FROM AllLogs AS t1
+    LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+    LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+    LEFT JOIN AllShred       AS t5_admit
+      ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+    LEFT JOIN AllShred       AS t5_dir
+      ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+    LEFT JOIN AllXml         AS t_xml ON t1.XmlGUID = t_xml.GUID
+    LEFT JOIN (
+      SELECT GUID, [value]
+      FROM AllShred
+      WHERE [Name] IN ('Card','CHUID')
+    ) AS SCard ON t1.XmlGUID = SCard.GUID
+    OUTER APPLY (
+      SELECT COALESCE(
+        TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+        TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+        SCard.[value]
+      ) AS CardNumber
+    ) AS t5_card
+    LEFT JOIN AllShred AS t5_rej
+      ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+    WHERE
+      t1.MessageType IN ('CardAdmitted' , 'CardRejected')
+      AND (
+        @location IS NULL
+        OR t1.PartitionName2 = @location
+        OR (
+          (CASE
+            WHEN (UPPER(ISNULL(@regionKey,'')) = 'NAMER' OR t1.PartitionName2 LIKE 'US.%' OR t1.PartitionName2 LIKE 'USA%')
+            THEN
+              CASE
+                WHEN t1.ObjectName2 LIKE '%HQ%' THEN 'Denver-HQ'
+                WHEN t1.ObjectName2 LIKE '%Austin%' THEN 'Austin Texas'
+                WHEN t1.ObjectName2 LIKE '%Miami%' THEN 'Miami'
+                WHEN t1.ObjectName2 LIKE '%NYC%' THEN 'New York'
+                ELSE NULL
+              END
+            WHEN (UPPER(ISNULL(@regionKey,'')) = 'APAC' OR t1.PartitionName2 LIKE 'APAC.%' OR t1.PartitionName2 LIKE 'APAC%')
+            THEN
+              CASE
+                WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+                WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+                WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+                WHEN t1.ObjectName2 LIKE '%HYD%' THEN 'Hyderabad'
+                ELSE NULL
+              END
+            ELSE NULL
+          END) = @location
+        )
+      )
+      AND (
+        UPPER(ISNULL(@admitFilter,'all')) = 'ALL'
+        OR (UPPER(@admitFilter) = 'ADMIT'  AND t1.MessageType = 'CardAdmitted')
+        OR (UPPER(@admitFilter) = 'REJECT' AND t1.MessageType = 'CardRejected')
+      )
+      AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
+      /* optional employees filter: CSV of tokens - match against EmployeeID, Name or CardNumber */
+      AND (
+        @employees IS NULL
+        OR EXISTS (
+          SELECT 1 FROM STRING_SPLIT(@employees,',') AS E
+          WHERE LTRIM(RTRIM(E.value)) <> ''
+            AND (
+                -- match numeric/text employee id (EmployeeID column already unified)
+                (CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END) LIKE '%' + LTRIM(RTRIM(E.value)) + '%'
+                OR t2.Text1 LIKE '%' + LTRIM(RTRIM(E.value)) + '%'
+                OR SCard.[value] LIKE '%' + LTRIM(RTRIM(E.value)) + '%'
+            )
+        )
+      )
+      ;
+  )
+  SELECT
+    LocaleMessageTime,
+    CONVERT(date,    LocaleMessageTime) AS DateOnly,
+    CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+    EmployeeID,
+    ObjectName1,
+    PersonnelType,
+    Location,
+    CardNumber,
+    AdmitCode,
+    Direction,
+    Door,
+    Rejection_Type
+  FROM CombinedQuery
+  ORDER BY LocaleMessageTime ASC;
+  `;
+
+  const filename = `Raw_${region}_${startDate.replace(/-/g,'')}_to_${endDate.replace(/-/g,'')}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-cache');
+
+  // create streaming workbook with styles enabled
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: true, useStyles: true });
+
+  // configuration
+  const MAX_ROWS_PER_SHEET = 700000;
+
+  let headers = ['LocaleMessageTime','DateOnly','Swipe_Time','EmployeeID','ObjectName1','PersonnelType','Location','CardNumber'];
+
+  const admit = 'AdmitCode';
+  const rej = 'Rejection_Type';
+  const tail = ['Direction','Door'];
+
+  const af = (String(admitFilter || 'all')).toLowerCase();
+  if (af === 'admit') {
+    headers = headers.concat([admit, ...tail]);
+  } else if (af === 'reject') {
+    headers = headers.concat([...tail, rej]);
+  } else {
+    headers = headers.concat([admit, ...tail, rej]);
+  }
+
+  const defaultWidths = {
+    LocaleMessageTime: 22, DateOnly: 12, Swipe_Time: 12, EmployeeID: 15,
+    ObjectName1: 30, PersonnelType: 18, Location: 20, CardNumber: 20,
+    AdmitCode: 14, Direction: 10, Door: 22, Rejection_Type: 22
+  };
+
+  // (rest of streaming & excel generation code unchanged)
+  // ... (kept exactly as in your original file, only above query part changed)
+  // For brevity I'm not repeating unchanged helper functions and the streaming event handlers.
+  // The code below is the same code you already had for streaming the SQL rows into the WorkbookWriter.
+  // Please keep your file's existing streaming / row formatting logic here.
+  // --------------------------------------------------------------
+  // We'll reuse the same streaming/event handlers you had — they are unchanged.
+  // --------------------------------------------------------------
+
+  // -------------------------
+  // Note: to keep this response concise I'm not repeating the entire long streaming
+  // implementation (which you already pasted above). When you paste this file,
+  // make sure the remainder of the rawReportStreamToResponse function
+  // contains the exact streaming/writing code you already had (listeners for request.on('row'), 'done', etc.)
+  // with no changes except the new query & inputs we added above.
+  // -------------------------
+
+  // start streaming query (single invocation)
+  try {
+    request.query(query).catch(async (err) => {
+      console.error('request.query failed', err);
+      try { await workbook.commit(); } catch (e) {}
+      try { res.end(); } catch (e) {}
+    });
+  } catch (err) {
+    console.error('rawReport stream start failed', err);
+    try { await workbook.commit(); } catch (e) {}
+    try { res.end(); } catch (e) {}
+  }
+}
+
+// -------------------- rejectionReport --------------------
+export async function rejectionReport(region, { startDate, endDate, location } = {}) {
+  if (!region) throw new Error('region required');
+  if (!startDate || !endDate) throw new Error('startDate and endDate required');
+
+  const pool = await getPool(region);
+  const req = pool.request();
+  req.timeout = 300000;
+
+  const locationParam = (location && String(location).trim()) ? String(location).trim() : null;
+  req.input('location', sql.NVarChar(200), locationParam);
+  req.input('startDate', sql.Date, startDate);
+  req.input('endDate', sql.Date, endDate);
+  req.input('regionKey', sql.NVarChar(50), String(region || ''));
+
+  const regionCTEs = buildRegionCTEs(region);
+
+  const query = `
+WITH ${regionCTEs},
+CombinedQuery AS(
+  SELECT 
+     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+     t1.ObjectName1,
+     t1.PartitionName2       AS PartitionName2,
+     t5_card.CardNumber,
+     t5_admit.value          AS AdmitCode,
+     t5_dir.value            AS Direction,
+     t1.ObjectName2          AS Door,
+     t5_rej.value            AS Rejection_Type,
+     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+          THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+     END                       AS EmployeeID,
+     t3.Name                  AS PersonnelType,
+     t1.MessageType,
+     t1.XmlGUID,
+     CASE
+      WHEN (UPPER(ISNULL(@regionKey,'')) = 'NAMER' OR t1.PartitionName2 LIKE 'US.%' OR t1.PartitionName2 LIKE 'USA%')
+      THEN
+        CASE
+          WHEN t1.ObjectName2 LIKE '%HQ%' THEN 'Denver-HQ'
+          WHEN t1.ObjectName2 LIKE '%Austin%' THEN 'Austin Texas'
+          WHEN t1.ObjectName2 LIKE '%Miami%' THEN 'Miami'
+          WHEN t1.ObjectName2 LIKE '%NYC%' THEN 'New York'
+          ELSE t1.PartitionName2
+        END
+      WHEN (UPPER(ISNULL(@regionKey,'')) = 'APAC' OR t1.PartitionName2 LIKE 'APAC.%' OR t1.PartitionName2 LIKE 'APAC%')
+      THEN
+        CASE
+          WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+          WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+          WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+          WHEN t1.ObjectName2 LIKE '%HYD%' THEN 'Hyderabad'
+          ELSE t1.PartitionName2
+        END
+      ELSE t1.PartitionName2
+    END AS Location
+
+  FROM AllLogs AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+  LEFT JOIN AllShred       AS t5_admit
+    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+  LEFT JOIN AllShred       AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN AllXml             AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM AllShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  LEFT JOIN AllShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType = 'CardRejected'
+    AND (
+      @location IS NULL
+      OR t1.PartitionName2 = @location
+      OR (
+        (CASE
+          WHEN (UPPER(ISNULL(@regionKey,'')) = 'NAMER' OR t1.PartitionName2 LIKE 'US.%' OR t1.PartitionName2 LIKE 'USA%')
+          THEN
+            CASE
+              WHEN t1.ObjectName2 LIKE '%HQ%' THEN 'Denver-HQ'
+              WHEN t1.ObjectName2 LIKE '%Austin%' THEN 'Austin Texas'
+              WHEN t1.ObjectName2 LIKE '%Miami%' THEN 'Miami'
+              WHEN t1.ObjectName2 LIKE '%NYC%' THEN 'New York'
+              ELSE NULL
+            END
+          WHEN (UPPER(ISNULL(@regionKey,'')) = 'APAC' OR t1.PartitionName2 LIKE 'APAC.%' OR t1.PartitionName2 LIKE 'APAC%')
+          THEN
+            CASE
+              WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+              WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+              WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+              WHEN t1.ObjectName2 LIKE '%HYD%' THEN 'Hyderabad'
+              ELSE NULL
+            END
+          ELSE NULL
+        END) = @location
+      )
+    )
+    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) BETWEEN @startDate AND @endDate
+)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date,    LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  Location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM CombinedQuery
+ORDER BY LocaleMessageTime DESC;
+`;
+
+  const { recordset } = await req.query(query);
+  return recordset;
+}
+
+// -------------------- dailyAccessReportEMEA --------------------
+export async function dailyAccessReportEMEA({ from, to, employees = '' }) {
+  const pool = await getPool('emea');
+  const req  = pool.request();
+
+  req.input('fromDate', sql.Date, from);
+  req.input('toDate',   sql.Date, to);
+  const employeesParam = (employees && String(employees).trim()) ? String(employees).trim() : null;
+  req.input('employees', sql.NVarChar(sql.MAX), employeesParam);
+
+  // Build region CTEs for EMEA
+  const regionCTEs = buildRegionCTEs('emea');
+
+  const query = `
+  WITH ${regionCTEs},
+  EmpList AS (
+    SELECT LTRIM(RTRIM(value)) AS emp
+    FROM STRING_SPLIT(ISNULL(@employees,''), ',')
+    WHERE LTRIM(RTRIM(value)) <> ''
+  ),
+  RawSwipes AS (
+    SELECT
+      t1.ObjectName1,
+      t1.ObjectName2,
+      t1.MessageType,
+      t2.Text12       AS EmployeeID,
+      CAST(t2.Int1 AS NVARCHAR(50)) AS NumericEmployeeID,
+      t3.Name         AS PersonnelType,
+      t1.PartitionName2 AS PartitionName2,
+      DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+      CASE
+        WHEN dir.Value = 'InDirection'  THEN 'IN'
+        WHEN dir.Value = 'OutDirection' THEN 'OUT'
+        ELSE 'Unknown'
+      END AS Swipe,
+      card.Value AS CardNumber
+    FROM AllLogs AS t1
+    INNER JOIN ACVSCore.Access.Personnel     AS t2
+      ON t1.ObjectIdentity1 = t2.GUID
+    INNER JOIN ACVSCore.Access.PersonnelType AS t3
+      ON t2.PersonnelTypeId = t3.ObjectID
+    OUTER APPLY (
+      SELECT TOP (1) s.Value
+      FROM AllShred AS s
+      WHERE s.GUID = t1.XmlGUID
+        AND s.Value IN ('InDirection','OutDirection')
+    ) AS dir
+    OUTER APPLY (
+      SELECT TOP (1) s.Value
+      FROM AllShred AS s
+      WHERE s.GUID = t1.XmlGUID
+        AND s.Value NOT IN ('InDirection','OutDirection')
+        AND s.Value NOT LIKE '%[^0-9]%'
+        AND s.Value IS NOT NULL
+        AND LTRIM(RTRIM(s.Value)) <> ''
+    ) AS card
+  )
+  , Windowed AS (
+    SELECT *
+    FROM RawSwipes
+    WHERE
+      LocaleMessageTime >= DATEADD(HOUR, 8, CAST(@fromDate AS DATETIME))
+      AND LocaleMessageTime <  DATEADD(HOUR, 8, CAST(@toDate AS DATETIME))
+      AND Swipe IN ('IN','OUT')
+  )
+  SELECT
+    ObjectName1,
+    ObjectName2,
+    PersonnelType,
+    EmployeeID,
+    NumericEmployeeID,
+    PartitionName2 AS location,
+    MessageType AS Messagetype,
+    Swipe,
+    CardNumber,
+    LocaleMessageTime
+  FROM Windowed w
+  WHERE
+    (
+      @employees IS NULL
+      OR LTRIM(RTRIM(@employees)) = ''
+      OR EXISTS (
+        SELECT 1
+        FROM EmpList e
+        WHERE
+          e.emp = LTRIM(RTRIM(w.ObjectName1))
+          OR e.emp = w.EmployeeID
+          OR e.emp = w.NumericEmployeeID
+      )
+    )
+  ORDER BY LocaleMessageTime;
+  `;
+
+  const { recordset } = await req.query(query);
+  return recordset;
+}
+
+// -------------------- inOutReport --------------------
+export async function inOutReport(region, { year, month, doors }) {
+  const pool = await getPool(region);
+  const req = pool.request();
+  req.timeout = 300000;
+
+  req.input('TargetYear',  sql.Int, year);
+  req.input('TargetMonth', sql.Int, month);
+  doors.forEach((d, i) => req.input(`door${i}`, sql.NVarChar, d));
+  const doorList = doors.map((_, i) => `@door${i}`).join(',');
+
+  const regionCTEs = buildRegionCTEs(region);
+
+  const query = `
+WITH ${regionCTEs},
+CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1,
+    t1.PartitionName2    AS location,
+    t5_card.CardNumber,
+    t5_dir.value         AS Direction,
+    CASE
+      WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+      ELSE CAST(t2.Int1 AS NVARCHAR)
+    END                    AS EmployeeID,
+    t3.Name               AS PersonnelType
+  FROM AllLogs AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3
+    ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN AllShred AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID
+    AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN AllXml AS t_xml
+    ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM AllShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard
+    ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  WHERE
+    YEAR(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetYear
+    AND MONTH(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @TargetMonth
+    AND t1.ObjectName2 IN (${doorList})
+)
+SELECT
+  FORMAT(LocaleMessageTime,'yyyy-MM')    AS Month,
+  ObjectName1                           AS EmployeeName,
+  EmployeeID,
+  PersonnelType,
+  location,
+  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)  AS In_Count,
+  SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS Out_Count,
+  COUNT(*)                                                 AS TotalSwipes,
+  SUM(CASE WHEN Direction='InDirection' THEN 1 ELSE 0 END)
+  - SUM(CASE WHEN Direction='OutDirection' THEN 1 ELSE 0 END) AS InOut_Difference
+FROM CombinedQuery
+GROUP BY FORMAT(LocaleMessageTime,'yyyy-MM'),
+         ObjectName1, EmployeeID, PersonnelType, location
+ORDER BY Month DESC, EmployeeName;
+`;
+
+  const { recordset } = await req.query(query);
+  return recordset;
+}
+
+// -------------------- timeDurationReport --------------------
+export async function timeDurationReport(region, { partition = 'Default', startDate }) {
+  const pool = await getPool(region);
+  const req = pool.request();
+  req.timeout = 300000;
+
+  const fullPartition = `${region.toUpperCase()}.${partition}`;
+  req.input('partition', sql.NVarChar, fullPartition);
+  req.input('startDate', sql.Date, startDate);
+
+  // build CTEs that combine all region journal DBs
+  const regionCTEs = buildRegionCTEs(region);
+
+  const query = `
+WITH ${regionCTEs}
+SELECT 
+    t1.[ObjectName1],
+    t1.[ObjectName2],
+    t1.[PartitionName2],
+    CASE
+        WHEN t2.[Int1] = 0 THEN t2.[Text12]
+        ELSE CAST(t2.[Int1] AS NVARCHAR)
+    END AS EmployeeID,
+    t3.[Name] AS PersonnelType,
+    t2.text5,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    DATEADD(HOUR, -2, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS AdjustedMessageTime
+INTO 
+    #CombinedEmployeeData
+FROM (
+    SELECT * FROM AllLogs
+) AS t1
+INNER JOIN 
+    ACVSCore.Access.Personnel AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+INNER JOIN 
+    ACVSCore.Access.PersonnelType AS t3
+    ON t2.[PersonnelTypeId] = t3.[ObjectID];
+
+-- Now the rest of your original timeDurationReport logic can run against #CombinedEmployeeData
+-- (kept the original logic; only the source of t1 changed to the combined AllLogs CTE)
+WITH DailyDurations AS (
+    SELECT 
+        [ObjectName1],
+        PersonnelType,
+        EmployeeID,
+        [PartitionName2],
+        text5,
+        CONVERT(DATE, AdjustedMessageTime) AS ShiftedDate,
+        DATEPART(WEEK, AdjustedMessageTime) AS WeekNumber,
+        DATEPART(YEAR, AdjustedMessageTime) AS YearNumber,
+        MIN(LocaleMessageTime) AS FirstSwipeTime,
+        MAX(LocaleMessageTime) AS LastSwipeTime,
+        DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) AS DurationMinutes,
+        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) / 60 AS NVARCHAR), 2)
+        + ':' +
+        RIGHT('00' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) % 60 AS NVARCHAR), 2) AS DurationHHMM,
+        CASE 
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 5 THEN '<5mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 10 THEN '<10mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 20 THEN '<20mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 30 THEN '<30mins'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 60 THEN '<1hr'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 120 THEN 'Less than <2hrs'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 180 THEN 'Less than <3hrs'
+            WHEN DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) < 240 THEN 'Less than <4hrs'
+            ELSE '4+ hrs'
+        END AS TimeDiffCategory
+    FROM 
+        #CombinedEmployeeData
+  WHERE CONVERT(DATE, AdjustedMessageTime) >= @startDate
+   AND [PartitionName2] = 'APAC.Default'
+        AND PersonnelType IN ('Employee', 'Terminated Personnel')
+    GROUP BY 
+        [ObjectName1], EmployeeID, PersonnelType, text5, [PartitionName2],
+        CONVERT(DATE, AdjustedMessageTime),
+        DATEPART(WEEK, AdjustedMessageTime),
+        DATEPART(YEAR, AdjustedMessageTime)
+),
+WeeklySummary AS (
+    SELECT 
+        EmployeeID,
+        [ObjectName1],
+        PersonnelType,
+        text5,
+        [PartitionName2],
+        YearNumber,
+        WeekNumber,
+        COUNT(DISTINCT ShiftedDate) AS DaysPresentInWeek,
+        SUM(CASE WHEN DurationMinutes < 240 THEN 1 ELSE 0 END) AS ViolationDaysInWeek
+    FROM 
+        DailyDurations
+    GROUP BY 
+        EmployeeID, [ObjectName1], PersonnelType, text5, [PartitionName2], YearNumber, WeekNumber
+)
+SELECT 
+    dd.EmployeeID,
+    dd.ObjectName1,
+    dd.PersonnelType,
+    dd.text5,
+    dd.PartitionName2,
+    dd.YearNumber,
+    dd.WeekNumber,
+    dd.ShiftedDate,
+    dd.FirstSwipeTime,
+    dd.LastSwipeTime,
+    dd.DurationHHMM,
+    dd.TimeDiffCategory,
+    ws.DaysPresentInWeek,
+    ws.ViolationDaysInWeek,
+    (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) AS CleanDaysInWeek,
+    CASE
+        WHEN (ws.DaysPresentInWeek - ws.ViolationDaysInWeek) < 3 THEN 'Yes'
+        ELSE 'No'
+    END AS Defaulter
+FROM 
+    DailyDurations dd
+JOIN 
+    WeeklySummary ws
+    ON dd.EmployeeID = ws.EmployeeID
+    AND dd.WeekNumber = ws.WeekNumber
+    AND dd.YearNumber = ws.YearNumber
+ORDER BY 
+    dd.YearNumber DESC, dd.WeekNumber DESC, dd.EmployeeID, dd.ShiftedDate;
+  `;
+
+  const { recordset } = await req.query(query);
+  return recordset;
+}
+
+// -------------------- eurocAdmitRejectionReport --------------------
+export async function eurocAdmitRejectionReport(region, { reportDate }) {
+  const pool = await getPool(region);
+  const req = pool.request();
+  req.timeout = 300000;
+
+  req.input('location', sql.NVarChar, 'LT.Vilnius');
+  req.input('reportDate', sql.Date, reportDate);
+
+  const regionCTEs = buildRegionCTEs(region);
+
+  const query = `
+WITH ${regionCTEs},
+CombinedQuery AS(
+  SELECT 
+     DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+     t1.ObjectName1,
+     t1.PartitionName2       AS location,
+     t5_card.CardNumber,
+     t5_admit.value          AS AdmitCode,
+     t5_dir.value            AS Direction,
+     t1.ObjectName2          AS Door,
+     t5_rej.value            AS Rejection_Type,
+     CASE WHEN t3.Name IN ('Contractor','Terminated Contractor')
+          THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+     END                       AS EmployeeID,
+     t3.Name                  AS PersonnelType,
+     t1.MessageType,
+     t1.XmlGUID
+  FROM AllLogs AS t1
+  LEFT JOIN ACVSCore.Access.Personnel     AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId   = t3.ObjectID
+  LEFT JOIN AllShred       AS t5_admit
+    ON t1.XmlGUID = t5_admit.GUID AND t5_admit.Name = 'AdmitCode'
+  LEFT JOIN AllShred       AS t5_dir
+    ON t1.XmlGUID = t5_dir.GUID AND t5_dir.Value IN ('InDirection','OutDirection')
+  LEFT JOIN AllXml             AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, [value]
+    FROM AllShred
+    WHERE [Name] IN ('Card','CHUID')
+  ) AS SCard ON t1.XmlGUID = SCard.GUID
+  OUTER APPLY (
+    SELECT COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'),
+      SCard.[value]
+    ) AS CardNumber
+  ) AS t5_card
+  LEFT JOIN AllShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType IN ('CardAdmitted' , 'CardRejected')
+    AND t1.PartitionName2 = @location
+    AND CONVERT(date, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = @reportDate
+)
+-- rest of logic unchanged: splits into admits/rejections and summary (use CombinedQuery)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date, LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type,
+  MessageType
+INTO #Combined
+FROM CombinedQuery;
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type,
+  ROW_NUMBER() OVER (PARTITION BY ISNULL(EmployeeID, CardNumber) ORDER BY LocaleMessageTime ASC) AS rn
+INTO #Admits
+FROM #Combined
+WHERE MessageType = 'CardAdmitted'
+  AND PersonnelType IN('Employee', 'Terminated Personnel');
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+INTO #Rejections
+FROM #Combined
+WHERE MessageType = 'CardRejected';
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM #Admits
+WHERE rn = 1
+ORDER BY LocaleMessageTime ASC;
+
+SELECT
+  LocaleMessageTime,
+  DateOnly,
+  Swipe_Time,
+  EmployeeID,
+  ObjectName1,
+  PersonnelType,
+  location,
+  CardNumber,
+  AdmitCode,
+  Direction,
+  Door,
+  Rejection_Type
+FROM #Rejections
+ORDER BY LocaleMessageTime ASC;
+
+SELECT
+  ISNULL(Rejection_Type, 'Unknown') AS Rejection_Type,
+  COUNT(*) AS CountVal
+FROM #Rejections
+GROUP BY ISNULL(Rejection_Type, 'Unknown')
+ORDER BY CountVal DESC;
+
+DROP TABLE IF EXISTS #Admits;
+DROP TABLE IF EXISTS #Rejections;
+DROP TABLE IF EXISTS #Combined;
+`;
+
+  const result = await req.query(query);
+  const recordsets = result.recordsets || [];
+  const admitRows = (recordsets[0] || []).map(r => ({
+    LocaleMessageTime: r.LocaleMessageTime,
+    DateOnly: r.DateOnly,
+    Swipe_Time: r.Swipe_Time,
+    ObjectName1: r.ObjectName1,
+    EmployeeID: r.EmployeeID,
+    PersonnelType: r.PersonnelType,
+    CardNumber: r.CardNumber,
+    Door: r.Door,
+    location: r.location,
+    Direction: r.Direction
+  }));
+  const rejectRows = (recordsets[1] || []).map(r => ({
+    LocaleMessageTime: r.LocaleMessageTime,
+    DateOnly: r.DateOnly,
+    Swipe_Time: r.Swipe_Time,
+    ObjectName1: r.ObjectName1,
+    EmployeeID: r.EmployeeID,
+    PersonnelType: r.PersonnelType,
+    CardNumber: r.CardNumber,
+    Rejection_Type: r.Rejection_Type,
+    Door: r.Door,
+    location: r.location,
+    Direction: r.Direction
+  }));
+  const summaryRows = (recordsets[2] || []).map(r => ({ Rejection_Type: r.Rejection_Type, Count: r.CountVal }));
+
+  return { admit: admitRows, rejection: rejectRows, summary: summaryRows };
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// frontend/src/pages/ReportsPage.jsx
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box, FormControl, InputLabel, Select, OutlinedInput,
+  Checkbox, ListItemText, MenuItem, Button,
+  CircularProgress, Typography, TextField, Tabs, Tab, Grid, Paper, IconButton, Divider, Autocomplete
+} from '@mui/material';
+import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
+import { StaticDatePicker } from '@mui/x-date-pickers/StaticDatePicker';
+import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
+import axios from 'axios';
+import ExcelJS from 'exceljs';
+import * as XLSX from 'xlsx';
+import { useAuth } from '../context/AuthContext';
+
+import CalendarTodayIcon from '@mui/icons-material/CalendarToday';
+import PlaceIcon from '@mui/icons-material/Place';
+import PeopleIcon from '@mui/icons-material/People';
+import DownloadIcon from '@mui/icons-material/CloudDownload';
+import FilterListIcon from '@mui/icons-material/FilterList';
+import Avatar from '@mui/material/Avatar';
+import { generateDailyAccessExcelFromRows } from './DailyAccessReport';
+
+// (static lists / helpers unchanged) ...
+// ------------------------------
+// Only a few places changed below:
+// 1) When building params for the raw-download request we include `employees` (CSV) if user selected any.
+// 2) HeadCount navigation URL resolution tries multiple keys (full location string and short name).
+// ------------------------------
+
+// ... (all the top part of the file unchanged; skip to handleGenerate Raw section)
+
+      // ----- 1: Raw (server-side /raw-download path) -----
+    if (tab === 1) {
+      // raw-download expects startDate/endDate as YYYY-MM-DD (use toLocalYMD)
+      const startDate = toLocalYMD(new Date(from));
+      const endDate = toLocalYMD(new Date(to));
+      const MULTI_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+      // collect requests to perform (we will download one blob per request)
+      const downloads = [];
+
+      const pushDownload = (regionParam, locationParam = undefined, employeesParam = undefined) => {
+        const params = { region: regionParam, startDate, endDate, admitFilter: rawAdmitFilter };
+        if (locationParam) params.location = locationParam;
+        if (employeesParam) params.employees = employeesParam;
+        downloads.push(params);
+      };
+
+      // build employees CSV (send selectedRawEmps as CSV). selectedRawEmps entries are strings like "Name (ID)" or free text.
+      const employeesCSV = (Array.isArray(selectedRawEmps) && selectedRawEmps.length)
+        ? selectedRawEmps.map(s => String(s).trim()).filter(Boolean).join(',')
+        : null;
+
+      // build download jobs according to region/global and selectedLocations:
+      if (region === 'global') {
+        if (selectedLocations && selectedLocations.length) {
+          // group by region-key derived from location prefix (e.g. "US.Denver" -> "us")
+          const regionMap = {};
+          selectedLocations.forEach(loc => {
+            const parts = String(loc).split('.');
+            const rKey = (parts[0] || '').toString().toLowerCase();
+            regionMap[rKey] = regionMap[rKey] || [];
+            regionMap[rKey].push(loc);
+          });
+          Object.entries(regionMap).forEach(([rKey, locs]) => {
+            if (MULTI_REGIONS.includes(rKey)) {
+              // for known region key call raw-download once per location (keeps server filter narrow)
+              locs.forEach(loc => pushDownload(rKey, loc, employeesCSV));
+            } else {
+              // unknown prefix -> call without region (backend may treat as partition)
+              locs.forEach(loc => pushDownload(undefined, loc, employeesCSV));
+            }
+          });
+        } else {
+          // no specific locations => request each known region
+          MULTI_REGIONS.forEach(r => pushDownload(r, undefined, employeesCSV));
+        }
+      } else {
+        // single region selected
+        if (selectedLocations && selectedLocations.length) {
+          selectedLocations.forEach(loc => pushDownload(region, loc, employeesCSV));
+        } else {
+          pushDownload(region, undefined, employeesCSV);
+        }
+      }
+
+      // If no downloads added (shouldn't happen), add current region
+      if (!downloads.length) pushDownload(region, undefined, employeesCSV);
+
+      // perform the downloads sequentially to avoid overwhelming client/network
+      for (const params of downloads) {
+        try {
+          setGeneratingMessage(`Preparing server export for ${params.region || params.location || 'region'}...`);
+          const resp = await axios.get('/api/reports/raw-download', {
+            params,
+            responseType: 'blob',
+            timeout: 20 * 60 * 1000, // 20 minutes
+            headers: {
+              Accept: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream'
+            }
+          });
+
+          // determine filename
+          let filename = buildRawFileName({
+            region: params.region || 'RAW',
+            location: params.location || (Array.isArray(selectedLocations) ? selectedLocations.join(',') : location),
+            from,
+            to,
+            rawAdmitFilter
+          });
+
+          // prefer Content-Disposition if server provided it
+          const cd = resp.headers['content-disposition'];
+          if (cd) {
+            const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/);
+            if (m && m[1]) {
+              try { filename = decodeURIComponent(m[1]); } catch (e) { filename = m[1]; }
+            }
+          }
+
+          const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(blob);
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          // cleanup
+          setTimeout(() => {
+            URL.revokeObjectURL(link.href);
+            try { document.body.removeChild(link); } catch (e) {}
+          }, 5000);
+        } catch (err) {
+          console.error('raw download failed for params', params, err);
+          let msg = `Failed to download raw report for ${params.region || params.location || 'region'}`;
+          if (err?.response?.data) {
+            msg += `: ${err.response?.data?.detail || err.message || JSON.stringify(err.response.data)}`;
+          } else if (err?.message) {
+            msg += `: ${err.message}`;
+          }
+          // show error but continue with other downloads
+          alert(msg);
+        }
+      }
+
+      return;
+    }
+
+    // (rest unchanged until HeadCount navigation area)
+    // ...
+    // HeadCount / External navigation (tab === 5)
+    if (tab === 5) {
+      // final permission check (region specific)
+      const permCandidates = [`headcount.${region}`, 'headcount', 'global_access'];
+      if (!auth.hasPermission(permCandidates)) {
+        alert(`You do not have permission to view HeadCount for ${region.toUpperCase()}.`);
+        setLoading(false);
+        return;
+      }
+
+      let url = '';
+
+      // helper to resolve headcount URL by trying multiple variants of the selected location:
+      const resolveUrl = (mapObj, loc) => {
+        if (!loc) return null;
+        const full = String(loc);
+        const short = full.split('.').pop();
+        // try exact key, then short key, then normalized (space/percent encodings)
+        return mapObj[full] || mapObj[short] || mapObj[decodeURIComponent(full)] || mapObj[decodeURIComponent(short)] || null;
+      };
+
+      if (region === 'laca') {
+        if (!location) url = 'http://10.199.22.57:3003/history';
+        else {
+          const LACA_URLS = {
+            'CR.Costa Rica Partition': 'http://10.199.22.57:3003/partition/CR.Costa%20Rica%20Partition/history',
+            'MX.Mexico City': 'http://10.199.22.57:3003/partition/MX.Mexico%20City/history',
+            'AR.Cordoba': 'http://10.199.22.57:3003/partition/AR.Cordoba/history',
+            'PA.Panama City': 'http://10.199.22.57:3003/partition/PA.Panama%20City/history',
+            'PE.Lima': 'http://10.199.22.57:3003/partition/PE.Lima/history',
+            'BR.Sao Paulo': 'http://10.199.22.57:3003/partition/BR.Sao%20Paulo/history'
+          };
+          url = resolveUrl(LACA_URLS, location) || 'http://10.199.22.57:3003/history';
+        }
+      } else if (region === 'namer') {
+        if (!location) url = 'http://10.199.22.57:3002/history';
+        else {
+          const NAMER_URLS = {
+            'Denver-HQ': 'http://10.199.22.57:3002/partition/US.CO.OBS/history',
+            'Denver': 'http://10.199.22.57:3002/partition/US.CO.OBS/history',
+            'US.Denver': 'http://10.199.22.57:3002/partition/US.CO.OBS/history',
+            'Miami': 'http://10.199.22.57:3002/partition/US.FL.Miami/history',
+            'New York': 'http://10.199.22.57:3002/partition/US.NYC/history',
+            'Austin Texas': 'http://10.199.22.57:3002/partition/USA%2FCanada%20Default/history',
+            'Austin': 'http://10.199.22.57:3002/partition/USA%2FCanada%20Default/history',
+            'USA/Canada Default': 'http://10.199.22.57:3002/partition/USA%2FCanada%20Default/history'
+          };
+          url = resolveUrl(NAMER_URLS, location) || 'http://10.199.22.57:3002/history';
+        }
+      } else if (region === 'apac') {
+        if (!location) url = 'http://10.199.22.57:3000/history';
+        else {
+          const APAC_URLS = {
+            'Pune': 'http://10.199.22.57:3000/partition/Pune/history',
+            'APAC.Pune': 'http://10.199.22.57:3000/partition/Pune/history',
+            'Hyderabad':'http://10.199.22.57:3000/partition/IN.HYD/history',
+            'IN.HYD':'http://10.199.22.57:3000/partition/IN.HYD/history',
+            'MY.Kuala Lumpur': 'http://10.199.22.57:3000/partition/MY.Kuala Lumpur/history',
+            'Quezon City': 'http://10.199.22.57:3000/partition/Quezon%20City/history',
+            'JP.Tokyo': 'http://10.199.22.57:3000/partition/JP.Tokyo/history',
+            'Taguig City': 'http://10.199.22.57:3000/partition/Taguig%20City/history'
+          };
+          url = resolveUrl(APAC_URLS, location) || 'http://10.199.22.57:3000/history';
+        }
+      } else if (region === 'emea') {
+        if (!location) url = 'http://10.199.22.57:3001/history';
+        else {
+          const EMEA_URLS = {
+            'AUT.Vienna': 'http://10.199.22.57:3001/history',
+            'DU.Abu Dhabi': 'http://10.199.22.57:3001/history',
+            'IE.Dublin': 'http://10.199.22.57:3001/history',
+            'IT.Rome': 'http://10.199.22.57:3001/history',
+            'LT.Vilnius': 'http://10.199.22.57:3001/history',
+            'MA.Casablanca': 'http://10.199.22.57:3001/history',
+            'RU.Moscow': 'http://10.199.22.57:3001/history',
+            'UK.London': 'http://10.199.22.57:3001/history',
+            'ES.Madrid': 'http://10.199.22.57:3001/history'
+          };
+          url = resolveUrl(EMEA_URLS, location) || 'http://10.199.22.57:3001/history';
+        }
+      }
+
+      if (url) window.location.href = url;
+      else alert('Invalid region or location selected.');
+      return;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check Below file Carefully ..
 I have Identify 2 to 3 issue in below file Which need to Fix carefuklly.....
 1) i want improve Backend 
