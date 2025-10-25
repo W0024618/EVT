@@ -1,5 +1,289 @@
+// (keep your existing require()s and helper functions above unchanged)
 
-  // src/controllers/occupancy.controller.js
+const service       = require('../services/occupancy.service');
+const doorMap       = require('../utils/doorMap');
+const normalizeDoor = doorMap.normalizeDoor;
+const roles         = require('../utils/roles');
+const tzMap         = require('../utils/timezones'); // partition→IANA tz
+
+/* ... keep helper functions (isEmployeeType, lookupFloor, formatInZone, etc.) unchanged ... */
+
+/**
+ * GET /api/occupancy/live-summary
+ * Optional query param: ts=ISO timestamp (UTC)
+ */
+exports.getLiveSummary = async (req, res) => {
+  try {
+    const { ts } = req.query;
+
+    // 1) Time-travel branch (pure UTC)
+    if (ts) {
+      const timestamp = new Date(ts);
+      if (isNaN(timestamp)) {
+        return res.status(400).json({ success:false, message:'invalid ts query param' });
+      }
+
+      // UTC date string of ts
+      const dayStr = timestamp.toISOString().slice(0,10); // e.g. "2025-07-15"
+
+      // a) fetch last 24h, narrow to that UTC date
+      const fetched = await service.fetchHistoricalData({ days:1, location:null });
+
+      // fetched might be array (old shape) or object { details, summaryByDate }
+      const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
+
+      const sameDay = raw.filter(r =>
+        new Date(r.LocaleMessageTime).toISOString().slice(0,10) === dayStr
+      );
+
+      // b) keep only swipes ≤ ts
+      const upTo = sameDay.filter(r => new Date(r.LocaleMessageTime) <= timestamp);
+
+      // c) last swipe per person ≤ ts
+      const lastByPerson = {};
+      upTo.forEach(r => {
+        const key = r.PersonGUID;
+        const t   = new Date(r.LocaleMessageTime).getTime();
+        if (!lastByPerson[key] ||
+            t > new Date(lastByPerson[key].LocaleMessageTime).getTime()) {
+          lastByPerson[key] = r;
+        }
+      });
+
+      // d) build “today” & realtime snapshot
+      const today    = { total:0, Employee:0, Contractor:0 };
+      const realtime = {};
+      const details  = [];
+      const unmapped = new Set();
+
+      Object.values(lastByPerson).forEach(r => {
+        // count
+        const isEmp = isEmployeeType(r.PersonnelType);
+        today.total++;
+        if (isEmp) today.Employee++; else today.Contractor++;
+
+        // floor mapping
+        const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
+        if (floorName === 'Out of office') return;
+
+        // tally realtime
+        const p = r.PartitionName2;
+        realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
+        realtime[p].total++;
+        if (isEmp) realtime[p].Employee++; else realtime[p].Contractor++;
+        realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
+
+        // detail row (UTC)
+        details.push({
+          ...r,
+          snapshotTime:      r.LocaleMessageTime,
+          LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
+          floor:             floorName
+        });
+      });
+
+      return res.json({
+        success:      true,
+        timestampUtc: timestamp.toISOString(),
+        today,
+        realtime,
+        details
+      });
+    }
+
+    // 2) Default live branch
+    const swipes = await service.fetchLiveOccupancy();
+
+    // 2a) “today” = first swipe per person (UTC date = today)
+    const first = {};
+    swipes.forEach(r => {
+      const t = new Date(r.LocaleMessageTime).getTime();
+      if (!first[r.PersonGUID] ||
+          t < new Date(first[r.PersonGUID].LocaleMessageTime).getTime()) {
+        first[r.PersonGUID] = r;
+      }
+    });
+    const today = { total:0, Employee:0, Contractor:0 };
+    Object.values(first).forEach(r => {
+      today.total++;
+      isEmployeeType(r.PersonnelType)
+        ? today.Employee++
+        : today.Contractor++;
+    });
+
+    // 2b) “realtime” = last swipe per person
+    const last     = {};
+    const realtime = {};
+    const details  = [];
+    const unmapped = new Set();
+
+    swipes.forEach(r => {
+      const t = new Date(r.LocaleMessageTime).getTime();
+      if (!last[r.PersonGUID] ||
+          t > new Date(last[r.PersonGUID].LocaleMessageTime).getTime()) {
+        last[r.PersonGUID] = r;
+      }
+    });
+
+    Object.values(last).forEach(r => {
+      // skip OUT→“Out of office”
+      if (r.Direction === 'OutDirection') {
+        const fl = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped);
+        if (fl === 'Out of office') return;
+      }
+
+      // floor
+      const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
+      if (floorName === 'Out of office') return;
+
+      // tally
+      const p = r.PartitionName2;
+      realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
+      realtime[p].total++;
+      isEmployeeType(r.PersonnelType)
+        ? realtime[p].Employee++
+        : realtime[p].Contractor++;
+      realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
+
+      // detail
+      details.push({
+        ...r,
+        snapshotTime:      r.LocaleMessageTime,
+        LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
+        floor:             floorName
+      });
+    });
+
+    return res.json({ success:true, today, realtime, details });
+  }
+  catch (err) {
+    console.error('live-summary error:', err);
+    return res.status(500).json({ success:false, message:'Live summary failed' });
+  }
+};
+
+
+/**
+ * GET /api/occupancy/history
+ * Optional query params: start=YYYY-MM-DD, end=YYYY-MM-DD
+ * Optional URL param: :location
+ */
+exports.getHistoricalOccupancy = async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    const location       = req.params.location || null;
+
+    if (start && end) {
+      // --- average-over-range logic ---
+      const startD = new Date(start);
+      const endD   = new Date(end);
+      if (isNaN(startD) || isNaN(endD) || endD < startD) {
+        return res
+          .status(400)
+          .json({ success:false, message:'invalid start/end date range' });
+      }
+
+      // inclusive days count
+      const days = Math.ceil((endD - startD)/(1000*60*60*24)) + 1;
+      const fetched = await service.fetchHistoricalData({ days, location });
+
+      // accommodate both service shapes: array OR { details, summaryByDate }
+      const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
+
+      // bucket unique PersonGUID per date
+      const byDate = {};
+      raw.forEach(r => {
+        const t    = new Date(r.LocaleMessageTime);
+        if (isNaN(t)) return;
+        const date = t.toISOString().slice(0,10);
+        if (date < start || date > end) return;
+        byDate[date] = byDate[date] || new Set();
+        byDate[date].add(r.PersonGUID);
+      });
+
+      // build breakdown & average
+      const dates     = Object.keys(byDate).sort();
+      const breakdown = dates.map(d => ({ date: d, count: byDate[d].size }));
+      const sum       = breakdown.reduce((s,x) => s + x.count, 0);
+      const average   = breakdown.length ? sum/breakdown.length : 0;
+
+      return res.json({
+        success:   true,
+        start,
+        end,
+        average,
+        breakdown
+      });
+    }
+
+    // --- default history logic ---
+    const fetched = await service.fetchHistoricalOccupancy(location);
+    const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
+    const byDate = {};
+    const details = [];
+
+    raw.forEach(r => {
+      const iso = (r.LocaleMessageTime instanceof Date)
+        ? r.LocaleMessageTime.toISOString()
+        : r.LocaleMessageTime;
+      if (!iso) return;
+      const date = iso.slice(0,10);
+      byDate[date] = byDate[date] || {};
+      const prev = byDate[date][r.PersonGUID];
+      if (!prev || new Date(iso) < new Date(prev.LocaleMessageTime)) {
+        byDate[date][r.PersonGUID] = { ...r, LocaleMessageTime: iso };
+      }
+    });
+
+    const summaryByDate = Object.keys(byDate).sort().map(date => {
+      const recs = Object.values(byDate[date]);
+      details.push(...recs);
+      const region = { total:0, Employee:0, Contractor:0 };
+      const partitions = {};
+
+      recs.forEach(r => {
+        region.total++;
+        isEmployeeType(r.PersonnelType) ? region.Employee++ : region.Contractor++;
+        if (!location) {
+          partitions[r.PartitionName2] = partitions[r.PartitionName2] || { total:0, Employee:0, Contractor:0 };
+          partitions[r.PartitionName2].total++;
+          isEmployeeType(r.PersonnelType)
+            ? partitions[r.PartitionName2].Employee++
+            : partitions[r.PartitionName2].Contractor++;
+        }
+      });
+
+      return {
+        date,
+        day: new Date(date).toLocaleDateString('en-US',{ weekday:'long' }),
+        region: location ? { name: location, ...region } : { name: 'NAMER', ...region },
+        partitions: location ? undefined : partitions
+      };
+    });
+
+    res.json({ success:true, summaryByDate, details });
+
+  } catch (e) {
+    console.error('history error:', e);
+    res.status(500).json({ success:false, message:'Historical fetch failed' });
+  }
+};
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+
+// src/controllers/occupancy.controller.js
 
   const service       = require('../services/occupancy.service');
   const doorMap       = require('../utils/doorMap');
