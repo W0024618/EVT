@@ -1,3 +1,343 @@
+// C:\Users\W0024618\Desktop\namer-occupancy-backend\src\services\occupancy.service.js
+
+const { poolPromise, sql } = require('../config/db');
+const roles = require('../utils/roles');
+
+const partitionList = [
+  'US.CO.OBS',           // Denver
+  'US.FL.Miami',
+  'US.NYC',
+  'USA/Canada Default'
+];
+
+// Helper: safely join a list of strings into quoted SQL literals
+function quoteList(arr) {
+  return arr.map(s => `'${s.replace(/'/g, "''")}'`).join(',');
+}
+
+// Shared CTE for today’s “CardAdmitted” swipes
+const combinedQueryCTE = `
+WITH CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1           AS ObjectName1,
+    t1.ObjectName2           AS Door,
+    CASE
+      WHEN t3.Name IN ('Contractor','Terminated Contractor')
+        THEN t2.Text12
+      ELSE CAST(t2.Int1 AS NVARCHAR)
+    END                       AS EmployeeID,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value
+    )                         AS CardNumber,
+    t1.PartitionName2         AS PartitionName2,
+    t1.ObjectIdentity1        AS PersonGUID,
+    t3.Name                   AS PersonnelType,
+    t5d.value                 AS Direction,
+    -- LogicalLocation: prefer door-based detection, fallback to partition name
+    CASE
+      WHEN t1.ObjectName2 LIKE '%HQ%' OR t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+      WHEN t1.ObjectName2 LIKE '%Austin%' OR t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+      WHEN t1.ObjectName2 LIKE '%Miami%' OR t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+      WHEN t1.ObjectName2 LIKE '%NYC%' OR t1.ObjectName2 LIKE '%New York%' OR t1.PartitionName2 = 'US.NYC' THEN 'New York'
+      ELSE 'Other'
+    END AS LogicalLocation
+  FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
+  LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3
+    ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+    ON t1.XmlGUID = t5d.GUID
+    AND t5d.Value IN ('InDirection','OutDirection')
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml]       AS t_xml
+    ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, value
+    FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
+    WHERE Name IN ('Card','CHUID')
+  ) AS sc
+    ON t1.XmlGUID = sc.GUID
+  WHERE
+    t1.MessageType = 'CardAdmitted'
+    AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+        = CONVERT(DATE, GETDATE())
+)
+`;
+
+/**
+ * Fetch today's live occupancy records.
+ */
+exports.fetchLiveOccupancy = async () => {
+  const pool = await poolPromise;
+  const query = `
+    ${combinedQueryCTE}
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM CombinedQuery
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Fetch historical swipe data for the last `days` days
+ * and optional single `location`.
+ */
+exports.fetchHistoricalData = async ({ days = 7, location = null }) => {
+  const pool = await poolPromise;
+  const parts = quoteList(partitionList);
+  const locCondition = location
+    ? `AND t1.PartitionName2 = @location`
+    : `AND t1.PartitionName2 IN (${parts})`;
+
+  const query = `
+    WITH Hist AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1,
+        t1.ObjectName2       AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor')
+            THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+          sc.value
+        )                     AS CardNumber,
+        t1.PartitionName2,
+        t1.ObjectIdentity1   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction,
+        CASE
+          WHEN t1.ObjectName2 LIKE '%HQ%' OR t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.ObjectName2 LIKE '%Austin%' OR t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.ObjectName2 LIKE '%Miami%' OR t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.ObjectName2 LIKE '%NYC%' OR t1.ObjectName2 LIKE '%New York%' OR t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3
+        ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID
+        AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml]       AS t_xml
+        ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value
+        FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
+        WHERE Name IN ('Card','CHUID')
+      ) AS sc
+        ON t1.XmlGUID = sc.GUID
+    WHERE
+      t1.MessageType = 'CardAdmitted'
+      ${locCondition}
+      AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+          >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    )
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM Hist
+    ORDER BY LocaleMessageTime ASC;
+  `;
+
+  const req = pool.request();
+  if (location) req.input('location', sql.NVarChar, location);
+  const result = await req.query(query);
+  return result.recordset;
+};
+
+exports.fetchHistoricalOccupancy = async (location) =>
+  exports.fetchHistoricalData({ days: 7, location: location || null });
+
+/**
+ * Fetch today's swipes for Denver security officers.
+ */
+exports.fetchSecuritySwipes = async () => {
+  const pool = await poolPromise;
+  const officers = quoteList(roles.securityOfficers);
+
+  const query = `
+    ${combinedQueryCTE}
+    SELECT
+      LocaleMessageTime,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PersonnelType,
+      PartitionName2,
+      LogicalLocation,
+      Direction
+    FROM CombinedQuery
+    WHERE
+      EmployeeID IN (${officers})
+      AND PartitionName2 = 'US.CO.OBS'
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Count visitor badge swipes per floor today.
+ */
+exports.fetchVisitorCountsByFloor = async () => {
+  const pool = await poolPromise;
+  const query = `
+    ${combinedQueryCTE}
+    SELECT
+      PartitionName2    AS PartitionName2,
+      LogicalLocation,
+      Door              AS Floor,
+      COUNT(*)          AS visitorCount
+    FROM CombinedQuery
+    WHERE PersonnelType = 'Visitor'
+    GROUP BY PartitionName2, LogicalLocation, Door;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Fetch badge‐rejection rows for the last 7 days (incl. today)
+ * and return both live‐today count and history.
+ */
+exports.fetchBadgeRejectionDetails = async () => {
+  const pool = await poolPromise;
+  const parts = quoteList(partitionList);
+
+  const query = `
+WITH CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1      AS ObjectName1,
+    t1.ObjectName2      AS Door,
+    t1.PartitionName2   AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value
+    )                    AS CardNumber,
+    t3.Name              AS PersonnelType,
+    t5_rej.value         AS RejectionType,
+    CASE
+      WHEN t1.ObjectName2 LIKE '%HQ%' OR t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+      WHEN t1.ObjectName2 LIKE '%Austin%' OR t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+      WHEN t1.ObjectName2 LIKE '%Miami%' OR t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+      WHEN t1.ObjectName2 LIKE '%NYC%' OR t1.ObjectName2 LIKE '%New York%' OR t1.PartitionName2 = 'US.NYC' THEN 'New York'
+      ELSE 'Other'
+    END AS LogicalLocation
+  FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+  LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2
+    ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3
+    ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml
+    ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, value
+    FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
+    WHERE Name IN ('Card','CHUID')
+  ) AS sc
+    ON t1.XmlGUID = sc.GUID
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType = 'CardRejected'
+    AND t1.PartitionName2 IN (${parts})
+    AND CONVERT(DATE,
+         DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)
+        ) >= DATEADD(DAY, -7, CONVERT(DATE, GETDATE()))
+)
+
+SELECT
+  LocaleMessageTime,
+  CONVERT(date, LocaleMessageTime)    AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS SwipeTime,
+  CardNumber,
+  PersonnelType,
+  PartitionName2                     AS Location,
+  LogicalLocation,
+  Door,
+  RejectionType
+FROM CombinedQuery
+ORDER BY LocaleMessageTime DESC;
+  `;
+
+  const result = await pool.request().query(query);
+  const rows = result.recordset;
+
+  // compute today’s count
+  const todayStr = new Date().toISOString().slice(0,10);
+  const liveCount = rows.filter(r =>
+    r.DateOnly.toISOString().slice(0,10) === todayStr
+  ).length;
+
+  return { liveCount, history: rows };
+};
+
+/**
+ * Fetch IN/OUT swipes for service vendors for time calculations.
+ */
+exports.fetchVendorSwipes = async ({ vendorBadgeId }) => {
+  const pool = await poolPromise;
+  const query = `
+    ${combinedQueryCTE}
+    SELECT
+      LocaleMessageTime,
+      EmployeeID,
+      CardNumber,
+      Direction,
+      PartitionName2,
+      LogicalLocation
+    FROM CombinedQuery
+    WHERE CardNumber = @vendorBadgeId
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const req = pool.request().input('vendorBadgeId', sql.NVarChar, vendorBadgeId);
+  const result = await req.query(query);
+  return result.recordset;
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check this Backend Query carefully and update 
  'US.CO.OBS',           // Denver
   'US.FL.Miami',
