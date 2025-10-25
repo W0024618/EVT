@@ -1,593 +1,517 @@
-Initailly Fix Backend Only ...
-When i run above Query We got ...
 
-[dotenv@17.0.1] injecting env (0) from .env – [tip] encrypt with dotenvx: https://dotenvx.com
-🚀 NAMER server running on port 3007
-✅ MSSQL connected (NAMER)
-history error: TypeError: raw.forEach is not a function
-    at exports.getHistoricalOccupancy (C:\Users\W0024618\Desktop\namer-occupancy-backend\src\controllers\occupancy.controller.js:716:11)
-    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+  // src/controllers/occupancy.controller.js
+
+  const service       = require('../services/occupancy.service');
+  const doorMap       = require('../utils/doorMap');
+  const normalizeDoor = doorMap.normalizeDoor;
+  const roles         = require('../utils/roles');
+  const tzMap         = require('../utils/timezones'); // partition→IANA tz
+ 
+
+  /**
+   * Determine if the given PersonnelType is considered an employee.
+   */
+  function isEmployeeType(pt) {
+    return ['Employee','Terminated Employee','Terminated Personnel'].includes(pt);
+  }
+
+
+  /**
+   * Map (partition, door, direction) → logical floor name.
+   * Tracks any unmapped doors in the provided Set.
+   */
+
+function lookupFloor(partition, door, direction, unmapped) {
+  const normPart = String(partition || '').trim().toUpperCase();
+  const normDoor = normalizeDoor(door);
+
+  // Special-case: when Default bucket receives an HQ door for the 15th floor,
+  // treat it as the Denver HQ (US.CO.OBS Floor 15).
+  if (normPart === 'USA/CANADA DEFAULT' && /USCOHQ.*\b15\b/.test(normDoor)) {
+    return direction === 'InDirection' ? 'Floor 15' : 'Out of office';
+  }
+
+  // existing logic continues unchanged...
+  // 1) exact partition+door match
+  let entry = doorMap.find(d =>
+    d.partition.trim().toUpperCase() === normPart &&
+    d.door === normDoor
+  );
+
+
+
+    // 1b) fallback for OBS doors mapped under Default
+    if (!entry && normPart === 'US.CO.OBS') {
+      entry = doorMap.find(d =>
+        d.partition.trim().toUpperCase() === 'USA/CANADA DEFAULT' &&
+        d.door === normDoor
+      );
+    }
+
+    // 2) general OBS wildcard (‘*’) under Default
+    if (!entry && normPart === 'US.CO.OBS') {
+      entry = doorMap.find(d =>
+        d.partition.trim().toUpperCase() === 'USA/CANADA DEFAULT' &&
+        d.door === '*'
+      );
+    }
+
+    // 2b) heuristic: catch any “15” or “1” in the door name for OBS
+    if (!entry && normPart === 'US.CO.OBS') {
+      if (/\b15\b/.test(normDoor)) {
+        return direction === 'InDirection' ? 'Floor 15' : 'Out of office';
+      }
+      if (/\b1\b/.test(normDoor)) {
+        return direction === 'InDirection' ? 'Floor 01' : 'Out of office';
+      }
+    }
+
+    // 3) still no mapping? record and bail
+    if (!entry) {
+      unmapped.add(`${partition}|${door}`);
+      return null;
+    }
+
+    return direction === 'InDirection'
+      ? entry.inDirectionFloor
+      : entry.outDirectionFloor;
+  }
 
 
 
 
-// occupancy.service.js
-const { poolPromise, sql } = require('../config/db');
-const roles = require('../utils/roles');
 
-const partitionList = [
-  'US.CO.OBS',           // Denver
-  'US.FL.Miami',
-  'US.NYC',
-  'USA/Canada Default'
-];
 
-// Helper: safely join a list of strings into quoted SQL literals
-function quoteList(arr) {
-  return arr.map(s => `'${s.replace(/'/g, "''")}'`).join(',');
+/**
+ * Format an ISO timestamp into the given partition’s timezone, with AM/PM.
+ */
+function formatInZone(isoString, partition) {
+  const tz = tzMap[partition] || 'UTC';
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour12:  true,
+    year:    'numeric',
+    month:   '2-digit',
+    day:     '2-digit',
+    hour:    'numeric',
+    minute:  '2-digit',
+    second:  '2-digit'
+  }).format(new Date(isoString));
 }
 
-// Shared door-first mapping snippets (kept inline in queries below)
 
-/**
- * Fetch today's live occupancy records.
- *
- * PartitionName2 returned here is the door-first mapped partition (HQ doors -> 'US.CO.OBS').
- */
-exports.fetchLiveOccupancy = async () => {
-  const pool = await poolPromise;
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1           AS ObjectName1,
-        t1.ObjectName2           AS Door,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                       AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
-          sc.value
-        )                         AS CardNumber,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.ObjectIdentity1        AS PersonGUID,
-        t3.Name                   AS PersonnelType,
-        t5d.value                 AS Direction,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            THEN 'Denver-HQ'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            THEN 'Austin Texas'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
-            THEN 'New York'
-          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-          ELSE 'Other'
-        END AS LogicalLocation
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT
-      LocaleMessageTime,
-      ObjectName1,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PartitionName2,
-      LogicalLocation,
-      PersonGUID,
-      PersonnelType,
-      Direction
-    FROM CombinedQuery
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
-};
-
-
-/**
- * Fetch historical swipe data for the last `days` days and also return a server-side summaryByDate.
- *
- * Returns: { details: [...rows...], summaryByDate: [...] }
- * - details: array of raw rows (mapped PartitionName2, LogicalLocation, PersonGUID, PersonnelType, Direction, LocaleMessageTime, etc)
- * - summaryByDate: for each date, region totals + partitions map { partitionCode: { total, Employee, Contractor } }
- *
- * Important: summary is built by taking the last swipe per PersonGUID per date (ORDER BY LocaleMessageTime DESC),
- * and counting that person present on that date only if that last swipe Direction = 'InDirection' (this matches SSMS approach).
- */
-exports.fetchHistoricalData = async ({ days = 7, location = null } = {}) => {
-  const pool = await poolPromise;
-  const parts = quoteList(partitionList);
-  const locCondition = location
-    ? `AND t1.PartitionName2 = @location`
-    : `AND t1.PartitionName2 IN (${parts})`;
-
-  // two queries: 1) details, 2) summary using last-swipe-per-person-per-day
-  const sqlQuery = `
-    -- DETAILS
-    WITH Hist AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1,
-        t1.ObjectName2       AS Door,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor')
-            THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                   AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
-          sc.value
-        )                     AS CardNumber,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.ObjectIdentity1   AS PersonGUID,
-        t3.Name              AS PersonnelType,
-        t5d.value            AS Direction,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            THEN 'Denver-HQ'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            THEN 'Austin Texas'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
-            THEN 'New York'
-          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-          ELSE 'Other'
-        END AS LogicalLocation
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml]       AS t_xml
-        ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value
-        FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
-        WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE
-        t1.MessageType = 'CardAdmitted'
-        ${locCondition}
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
-            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
-    )
-    SELECT
-      LocaleMessageTime,
-      ObjectName1,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PartitionName2,
-      LogicalLocation,
-      PersonGUID,
-      PersonnelType,
-      Direction
-    FROM Hist
-    ORDER BY LocaleMessageTime ASC;
-
-    -- SUMMARY: last-swipe-per-person-per-day, count if last swipe Direction = 'InDirection'
-    WITH Hist2 AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName2       AS Door,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                   AS EmployeeID,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.ObjectIdentity1   AS PersonGUID,
-        t3.Name              AS PersonnelType,
-        t5d.value            AS Direction
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      WHERE
-        t1.MessageType = 'CardAdmitted'
-        ${locCondition}
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
-            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
-    ),
-    LastSwipe AS (
-      SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY PersonGUID, CONVERT(date, LocaleMessageTime) ORDER BY LocaleMessageTime DESC) AS rn,
-        CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23) AS DateOnly
-      FROM Hist2
-    )
-    SELECT
-      DateOnly AS [date],
-      DATENAME(WEEKDAY, CONVERT(date, DateOnly)) AS [day],
-      PartitionName2 AS partitionCode,
-      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%employee%' THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS Employee,
-      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%contractor%' THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS Contractor,
-      SUM(CASE WHEN (LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%employee%' AND LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%contractor%') THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS OtherPresent
-    FROM LastSwipe
-    WHERE rn = 1
-    GROUP BY DateOnly, PartitionName2
-    ORDER BY DateOnly DESC, PartitionName2;
-  `;
-
-  const req = pool.request();
-  if (location) req.input('location', sql.NVarChar, location);
-
-  const result = await req.query(sqlQuery);
-  // result.recordsets[0] => details rows
-  // result.recordsets[1] => summary rows
-  const details = Array.isArray(result.recordsets[0]) ? result.recordsets[0] : [];
-  const summaryRows = Array.isArray(result.recordsets[1]) ? result.recordsets[1] : [];
-
-  // Transform summaryRows into summaryByDate structure as frontend expects
-  const summaryByDateMap = {};
-  summaryRows.forEach(r => {
-    const date = r.date;
-    if (!summaryByDateMap[date]) {
-      summaryByDateMap[date] = {
-        date,
-        day: r.day,
-        region: { name: 'NAMER', total: 0, Employee: 0, Contractor: 0 },
-        partitions: {}
-      };
+  /**
+   * GET /api/occupancy/live
+   */
+  exports.getLiveOccupancy = async (req, res) => {
+    try {
+      const data = await service.fetchLiveOccupancy();
+      res.json({ success:true, count:data.length, data });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ success:false, message:'Live occupancy fetch failed' });
     }
-    const emp = r.Employee || 0;
-    const con = r.Contractor || 0;
-    const other = r.OtherPresent || 0;
-    const total = emp + con + other;
+  };
 
-    summaryByDateMap[date].partitions[r.partitionCode] = {
-      total,
-      Employee: emp,
-      Contractor: con
-    };
 
-    summaryByDateMap[date].region.Employee += emp;
-    summaryByDateMap[date].region.Contractor += con;
-    summaryByDateMap[date].region.total += total;
-  });
-
-  const summaryByDate = Object.values(summaryByDateMap).sort((a,b) => b.date.localeCompare(a.date));
-
-  return { details, summaryByDate };
-};
-
-exports.fetchHistoricalOccupancy = async (location) =>
-  exports.fetchHistoricalData({ days: 7, location: location || null });
+  
 
 /**
- * Fetch today's swipes for Denver security officers.
- * Use door-first PartitionName2 to identify Denver HQ swipes.
+ * GET /api/occupancy/live
  */
-exports.fetchSecuritySwipes = async () => {
-  const pool = await poolPromise;
-  const officers = quoteList(roles.securityOfficers);
-
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1      AS ObjectName1,
-        t1.ObjectName2      AS Door,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t3.Name AS PersonnelType,
-        t5d.value AS Direction,
-        t1.ObjectIdentity1 AS PersonGUID,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        ) AS CardNumber
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT
-      LocaleMessageTime,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PersonnelType,
-      PartitionName2,
-      Direction
-    FROM CombinedQuery
-    WHERE EmployeeID IN (${officers})
-      AND PartitionName2 = 'US.CO.OBS'
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
+exports.getLiveOccupancy = async (req, res) => {
+  try {
+    const data = await service.fetchLiveOccupancy();
+    res.json({ success:true, count:data.length, data });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success:false, message:'Live occupancy fetch failed' });
+  }
 };
+
 
 /**
- * Count visitor badge swipes per floor today (returns door-first PartitionName2).
+ * GET /api/occupancy/live-summary
+ * Optional query param: ts=ISO timestamp (UTC, e.g. "...?ts=2025-07-15T10:30:00Z")
  */
-exports.fetchVisitorCountsByFloor = async () => {
-  const pool = await poolPromise;
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
-        t3.Name AS PersonnelType,
-        t1.ObjectName2 AS Door
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT PartitionName2, LogicalLocation = NULL, Door AS Floor, COUNT(*) AS visitorCount
-    FROM CombinedQuery
-    WHERE PersonnelType = 'Visitor'
-    GROUP BY PartitionName2, Door;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
+exports.getLiveSummary = async (req, res) => {
+  try {
+    const { ts } = req.query;
+
+    // ────────────────────────────
+    // 1) Time-travel branch (pure UTC)
+    // ────────────────────────────
+    if (ts) {
+      const timestamp = new Date(ts);
+      if (isNaN(timestamp)) {
+        return res
+          .status(400)
+          .json({ success:false, message:'invalid ts query param' });
+      }
+
+      // UTC date string of ts
+      const dayStr = timestamp.toISOString().slice(0,10); // e.g. "2025-07-15"
+
+      // a) fetch last 24h, narrow to that UTC date
+      const raw     = await service.fetchHistoricalData({ days:1, location:null });
+      const sameDay = raw.filter(r => 
+        new Date(r.LocaleMessageTime).toISOString().slice(0,10) === dayStr
+      );
+
+      // b) keep only swipes ≤ ts
+      const upTo = sameDay.filter(r => new Date(r.LocaleMessageTime) <= timestamp);
+
+      // c) last swipe per person ≤ ts
+      const lastByPerson = {};
+      upTo.forEach(r => {
+        const key = r.PersonGUID;
+        const t   = new Date(r.LocaleMessageTime).getTime();
+        if (!lastByPerson[key] ||
+            t > new Date(lastByPerson[key].LocaleMessageTime).getTime()) {
+          lastByPerson[key] = r;
+        }
+      });
+
+      // d) build “today” & realtime snapshot
+      const today    = { total:0, Employee:0, Contractor:0 };
+      const realtime = {};
+      const details  = [];
+      const unmapped = new Set();
+
+      Object.values(lastByPerson).forEach(r => {
+        // count
+        const isEmp = isEmployeeType(r.PersonnelType);
+        today.total++;
+        if (isEmp) today.Employee++; else today.Contractor++;
+
+        // floor mapping
+        const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
+        if (floorName === 'Out of office') return;
+
+        // tally realtime
+        const p = r.PartitionName2;
+        realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
+        realtime[p].total++;
+        if (isEmp) realtime[p].Employee++; else realtime[p].Contractor++;
+        realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
+
+        // detail row (UTC)
+        details.push({
+          ...r,
+          snapshotTime:      r.LocaleMessageTime,
+          LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
+          floor:             floorName
+        });
+      });
+
+      return res.json({
+        success:      true,
+        timestampUtc: timestamp.toISOString(),
+        today,
+        realtime,
+        details
+      });
+    }
+
+    // ────────────────────────────
+    // 2) Default live branch
+    // ────────────────────────────
+    const swipes = await service.fetchLiveOccupancy();
+
+    // 2a) “today” = first swipe per person (UTC date = today)
+    const first = {};
+    swipes.forEach(r => {
+      const t = new Date(r.LocaleMessageTime).getTime();
+      if (!first[r.PersonGUID] ||
+          t < new Date(first[r.PersonGUID].LocaleMessageTime).getTime()) {
+        first[r.PersonGUID] = r;
+      }
+    });
+    const today = { total:0, Employee:0, Contractor:0 };
+    Object.values(first).forEach(r => {
+      today.total++;
+      isEmployeeType(r.PersonnelType)
+        ? today.Employee++
+        : today.Contractor++;
+    });
+
+    // 2b) “realtime” = last swipe per person
+    const last     = {};
+    const realtime = {};
+    const details  = [];
+    const unmapped = new Set();
+
+    swipes.forEach(r => {
+      const t = new Date(r.LocaleMessageTime).getTime();
+      if (!last[r.PersonGUID] ||
+          t > new Date(last[r.PersonGUID].LocaleMessageTime).getTime()) {
+        last[r.PersonGUID] = r;
+      }
+    });
+
+    Object.values(last).forEach(r => {
+      // skip OUT→“Out of office”
+      if (r.Direction === 'OutDirection') {
+        const fl = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped);
+        if (fl === 'Out of office') return;
+      }
+
+      // floor
+      const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
+      if (floorName === 'Out of office') return;
+
+      // tally
+      const p = r.PartitionName2;
+      realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
+      realtime[p].total++;
+      isEmployeeType(r.PersonnelType)
+        ? realtime[p].Employee++
+        : realtime[p].Contractor++;
+      realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
+
+      // detail
+      details.push({
+        ...r,
+        snapshotTime:      r.LocaleMessageTime,
+        LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
+        floor:             floorName
+      });
+    });
+
+    return res.json({ success:true, today, realtime, details });
+  }
+  catch (err) {
+    console.error('live-summary error:', err);
+    return res.status(500).json({ success:false, message:'Live summary failed' });
+  }
 };
 
-/**
- * Badge rejections last 7 days
- */
-exports.fetchBadgeRejectionDetails = async () => {
-  const pool = await poolPromise;
-  const parts = quoteList(partitionList);
 
-  const query = `
-WITH CombinedQuery AS (
-  SELECT
-    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-    t1.ObjectName1      AS ObjectName1,
-    t1.ObjectName2      AS Door,
-    CASE
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-        OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-        OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-        OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-        OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-      ELSE t1.PartitionName2
-    END AS PartitionName2,
-    COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-      sc.value
-    ) AS CardNumber,
-    t3.Name AS PersonnelType,
-    t5_rej.value AS RejectionType,
-    CASE
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-        THEN 'Denver-HQ'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' THEN 'Austin Texas'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' THEN 'New York'
-      WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-      WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-      WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-      WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-      ELSE 'Other'
-    END AS LogicalLocation
-  FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-  LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-  LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
-  LEFT JOIN (
-    SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
-  ) AS sc ON t1.XmlGUID = sc.GUID
-  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5_rej
-    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-  WHERE
-    t1.MessageType = 'CardRejected'
-    AND t1.PartitionName2 IN (${parts})
-    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) >= DATEADD(DAY, -7, CONVERT(DATE, GETDATE()))
-)
-SELECT
-  LocaleMessageTime,
-  CONVERT(date, LocaleMessageTime) AS DateOnly,
-  CONVERT(time(0), LocaleMessageTime) AS SwipeTime,
-  CardNumber,
-  PersonnelType,
-  PartitionName2 AS Location,
-  LogicalLocation,
-  Door,
-  RejectionType
-FROM CombinedQuery
-ORDER BY LocaleMessageTime DESC;
-  `;
 
-  const result = await pool.request().query(query);
-  const rows = result.recordset;
 
-  // compute today's count
-  const todayStr = new Date().toISOString().slice(0,10);
-  const liveCount = rows.filter(r =>
-    r.DateOnly && r.DateOnly.toISOString && r.DateOnly.toISOString().slice(0,10) === todayStr
-  ).length;
+  /**
+   * GET /api/occupancy/history
+   * Optional query params: start=YYYY-MM-DD, end=YYYY-MM-DD
+   * Optional URL param: :location
+   */
+  exports.getHistoricalOccupancy = async (req, res) => {
+    try {
+      const { start, end } = req.query;
+      const location       = req.params.location || null;
 
-  return { liveCount, history: rows };
-};
+      if (start && end) {
+        // --- average-over-range logic ---
+        const startD = new Date(start);
+        const endD   = new Date(end);
+        if (isNaN(startD) || isNaN(endD) || endD < startD) {
+          return res
+            .status(400)
+            .json({ success:false, message:'invalid start/end date range' });
+        }
 
-/**
- * Fetch IN/OUT swipes for service vendors for time calculations.
- */
-exports.fetchVendorSwipes = async ({ vendorBadgeId }) => {
-  const pool = await poolPromise;
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
-        t5d.value AS Direction,
-        t1.ObjectIdentity1 AS PersonGUID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        ) AS CardNumber,
-        t3.Name AS PersonnelType
-      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
-      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-    )
-    SELECT LocaleMessageTime, EmployeeID, CardNumber, Direction, PartitionName2, PersonnelType, PersonGUID
-    FROM CombinedQuery
-    WHERE CardNumber = @vendorBadgeId
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const req = pool.request().input('vendorBadgeId', sql.NVarChar, vendorBadgeId);
-  const result = await req.query(query);
-  return result.recordset;
-};
+        // inclusive days count
+        const days = Math.ceil((endD - startD)/(1000*60*60*24)) + 1;
+        const raw  = await service.fetchHistoricalData({ days, location });
+
+        // bucket unique PersonGUID per date
+        const byDate = {};
+        raw.forEach(r => {
+          const t    = new Date(r.LocaleMessageTime);
+          const date = t.toISOString().slice(0,10);
+          if (date < start || date > end) return;
+          byDate[date] = byDate[date] || new Set();
+          byDate[date].add(r.PersonGUID);
+        });
+
+        // build breakdown & average
+        const dates     = Object.keys(byDate).sort();
+        const breakdown = dates.map(d => ({ date: d, count: byDate[d].size }));
+        const sum       = breakdown.reduce((s,x) => s + x.count, 0);
+        const average   = breakdown.length ? sum/breakdown.length : 0;
+
+        return res.json({
+          success:   true,
+          start,
+          end,
+          average,
+          breakdown
+        });
+      }
+
+      // --- default history logic ---
+      const raw = await service.fetchHistoricalOccupancy(location);
+      const byDate = {};
+      const details = [];
+
+      raw.forEach(r => {
+        const iso = (r.LocaleMessageTime instanceof Date)
+          ? r.LocaleMessageTime.toISOString()
+          : r.LocaleMessageTime;
+        const date = iso.slice(0,10);
+        byDate[date] = byDate[date] || {};
+        const prev = byDate[date][r.PersonGUID];
+        if (!prev || new Date(iso) < new Date(prev.LocaleMessageTime)) {
+          byDate[date][r.PersonGUID] = { ...r, LocaleMessageTime: iso };
+        }
+      });
+
+      const summaryByDate = Object.keys(byDate).sort().map(date => {
+        const recs = Object.values(byDate[date]);
+        details.push(...recs);
+        const region = { total:0, Employee:0, Contractor:0 };
+        const partitions = {};
+
+        recs.forEach(r => {
+          region.total++;
+          isEmployeeType(r.PersonnelType) ? region.Employee++ : region.Contractor++;
+          if (!location) {
+            partitions[r.PartitionName2] = partitions[r.PartitionName2] || { total:0, Employee:0, Contractor:0 };
+            partitions[r.PartitionName2].total++;
+            isEmployeeType(r.PersonnelType)
+              ? partitions[r.PartitionName2].Employee++
+              : partitions[r.PartitionName2].Contractor++;
+          }
+        });
+
+        return {
+          date,
+          day: new Date(date).toLocaleDateString('en-US',{ weekday:'long' }),
+          region: location ? { name: location, ...region } : { name: 'NAMER', ...region },
+          partitions: location ? undefined : partitions
+        };
+      });
+
+      res.json({ success:true, summaryByDate, details });
+
+    } catch (e) {
+      console.error('history error:', e);
+      res.status(500).json({ success:false, message:'Historical fetch failed' });
+    }
+  };
+
+  /**
+   * GET /api/occupancy/security-officers
+   */
+  exports.getSecurityOfficersInBuilding = async (req, res) => {
+    try {
+      const swipes = await service.fetchSecuritySwipes();
+      const lastByOfficer = {};
+
+      swipes.forEach(s => {
+        const key = s.EmployeeID;
+        if (!lastByOfficer[key] ||
+            new Date(s.LocaleMessageTime) > new Date(lastByOfficer[key].LocaleMessageTime)) {
+          lastByOfficer[key] = s;
+        }
+      });
+
+      const present = Object.values(lastByOfficer)
+        .filter(s => s.Direction === 'InDirection')
+        .map(s => {
+          const floor = lookupFloor(s.PartitionName2, s.Door, s.Direction, new Set()) || 'Unknown';
+          return { badge: s.EmployeeID, time: s.LocaleMessageTime, floor };
+        });
+
+      res.json({ success:true, present });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ success:false, message:'Security officers fetch failed' });
+    }
+  };
+
+  /**
+   * GET /api/occupancy/visitors-by-floor
+   */
+  exports.getVisitorCountsByFloor = async (req, res) => {
+    try {
+      const raw = await service.fetchVisitorCountsByFloor();
+      const unmapped = new Set();
+      const floorCounts = raw.reduce((acc, { PartitionName2, Floor, visitorCount }) => {
+        const floor = lookupFloor(PartitionName2, Floor, 'InDirection', unmapped) || 'Unknown';
+        acc[floor] = (acc[floor]||0) + visitorCount;
+        return acc;
+      }, {});
+      const counts = Object.entries(floorCounts)
+                          .map(([floor, visitorCount]) => ({ floor, visitorCount }));
+      res.json({ success:true, counts });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ success:false, message:'Visitor counts fetch failed' });
+    }
+  };
+
+  /**
+   * GET /api/occupancy/badge-rejections
+   */
+  exports.getBadgeRejections = async (req, res) => {
+    try {
+      const { liveCount, history } = await service.fetchBadgeRejectionDetails();
+
+      // normalize history rows
+      const normHistory = history.map(r => {
+        const dateOnlyStr = (r.DateOnly instanceof Date)
+          ? r.DateOnly.toISOString().slice(0,10)
+          : String(r.DateOnly).slice(0,10);
+        let swipeTimeStr;
+        if (r.SwipeTime instanceof Date) {
+          swipeTimeStr = r.SwipeTime.toISOString().slice(11,19);
+        } else {
+          const m = String(r.SwipeTime).match(/(\d{2}:\d{2}:\d{2})/);
+          swipeTimeStr = m ? m[1] : String(r.SwipeTime);
+        }
+        return { ...r, DateOnly: dateOnlyStr, SwipeTime: swipeTimeStr, Door: r.Door };
+      });
+
+      const todayDate = new Date().toISOString().slice(0,10);
+      const todayRows = normHistory.filter(r => r.DateOnly === todayDate);
+
+      const today = {
+        total:      liveCount,
+        Employee:   todayRows.filter(r => r.PersonnelType === 'Employee').length,
+        Contractor: todayRows.filter(r => r.PersonnelType !== 'Employee').length
+      };
+
+      const realtime = {};
+      todayRows.forEach(r => {
+        const loc = r.Location || 'Unknown';
+        if (!realtime[loc]) realtime[loc] = { total:0, Employee:0, Contractor:0 };
+        realtime[loc].total++;
+        if (r.PersonnelType === 'Employee') realtime[loc].Employee++;
+        else realtime[loc].Contractor++;
+      });
+
+      res.json({ success:true, today, realtime, details: normHistory });
+    } catch (e) {
+      console.error('Badge‐rejection fetch failed:', e);
+      res.status(500).json({ success:false, message:'Badge rejections fetch failed' });
+    }
+  };
+
+  /**
+   * GET /api/occupancy/vendor-time/:badgeId
+   */
+  exports.getVendorTimeCalc = async (req, res) => {
+    try {
+      const { badgeId } = req.params;
+      const swipes       = await service.fetchVendorSwipes({ vendorBadgeId: badgeId });
+      const durations    = [];
+      let inTime         = null;
+
+      swipes.forEach(s => {
+        const t = new Date(s.LocaleMessageTime);
+        if (s.Direction === 'InDirection') {
+          inTime = t;
+        } else if (s.Direction === 'OutDirection' && inTime) {
+          durations.push((t - inTime) / 3600000);
+          inTime = null;
+        }
+      });
+
+      res.json({ success:true, badgeId, durations });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ success:false, message:'Vendor time calc failed' });
+    }
+  };
+
 
