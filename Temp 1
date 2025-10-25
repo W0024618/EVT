@@ -1,3 +1,1008 @@
+// occupancy.service.js
+const { poolPromise, sql } = require('../config/db');
+const roles = require('../utils/roles');
+
+const partitionList = [
+  'US.CO.OBS',           // Denver
+  'US.FL.Miami',
+  'US.NYC',
+  'USA/Canada Default'
+];
+
+// Helper: safely join a list of strings into quoted SQL literals
+function quoteList(arr) {
+  return arr.map(s => `'${s.replace(/'/g, "''")}'`).join(',');
+}
+
+// Shared door-first mapping snippets (kept inline in queries below)
+
+/**
+ * Fetch today's live occupancy records.
+ *
+ * PartitionName2 returned here is the door-first mapped partition (HQ doors -> 'US.CO.OBS').
+ */
+exports.fetchLiveOccupancy = async () => {
+  const pool = await poolPromise;
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1           AS ObjectName1,
+        t1.ObjectName2           AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                       AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+          sc.value
+        )                         AS CardNumber,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.ObjectIdentity1        AS PersonGUID,
+        t3.Name                   AS PersonnelType,
+        t5d.value                 AS Direction,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            THEN 'Denver-HQ'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            THEN 'Austin Texas'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
+            THEN 'New York'
+          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM CombinedQuery
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+
+/**
+ * Fetch historical swipe data for the last `days` days and also return a server-side summaryByDate.
+ *
+ * Returns: { details: [...rows...], summaryByDate: [...] }
+ * - details: array of raw rows (mapped PartitionName2, LogicalLocation, PersonGUID, PersonnelType, Direction, LocaleMessageTime, etc)
+ * - summaryByDate: for each date, region totals + partitions map { partitionCode: { total, Employee, Contractor } }
+ *
+ * Important: summary is built by taking the last swipe per PersonGUID per date (ORDER BY LocaleMessageTime DESC),
+ * and counting that person present on that date only if that last swipe Direction = 'InDirection' (this matches SSMS approach).
+ */
+exports.fetchHistoricalData = async ({ days = 7, location = null } = {}) => {
+  const pool = await poolPromise;
+  const parts = quoteList(partitionList);
+  const locCondition = location
+    ? `AND t1.PartitionName2 = @location`
+    : `AND t1.PartitionName2 IN (${parts})`;
+
+  // two queries: 1) details, 2) summary using last-swipe-per-person-per-day
+  const sqlQuery = `
+    -- DETAILS
+    WITH Hist AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1,
+        t1.ObjectName2       AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor')
+            THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+          sc.value
+        )                     AS CardNumber,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.ObjectIdentity1   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            THEN 'Denver-HQ'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            THEN 'Austin Texas'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
+            THEN 'New York'
+          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml]       AS t_xml
+        ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value
+        FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
+        WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE
+        t1.MessageType = 'CardAdmitted'
+        ${locCondition}
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    )
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM Hist
+    ORDER BY LocaleMessageTime ASC;
+
+    -- SUMMARY: last-swipe-per-person-per-day, count if last swipe Direction = 'InDirection'
+    WITH Hist2 AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName2       AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.ObjectIdentity1   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      WHERE
+        t1.MessageType = 'CardAdmitted'
+        ${locCondition}
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    ),
+    LastSwipe AS (
+      SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY PersonGUID, CONVERT(date, LocaleMessageTime) ORDER BY LocaleMessageTime DESC) AS rn,
+        CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23) AS DateOnly
+      FROM Hist2
+    )
+    SELECT
+      DateOnly AS [date],
+      DATENAME(WEEKDAY, CONVERT(date, DateOnly)) AS [day],
+      PartitionName2 AS partitionCode,
+      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%employee%' THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS Employee,
+      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%contractor%' THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS Contractor,
+      SUM(CASE WHEN (LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%employee%' AND LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%contractor%') THEN CASE WHEN Direction = 'InDirection' THEN 1 ELSE 0 END ELSE 0 END) AS OtherPresent
+    FROM LastSwipe
+    WHERE rn = 1
+    GROUP BY DateOnly, PartitionName2
+    ORDER BY DateOnly DESC, PartitionName2;
+  `;
+
+  const req = pool.request();
+  if (location) req.input('location', sql.NVarChar, location);
+
+  const result = await req.query(sqlQuery);
+  // result.recordsets[0] => details rows
+  // result.recordsets[1] => summary rows
+  const details = Array.isArray(result.recordsets[0]) ? result.recordsets[0] : [];
+  const summaryRows = Array.isArray(result.recordsets[1]) ? result.recordsets[1] : [];
+
+  // Transform summaryRows into summaryByDate structure as frontend expects
+  const summaryByDateMap = {};
+  summaryRows.forEach(r => {
+    const date = r.date;
+    if (!summaryByDateMap[date]) {
+      summaryByDateMap[date] = {
+        date,
+        day: r.day,
+        region: { name: 'NAMER', total: 0, Employee: 0, Contractor: 0 },
+        partitions: {}
+      };
+    }
+    const emp = r.Employee || 0;
+    const con = r.Contractor || 0;
+    const other = r.OtherPresent || 0;
+    const total = emp + con + other;
+
+    summaryByDateMap[date].partitions[r.partitionCode] = {
+      total,
+      Employee: emp,
+      Contractor: con
+    };
+
+    summaryByDateMap[date].region.Employee += emp;
+    summaryByDateMap[date].region.Contractor += con;
+    summaryByDateMap[date].region.total += total;
+  });
+
+  const summaryByDate = Object.values(summaryByDateMap).sort((a,b) => b.date.localeCompare(a.date));
+
+  return { details, summaryByDate };
+};
+
+exports.fetchHistoricalOccupancy = async (location) =>
+  exports.fetchHistoricalData({ days: 7, location: location || null });
+
+/**
+ * Fetch today's swipes for Denver security officers.
+ * Use door-first PartitionName2 to identify Denver HQ swipes.
+ */
+exports.fetchSecuritySwipes = async () => {
+  const pool = await poolPromise;
+  const officers = quoteList(roles.securityOfficers);
+
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1      AS ObjectName1,
+        t1.ObjectName2      AS Door,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t3.Name AS PersonnelType,
+        t5d.value AS Direction,
+        t1.ObjectIdentity1 AS PersonGUID,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        ) AS CardNumber
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT
+      LocaleMessageTime,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PersonnelType,
+      PartitionName2,
+      Direction
+    FROM CombinedQuery
+    WHERE EmployeeID IN (${officers})
+      AND PartitionName2 = 'US.CO.OBS'
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Count visitor badge swipes per floor today (returns door-first PartitionName2).
+ */
+exports.fetchVisitorCountsByFloor = async () => {
+  const pool = await poolPromise;
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+        t3.Name AS PersonnelType,
+        t1.ObjectName2 AS Door
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT PartitionName2, LogicalLocation = NULL, Door AS Floor, COUNT(*) AS visitorCount
+    FROM CombinedQuery
+    WHERE PersonnelType = 'Visitor'
+    GROUP BY PartitionName2, Door;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Badge rejections last 7 days
+ */
+exports.fetchBadgeRejectionDetails = async () => {
+  const pool = await poolPromise;
+  const parts = quoteList(partitionList);
+
+  const query = `
+WITH CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1      AS ObjectName1,
+    t1.ObjectName2      AS Door,
+    CASE
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+        OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+        OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+        OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+        OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+      ELSE t1.PartitionName2
+    END AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      sc.value
+    ) AS CardNumber,
+    t3.Name AS PersonnelType,
+    t5_rej.value AS RejectionType,
+    CASE
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+        THEN 'Denver-HQ'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' THEN 'Austin Texas'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' THEN 'New York'
+      WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+      WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+      WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+      WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+      ELSE 'Other'
+    END AS LogicalLocation
+  FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+  LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+  LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
+  ) AS sc ON t1.XmlGUID = sc.GUID
+  LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType = 'CardRejected'
+    AND t1.PartitionName2 IN (${parts})
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) >= DATEADD(DAY, -7, CONVERT(DATE, GETDATE()))
+)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date, LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS SwipeTime,
+  CardNumber,
+  PersonnelType,
+  PartitionName2 AS Location,
+  LogicalLocation,
+  Door,
+  RejectionType
+FROM CombinedQuery
+ORDER BY LocaleMessageTime DESC;
+  `;
+
+  const result = await pool.request().query(query);
+  const rows = result.recordset;
+
+  // compute today's count
+  const todayStr = new Date().toISOString().slice(0,10);
+  const liveCount = rows.filter(r =>
+    r.DateOnly && r.DateOnly.toISOString && r.DateOnly.toISOString().slice(0,10) === todayStr
+  ).length;
+
+  return { liveCount, history: rows };
+};
+
+/**
+ * Fetch IN/OUT swipes for service vendors for time calculations.
+ */
+exports.fetchVendorSwipes = async ({ vendorBadgeId }) => {
+  const pool = await poolPromise;
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+        t5d.value AS Direction,
+        t1.ObjectIdentity1 AS PersonGUID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        ) AS CardNumber,
+        t3.Name AS PersonnelType
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+    )
+    SELECT LocaleMessageTime, EmployeeID, CardNumber, Direction, PartitionName2, PersonnelType, PersonGUID
+    FROM CombinedQuery
+    WHERE CardNumber = @vendorBadgeId
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const req = pool.request().input('vendorBadgeId', sql.NVarChar, vendorBadgeId);
+  const result = await req.query(query);
+  return result.recordset;
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+// History.jsx
+import React, { useEffect, useState, useMemo } from 'react';
+import { useParams } from 'react-router-dom';
+import {
+  Container, Box, Button, Typography, Table,
+  TableHead, TableBody, TableRow, TableCell,
+  Paper, TextField
+} from '@mui/material';
+import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
+import { LocalizationProvider, DatePicker } from '@mui/x-date-pickers';
+import { format } from 'date-fns';
+import { saveAs } from 'file-saver';
+
+import Header from '../components/Header';
+import Footer from '../components/Footer';
+import LoadingSpinner from '../components/LoadingSpinner';
+import { fetchHistory } from '../api/occupancy.service';
+
+// Map partition code → friendly city/country
+const partitionToDisplay = {
+  'US.CO.OBS': { city: 'Denver', country: 'United States' },
+  'US.FL.Miami': { city: 'Miami', country: 'United States' },
+  'US.NYC': { city: 'New York', country: 'United States' },
+  'USA/Canada Default': { city: 'Austin TX', country: 'United States' }
+};
+
+// LogicalLocation ↔ city (human readable)
+const logicalToCity = {
+  'Denver-HQ': 'Denver',
+  'Austin Texas': 'Austin TX',
+  'Miami': 'Miami',
+  'New York': 'New York'
+};
+
+// LogicalLocation -> canonical partition mapping (used for robust filtering)
+const logicalToPartition = {
+  'Denver-HQ': 'US.CO.OBS',
+  'Austin Texas': 'USA/Canada Default',
+  'Miami': 'US.FL.Miami',
+  'New York': 'US.NYC'
+};
+
+export default function History() {
+  const { partition: partitionParam } = useParams();
+  const decodedKey = partitionParam ? decodeURIComponent(partitionParam) : null;
+
+  // stable list of partitions to show (either selected partition or all)
+  const filteredPartitionKeys = useMemo(
+    () => decodedKey ? [decodedKey] : Object.keys(partitionToDisplay),
+    [decodedKey]
+  );
+
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [pickedDate, setPickedDate] = useState(null);
+  const [showDetails, setShowDetails] = useState(false);
+
+  const getIsoDate = (r) =>
+    (r?.SwipeDate && typeof r.SwipeDate === 'string' && r.SwipeDate.slice(0, 10)) ||
+    (r?.LocaleMessageTime && typeof r.LocaleMessageTime === 'string' && r.LocaleMessageTime.slice(0, 10)) ||
+    '';
+
+  // 12-hour time formatter for API ISO timestamps
+  const formatApiTime12 = (isoOrTime) => {
+    if (!isoOrTime || typeof isoOrTime !== 'string') return '';
+    const m = isoOrTime.match(/T?(\d{2}):(\d{2}):(\d{2})/);
+    if (!m) return '';
+    let hh = parseInt(m[1], 10);
+    const mm = m[2];
+    const ss = m[3];
+    if (Number.isNaN(hh)) return `${m[1]}:${mm}:${ss}`;
+    const ampm = hh >= 12 ? 'PM' : 'AM';
+    let h12 = hh % 12;
+    if (h12 === 0) h12 = 12;
+    return `${String(h12).padStart(2, '0')}:${mm}:${ss} ${ampm}`;
+  };
+
+  // helper: does this row belong to partition pk?
+  const rowBelongsToPartition = (r, pk) => {
+    if (!r) return false;
+    const partitionName = (r.PartitionName2 || '').toString();
+    if (partitionName === pk) return true;
+
+    // check logical location mapping
+    const logical = r.LogicalLocation || '';
+    const logicalMappedPartition = logicalToPartition[logical];
+    if (logicalMappedPartition === pk) return true;
+
+    return false;
+  };
+
+  // Build partitionRows from server summaryByDate (preferred) OR from details fallback
+  const partitionRows = useMemo(() => {
+    if (!data || !pickedDate) return [];
+    const ds = format(pickedDate, 'yyyy-MM-dd');
+
+    // If server provided authoritative summary, use it
+    if (Array.isArray(data.summaryByDate) && data.summaryByDate.length > 0) {
+      const entry = data.summaryByDate.find(s => s.date === ds);
+      return filteredPartitionKeys.map(pk => {
+        const disp = partitionToDisplay[pk];
+        if (!entry) {
+          return { country: disp?.country || '', city: disp?.city || pk, employee: 0, contractor: 0, total: 0 };
+        }
+        const vals = (entry.partitions && entry.partitions[pk]) ? entry.partitions[pk] : { Employee: 0, Contractor: 0, total: 0 };
+        return {
+          country: disp?.country || '',
+          city: disp?.city || pk,
+          employee: vals.Employee || 0,
+          contractor: vals.Contractor || 0,
+          total: vals.total || ((vals.Employee || 0) + (vals.Contractor || 0))
+        };
+      });
+    }
+
+    // FALLBACK: compute locally (partition-aware last-swipe dedupe)
+    const result = [];
+
+    filteredPartitionKeys.forEach(pk => {
+      const rowsForPartition = (data.details || []).filter(r => {
+        const dateMatch = getIsoDate(r) === ds;
+        if (!dateMatch) return false;
+        return rowBelongsToPartition(r, pk);
+      });
+
+      if (rowsForPartition.length === 0) {
+        const disp = partitionToDisplay[pk];
+        result.push({ country: disp?.country || '', city: disp?.city || pk, employee: 0, contractor: 0, total: 0 });
+        return;
+      }
+
+      rowsForPartition.sort((a, b) => (a.LocaleMessageTime || '').localeCompare(b.LocaleMessageTime || ''));
+      const lastByPerson = {};
+      rowsForPartition.forEach(r => { lastByPerson[r.PersonGUID] = r; });
+
+      const counts = { Employee: 0, Contractor: 0, Other: 0 };
+      Object.values(lastByPerson).forEach(r => {
+        if (r.Direction !== 'InDirection') return;
+        const ptype = (r.PersonnelType || '').toLowerCase();
+        if (ptype.includes('contractor')) counts.Contractor += 1;
+        else if (ptype.includes('employee')) counts.Employee += 1;
+        else counts.Other += 1;
+      });
+
+      const disp = partitionToDisplay[pk];
+      result.push({
+        country: disp?.country || '',
+        city: disp?.city || pk,
+        employee: counts.Employee,
+        contractor: counts.Contractor,
+        total: counts.Employee + counts.Contractor + counts.Other
+      });
+    });
+
+    return result;
+  }, [data, pickedDate, filteredPartitionKeys]);
+
+  // detailRows for the details table: show last swipe per person across the selected partitions
+  const detailRows = useMemo(() => {
+    if (!data || !pickedDate) return [];
+    const ds = format(pickedDate, 'yyyy-MM-dd');
+
+    const all = (data.details || []).filter(r => getIsoDate(r) === ds);
+
+    const included = all.filter(r => filteredPartitionKeys.some(pk => rowBelongsToPartition(r, pk)));
+
+    included.sort((a, b) => (a.LocaleMessageTime || '').localeCompare(b.LocaleMessageTime || ''));
+
+    const lastByPerson = {};
+    included.forEach(r => { lastByPerson[r.PersonGUID] = r; });
+
+    return Object.values(lastByPerson).filter(r => r.Direction === 'InDirection');
+  }, [data, pickedDate, filteredPartitionKeys]);
+
+  // Fetch history once on mount
+  useEffect(() => {
+    setLoading(true);
+    fetchHistory()
+      .then(json => {
+        // backend returns { details, summaryByDate } as we implemented
+        setData(json);
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <LoadingSpinner />;
+  if (!data) return null;
+
+  // Excel export
+  const handleExport = async () => {
+    if (!pickedDate) return;
+
+    try {
+      const excelModule = await import('exceljs');
+      const Excel = excelModule.default || excelModule;
+      let wb;
+      if (Excel && Excel.Workbook) wb = new Excel.Workbook();
+      else if (typeof Excel === 'function') wb = new Excel();
+      else throw new Error('ExcelJS Workbook constructor not found');
+
+      // SHEET: Details
+      const wsDetails = wb.addWorksheet('WU Employee');
+      const headers = ['Sr.No', 'Date', 'Time', 'Employee Name', 'Employee ID', 'Personal Type', 'Door Name', 'Location'];
+      wsDetails.addRow(headers);
+      (detailRows || []).forEach((r, i) => {
+        const dateVal = (r.LocaleMessageTime?.slice(0, 10)) || (r.SwipeDate?.slice(0, 10)) || '';
+        const timeVal = formatApiTime12(r.LocaleMessageTime) || '';
+        const name = r.ObjectName1 || '';
+        const empId = r.EmployeeID || '';
+        const ptype = r.PersonnelType || '';
+        const door = r.Door || r.ObjectName2 || '';
+        const location = (r.LogicalLocation && logicalToCity[r.LogicalLocation])
+          || (r.PartitionName2 && partitionToDisplay[r.PartitionName2]?.city)
+          || '';
+        wsDetails.addRow([i + 1, dateVal, timeVal, name, empId, ptype, door, location]);
+      });
+
+      // SHEET: Summary
+      const ws = wb.addWorksheet('WU Summary');
+      ws.addRow(['Country', 'City', format(pickedDate, 'EEEE, d MMMM, yyyy'), null, null]);
+      ws.mergeCells('C1:E1');
+      ws.addRow(['', '', 'Employee', 'Contractors', 'Total']);
+      (partitionRows || []).forEach(r => {
+        ws.addRow([r.country || '', r.city || '', r.employee || 0, r.contractor || 0, r.total || 0]);
+      });
+
+      const totalEmployees = (partitionRows || []).reduce((s, r) => s + (r.employee || 0), 0);
+      const totalContractors = (partitionRows || []).reduce((s, r) => s + (r.contractor || 0), 0);
+      const totalTotals = (partitionRows || []).reduce((s, r) => s + (r.total || 0), 0);
+      ws.addRow(['Total', '', totalEmployees, totalContractors, totalTotals]);
+
+      const cityName = filteredPartitionKeys.length === 1 ? partitionToDisplay[filteredPartitionKeys[0]]?.city : '';
+      const filename = cityName
+        ? `Western Union NAMER (${cityName}) Headcount Report - ${format(pickedDate, 'd MMMM yyyy')}.xlsx`
+        : `Western Union NAMER Headcount Report - ${format(pickedDate, 'd MMMM yyyy')}.xlsx`;
+
+      const buf = await wb.xlsx.writeBuffer();
+      saveAs(new Blob([buf]), filename);
+    } catch (err) {
+      console.error('handleExport error:', err);
+    }
+  };
+
+  return (
+    <>
+      <Header />
+      <Container maxWidth={false} disableGutters sx={{ pt: 2, pb: 4 }}>
+        <Box sx={{ px: 2, mb: 2 }}>
+          <LocalizationProvider dateAdapter={AdapterDateFns}>
+            <DatePicker
+              label="Select date"
+              value={pickedDate}
+              onChange={d => { setPickedDate(d); setShowDetails(false); }}
+              renderInput={params => <TextField fullWidth {...params} />}
+            />
+          </LocalizationProvider>
+          {!pickedDate && (
+            <Typography variant="body1" color="textSecondary" sx={{ mt: 2 }}>
+              Please pick a date to view region summary.
+            </Typography>
+          )}
+        </Box>
+
+        {pickedDate && (
+          <Box display="flex" alignItems="flex-start" sx={{ px: 2, mb: 2, gap: 1 }}>
+            <Box sx={{ flex: 1, maxWidth: 900, display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Paper elevation={3} sx={{ px: 4, py: 3, border: '3px solid #000', borderRadius: 2 }}>
+                <Table sx={{ border: '2px solid #000' }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell colSpan={5} align="center"
+                        sx={{ fontWeight: 'bold', fontSize: 16, bgcolor: '#000', color: '#FFC107', border: '2px solid #000' }}
+                      >
+                        {format(pickedDate, 'EEEE, d MMMM, yyyy')}
+                      </TableCell>
+                    </TableRow>
+                    <TableRow sx={{ bgcolor: '#FFC107' }}>
+                      {['Country', 'City', 'Employees', 'Contractors', 'Total'].map(h => (
+                        <TableCell key={h}
+                          align={['Country', 'City'].includes(h) ? 'left' : 'right'}
+                          sx={{ color: '#000', fontWeight: 'bold', fontSize: 14, border: '2px solid #000' }}
+                        >
+                          {h}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {partitionRows.map((r, i) => (
+                      <TableRow key={i}>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.country}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.city}</TableCell>
+                        <TableCell align="right" sx={{ border: '2px solid #000' }}>{r.employee}</TableCell>
+                        <TableCell align="right" sx={{ border: '2px solid #000' }}>{r.contractor}</TableCell>
+                        <TableCell align="right" sx={{ bgcolor: '#FFC107', fontWeight: 'bold', border: '2px solid #000' }}>
+                          {r.total}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    <TableRow sx={{ bgcolor: '#666' }}>
+                      <TableCell colSpan={2} align="right"
+                        sx={{ color: '#fff', fontWeight: 'bold', border: '2px solid #000' }}>
+                        Total
+                      </TableCell>
+                      <TableCell align="right"
+                        sx={{ color: '#fff', fontWeight: 'bold', border: '2px solid #000' }}>
+                        {partitionRows.reduce((s, r) => s + r.employee, 0)}
+                      </TableCell>
+                      <TableCell align="right"
+                        sx={{ color: '#fff', fontWeight: 'bold', border: '2px solid #000' }}>
+                        {partitionRows.reduce((s, r) => s + r.contractor, 0)}
+                      </TableCell>
+                      <TableCell align="right"
+                        sx={{ color: '#fff', fontWeight: 'bold', bgcolor: '#333', border: '2px solid #000' }}>
+                        {partitionRows.reduce((s, r) => s + r.total, 0)}
+                      </TableCell>
+                    </TableRow>
+                  </TableBody>
+                </Table>
+
+                <Box display="flex" justifyContent="center" sx={{ mt: 1 }}>
+                  <Button variant="contained" sx={{ bgcolor: '#FFC107', color: '#000' }}
+                    onClick={() => setShowDetails(v => !v)}>
+                    {showDetails ? 'Hide Details' : 'See Details'}
+                  </Button>
+                  {showDetails && (
+                    <Button variant="outlined" sx={{ ml: 2, borderColor: '#FFC107', color: '#FFC107' }}
+                      onClick={handleExport}>
+                      Export to Excel
+                    </Button>
+                  )}
+                </Box>
+              </Paper>
+            </Box>
+          </Box>
+        )}
+
+        {showDetails && (
+          <Box display="flex" justifyContent="center" mb={2} sx={{ width: '100%' }}>
+            <Paper elevation={1} sx={{ px: 4, py: 1, width: '100%', border: '3px solid #000', borderRadius: 2 }}>
+              {detailRows.length > 0 ? (
+                <Table sx={{ border: '2px solid #000', borderCollapse: 'collapse' }}>
+                  <TableHead>
+                    <TableRow sx={{ bgcolor: '#000' }}>
+                      {['Sr', 'Date', 'Time', 'Emp ID', 'Name', 'Type', 'Card', 'Door', 'Partition']
+                        .map(h => (
+                          <TableCell key={h} align="center"
+                            sx={{ color: '#FFC107', fontWeight: 'bold', fontSize: 14, border: '2px solid #000' }}>
+                            {h}
+                          </TableCell>
+                        ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {detailRows.map((r, i) => (
+                      <TableRow key={r.PersonGUID}>
+                        <TableCell sx={{ border: '2px solid #000' }}>{i + 1}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{getIsoDate(r)}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{formatApiTime12(r.LocaleMessageTime || r.Swipe_Time || '')}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.EmployeeID}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.ObjectName1}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.PersonnelType}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.CardNumber}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>{r.Door}</TableCell>
+                        <TableCell sx={{ border: '2px solid #000' }}>
+                          {(r.LogicalLocation && logicalToCity[r.LogicalLocation])
+                            || (r.PartitionName2 && partitionToDisplay[r.PartitionName2]?.city)
+                            || r.PartitionName2}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <Typography variant="body2" sx={{ color: '#666', textAlign: 'center', mt: 2, fontStyle: 'italic' }}>
+                  No swipe records found for this date.
+                </Typography>
+              )}
+            </Paper>
+          </Box>
+        )}
+      </Container>
+      <Footer />
+    </>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // --- Replace existing fetchHistoricalData with this implementation ---
 
 /**
