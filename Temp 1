@@ -1,3 +1,650 @@
+// occupancy.service.js
+const { poolPromise, sql } = require('../config/db');
+const roles = require('../utils/roles');
+
+const partitionList = [
+  'US.CO.OBS',           // Denver
+  'US.FL.Miami',
+  'US.NYC',
+  'USA/Canada Default'
+];
+
+// Helper: safely join a list of strings into quoted SQL literals
+function quoteList(arr) {
+  return arr.map(s => `'${s.replace(/'/g, "''")}'`).join(',');
+}
+
+// cache detected journal ID column name (avoid repeated metadata queries)
+let _journalIdColCache = null;
+async function detectJournalIdColumn(pool) {
+  if (_journalIdColCache) return _journalIdColCache;
+
+  // Look for common GUID columns used across environments
+  const res = await pool.request().query(`
+    SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'ACVSUJournalLog'
+      AND COLUMN_NAME IN ('ObjectIdentity1','ObjectIdentity','ObjectIdentityGUID','ObjectIdentityID')
+  `);
+
+  if (res && res.recordset && res.recordset.length > 0) {
+    _journalIdColCache = res.recordset[0].COLUMN_NAME;
+  } else {
+    // fallback to the original name (keeps older behaviour for environments that match original column)
+    _journalIdColCache = 'ObjectIdentity1';
+  }
+
+  return _journalIdColCache;
+}
+
+/**
+ * Fetch today's live occupancy records.
+ *
+ * PartitionName2 returned here is the door-first mapped partition (HQ doors -> 'US.CO.OBS').
+ */
+exports.fetchLiveOccupancy = async () => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1           AS ObjectName1,
+        t1.ObjectName2           AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                       AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        )                         AS CardNumber,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.[${journalIdCol}]        AS PersonGUID,
+        t3.Name                   AS PersonnelType,
+        t5d.value                 AS Direction,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            THEN 'Denver-HQ'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            THEN 'Austin Texas'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
+            THEN 'New York'
+          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+      FROM dbo.ACVSUJournalLog AS t1
+      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM CombinedQuery
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+
+/**
+ * Fetch historical swipe data and server-side summaryByDate.
+ *
+ * Summary logic:
+ * - build a personKey = COALESCE(PersonGUID, CardNumber, EmployeeID, ObjectName1)
+ * - dedupe per (partition, personKey, date) taking the last swipe for that personKey/day
+ * - count one unique person per day regardless of Direction
+ */
+exports.fetchHistoricalData = async ({ days = 7, location = null } = {}) => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+  const parts = quoteList(partitionList);
+  const locCondition = location
+    ? `AND t1.PartitionName2 = @location`
+    : `AND t1.PartitionName2 IN (${parts})`;
+
+  const sqlQuery = `
+    -- DETAILS (full rows)
+    WITH Hist AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1,
+        t1.ObjectName2       AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor')
+            THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        )                     AS CardNumber,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.[${journalIdCol}]   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            THEN 'Denver-HQ'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            THEN 'Austin Texas'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
+            THEN 'New York'
+          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+      FROM dbo.ACVSUJournalLog       AS t1
+      LEFT JOIN ACVSCore.Access.Personnel                 AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN dbo.ACVSUJournalLogxml       AS t_xml
+        ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value
+        FROM dbo.ACVSUJournalLogxmlShred
+        WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE
+        t1.MessageType = 'CardAdmitted'
+        ${locCondition}
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    )
+    SELECT
+      LocaleMessageTime,
+      ObjectName1,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PartitionName2,
+      LogicalLocation,
+      PersonGUID,
+      PersonnelType,
+      Direction
+    FROM Hist
+    ORDER BY LocaleMessageTime ASC;
+
+    -- SUMMARY: dedupe per (partition, personKey, date) using fallback keys; count unique person per day
+    WITH Hist2 AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName2       AS Door,
+        t1.ObjectName1       AS ObjectName1,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        )                     AS CardNumber,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.[${journalIdCol}]   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction
+      FROM dbo.ACVSUJournalLog       AS t1
+      LEFT JOIN ACVSCore.Access.Personnel                 AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml
+        ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value
+        FROM dbo.ACVSUJournalLogxmlShred
+        WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE
+        t1.MessageType = 'CardAdmitted'
+        ${locCondition}
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    ),
+    WithPersonKey AS (
+      SELECT *,
+        -- personKey fallback order: PersonGUID -> CardNumber -> EmployeeID -> ObjectName1
+        COALESCE(
+          NULLIF(CAST(PersonGUID AS NVARCHAR(100)), ''),
+          NULLIF(CardNumber, ''),
+          NULLIF(EmployeeID, ''),
+          NULLIF(ObjectName1, '')
+        ) AS PersonKey,
+        CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23) AS DateOnly
+      FROM Hist2
+    ),
+    LastPerPersonKey AS (
+      SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY PartitionName2, PersonKey, DateOnly ORDER BY LocaleMessageTime DESC) AS rn
+      FROM WithPersonKey
+      WHERE COALESCE(NULLIF(CAST(PersonGUID AS NVARCHAR(100)), ''), NULLIF(CardNumber, ''), NULLIF(EmployeeID, ''), NULLIF(ObjectName1, '')) IS NOT NULL
+    )
+    SELECT
+      DateOnly AS [date],
+      DATENAME(WEEKDAY, CONVERT(date, DateOnly)) AS [day],
+      PartitionName2 AS partitionCode,
+      COUNT(*) AS total,
+      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%employee%' THEN 1 ELSE 0 END) AS Employee,
+      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%contractor%' THEN 1 ELSE 0 END) AS Contractor
+    FROM LastPerPersonKey
+    WHERE rn = 1
+    GROUP BY DateOnly, PartitionName2
+    ORDER BY DateOnly DESC, PartitionName2;
+  `;
+
+  const req = pool.request();
+  if (location) req.input('location', sql.NVarChar, location);
+
+  const result = await req.query(sqlQuery);
+
+  // result.recordsets[0] => details rows (full list)
+  // result.recordsets[1] => summary rows (counts per date/partition)
+  const details = (result && Array.isArray(result.recordsets) && Array.isArray(result.recordsets[0])) ? result.recordsets[0] : (Array.isArray(result.recordset) ? result.recordset : []);
+  const summaryRows = (result && Array.isArray(result.recordsets) && Array.isArray(result.recordsets[1])) ? result.recordsets[1] : [];
+
+  // Build summaryByDate structure expected by frontend
+  const summaryByDateMap = {};
+  summaryRows.forEach(r => {
+    const date = r.date;
+    if (!summaryByDateMap[date]) {
+      summaryByDateMap[date] = {
+        date,
+        day: r.day,
+        region: { name: 'NAMER', total: 0, Employee: 0, Contractor: 0 },
+        partitions: {}
+      };
+    }
+    const emp = r.Employee || 0;
+    const con = r.Contractor || 0;
+    const total = r.total || (emp + con);
+
+    summaryByDateMap[date].partitions[r.partitionCode] = {
+      total,
+      Employee: emp,
+      Contractor: con
+    };
+
+    summaryByDateMap[date].region.Employee += emp;
+    summaryByDateMap[date].region.Contractor += con;
+    summaryByDateMap[date].region.total += total;
+  });
+
+  const summaryByDate = Object.values(summaryByDateMap).sort((a,b) => b.date.localeCompare(a.date));
+
+  return { details, summaryByDate };
+};
+
+exports.fetchHistoricalOccupancy = async (location) =>
+  exports.fetchHistoricalData({ days: 7, location: location || null });
+
+
+/**
+ * Fetch today's swipes for Denver security officers.
+ */
+exports.fetchSecuritySwipes = async () => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+  const officers = quoteList(roles.securityOfficers);
+
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1      AS ObjectName1,
+        t1.ObjectName2      AS Door,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t3.Name AS PersonnelType,
+        t5d.value AS Direction,
+        t1.[${journalIdCol}] AS PersonGUID,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        ) AS CardNumber
+      FROM dbo.ACVSUJournalLog AS t1
+      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT
+      LocaleMessageTime,
+      Door,
+      EmployeeID,
+      CardNumber,
+      PersonnelType,
+      PartitionName2,
+      Direction
+    FROM CombinedQuery
+    WHERE EmployeeID IN (${officers})
+      AND PartitionName2 = 'US.CO.OBS'
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+/**
+ * Count visitor badge swipes per floor today (returns door-first PartitionName2).
+ */
+exports.fetchVisitorCountsByFloor = async () => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+        t3.Name AS PersonnelType,
+        t1.ObjectName2 AS Door
+      FROM dbo.ACVSUJournalLog AS t1
+      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
+    )
+    SELECT PartitionName2, LogicalLocation = NULL, Door AS Floor, COUNT(*) AS visitorCount
+    FROM CombinedQuery
+    WHERE PersonnelType = 'Visitor'
+    GROUP BY PartitionName2, Door;
+  `;
+  const result = await pool.request().query(query);
+  return result.recordset;
+};
+
+
+/**
+ * Badge rejections last 7 days
+ */
+exports.fetchBadgeRejectionDetails = async () => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+  const parts = quoteList(partitionList);
+
+  const query = `
+WITH CombinedQuery AS (
+  SELECT
+    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+    t1.ObjectName1      AS ObjectName1,
+    t1.ObjectName2      AS Door,
+    CASE
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+        OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+        OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+        OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+        OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+      ELSE t1.PartitionName2
+    END AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      sc.value
+    ) AS CardNumber,
+    t3.Name AS PersonnelType,
+    t5_rej.value AS RejectionType,
+    CASE
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+        THEN 'Denver-HQ'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' THEN 'Austin Texas'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' THEN 'New York'
+      WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+      WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+      WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+      WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+      ELSE 'Other'
+    END AS LogicalLocation
+  FROM dbo.ACVSUJournalLog AS t1
+  LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
+  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+  LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
+  LEFT JOIN (
+    SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
+  ) AS sc ON t1.XmlGUID = sc.GUID
+  LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5_rej
+    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
+  WHERE
+    t1.MessageType = 'CardRejected'
+    AND t1.PartitionName2 IN (${parts})
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) >= DATEADD(DAY, -7, CONVERT(DATE, GETDATE()))
+)
+SELECT
+  LocaleMessageTime,
+  CONVERT(date, LocaleMessageTime) AS DateOnly,
+  CONVERT(time(0), LocaleMessageTime) AS SwipeTime,
+  CardNumber,
+  PersonnelType,
+  PartitionName2 AS Location,
+  LogicalLocation,
+  Door,
+  RejectionType
+FROM CombinedQuery
+ORDER BY LocaleMessageTime DESC;
+  `;
+
+  const result = await pool.request().query(query);
+  const rows = result.recordset;
+
+  // compute today's count
+  const todayStr = new Date().toISOString().slice(0,10);
+  const liveCount = rows.filter(r =>
+    r.DateOnly && r.DateOnly.toISOString && r.DateOnly.toISOString().slice(0,10) === todayStr
+  ).length;
+
+  return { liveCount, history: rows };
+};
+
+/**
+ * Fetch IN/OUT swipes for service vendors for time calculations.
+ */
+exports.fetchVendorSwipes = async ({ vendorBadgeId }) => {
+  const pool = await poolPromise;
+  const journalIdCol = await detectJournalIdColumn(pool);
+
+  const query = `
+    WITH CombinedQuery AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+        t5d.value AS Direction,
+        t1.[${journalIdCol}] AS PersonGUID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          sc.value
+        ) AS CardNumber,
+        t3.Name AS PersonnelType
+      FROM dbo.ACVSUJournalLog AS t1
+      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
+      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
+        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
+      ) AS sc ON t1.XmlGUID = sc.GUID
+      WHERE t1.MessageType = 'CardAdmitted'
+        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
+    )
+    SELECT LocaleMessageTime, EmployeeID, CardNumber, Direction, PartitionName2, PersonnelType, PersonGUID
+    FROM CombinedQuery
+    WHERE CardNumber = @vendorBadgeId
+    ORDER BY LocaleMessageTime ASC;
+  `;
+  const req = pool.request().input('vendorBadgeId', sql.NVarChar, vendorBadgeId);
+  const result = await req.query(query);
+  return result.recordset;
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ACVSCore.Access.Personnel		-database anme 
 
 
