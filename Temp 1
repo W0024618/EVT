@@ -1,3 +1,312 @@
+// --- Replace existing fetchHistoricalData with this implementation ---
+
+/**
+ * Fetch historical swipe data for the last `days` days.
+ * Returns an object: { details: [...rows...], summaryByDate: [...summary...] }
+ *
+ * Summary is computed as: for each person & each date, pick the last swipe (by LocaleMessageTime).
+ * If that last swipe Direction = 'InDirection' then we count them as present on that date;
+ * grouping uses the door-first mapped PartitionName2 (so HQ doors => US.CO.OBS).
+ */
+exports.fetchHistoricalData = async ({ days = 7, location = null }) => {
+  const pool = await poolPromise;
+  const parts = quoteList(partitionList);
+  const locCondition = location
+    ? `AND t1.PartitionName2 = @location`
+    : `AND t1.PartitionName2 IN (${parts})`;
+
+  // Hist CTE: same door-first mapping for PartitionName2 + LogicalLocation
+  const query = `
+    WITH Hist AS (
+      SELECT
+        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
+        t1.ObjectName1,
+        t1.ObjectName2       AS Door,
+        CASE
+          WHEN t3.Name IN ('Contractor','Terminated Contractor')
+            THEN t2.Text12
+          ELSE CAST(t2.Int1 AS NVARCHAR)
+        END                   AS EmployeeID,
+        COALESCE(
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+          sc.value
+        )                     AS CardNumber,
+        -- door-first mapped PartitionName2 (returned as PartitionName2)
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
+            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
+            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
+
+          ELSE t1.PartitionName2
+        END AS PartitionName2,
+        t1.ObjectIdentity1   AS PersonGUID,
+        t3.Name              AS PersonnelType,
+        t5d.value            AS Direction,
+
+        CASE
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
+            THEN 'Denver-HQ'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
+            THEN 'Austin Texas'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
+
+          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
+            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
+            THEN 'New York'
+
+          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
+          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
+          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
+          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
+          ELSE 'Other'
+        END AS LogicalLocation
+
+      FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog]       AS t1
+      LEFT JOIN [ACVSCore].[Access].[Personnel]                 AS t2
+        ON t1.ObjectIdentity1 = t2.GUID
+      LEFT JOIN [ACVSCore].[Access].[PersonnelType]             AS t3
+        ON t2.PersonnelTypeId = t3.ObjectID
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS t5d
+        ON t1.XmlGUID = t5d.GUID
+        AND t5d.Value IN ('InDirection','OutDirection')
+      LEFT JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxml]       AS t_xml
+        ON t1.XmlGUID = t_xml.GUID
+      LEFT JOIN (
+        SELECT GUID, value
+        FROM [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred]
+        WHERE Name IN ('Card','CHUID')
+      ) AS sc
+        ON t1.XmlGUID = sc.GUID
+    WHERE
+      t1.MessageType = 'CardAdmitted'
+      ${locCondition}
+      AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
+          >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
+    ),
+
+    -- LastSwipe picks the last swipe (by time) PER PersonGUID PER DATE
+    LastSwipe AS (
+      SELECT *,
+        ROW_NUMBER() OVER (
+          PARTITION BY PersonGUID, CONVERT(date, LocaleMessageTime)
+          ORDER BY LocaleMessageTime DESC
+        ) AS rn
+      FROM Hist
+    ),
+
+    -- Build summary counts: only keep rn = 1 (last swipe) and Direction = 'InDirection' to count as present
+    Summary AS (
+      SELECT
+        CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23) AS [date], -- yyyy-mm-dd
+        DATENAME(WEEKDAY, CONVERT(date, LocaleMessageTime)) AS [day],
+        PartitionName2,
+        SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%employee%' THEN 1 ELSE 0 END) AS Employee,
+        SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%contractor%' THEN 1 ELSE 0 END) AS Contractor,
+        SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%employee%' AND LOWER(ISNULL(PersonnelType,'')) NOT LIKE '%contractor%' THEN 1 ELSE 0 END) AS OtherPresent
+      FROM LastSwipe
+      WHERE rn = 1 AND Direction = 'InDirection'
+      GROUP BY CONVERT(date, LocaleMessageTime), PartitionName2, CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23)
+    )
+
+    -- final select: details + summary rows
+    SELECT
+      -- details: full rowset
+      (SELECT LocaleMessageTime, ObjectName1, Door, EmployeeID, CardNumber, PartitionName2, LogicalLocation, PersonGUID, PersonnelType, Direction
+       FROM Hist
+       ORDER BY LocaleMessageTime ASC
+       FOR JSON PATH) AS details_json,
+
+      -- summary: aggregated per-date per-partition
+      (SELECT
+         s.[date],
+         s.[day],
+         s.PartitionName2 AS partitionCode,
+         s.Employee, s.Contractor, s.OtherPresent
+       FROM Summary s
+       ORDER BY s.[date] DESC, s.PartitionName2
+       FOR JSON PATH) AS summary_json
+  `;
+
+  const req = pool.request();
+  if (location) req.input('location', sql.NVarChar, location);
+  const result = await req.query(query);
+  // result.recordset[0] contains details_json and summary_json strings
+  const row = result.recordset[0] || {};
+  const details = row.details_json ? JSON.parse(row.details_json) : [];
+  const summaryRows = row.summary_json ? JSON.parse(row.summary_json) : [];
+
+  // Transform summaryRows into the shape your frontend expects: summaryByDate array where each date has partitions map
+  const summaryByDateMap = {};
+  summaryRows.forEach(r => {
+    const date = r.date;
+    if (!summaryByDateMap[date]) {
+      summaryByDateMap[date] = { date, day: r.day, region: { name: 'NAMER', total: 0, Employee: 0, Contractor: 0 }, partitions: {} };
+    }
+    summaryByDateMap[date].partitions[r.partitionCode] = {
+      total: (r.Employee || 0) + (r.Contractor || 0) + (r.OtherPresent || 0),
+      Employee: r.Employee || 0,
+      Contractor: r.Contractor || 0
+    };
+    // update region totals
+    summaryByDateMap[date].region.Employee += (r.Employee || 0);
+    summaryByDateMap[date].region.Contractor += (r.Contractor || 0);
+    summaryByDateMap[date].region.total += (r.Employee || 0) + (r.Contractor || 0) + (r.OtherPresent || 0);
+  });
+
+  const summaryByDate = Object.values(summaryByDateMap).sort((a,b)=> b.date.localeCompare(a.date));
+
+  return { details, summaryByDate };
+};
+
+
+
+
+
+
+
+
+
+
+  // ---------- FRONTEND: build partitionRows (prefer server summary if available) ----------
+  const partitionRows = useMemo(() => {
+    if (!data || !pickedDate) return [];
+    const ds = format(pickedDate, 'yyyy-MM-dd');
+
+    // If server provided a summaryByDate, use it (authoritative)
+    if (Array.isArray(data.summaryByDate) && data.summaryByDate.length > 0) {
+      const entry = data.summaryByDate.find(s => s.date === ds);
+      if (!entry) {
+        // return zero rows for the selected partitions if no summary row for that date
+        return filteredPartitionKeys.map(pk => {
+          const disp = partitionToDisplay[pk];
+          return { country: disp?.country || '', city: disp?.city || pk, employee: 0, contractor: 0, total: 0 };
+        });
+      }
+
+      return filteredPartitionKeys.map(pk => {
+        const vals = entry.partitions && entry.partitions[pk] ? entry.partitions[pk] : { Employee: 0, Contractor: 0, total: 0 };
+        const disp = partitionToDisplay[pk];
+        return {
+          country: disp?.country || '',
+          city: disp?.city || pk,
+          employee: vals.Employee || 0,
+          contractor: vals.Contractor || 0,
+          total: vals.total || ( (vals.Employee||0) + (vals.Contractor||0) )
+        };
+      });
+    }
+
+    // FALLBACK: compute locally but do robust per-partition dedupe (last swipe in that partition)
+    const results = [];
+
+    filteredPartitionKeys.forEach(pk => {
+      // filter rows that match the date and that belong to this partition
+      const rowsForPartition = (data.details || []).filter(r => {
+        const dateMatch = getIsoDate(r) === ds;
+        if (!dateMatch) return false;
+        // Use partitionName (which backend now returns door-first) OR LogicalLocation mapping
+        const partitionName = r.PartitionName2 || '';
+        const logical = r.LogicalLocation || '';
+        const logicalMapped = logicalToPartition[logical];
+        return partitionName === pk || logicalMapped === pk;
+      });
+
+      if (rowsForPartition.length === 0) {
+        const disp = partitionToDisplay[pk];
+        results.push({ country: disp?.country || '', city: disp?.city || pk, employee: 0, contractor: 0, total: 0 });
+        return;
+      }
+
+      // sort ascending, then keep last per person (last swipe in that partition)
+      rowsForPartition.sort((a,b) => (a.LocaleMessageTime||'').localeCompare(b.LocaleMessageTime||''));
+      const lastByPerson = {};
+      rowsForPartition.forEach(r => { lastByPerson[r.PersonGUID] = r; });
+
+      const counts = { Employee: 0, Contractor: 0, Other: 0 };
+      Object.values(lastByPerson).forEach(r => {
+        if (r.Direction !== 'InDirection') return;
+        const ptype = (r.PersonnelType || '').toLowerCase();
+        if (ptype.includes('contractor')) counts.Contractor += 1;
+        else if (ptype.includes('employee')) counts.Employee += 1;
+        else counts.Other += 1;
+      });
+
+      const disp = partitionToDisplay[pk];
+      results.push({
+        country: disp?.country || '',
+        city: disp?.city || pk,
+        employee: counts.Employee,
+        contractor: counts.Contractor,
+        total: counts.Employee + counts.Contractor + counts.Other
+      });
+    });
+
+    return results;
+  }, [data, pickedDate, filteredPartitionKeys]);
+
+  // ---------- FRONTEND: detailRows (use server details but dedupe per-person across selected partitions) ----------
+  const detailRows = useMemo(() => {
+    if (!data || !pickedDate) return [];
+    const ds = format(pickedDate, 'yyyy-MM-dd');
+
+    // First try to use server details directly (it will be the same object returned by backend)
+    const all = (data.details || []).filter(r => getIsoDate(r) === ds);
+
+    // Keep rows that match any selected partition (using PartitionName2 or LogicalLocation)
+    const rowsIncluded = all.filter(r => filteredPartitionKeys.some(pk => {
+      const partitionName = r.PartitionName2 || '';
+      const logicalMapped = logicalToPartition[r.LogicalLocation] || null;
+      return partitionName === pk || logicalMapped === pk;
+    }));
+
+    // Sort chronologically and then pick last swipe per person (within the included set),
+    // but ensure lastByPerson uses only rows included for the partition chosen in the UI.
+    // For multi-partition views we still choose last swipe across included partitions,
+    // which matches historical detail export logic.
+    rowsIncluded.sort((a,b) => (a.LocaleMessageTime||'').localeCompare(b.LocaleMessageTime||''));
+    const lastByPerson = {};
+    rowsIncluded.forEach(r => { lastByPerson[r.PersonGUID] = r; });
+
+    // Return only those whose final swipe was an entry
+    return Object.values(lastByPerson).filter(r => r.Direction === 'InDirection');
+  }, [data, pickedDate, filteredPartitionKeys]);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Refer API Responce 
 
 {
