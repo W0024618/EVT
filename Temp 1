@@ -1,1166 +1,477 @@
 
+//C:\Users\W0024618\Desktop\global-page\backend\config\dbConfig.js
+import sql from 'mssql';
 
-
-
-  // src/controllers/occupancy.controller.js
-const service       = require('../services/occupancy.service');
-const doorMap       = require('../utils/doorMap');
-const normalizeDoor = doorMap.normalizeDoor;
-const roles         = require('../utils/roles');
-const tzMap         = require('../utils/timezones'); // partition→IANA tz
-
-  /**
-   * Determine if the given PersonnelType is considered an employee.
-   */
-  function isEmployeeType(pt) {
-    return ['Employee','Terminated Employee','Terminated Personnel'].includes(pt);
+// shared options
+const commonOpts = {
+  options: {
+    encrypt: true,
+    trustServerCertificate: true
+  },
+  // increase timeouts (milliseconds)
+  requestTimeout: 300000,      // 5 minutes
+  connectionTimeout: 30000,    // 30 seconds
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
   }
+};
 
-
-  /**
-   * Map (partition, door, direction) → logical floor name.
-   * Tracks any unmapped doors in the provided Set.
-   */
-
-function lookupFloor(partition, door, direction, unmapped) {
-  const normPart = String(partition || '').trim().toUpperCase();
-  const normDoor = normalizeDoor(door);
-
-  // Special-case: when Default bucket receives an HQ door for the 15th floor,
-  // treat it as the Denver HQ (US.CO.OBS Floor 15).
-  if (normPart === 'USA/CANADA DEFAULT' && /USCOHQ.*\b15\b/.test(normDoor)) {
-    return direction === 'InDirection' ? 'Floor 15' : 'Out of office';
+// lowercase keys only
+// NOTE: moved to `databases` array so we can reference previous/other ACVSUJournal DBs easily.
+const regions = {
+  apac: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUPNQ0986V',
+    // primary DB first; add previous/other ACVSUJournal DB names to this array as needed
+    databases: ['ACVSUJournal_00010030','ACVSUJournal_00010029','ACVSUJournal_00010028','ACVSUJournal_00010027','ACVSUJournal_00010026','ACVSUJournal_00010025'],
+    ...commonOpts
+  },
+  emea: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUFRA0986V',
+    databases: ['ACVSUJournal_00011029','ACVSUJournal_00011028','ACVSUJournal_00011027','ACVSUJournal_00011026','ACVSUJournal_00011025','ACVSUJournal_00011024','ACVSUJournal_00011023'],
+    ...commonOpts
+  },
+  laca: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUSJO0986V',
+    databases: ['ACVSUJournal_00010030','ACVSUJournal_00010029','ACVSUJournal_00010028','ACVSUJournal_00010027','ACVSUJournal_00010026','ACVSUJournal_00010025'],
+    ...commonOpts
+  },
+  namer: {
+    user: 'GSOC_Test',
+    password: 'Westernccure@2025',
+    server: 'SRVWUDEN0891V',
+    databases: ['ACVSUJournal_00010030','ACVSUJournal_00010029','ACVSUJournal_00010028','ACVSUJournal_00010027','ACVSUJournal_00010026','ACVSUJournal_00010025'],
+    ...commonOpts
   }
+};
 
-  // existing logic continues unchanged...
-  // 1) exact partition+door match
-  let entry = doorMap.find(d =>
-    d.partition.trim().toUpperCase() === normPart &&
-    d.door === normDoor
-  );
-
-
-
-    // 1b) fallback for OBS doors mapped under Default
-    if (!entry && normPart === 'US.CO.OBS') {
-      entry = doorMap.find(d =>
-        d.partition.trim().toUpperCase() === 'USA/CANADA DEFAULT' &&
-        d.door === normDoor
-      );
-    }
-
-    // 2) general OBS wildcard (‘*’) under Default
-    if (!entry && normPart === 'US.CO.OBS') {
-      entry = doorMap.find(d =>
-        d.partition.trim().toUpperCase() === 'USA/CANADA DEFAULT' &&
-        d.door === '*'
-      );
-    }
-
-    // 2b) heuristic: catch any “15” or “1” in the door name for OBS
-    if (!entry && normPart === 'US.CO.OBS') {
-      if (/\b15\b/.test(normDoor)) {
-        return direction === 'InDirection' ? 'Floor 15' : 'Out of office';
-      }
-      if (/\b1\b/.test(normDoor)) {
-        return direction === 'InDirection' ? 'Floor 01' : 'Out of office';
-      }
-    }
-
-    // 3) still no mapping? record and bail
-    if (!entry) {
-      unmapped.add(`${partition}|${door}`);
-      return null;
-    }
-
-    return direction === 'InDirection'
-      ? entry.inDirectionFloor
-      : entry.outDirectionFloor;
-  }
-
-
-
-
-
+const pools = {};
 
 /**
- * Format an ISO timestamp into the given partition’s timezone, with AM/PM.
+ * @param {string} regionKey  one of the keys in `regions`, case-insensitive
  */
-function formatInZone(isoString, partition) {
-  const tz = tzMap[partition] || 'UTC';
-  return new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    hour12:  true,
-    year:    'numeric',
-    month:   '2-digit',
-    day:     '2-digit',
-    hour:    'numeric',
-    minute:  '2-digit',
-    second:  '2-digit'
-  }).format(new Date(isoString));
+export async function getPool(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) {
+    throw new Error(`Unknown region: ${regionKey}`);
+  }
+
+  // Use the first database in the array as the connection default (so queries without explicit db still work).
+  if (Array.isArray(cfg.databases) && cfg.databases.length) {
+    cfg.database = cfg.databases[0];
+  } else if (!cfg.database) {
+    // If no database specified, leave it alone (the server's default DB will be used).
+    cfg.database = undefined;
+  }
+
+  if (!pools[key]) {
+    pools[key] = await new sql.ConnectionPool(cfg).connect();
+  }
+  return pools[key];
 }
 
-
-  /**
-   * GET /api/occupancy/live
-   */
-  exports.getLiveOccupancy = async (req, res) => {
-    try {
-      const data = await service.fetchLiveOccupancy();
-      res.json({ success:true, count:data.length, data });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ success:false, message:'Live occupancy fetch failed' });
-    }
-  };
-
-
-
-
 /**
- * GET /api/occupancy/live
+ * Return array of database names configured for a region (always returns array).
+ * This is intentionally exported for other modules to dynamically build fully-qualified table references.
  */
-exports.getLiveOccupancy = async (req, res) => {
-  try {
-    const data = await service.fetchLiveOccupancy();
-    res.json({ success:true, count:data.length, data });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ success:false, message:'Live occupancy fetch failed' });
-  }
-};
-
-
-
-
-/**
- * GET /api/occupancy/live-summary
- * Optional query param: ts=ISO timestamp (UTC)
- */
-exports.getLiveSummary = async (req, res) => {
-  try {
-    const { ts } = req.query;
-
-    // 1) Time-travel branch (pure UTC)
-    if (ts) {
-      const timestamp = new Date(ts);
-      if (isNaN(timestamp)) {
-        return res.status(400).json({ success:false, message:'invalid ts query param' });
-      }
-
-      // UTC date string of ts
-      const dayStr = timestamp.toISOString().slice(0,10); // e.g. "2025-07-15"
-
-      // a) fetch last 24h, narrow to that UTC date
-      const fetched = await service.fetchHistoricalData({ days:1, location:null });
-
-      // fetched might be array (old shape) or object { details, summaryByDate }
-      const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
-
-      const sameDay = raw.filter(r =>
-        new Date(r.LocaleMessageTime).toISOString().slice(0,10) === dayStr
-      );
-
-      // b) keep only swipes ≤ ts
-      const upTo = sameDay.filter(r => new Date(r.LocaleMessageTime) <= timestamp);
-
-      // c) last swipe per person ≤ ts
-      const lastByPerson = {};
-      upTo.forEach(r => {
-        const key = r.PersonGUID;
-        const t   = new Date(r.LocaleMessageTime).getTime();
-        if (!lastByPerson[key] ||
-            t > new Date(lastByPerson[key].LocaleMessageTime).getTime()) {
-          lastByPerson[key] = r;
-        }
-      });
-
-      // d) build “today” & realtime snapshot
-      const today    = { total:0, Employee:0, Contractor:0 };
-      const realtime = {};
-      const details  = [];
-      const unmapped = new Set();
-
-      Object.values(lastByPerson).forEach(r => {
-        // count
-        const isEmp = isEmployeeType(r.PersonnelType);
-        today.total++;
-        if (isEmp) today.Employee++; else today.Contractor++;
-
-        // floor mapping
-        const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
-        if (floorName === 'Out of office') return;
-
-        // tally realtime
-        const p = r.PartitionName2;
-        realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
-        realtime[p].total++;
-        if (isEmp) realtime[p].Employee++; else realtime[p].Contractor++;
-        realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
-
-        // detail row (UTC)
-        details.push({
-          ...r,
-          snapshotTime:      r.LocaleMessageTime,
-          LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
-          floor:             floorName
-        });
-      });
-
-      return res.json({
-        success:      true,
-        timestampUtc: timestamp.toISOString(),
-        today,
-        realtime,
-        details
-      });
-    }
-
-    // 2) Default live branch
-    const swipes = await service.fetchLiveOccupancy();
-
-    // 2a) “today” = first swipe per person (UTC date = today)
-    const first = {};
-    swipes.forEach(r => {
-      const t = new Date(r.LocaleMessageTime).getTime();
-      if (!first[r.PersonGUID] ||
-          t < new Date(first[r.PersonGUID].LocaleMessageTime).getTime()) {
-        first[r.PersonGUID] = r;
-      }
-    });
-    const today = { total:0, Employee:0, Contractor:0 };
-    Object.values(first).forEach(r => {
-      today.total++;
-      isEmployeeType(r.PersonnelType)
-        ? today.Employee++
-        : today.Contractor++;
-    });
-
-    // 2b) “realtime” = last swipe per person
-    const last     = {};
-    const realtime = {};
-    const details  = [];
-    const unmapped = new Set();
-
-    swipes.forEach(r => {
-      const t = new Date(r.LocaleMessageTime).getTime();
-      if (!last[r.PersonGUID] ||
-          t > new Date(last[r.PersonGUID].LocaleMessageTime).getTime()) {
-        last[r.PersonGUID] = r;
-      }
-    });
-
-    Object.values(last).forEach(r => {
-      // skip OUT→“Out of office”
-      if (r.Direction === 'OutDirection') {
-        const fl = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped);
-        if (fl === 'Out of office') return;
-      }
-
-      // floor
-      const floorName = lookupFloor(r.PartitionName2, r.Door, r.Direction, unmapped) || 'Unknown';
-      if (floorName === 'Out of office') return;
-
-      // tally
-      const p = r.PartitionName2;
-      realtime[p] = realtime[p] || { total:0, Employee:0, Contractor:0, floors:{} };
-      realtime[p].total++;
-      isEmployeeType(r.PersonnelType)
-        ? realtime[p].Employee++
-        : realtime[p].Contractor++;
-      realtime[p].floors[floorName] = (realtime[p].floors[floorName]||0) + 1;
-
-      // detail
-      details.push({
-        ...r,
-        snapshotTime:      r.LocaleMessageTime,
-        LocaleMessageTime: new Date(r.LocaleMessageTime).toISOString(),
-        floor:             floorName
-      });
-    });
-
-    return res.json({ success:true, today, realtime, details });
-  }
-  catch (err) {
-    console.error('live-summary error:', err);
-    return res.status(500).json({ success:false, message:'Live summary failed' });
-  }
-};
-
-
-/**
- * GET /api/occupancy/history
- * Optional query params: start=YYYY-MM-DD, end=YYYY-MM-DD
- * Optional URL param: :location
- */
-exports.getHistoricalOccupancy = async (req, res) => {
-  try {
-    const { start, end } = req.query;
-    const location       = req.params.location || null;
-
-    if (start && end) {
-      // --- average-over-range logic ---
-      const startD = new Date(start);
-      const endD   = new Date(end);
-      if (isNaN(startD) || isNaN(endD) || endD < startD) {
-        return res
-          .status(400)
-          .json({ success:false, message:'invalid start/end date range' });
-      }
-
-      // inclusive days count
-      const days = Math.ceil((endD - startD)/(1000*60*60*24)) + 1;
-      const fetched = await service.fetchHistoricalData({ days, location });
-
-      // accommodate both service shapes: array OR { details, summaryByDate }
-      const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
-
-      // bucket unique PersonGUID per date
-      const byDate = {};
-      raw.forEach(r => {
-        const t    = new Date(r.LocaleMessageTime);
-        if (isNaN(t)) return;
-        const date = t.toISOString().slice(0,10);
-        if (date < start || date > end) return;
-        byDate[date] = byDate[date] || new Set();
-        byDate[date].add(r.PersonGUID);
-      });
-
-      // build breakdown & average
-      const dates     = Object.keys(byDate).sort();
-      const breakdown = dates.map(d => ({ date: d, count: byDate[d].size }));
-      const sum       = breakdown.reduce((s,x) => s + x.count, 0);
-      const average   = breakdown.length ? sum/breakdown.length : 0;
-
-      return res.json({
-        success:   true,
-        start,
-        end,
-        average,
-        breakdown
-      });
-    }
-
-    // --- default history logic ---
-    const fetched = await service.fetchHistoricalOccupancy(location);
-    const raw = Array.isArray(fetched) ? fetched : (fetched && Array.isArray(fetched.details) ? fetched.details : []);
-    const byDate = {};
-    const details = [];
-
-    raw.forEach(r => {
-      const iso = (r.LocaleMessageTime instanceof Date)
-        ? r.LocaleMessageTime.toISOString()
-        : r.LocaleMessageTime;
-      if (!iso) return;
-      const date = iso.slice(0,10);
-      byDate[date] = byDate[date] || {};
-      const prev = byDate[date][r.PersonGUID];
-      if (!prev || new Date(iso) < new Date(prev.LocaleMessageTime)) {
-        byDate[date][r.PersonGUID] = { ...r, LocaleMessageTime: iso };
-      }
-    });
-
-    const summaryByDate = Object.keys(byDate).sort().map(date => {
-      const recs = Object.values(byDate[date]);
-      details.push(...recs);
-      const region = { total:0, Employee:0, Contractor:0 };
-      const partitions = {};
-
-      recs.forEach(r => {
-        region.total++;
-        isEmployeeType(r.PersonnelType) ? region.Employee++ : region.Contractor++;
-        if (!location) {
-          partitions[r.PartitionName2] = partitions[r.PartitionName2] || { total:0, Employee:0, Contractor:0 };
-          partitions[r.PartitionName2].total++;
-          isEmployeeType(r.PersonnelType)
-            ? partitions[r.PartitionName2].Employee++
-            : partitions[r.PartitionName2].Contractor++;
-        }
-      });
-
-      return {
-        date,
-        day: new Date(date).toLocaleDateString('en-US',{ weekday:'long' }),
-        region: location ? { name: location, ...region } : { name: 'NAMER', ...region },
-        partitions: location ? undefined : partitions
-      };
-    });
-
-    res.json({ success:true, summaryByDate, details });
-
-  } catch (e) {
-    console.error('history error:', e);
-    res.status(500).json({ success:false, message:'Historical fetch failed' });
-  }
-};
-
-  /**
-   * GET /api/occupancy/security-officers
-   */
-  exports.getSecurityOfficersInBuilding = async (req, res) => {
-    try {
-      const swipes = await service.fetchSecuritySwipes();
-      const lastByOfficer = {};
-
-      swipes.forEach(s => {
-        const key = s.EmployeeID;
-        if (!lastByOfficer[key] ||
-            new Date(s.LocaleMessageTime) > new Date(lastByOfficer[key].LocaleMessageTime)) {
-          lastByOfficer[key] = s;
-        }
-      });
-
-      const present = Object.values(lastByOfficer)
-        .filter(s => s.Direction === 'InDirection')
-        .map(s => {
-          const floor = lookupFloor(s.PartitionName2, s.Door, s.Direction, new Set()) || 'Unknown';
-          return { badge: s.EmployeeID, time: s.LocaleMessageTime, floor };
-        });
-
-      res.json({ success:true, present });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ success:false, message:'Security officers fetch failed' });
-    }
-  };
-
-  /**
-   * GET /api/occupancy/visitors-by-floor
-   */
-  exports.getVisitorCountsByFloor = async (req, res) => {
-    try {
-      const raw = await service.fetchVisitorCountsByFloor();
-      const unmapped = new Set();
-      const floorCounts = raw.reduce((acc, { PartitionName2, Floor, visitorCount }) => {
-        const floor = lookupFloor(PartitionName2, Floor, 'InDirection', unmapped) || 'Unknown';
-        acc[floor] = (acc[floor]||0) + visitorCount;
-        return acc;
-      }, {});
-      const counts = Object.entries(floorCounts)
-                          .map(([floor, visitorCount]) => ({ floor, visitorCount }));
-      res.json({ success:true, counts });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ success:false, message:'Visitor counts fetch failed' });
-    }
-  };
-
-  /**
-   * GET /api/occupancy/badge-rejections
-   */
-  exports.getBadgeRejections = async (req, res) => {
-    try {
-      const { liveCount, history } = await service.fetchBadgeRejectionDetails();
-
-      // normalize history rows
-      const normHistory = history.map(r => {
-        const dateOnlyStr = (r.DateOnly instanceof Date)
-          ? r.DateOnly.toISOString().slice(0,10)
-          : String(r.DateOnly).slice(0,10);
-        let swipeTimeStr;
-        if (r.SwipeTime instanceof Date) {
-          swipeTimeStr = r.SwipeTime.toISOString().slice(11,19);
-        } else {
-          const m = String(r.SwipeTime).match(/(\d{2}:\d{2}:\d{2})/);
-          swipeTimeStr = m ? m[1] : String(r.SwipeTime);
-        }
-        return { ...r, DateOnly: dateOnlyStr, SwipeTime: swipeTimeStr, Door: r.Door };
-      });
-
-      const todayDate = new Date().toISOString().slice(0,10);
-      const todayRows = normHistory.filter(r => r.DateOnly === todayDate);
-
-      const today = {
-        total:      liveCount,
-        Employee:   todayRows.filter(r => r.PersonnelType === 'Employee').length,
-        Contractor: todayRows.filter(r => r.PersonnelType !== 'Employee').length
-      };
-
-      const realtime = {};
-      todayRows.forEach(r => {
-        const loc = r.Location || 'Unknown';
-        if (!realtime[loc]) realtime[loc] = { total:0, Employee:0, Contractor:0 };
-        realtime[loc].total++;
-        if (r.PersonnelType === 'Employee') realtime[loc].Employee++;
-        else realtime[loc].Contractor++;
-      });
-
-      res.json({ success:true, today, realtime, details: normHistory });
-    } catch (e) {
-      console.error('Badge‐rejection fetch failed:', e);
-      res.status(500).json({ success:false, message:'Badge rejections fetch failed' });
-    }
-  };
-
-  /**
-   * GET /api/occupancy/vendor-time/:badgeId
-   */
-  exports.getVendorTimeCalc = async (req, res) => {
-    try {
-      const { badgeId } = req.params;
-      const swipes       = await service.fetchVendorSwipes({ vendorBadgeId: badgeId });
-      const durations    = [];
-      let inTime         = null;
-
-      swipes.forEach(s => {
-        const t = new Date(s.LocaleMessageTime);
-        if (s.Direction === 'InDirection') {
-          inTime = t;
-        } else if (s.Direction === 'OutDirection' && inTime) {
-          durations.push((t - inTime) / 3600000);
-          inTime = null;
-        }
-      });
-
-      res.json({ success:true, badgeId, durations });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ success:false, message:'Vendor time calc failed' });
-    }
-  };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-//Correct Output
-
-// occupancy.service.js
-const { poolPromise, sql } = require('../config/db');
-const roles = require('../utils/roles');
-
-const partitionList = [
-  'US.CO.OBS',           // Denver
-  'US.FL.Miami',
-  'US.NYC',
-  'USA/Canada Default'
-];
-
-// Helper: safely join a list of strings into quoted SQL literals
-function quoteList(arr) {
-  return arr.map(s => `'${s.replace(/'/g, "''")}'`).join(',');
+export function getRegionDatabases(regionKey) {
+  const key = (regionKey || '').toLowerCase();
+  const cfg = regions[key];
+  if (!cfg) return [];
+  if (Array.isArray(cfg.databases) && cfg.databases.length) return cfg.databases.slice();
+  if (cfg.database) return [cfg.database];
+  return [];
 }
 
-// cache detected journal ID column name (avoid repeated metadata queries)
-let _journalIdColCache = null;
-async function detectJournalIdColumn(pool) {
-  if (_journalIdColCache) return _journalIdColCache;
+/**
+ * Safe bracketed DB name for embedding into SQL identifiers.
+ */
+export function bracketDb(dbName) {
+  if (!dbName) return '';
+  // protect against accidental injection: remove closing bracket then bracket it
+  const safe = String(dbName).replace(/]/g, '');
+  return `[${safe}]`;
+}
 
-  // Look for common GUID columns used across environments
-  const res = await pool.request().query(`
-    SELECT COLUMN_NAME
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'ACVSUJournalLog'
-      AND COLUMN_NAME IN ('ObjectIdentity1','ObjectIdentity','ObjectIdentityGUID','ObjectIdentityID')
-  `);
+export { sql };
 
-  if (res && res.recordset && res.recordset.length > 0) {
-    _journalIdColCache = res.recordset[0].COLUMN_NAME;
+
+
+
+
+
+
+
+
+
+// C:\Users\W0024618\Desktop\global-page\backend\routes\reports.js
+
+
+ import express from 'express';
+import {
+ // rawReport,
+  rejectionReport,
+  dailyAccessReportEMEA,
+   inOutReport,
+  timeDurationReport,
+  eurocAdmitRejectionReport,
+  rawReportStreamToResponse 
+
+} from '../services/reportService.js';
+import { listLocations, searchEmployees } from '../services/reportService.js';
+
+const router = express.Router();
+
+// router.get('/raw', rawReportHandler);
+
+
+
+
+
+router.get('/locations', async (req, res) => {
+  try {
+    const region = (req.query.region || 'emea').toString().toLowerCase();
+    // for 'global' you could optionally return combined results by calling each region's pool,
+    // but frontend already calls fetchLocationsForRegion per region when region==='global'.
+    const locations = await listLocations(region);
+    res.json({ data: locations });
+  } catch (err) {
+    console.error('GET /api/locations err', err);
+    res.status(500).json({ error: err.message || 'failed' });
+  }
+});
+
+router.get('/employees', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString();
+    const region = (req.query.region || 'emea').toString().toLowerCase();
+    if (!q || q.length < 2) return res.json({ data: [] });
+    const rows = await searchEmployees(region, q);
+    // return as array of objects
+    res.json({ data: rows });
+  } catch (err) {
+    console.error('GET /api/employees err', err);
+    res.status(500).json({ error: err.message || 'failed' });
+  }
+});
+
+
+
+
+
+
+// Helper to unify GET/POST inputs
+function getParam(req, name, defaultValue = undefined) {
+  if (req.method === 'GET') {
+    return req.query[name] ?? defaultValue;
   } else {
-    // fallback to the original name (keeps older behaviour for environments that match original column)
-    _journalIdColCache = 'ObjectIdentity1';
+    return req.body[name] ?? defaultValue;
   }
-
-  return _journalIdColCache;
 }
 
-/**
- * Fetch today's live occupancy records.
- *
- * PartitionName2 returned here is the door-first mapped partition (HQ doors -> 'US.CO.OBS').
- */
-exports.fetchLiveOccupancy = async () => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
-
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1           AS ObjectName1,
-        t1.ObjectName2           AS Door,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                       AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        )                         AS CardNumber,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.[${journalIdCol}]        AS PersonGUID,
-        t3.Name                   AS PersonnelType,
-        t5d.value                 AS Direction,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            THEN 'Denver-HQ'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            THEN 'Austin Texas'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
-            THEN 'New York'
-          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-          ELSE 'Other'
-        END AS LogicalLocation
-      FROM dbo.ACVSUJournalLog AS t1
-      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT
-      LocaleMessageTime,
-      ObjectName1,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PartitionName2,
-      LogicalLocation,
-      PersonGUID,
-      PersonnelType,
-      Direction
-    FROM CombinedQuery
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
-};
+// Middleware to ensure `region` is defined
+function requireRegion(req, res, next) {
+  const region = getParam(req, 'region');
+  if (!region) {
+    return res
+      .status(400)
+      .json({ error: "Missing required parameter: 'region'" });
+  }
+  next();
+}
 
 
-/**
- * Fetch historical swipe data and server-side summaryByDate.
- *
- * Summary logic:
- * - build a personKey = COALESCE(PersonGUID, CardNumber, EmployeeID, ObjectName1)
- * - dedupe per (partition, personKey, date) taking the last swipe for that personKey/day
- * - count one unique person per day regardless of Direction
- */
-exports.fetchHistoricalData = async ({ days = 7, location = null } = {}) => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
-  const parts = quoteList(partitionList);
-  const locCondition = location
-    ? `AND t1.PartitionName2 = @location`
-    : `AND t1.PartitionName2 IN (${parts})`;
 
-  const sqlQuery = `
-    -- DETAILS (full rows)
-    WITH Hist AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1,
-        t1.ObjectName2       AS Door,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor')
-            THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                   AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        )                     AS CardNumber,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.[${journalIdCol}]   AS PersonGUID,
-        t3.Name              AS PersonnelType,
-        t5d.value            AS Direction,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            THEN 'Denver-HQ'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            THEN 'Austin Texas'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' 
-            THEN 'New York'
-          WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-          WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-          WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-          WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-          ELSE 'Other'
-        END AS LogicalLocation
-      FROM dbo.ACVSUJournalLog       AS t1
-      LEFT JOIN ACVSCore.Access.Personnel                 AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN dbo.ACVSUJournalLogxml       AS t_xml
-        ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value
-        FROM dbo.ACVSUJournalLogxmlShred
-        WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE
-        t1.MessageType = 'CardAdmitted'
-        ${locCondition}
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
-            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
-    )
-    SELECT
-      LocaleMessageTime,
-      ObjectName1,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PartitionName2,
-      LogicalLocation,
-      PersonGUID,
-      PersonnelType,
-      Direction
-    FROM Hist
-    ORDER BY LocaleMessageTime ASC;
+async function handleRaw(req, res, next) {
+  try {
+    const region = getParam(req, 'region');
+    const startDateParam = getParam(req, 'startDate');
+    const endDateParam = getParam(req, 'endDate');
+    const location = getParam(req, 'location', undefined);
+    const admitFilter = getParam(req, 'admitFilter', 'all');
 
-    -- SUMMARY: dedupe per (partition, personKey, date) using fallback keys; count unique person per day
-    WITH Hist2 AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName2       AS Door,
-        t1.ObjectName1       AS ObjectName1,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END                   AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        )                     AS CardNumber,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%'
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t1.[${journalIdCol}]   AS PersonGUID,
-        t3.Name              AS PersonnelType,
-        t5d.value            AS Direction
-      FROM dbo.ACVSUJournalLog       AS t1
-      LEFT JOIN ACVSCore.Access.Personnel                 AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType             AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml
-        ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value
-        FROM dbo.ACVSUJournalLogxmlShred
-        WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE
-        t1.MessageType = 'CardAdmitted'
-        ${locCondition}
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC))
-            >= DATEADD(DAY, -${days}, CONVERT(DATE, GETDATE()))
-    ),
-    WithPersonKey AS (
-      SELECT *,
-        -- personKey fallback order: PersonGUID -> CardNumber -> EmployeeID -> ObjectName1
-        COALESCE(
-          NULLIF(CAST(PersonGUID AS NVARCHAR(100)), ''),
-          NULLIF(CardNumber, ''),
-          NULLIF(EmployeeID, ''),
-          NULLIF(ObjectName1, '')
-        ) AS PersonKey,
-        CONVERT(VARCHAR(10), CONVERT(date, LocaleMessageTime), 23) AS DateOnly
-      FROM Hist2
-    ),
-    LastPerPersonKey AS (
-      SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY PartitionName2, PersonKey, DateOnly ORDER BY LocaleMessageTime DESC) AS rn
-      FROM WithPersonKey
-      WHERE COALESCE(NULLIF(CAST(PersonGUID AS NVARCHAR(100)), ''), NULLIF(CardNumber, ''), NULLIF(EmployeeID, ''), NULLIF(ObjectName1, '')) IS NOT NULL
-    )
-    SELECT
-      DateOnly AS [date],
-      DATENAME(WEEKDAY, CONVERT(date, DateOnly)) AS [day],
-      PartitionName2 AS partitionCode,
-      COUNT(*) AS total,
-      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%employee%' THEN 1 ELSE 0 END) AS Employee,
-      SUM(CASE WHEN LOWER(ISNULL(PersonnelType,'')) LIKE '%contractor%' THEN 1 ELSE 0 END) AS Contractor
-    FROM LastPerPersonKey
-    WHERE rn = 1
-    GROUP BY DateOnly, PartitionName2
-    ORDER BY DateOnly DESC, PartitionName2;
-  `;
-
-  const req = pool.request();
-  if (location) req.input('location', sql.NVarChar, location);
-
-  const result = await req.query(sqlQuery);
-
-  // result.recordsets[0] => details rows (full list)
-  // result.recordsets[1] => summary rows (counts per date/partition)
-  const details = (result && Array.isArray(result.recordsets) && Array.isArray(result.recordsets[0])) ? result.recordsets[0] : (Array.isArray(result.recordset) ? result.recordset : []);
-  const summaryRows = (result && Array.isArray(result.recordsets) && Array.isArray(result.recordsets[1])) ? result.recordsets[1] : [];
-
-  // Build summaryByDate structure expected by frontend
-  const summaryByDateMap = {};
-  summaryRows.forEach(r => {
-    const date = r.date;
-    if (!summaryByDateMap[date]) {
-      summaryByDateMap[date] = {
-        date,
-        day: r.day,
-        region: { name: 'NAMER', total: 0, Employee: 0, Contractor: 0 },
-        partitions: {}
-      };
+    if (!startDateParam || !endDateParam) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameters: 'startDate' and/or 'endDate'" });
     }
-    const emp = r.Employee || 0;
-    const con = r.Contractor || 0;
-    const total = r.total || (emp + con);
 
-    summaryByDateMap[date].partitions[r.partitionCode] = {
-      total,
-      Employee: emp,
-      Contractor: con
+    const startDate = new Date(startDateParam);
+    const endDate = new Date(endDateParam);
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date format for startDate/endDate" });
+    }
+
+    // call service with validated params (service expects startDate & endDate + optional location & admitFilter)
+    const data = await rawReport(region, { startDate, endDate, location, admitFilter });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+
+router.get ('/raw',  requireRegion, handleRaw);
+router.post('/raw',  requireRegion, handleRaw);
+
+
+// Rejection Report handler (supports region=global)
+async function handleRejection(req, res, next) {
+  try {
+    const regionRaw = getParam(req, 'region');
+    const region = (regionRaw || '').toString().toLowerCase();
+    const startDateParam = getParam(req, 'startDate');
+    const endDateParam = getParam(req, 'endDate');
+    const location = getParam(req, 'location', undefined);
+
+    if (!startDateParam || !endDateParam) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameters: 'startDate' and/or 'endDate'" });
+    }
+
+    const startDate = new Date(startDateParam);
+    const endDate = new Date(endDateParam);
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date format for startDate/endDate" });
+    }
+
+    const ALL_REGIONS = ['apac', 'emea', 'laca', 'namer'];
+
+    if (region === 'global') {
+      const promises = ALL_REGIONS.map(r => rejectionReport(r, { startDate, endDate, location }));
+      const results = await Promise.all(promises);
+      const merged = results.flat();
+      // sort by LocaleMessageTime desc (most recent first)
+      merged.sort((a, b) => {
+        const ta = a.LocaleMessageTime ? new Date(a.LocaleMessageTime).getTime() : 0;
+        const tb = b.LocaleMessageTime ? new Date(b.LocaleMessageTime).getTime() : 0;
+        return tb - ta;
+      });
+      return res.json({ data: merged });
+    }
+
+    // single-region
+    const data = await rejectionReport(region, { startDate, endDate, location });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+router.get('/rejection', requireRegion, handleRejection);
+router.post('/rejection', requireRegion, handleRejection);
+
+
+
+
+
+// Daily Access Report handler
+async function handleDailyAccess(req, res, next) {
+  try {
+    const region    = getParam(req, 'region');
+    const from      = getParam(req, 'from');
+    const to        = getParam(req, 'to');
+    if (!from || !to) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameters: 'from' and/or 'to'" });
+    }
+    // employees: POST expects array, GET expects comma-separated string
+    let employees = getParam(req, 'employees', []);
+    if (typeof employees === 'string') {
+      employees = employees.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(employees) || employees.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Missing or empty required parameter: 'employees'" });
+    }
+    const data = await dailyAccessReportEMEA({ from, to });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get ('/daily-access',  requireRegion, handleDailyAccess);
+router.post('/daily-access',  requireRegion, handleDailyAccess);
+
+// In vs Out Report handler
+async function handleInOut(req, res, next) {
+  try {
+    const region = getParam(req, 'region');
+    const year   = parseInt(getParam(req, 'year'),  10);
+    const month  = parseInt(getParam(req, 'month'), 10);
+    if (Number.isNaN(year) || Number.isNaN(month)) {
+      return res
+        .status(400)
+        .json({ error: "Missing or invalid parameters: 'year' and/or 'month'" });
+    }
+    // doors: POST expects array, GET expects comma-separated string
+    let doors = getParam(req, 'doors', []);
+    if (typeof doors === 'string') {
+      doors = doors.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(doors) || doors.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Missing or empty required parameter: 'doors'" });
+    }
+    const data = await inOutReport(region, { year, month, doors });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get ('/in-out',  requireRegion, handleInOut);
+router.post('/in-out',  requireRegion, handleInOut);
+
+
+// Time Duration Report handler
+async function handleTimeDuration(req, res, next) {
+  try {
+    const region    = getParam(req, 'region');
+    const startDate = getParam(req, 'startDate');
+    const partition = getParam(req, 'partition', 'Default');
+
+    if (!startDate) {
+      return res
+        .status(400)
+        .json({ error: "Missing required parameter: 'startDate'" });
+    }
+
+    const data = await timeDurationReport(region, { partition, startDate });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/time-duration',  requireRegion, handleTimeDuration);
+router.post('/time-duration', requireRegion, handleTimeDuration);
+
+
+
+
+
+// EUROC Admit-Rejection handler
+async function handleEuroc(req, res, next) {
+  try {
+    const region = getParam(req, 'region');
+    const dateParam = getParam(req, 'date'); // expected YYYY-MM-DD or JS date string
+    if (!region || region.toLowerCase() !== 'emea') {
+      return res.status(400).json({ error: "EUROC report only supported for region 'emea'" });
+    }
+    if (!dateParam) {
+      return res.status(400).json({ error: "Missing required parameter: 'date' (YYYY-MM-DD)" });
+    }
+    // normalize date (send only date part)
+    const dt = new Date(dateParam);
+    if (Number.isNaN(dt.getTime())) {
+      return res.status(400).json({ error: "Invalid date parameter" });
+    }
+    const isoDate = dt.toISOString().slice(0, 10); // YYYY-MM-DD
+    const data = await eurocAdmitRejectionReport(region, { reportDate: isoDate });
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+router.get('/euroc-admit-rejection', requireRegion, handleEuroc);
+router.post('/euroc-admit-rejection', requireRegion, handleEuroc);
+
+
+
+
+
+
+// new - robust raw-download handler
+router.get('/raw-download', async (req, res) => {
+  try {
+    const region = req.query.region;
+    const startDate = req.query.startDate; // expect 'YYYY-MM-DD' or ISO
+    const endDate = req.query.endDate;
+    const location = req.query.location || null;
+    const admitFilter = req.query.admitFilter || 'all';
+
+    // Basic validation
+    if (!region || !startDate || !endDate) {
+      return res.status(400).json({ error: 'region, startDate and endDate required' });
+    }
+
+    // Normalize employees param: support CSV string OR array (employees[]=a&employees[]=b) OR frontend rawSearch/q
+    let employeesRaw = null;
+
+    const decodeAndTrim = s => {
+      if (!s && s !== 0) return null;
+      try { s = decodeURIComponent(String(s)); } catch (e) { s = String(s); }
+      s = String(s).trim();
+      return s.length ? s : null;
     };
 
-    summaryByDateMap[date].region.Employee += emp;
-    summaryByDateMap[date].region.Contractor += con;
-    summaryByDateMap[date].region.total += total;
-  });
+    if (typeof req.query.employees === 'string' && req.query.employees.trim() !== '') {
+      employeesRaw = decodeAndTrim(req.query.employees);
+    } else if (Array.isArray(req.query.employees) && req.query.employees.length) {
+      employeesRaw = req.query.employees.map(s => decodeAndTrim(s)).filter(Boolean).join(',');
+    } else if (Array.isArray(req.query['employees[]']) && req.query['employees[]'].length) {
+      employeesRaw = req.query['employees[]'].map(s => decodeAndTrim(s)).filter(Boolean).join(',');
+    } else if (req.query.q && String(req.query.q).trim() !== '') {
+      // support '?q=...' if frontend sends the search token under q
+      employeesRaw = decodeAndTrim(req.query.q);
+    } else if (req.query.rawSearch && String(req.query.rawSearch).trim() !== '') {
+      employeesRaw = decodeAndTrim(req.query.rawSearch);
+    } else if (req.body && req.body.employees) {
+      // POST fallback
+      if (typeof req.body.employees === 'string' && req.body.employees.trim() !== '') {
+        employeesRaw = decodeAndTrim(req.body.employees);
+      } else if (Array.isArray(req.body.employees) && req.body.employees.length) {
+        employeesRaw = req.body.employees.map(s => decodeAndTrim(s)).filter(Boolean).join(',');
+      }
+    }
 
-  const summaryByDate = Object.values(summaryByDateMap).sort((a,b) => b.date.localeCompare(a.date));
+    // Defensive: if it's a single token with spaces but no commas, keep it intact (string_split will treat it as one token)
+    // Log first 200 chars for debugging
+    console.log('raw-download params:', {
+      region, startDate, endDate, location, admitFilter,
+      employees: employeesRaw ? employeesRaw.slice(0, 200) : null
+    });
 
-  return { details, summaryByDate };
-};
-
-exports.fetchHistoricalOccupancy = async (location) =>
-  exports.fetchHistoricalData({ days: 7, location: location || null });
-
-
-/**
- * Fetch today's swipes for Denver security officers.
- */
-exports.fetchSecuritySwipes = async () => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
-  const officers = quoteList(roles.securityOfficers);
-
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        t1.ObjectName1      AS ObjectName1,
-        t1.ObjectName2      AS Door,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        t3.Name AS PersonnelType,
-        t5d.value AS Direction,
-        t1.[${journalIdCol}] AS PersonGUID,
-        CASE
-          WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12
-          ELSE CAST(t2.Int1 AS NVARCHAR)
-        END AS EmployeeID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        ) AS CardNumber
-      FROM dbo.ACVSUJournalLog AS t1
-      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT
-      LocaleMessageTime,
-      Door,
-      EmployeeID,
-      CardNumber,
-      PersonnelType,
-      PartitionName2,
-      Direction
-    FROM CombinedQuery
-    WHERE EmployeeID IN (${officers})
-      AND PartitionName2 = 'US.CO.OBS'
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
-};
-
-/**
- * Count visitor badge swipes per floor today (returns door-first PartitionName2).
- */
-exports.fetchVisitorCountsByFloor = async () => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
-
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
-        t3.Name AS PersonnelType,
-        t1.ObjectName2 AS Door
-      FROM dbo.ACVSUJournalLog AS t1
-      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-        AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) = CONVERT(DATE, GETDATE())
-    )
-    SELECT PartitionName2, LogicalLocation = NULL, Door AS Floor, COUNT(*) AS visitorCount
-    FROM CombinedQuery
-    WHERE PersonnelType = 'Visitor'
-    GROUP BY PartitionName2, Door;
-  `;
-  const result = await pool.request().query(query);
-  return result.recordset;
-};
+    // call streaming service — it writes directly to res and ends it
+    await rawReportStreamToResponse(res, region, { startDate, endDate, location, admitFilter, employees: employeesRaw });
+  } catch (err) {
+    console.error('raw-download error', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to generate download' });
+    try { res.end(); } catch (e) {}
+  }
+});
 
 
-/**
- * Badge rejections last 7 days
- */
-exports.fetchBadgeRejectionDetails = async () => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
-  const parts = quoteList(partitionList);
 
-  const query = `
-WITH CombinedQuery AS (
-  SELECT
-    DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-    t1.ObjectName1      AS ObjectName1,
-    t1.ObjectName2      AS Door,
-    CASE
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-        OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-        OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-        OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-        OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-      ELSE t1.PartitionName2
-    END AS PartitionName2,
-    COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-      sc.value
-    ) AS CardNumber,
-    t3.Name AS PersonnelType,
-    t5_rej.value AS RejectionType,
-    CASE
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-        THEN 'Denver-HQ'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' THEN 'Austin Texas'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' THEN 'Miami'
-      WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-        OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%' THEN 'New York'
-      WHEN t1.PartitionName2 = 'US.CO.OBS' THEN 'Denver-HQ'
-      WHEN t1.PartitionName2 = 'USA/Canada Default' THEN 'Austin Texas'
-      WHEN t1.PartitionName2 = 'US.FL.Miami' THEN 'Miami'
-      WHEN t1.PartitionName2 = 'US.NYC' THEN 'New York'
-      ELSE 'Other'
-    END AS LogicalLocation
-  FROM dbo.ACVSUJournalLog AS t1
-  LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
-  LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-  LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
-  LEFT JOIN (
-    SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
-  ) AS sc ON t1.XmlGUID = sc.GUID
-  LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5_rej
-    ON t1.XmlGUID = t5_rej.GUID AND t5_rej.Name = 'RejectCode'
-  WHERE
-    t1.MessageType = 'CardRejected'
-    AND t1.PartitionName2 IN (${parts})
-    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC)) >= DATEADD(DAY, -7, CONVERT(DATE, GETDATE()))
-)
-SELECT
-  LocaleMessageTime,
-  CONVERT(date, LocaleMessageTime) AS DateOnly,
-  CONVERT(time(0), LocaleMessageTime) AS SwipeTime,
-  CardNumber,
-  PersonnelType,
-  PartitionName2 AS Location,
-  LogicalLocation,
-  Door,
-  RejectionType
-FROM CombinedQuery
-ORDER BY LocaleMessageTime DESC;
-  `;
 
-  const result = await pool.request().query(query);
-  const rows = result.recordset;
 
-  // compute today's count
-  const todayStr = new Date().toISOString().slice(0,10);
-  const liveCount = rows.filter(r =>
-    r.DateOnly && r.DateOnly.toISOString && r.DateOnly.toISOString().slice(0,10) === todayStr
-  ).length;
 
-  return { liveCount, history: rows };
-};
+export default router;
 
-/**
- * Fetch IN/OUT swipes for service vendors for time calculations.
- */
-exports.fetchVendorSwipes = async ({ vendorBadgeId }) => {
-  const pool = await poolPromise;
-  const journalIdCol = await detectJournalIdColumn(pool);
 
-  const query = `
-    WITH CombinedQuery AS (
-      SELECT
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        CASE
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%US.CO.HQ.%'
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%HQ%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%DENVER%' 
-            OR t1.PartitionName2 = 'US.CO.OBS' THEN 'US.CO.OBS'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%AUSTIN TX%' 
-            OR t1.PartitionName2 = 'USA/Canada Default' THEN 'USA/Canada Default'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%MIAMI%' 
-            OR t1.PartitionName2 = 'US.FL.Miami' THEN 'US.FL.Miami'
-          WHEN UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NYC%' 
-            OR UPPER(ISNULL(t1.ObjectName2,'')) LIKE '%NEW YORK%'
-            OR t1.PartitionName2 = 'US.NYC' THEN 'US.NYC'
-          ELSE t1.PartitionName2
-        END AS PartitionName2,
-        CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
-        t5d.value AS Direction,
-        t1.[${journalIdCol}] AS PersonGUID,
-        COALESCE(
-          TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-          sc.value
-        ) AS CardNumber,
-        t3.Name AS PersonnelType
-      FROM dbo.ACVSUJournalLog AS t1
-      LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.[${journalIdCol}] = t2.GUID
-      LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeId = t3.ObjectID
-      LEFT JOIN dbo.ACVSUJournalLogxmlShred AS t5d
-        ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-      LEFT JOIN dbo.ACVSUJournalLogxml AS t_xml ON t1.XmlGUID = t_xml.GUID
-      LEFT JOIN (
-        SELECT GUID, value FROM dbo.ACVSUJournalLogxmlShred WHERE Name IN ('Card','CHUID')
-      ) AS sc ON t1.XmlGUID = sc.GUID
-      WHERE t1.MessageType = 'CardAdmitted'
-        AND t1.PartitionName2 IN (${ quoteList(partitionList) })
-    )
-    SELECT LocaleMessageTime, EmployeeID, CardNumber, Direction, PartitionName2, PersonnelType, PersonGUID
-    FROM CombinedQuery
-    WHERE CardNumber = @vendorBadgeId
-    ORDER BY LocaleMessageTime ASC;
-  `;
-  const req = pool.request().input('vendorBadgeId', sql.NVarChar, vendorBadgeId);
-  const result = await req.query(query);
-  return result.recordset;
-};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
