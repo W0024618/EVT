@@ -1,1 +1,266 @@
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r backend\requirements.txt
+
+
+
+
+
+
+# backend/trend_runner.py
+from datetime import date, datetime
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import logging
+from duration_report import run_for_date  # your module (must be reachable)
+# if your duration_report is in a different module path, adjust import.
+
+OUTDIR = Path("./outputs")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=logging.INFO)
+
+# ---------- Utilities to compute features ----------
+def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build one-row-per-person-per-date features used by scenarios.
+    swipes: raw swipe rows (LocaleMessageTime, Direction, Door, EmployeeIdentity, EmployeeID,...)
+    durations: output of compute_daily_durations (person_uid, Date, FirstSwipe, LastSwipe, CountSwipes, DurationSeconds, ...)
+    """
+    if swipes is None or swipes.empty:
+        return pd.DataFrame()
+
+    # Normalize columns
+    sw = swipes.copy()
+    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
+    sw['Date'] = sw['LocaleMessageTime'].dt.date
+
+    # per person/date: count in/out, unique doors, max swipe gap
+    def agg_swipe_group(g):
+        times = sorted(g['LocaleMessageTime'].dropna().tolist())
+        gaps = []
+        for i in range(1, len(times)):
+            gaps.append((times[i] - times[i-1]).total_seconds())
+        max_gap = max(gaps) if gaps else 0
+        in_count = (g['Direction'] == 'InDirection').sum() if 'Direction' in g.columns else 0
+        out_count = (g['Direction'] == 'OutDirection').sum() if 'Direction' in g.columns else 0
+        unique_doors = g['Door'].nunique() if 'Door' in g.columns else 0
+        return pd.Series({
+            'CountSwipes': int(len(g)),
+            'MaxSwipeGapSeconds': int(max_gap),
+            'InCount': int(in_count),
+            'OutCount': int(out_count),
+            'UniqueDoors': int(unique_doors)
+        })
+
+    grouped = sw.groupby(['person_uid', 'Date']).apply(agg_swipe_group).reset_index()
+
+    # Merge durations (by person_uid + Date)
+    if durations is None or durations.empty:
+        durations = pd.DataFrame(columns=['person_uid','Date','DurationSeconds','CountSwipes'])
+
+    dur = durations.copy()
+    # ensure Date column is date type
+    dur['Date'] = pd.to_datetime(dur['Date']).dt.date
+    merged = pd.merge(grouped, dur, how='left', left_on=['person_uid','Date'], right_on=['person_uid','Date'])
+
+    # fill NaNs
+    merged['DurationSeconds'] = merged['DurationSeconds'].fillna(0).astype(float)
+    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
+    merged['CountSwipes'] = merged['CountSwipes_x'].fillna(merged['CountSwipes_y']).fillna(0).astype(int)
+    # derive flags
+    merged['OnlyIn'] = merged['InCount'].apply(lambda x: 1 if x>0 and merged.loc[merged['InCount'].index, 'OutCount'] is None else 0) \
+                     if 'InCount' in merged else 0
+    # simpler: OnlyIn if InCount>0 and OutCount==0 on same day
+    merged['OnlyIn'] = ((merged['InCount'] > 0) & (merged['OutCount'] == 0)).astype(int)
+    merged['OnlyOut'] = ((merged['OutCount'] > 0) & (merged['InCount'] == 0)).astype(int)
+
+    return merged
+
+# ---------- Scenario functions ----------
+def scenario_long_gap(row):
+    # swipe gap > 90 minutes
+    return row['MaxSwipeGapSeconds'] >= 90*60
+
+def scenario_short_duration(row):
+    # duration < 4 hours (240 minutes)
+    return row['DurationMinutes'] < 240
+
+def scenario_coffee_badging(row):
+    # many short visits: CountSwipes >= 4 and DurationMinutes < 60
+    return (row['CountSwipes'] >= 4) and (row['DurationMinutes'] < 60)
+
+def scenario_low_swipe_count(row):
+    # low swipe count for a workday
+    return row['CountSwipes'] <= 2
+
+def scenario_single_door(row):
+    return row['UniqueDoors'] <= 1
+
+def scenario_only_in(row):
+    return int(row.get('OnlyIn',0)) == 1
+
+def scenario_only_out(row):
+    return int(row.get('OnlyOut',0)) == 1
+
+def scenario_overtime(row):
+    # Duration > 10 hours
+    return row['DurationMinutes'] >= 10*60
+
+def scenario_very_long_duration(row):
+    # Duration > 16 hours (suspicious)
+    return row['DurationMinutes'] >= 16*60
+
+def scenario_zero_swipes(row):
+    return row['CountSwipes'] == 0
+
+def scenario_early_arrival(row):
+    # if FirstSwipe exists and earlier than 06:00 - we need FirstSwipe in durations
+    # If durations contains FirstSwipe, user can expand. Placeholder return False for now.
+    return False
+
+# Add more scenarios as small functions here...
+# I'll build a list of scenario functions to apply
+
+SCENARIOS = [
+    ("long_gap_>=90min", scenario_long_gap),
+    ("short_duration_<4h", scenario_short_duration),
+    ("coffee_badging", scenario_coffee_badging),
+    ("low_swipe_count_<=2", scenario_low_swipe_count),
+    ("single_door", scenario_single_door),
+    ("only_in", scenario_only_in),
+    ("only_out", scenario_only_out),
+    ("overtime_>=10h", scenario_overtime),
+    ("very_long_duration_>=16h", scenario_very_long_duration),
+    ("zero_swipes", scenario_zero_swipes)
+    # add more names/functions to reach 20+ as needed
+]
+
+# ---------- Main run function ----------
+def run_trend_for_date(target_date: date, outdir: str = "./outputs"):
+    # Use duration_report.run_for_date to fetch Pune (region apac, city Pune)
+    logging.info("Running trend for date %s (Pune test)", target_date)
+    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city='Pune')
+    apac = results.get('apac', {})
+    swipes = apac.get('swipes', pd.DataFrame())
+    durations = apac.get('durations', pd.DataFrame())
+
+    features = compute_features(swipes, durations)
+    if features.empty:
+        logging.warning("No features computed - empty input")
+        return pd.DataFrame()
+
+    # Apply scenarios
+    for name, fn in SCENARIOS:
+        features[name] = features.apply(fn, axis=1)
+
+    # Create reason text
+    def reasons_for_row(r):
+        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
+        return "; ".join(reasons) if reasons else None
+
+    features['Reasons'] = features.apply(reasons_for_row, axis=1)
+    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
+    features.to_csv(out_csv, index=False)
+    logging.info("Wrote trends to %s (rows=%d)", out_csv, len(features))
+    return features
+
+# If run as script
+if __name__ == "__main__":
+    today = datetime.now().date()
+    # test run for today-1 or pass specific date:
+    df = run_trend_for_date(today)
+    print("Completed; rows:", len(df))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# backend/app.py
+from flask import Flask, jsonify, request
+from datetime import datetime
+from trend_runner import run_trend_for_date
+import pandas as pd
+import logging
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+@app.route('/')
+def root():
+    return "Trend Analysis API — Pune test"
+
+@app.route('/run', methods=['POST', 'GET'])
+def run_trend():
+    # Accept date param (YYYY-MM-DD). If not provided, default to yesterday.
+    date_str = request.args.get('date') or request.json.get('date') if request.is_json else None
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception as e:
+            return jsonify({"error": f"Invalid date format: {e}"}), 400
+    else:
+        target_date = datetime.now().date()
+
+    df = run_trend_for_date(target_date, outdir="./backend/outputs")
+    if df is None or df.empty:
+        return jsonify({"message":"No records computed", "rows":0}), 200
+    # return summary
+    flagged = df[df['Reasons'].notna()]
+    return jsonify({
+        "date": target_date.isoformat(),
+        "rows": len(df),
+        "flagged_rows": int(len(flagged))
+    })
+
+@app.route('/latest', methods=['GET'])
+def latest_results():
+    # serve a simple summary of the latest CSV in outputs
+    from pathlib import Path
+    p = Path("./backend/outputs")
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({"error":"no outputs found"}), 404
+    df = pd.read_csv(csvs[0])
+    return jsonify({
+        "file": csvs[0].name,
+        "rows": int(len(df)),
+        "sample": df.head(5).to_dict(orient='records')
+    })
+
+if __name__ == "__main__":
+    app.run(debug=True, port=8002)
+
+
+
+
+
+
+
+
+cd "Trend Analysis\backend"
+.\.venv\Scripts\Activate.ps1
+python app.py
+
+
+
+
+
+GET http://localhost:8002/run?date=2025-10-26
+GET http://localhost:8002/latest
+
+
+
+
+
+
 
