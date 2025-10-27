@@ -1,4 +1,408 @@
-(.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
+# backend/trend_runner.py
+from datetime import date, datetime, time
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import logging
+
+# IMPORTANT: import duration_report as a top-level module (file in same folder).
+# Do NOT use a relative import (from .duration_report ...) if running scripts directly.
+from duration_report import run_for_date
+
+# try to load historical profile (current_analysis.csv) if present
+HIST_PATH = Path(__file__).parent / "current_analysis.csv"
+if HIST_PATH.exists():
+    try:
+        HIST_DF = pd.read_csv(HIST_PATH)
+        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
+    except Exception as e:
+        logging.warning("Failed to load historical profile: %s", e)
+        HIST_DF = pd.DataFrame()
+else:
+    logging.warning("Historical profile file current_analysis.csv not found; history-based scenarios will fallback.")
+    HIST_DF = pd.DataFrame()
+
+OUTDIR = Path("./outputs")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=logging.INFO)
+
+
+def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per person-per-date features used by scenarios.
+    - swipes: raw swipe logs (LocaleMessageTime, Direction, Door, EmployeeID, CardNumber, PartitionName2, ...)
+    - durations: result from compute_daily_durations (person_uid, Date, FirstSwipe, LastSwipe, CountSwipes, DurationSeconds, ...)
+    Returns merged feature DataFrame
+    """
+    if swipes is None or swipes.empty:
+        return pd.DataFrame()
+
+    sw = swipes.copy()
+    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
+    sw['Date'] = sw['LocaleMessageTime'].dt.date
+
+    # create person_uid if missing (same logic as duration_report)
+    if 'person_uid' not in sw.columns:
+        def make_person_uid(row):
+            parts = []
+            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
+                v = row.get(c)
+                if pd.notna(v) and str(v).strip():
+                    parts.append(str(v).strip())
+            return "|".join(parts) if parts else None
+        sw['person_uid'] = sw.apply(make_person_uid, axis=1)
+
+    # compute per-person-date aggregated swipe stats (including gaps and short-gap count)
+    def agg_swipe_group(g):
+        times = sorted(g['LocaleMessageTime'].dropna().tolist())
+        gaps = []
+        short_gap_count = 0
+        for i in range(1, len(times)):
+            s = (times[i] - times[i-1]).total_seconds()
+            gaps.append(s)
+            if s <= 5*60:  # <= 5 minutes
+                short_gap_count += 1
+        max_gap = int(max(gaps)) if gaps else 0
+        in_count = int((g.get('Direction') == 'InDirection').sum()) if 'Direction' in g.columns else 0
+        out_count = int((g.get('Direction') == 'OutDirection').sum()) if 'Direction' in g.columns else 0
+        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+        card_numbers = list(pd.unique(g['CardNumber'].dropna())) if 'CardNumber' in g.columns else []
+        card_number = card_numbers[0] if card_numbers else None
+
+        # EmployeeID/Name keep-first
+        employee_id = None
+        employee_name = None
+        personnel_type = None
+        if 'EmployeeID' in g.columns:
+            employee_id = g['EmployeeID'].dropna().iloc[0] if not g['EmployeeID'].dropna().empty else None
+        if 'ObjectName1' in g.columns:
+            employee_name = g['ObjectName1'].dropna().iloc[0] if not g['ObjectName1'].dropna().empty else None
+        if 'PersonnelType' in g.columns:
+            personnel_type = g['PersonnelType'].dropna().iloc[0] if not g['PersonnelType'].dropna().empty else None
+
+        return pd.Series({
+            'CountSwipes': int(len(g)),
+            'MaxSwipeGapSeconds': max_gap,
+            'ShortGapCount': int(short_gap_count),
+            'InCount': in_count,
+            'OutCount': out_count,
+            'UniqueDoors': unique_doors,
+            'UniqueLocations': unique_locations,
+            'RejectionCount': rejection_count,
+            'CardNumber': card_number,
+            'EmployeeID': employee_id,
+            'EmployeeName': employee_name,
+            'PersonnelType': personnel_type
+        })
+
+    grouped = sw.groupby(['person_uid', 'Date']).apply(agg_swipe_group).reset_index()
+
+    # normalize durations
+    dur = pd.DataFrame() if durations is None else durations.copy()
+    if not dur.empty and 'Date' in dur.columns:
+        dur['Date'] = pd.to_datetime(dur['Date']).dt.date
+
+    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
+
+    # ensure important columns exist and cast types
+    merged['DurationSeconds'] = merged.get('DurationSeconds', 0).fillna(0).astype(float)
+    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
+    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
+    merged['MaxSwipeGapSeconds'] = merged['MaxSwipeGapSeconds'].fillna(0).astype(int)
+    merged['ShortGapCount'] = merged['ShortGapCount'].fillna(0).astype(int)
+    merged['RejectionCount'] = merged['RejectionCount'].fillna(0).astype(int)
+    merged['UniqueLocations'] = merged['UniqueLocations'].fillna(0).astype(int)
+    merged['UniqueDoors'] = merged['UniqueDoors'].fillna(0).astype(int)
+
+    # ensure FirstSwipe/LastSwipe exist (they come from durations)
+    for col in ['FirstSwipe', 'LastSwipe']:
+        if col not in merged.columns:
+            merged[col] = pd.NaT
+
+    # easy boolean flags
+    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
+    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
+    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
+
+    # helper: map historical medians/stds for lookups (if available)
+    hist_map = {}
+    if not HIST_DF.empty:
+        # ensure consistent types/columns - prefer EmployeeID as key
+        if 'EmployeeID' in HIST_DF.columns:
+            hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
+
+    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: x in hist_map if pd.notna(x) else False)
+
+    return merged
+
+
+# ----------------- Scenarios -----------------
+# Each scenario returns True/False for a row (input: pandas Series)
+
+def scenario_long_gap(row):
+    return (row.get('MaxSwipeGapSeconds') or 0) >= 90 * 60
+
+def scenario_short_duration(row):
+    return (row.get('DurationMinutes') or 0) < 240
+
+def scenario_coffee_badging(row):
+    # many small swipes but short overall duration
+    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
+
+def scenario_low_swipe_count(row):
+    return (row.get('CountSwipes') or 0) <= 2 and (row.get('CountSwipes') or 0) > 0
+
+def scenario_single_door(row):
+    return (row.get('UniqueDoors') or 0) <= 1
+
+def scenario_only_in(row):
+    return int(row.get('OnlyIn', 0)) == 1
+
+def scenario_only_out(row):
+    return int(row.get('OnlyOut', 0)) == 1
+
+def scenario_overtime(row):
+    # DurationMinutes already in minutes
+    return (row.get('DurationMinutes') or 0) >= 10 * 60
+
+def scenario_very_long_duration(row):
+    return (row.get('DurationMinutes') or 0) >= 16 * 60
+
+def scenario_zero_swipes(row):
+    return int(row.get('CountSwipes', 0)) == 0
+
+def scenario_unusually_high_swipes(row):
+    # compare to historical median if present, fallback to population median
+    cur = row.get('CountSwipes') or 0
+    empid = row.get('EmployeeID')
+    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
+        try:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+            median = float(rec.get('TotalSwipes_median', np.nan))
+            if np.isfinite(median) and median > 0:
+                return cur > 3 * median
+        except Exception:
+            pass
+    # fallback: global median from HIST_DF TotalSwipes_median if exists
+    if 'TotalSwipes_median' in HIST_DF.columns and not HIST_DF.empty:
+        global_med = HIST_DF['TotalSwipes_median'].median()
+        if pd.notna(global_med) and global_med > 0:
+            return cur > 3 * global_med
+    # final fallback: > 50 swipes in day is suspicious
+    return cur > 50
+
+def scenario_repeated_short_breaks(row):
+    # many short gaps <= 5 minutes
+    return (row.get('ShortGapCount') or 0) >= 3
+
+def scenario_multiple_location_same_day(row):
+    return (row.get('UniqueLocations') or 0) > 1
+
+def scenario_weekend_activity(row):
+    try:
+        d = pd.to_datetime(row['Date'])
+        return d.weekday() >= 5  # 5=Saturday,6=Sunday
+    except Exception:
+        return False
+
+def scenario_repeated_rejection_count(row):
+    return (row.get('RejectionCount') or 0) >= 2
+
+def scenario_badge_sharing_suspected(row, full_df=None):
+    """
+    Badge sharing: same CardNumber for >1 person_uid on same date.
+    Placeholder; a daily badge_map is built in run_trend_for_date and applied there.
+    """
+    return False  # resolved later in run_trend_for_date
+
+def scenario_early_arrival_before_06(row):
+    fs = row.get('FirstSwipe')
+    if pd.isna(fs) or fs is None:
+        return False
+    try:
+        t = pd.to_datetime(fs).time()
+        return t < time(hour=6, minute=0, second=0)
+    except Exception:
+        return False
+
+def scenario_late_exit_after_22(row):
+    ls = row.get('LastSwipe')
+    if pd.isna(ls) or ls is None:
+        return False
+    try:
+        t = pd.to_datetime(ls).time()
+        return t >= time(hour=22, minute=0, second=0)
+    except Exception:
+        return False
+
+def scenario_shift_inconsistency(row):
+    # compare DurationMinutes with historical median/std if present
+    empid = row.get('EmployeeID')
+    dur = row.get('DurationMinutes') or 0
+    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
+        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+        med = rec.get('AvgDurationMins_median', np.nan)
+        std = rec.get('AvgDurationMins_std', np.nan)
+        if pd.notna(med) and pd.notna(std):
+            # inconsistent if outside median +/- 2.5*std
+            return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
+    return False
+
+def scenario_trending_decline(row):
+    # attempts to detect `trending decline` if historical file contains weekly sliding averages
+    empid = row.get('EmployeeID')
+    if HIST_DF is None or HIST_DF.empty:
+        return False
+    if 'TrendingDecline' in HIST_DF.columns:
+        rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
+        if not rec.empty:
+            val = rec.iloc[0].get('TrendingDecline')
+            return str(val).strip().lower() == 'yes' if pd.notna(val) else False
+    return False
+
+def scenario_consecutive_absent_days(row):
+    # fallback: check if CountSwipes == 0 and historical field exists marking consecutive absences
+    if row.get('CountSwipes') == 0:
+        empid = row.get('EmployeeID')
+        if HIST_DF is not None and not HIST_DF.empty and 'ConsecAbsent3Plus' in HIST_DF.columns:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
+            if not rec.empty:
+                v = rec.iloc[0].get('ConsecAbsent3Plus')
+                return str(v).strip().lower() in ('yes', 'true', '1')
+        # otherwise, treat single zero-swipe as not necessarily consecutive
+        return False
+    return False
+
+def scenario_high_variance_duration(row):
+    # if historical std is high relative to median (CV > 1.0)
+    empid = row.get('EmployeeID')
+    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
+        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+        med = rec.get('AvgDurationMins_median', np.nan)
+        std = rec.get('AvgDurationMins_std', np.nan)
+        if pd.notna(med) and pd.notna(std) and med > 0:
+            cv = std / med
+            return cv > 1.0
+    return False
+
+def scenario_short_duration_on_high_presence_days(row):
+    days_present = row.get('DaysPresentInWeek') or 0
+    dur = row.get('DurationMinutes') or 0
+    return (days_present >= 4) and (dur < 240)
+
+
+# SCENARIO LIST (ordered)
+SCENARIOS = [
+    ("long_gap_>=90min", scenario_long_gap),
+    ("short_duration_<4h", scenario_short_duration),
+    ("coffee_badging", scenario_coffee_badging),
+    ("low_swipe_count_<=2", scenario_low_swipe_count),
+    ("single_door", scenario_single_door),
+    ("only_in", scenario_only_in),
+    ("only_out", scenario_only_out),
+    ("overtime_>=10h", scenario_overtime),
+    ("very_long_duration_>=16h", scenario_very_long_duration),
+    ("zero_swipes", scenario_zero_swipes),
+    ("unusually_high_swipes", scenario_unusually_high_swipes),
+    ("repeated_short_breaks", scenario_repeated_short_breaks),
+    ("multiple_location_same_day", scenario_multiple_location_same_day),
+    ("weekend_activity", scenario_weekend_activity),
+    ("repeated_rejection_count", scenario_repeated_rejection_count),
+    ("badge_sharing_suspected", scenario_badge_sharing_suspected),  # special: resolved later with map
+    ("early_arrival_before_06", scenario_early_arrival_before_06),
+    ("late_exit_after_22", scenario_late_exit_after_22),
+    ("shift_inconsistency", scenario_shift_inconsistency),
+    ("trending_decline", scenario_trending_decline),
+    ("consecutive_absent_days", scenario_consecutive_absent_days),
+    ("high_variance_duration", scenario_high_variance_duration),
+    ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days)
+]
+
+
+# ---------- Main run function ----------
+def run_trend_for_date(target_date: date, outdir: str = "./outputs"):
+    logging.info("run_trend_for_date: date=%s (Pune test)", target_date)
+    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city='Pune')
+    apac = results.get('apac', {})
+    swipes = apac.get('swipes', pd.DataFrame())
+    durations = apac.get('durations', pd.DataFrame())
+
+    features = compute_features(swipes, durations)
+    if features.empty:
+        logging.warning("run_trend_for_date: no features computed")
+        return pd.DataFrame()
+
+    # Build a map for badge sharing: for the day's swipes check CardNumber -> distinct person_uid count
+    badge_map = {}
+    if 'CardNumber' in swipes.columns:
+        tmp = swipes[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
+        if not tmp.empty:
+            grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
+            # convert to dict keyed by (Date, CardNumber)
+            badge_map = {(row.Date, row.CardNumber): row.distinct_users for row in grouped_card.itertuples(index=False)}
+
+    # Apply scenarios
+    for name, fn in SCENARIOS:
+        if name == "badge_sharing_suspected":
+            # custom application using badge_map
+            def badge_fn(r):
+                card = r.get('CardNumber')
+                d = r.get('Date')
+                if pd.isna(card) or card is None:
+                    return False
+                key = (d, card)
+                return badge_map.get(key, 0) > 1
+            features[name] = features.apply(badge_fn, axis=1)
+        else:
+            features[name] = features.apply(lambda r, f=fn: bool(f(r)), axis=1)
+
+    # Create reason text
+    def reasons_for_row(r):
+        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
+        return "; ".join(reasons) if reasons else None
+
+    features['Reasons'] = features.apply(reasons_for_row, axis=1)
+
+    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
+    features.to_csv(out_csv, index=False)
+    logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(features))
+    return features
+
+
+if __name__ == "__main__":
+    today = datetime.now().date()
+    df = run_trend_for_date(today)
+    print("Completed; rows:", len(df))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(
+
+
+
+
+
+.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
 Traceback (most recent call last):
   File "C:\Users\W0024618\Desktop\Trend Analysis\backend\app.py", line 17, in <module>
     from trend_runner import run_trend_for_date
