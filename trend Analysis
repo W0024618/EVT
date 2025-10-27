@@ -1,3 +1,272 @@
+from flask import Flask, jsonify, request
+from datetime import datetime, timedelta
+from pathlib import Path
+import logging
+import pandas as pd
+import numpy as np
+
+# Try to enable CORS if available; otherwise continue without it.
+try:
+    from flask_cors import CORS
+    _HAS_CORS = True
+except Exception:
+    CORS = None
+    _HAS_CORS = False
+
+# import runner (local)
+from trend_runner import run_trend_for_date
+
+app = Flask(__name__)
+if _HAS_CORS:
+    CORS(app)
+else:
+    logging.warning("flask_cors not available; continuing without CORS. Install Flask-Cors to enable cross-origin access from browser.")
+
+logging.basicConfig(level=logging.INFO)
+
+# Resolve output directory relative to this file
+BASE_DIR = Path(__file__).parent.resolve()
+DEFAULT_OUTDIR = BASE_DIR / "outputs"
+DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+
+def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
+    """
+    Return a clean JSON-serializable sample.  - drop any _x/_y duplicates and convert datetimes.
+    Important: replace NaN / NaT with None and convert numpy scalars to native Python types so
+    Flask/json can produce valid JSON.
+    """
+    if df is None or df.empty:
+        return []
+
+    # work on a copy
+    df = df.copy()
+
+    # drop _x/_y columns (prefer canonical base if present, otherwise rename _x/_y -> base)
+    cols_to_suffix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    if cols_to_suffix:
+        for c in cols_to_suffix:
+            base = c[:-2]
+            if base in df.columns:
+                # base exists, drop the suffixed column
+                try:
+                    df.drop(columns=[c], inplace=True)
+                except Exception:
+                    pass
+            else:
+                # rename suffixed column to base (prefer _x over _y if both present will be handled by dropping later)
+                try:
+                    df.rename(columns={c: base}, inplace=True)
+                except Exception:
+                    pass
+
+    # drop any duplicate-named columns preserving first occurrence
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # convert known datetime columns to ISO strings (or None)
+    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
+        if dtcol in df.columns:
+            try:
+                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
+                # isoformat without timezone (consistent readable format)
+                df[dtcol] = df[dtcol].dt.strftime('%Y-%m-%dT%H:%M:%S')
+                # above returns NaN for NaT; will be converted to None below
+            except Exception:
+                # fall back to string conversion then nullify invalid
+                try:
+                    df[dtcol] = df[dtcol].astype(str)
+                except Exception:
+                    pass
+
+    # ensure all pandas / numpy NaN/NaT are replaced with Python None
+    df = df.where(pd.notnull(df), None)
+
+    # convert numpy scalar types to native Python types (e.g., numpy.int64 -> int)
+    # applymap is fine for small sample sizes
+    def _to_python_scalar(x):
+        # numpy scalar
+        if isinstance(x, np.generic):
+            try:
+                return x.item()
+            except Exception:
+                return x
+        # pandas Timestamp already converted to str above; but if any left, convert to iso string
+        if isinstance(x, pd.Timestamp):
+            try:
+                return x.to_pydatetime().isoformat()
+            except Exception:
+                return str(x)
+        return x
+
+    df = df.head(max_rows).applymap(_to_python_scalar)
+
+    # to_dict now produces JSON-serializable Python primitives (None instead of NaN)
+    return df.to_dict(orient='records')
+
+
+@app.route('/')
+def root():
+    return "Trend Analysis API — Pune test"
+
+
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    """
+    /run?date=YYYY-MM-DD                 -> single date
+    /run?start=YYYY-MM-DD&end=YYYY-MM-DD -> date range inclusive
+    POST json: { "date": "..."} or { "start": "...", "end":"..." }
+    Returns summary + sample rows + list of generated files.
+    """
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.json or {}
+
+    # parse date(s)
+    date_str = params.get('date')
+    start_str = params.get('start')
+    end_str = params.get('end')
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            # default: today
+            dates = [datetime.now().date()]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    combined_rows = []
+    files = []
+    total_rows = 0
+    total_flagged = 0
+    samples = []
+
+    for d in dates:
+        try:
+            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
+        files.append(csv_path.name if csv_path.exists() else None)
+
+        if df is None or df.empty:
+            continue
+
+        # ensure Reasons column exists
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        # count
+        total_rows += len(df)
+        total_flagged += int(df['Reasons'].notna().sum())
+
+        # sample top flagged first, else top rows
+        flagged = df[df['Reasons'].notna()]
+        sample_df = flagged.head(10) if not flagged.empty else df.head(10)
+        samples.extend(_clean_sample_df(sample_df, max_rows=10))
+
+        # keep combined rows if user wants full (we won't return full by default)
+        combined_rows.append(df)
+
+    # combine for convenience if needed
+    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+
+    # produce response
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "files": [f for f in files if f],
+        "rows": int(total_rows),
+        "flagged_rows": int(total_flagged),
+        "sample": samples[:20]  # limit sample size
+    }
+    return jsonify(resp)
+
+
+@app.route('/latest', methods=['GET'])
+def latest_results():
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({"error": "no outputs found"}), 404
+    latest = csvs[0]
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        df = pd.read_csv(latest, dtype=str)
+    sample = _clean_sample_df(df, max_rows=5)
+    return jsonify({
+        "file": latest.name,
+        "rows": int(len(df)),
+        "sample": sample
+    })
+
+
+@app.route('/record', methods=['GET'])
+def get_record():
+    """
+    /record?employee_id=... or /record?person_uid=...
+    Returns matching rows from latest output (cleaned).
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({'error':'no outputs'}), 404
+    try:
+        df = pd.read_csv(csvs[0], parse_dates=['FirstSwipe','LastSwipe'], infer_datetime_format=True)
+    except Exception:
+        df = pd.read_csv(csvs[0])
+    # clean suffixes and types
+    df_clean = pd.DataFrame(_clean_sample_df(df, max_rows=len(df)))
+    if q is None:
+        return jsonify(df_clean.head(10).to_dict(orient='records'))
+    mask = (df_clean.get('EmployeeID', '').astype(str) == str(q)) | (df_clean.get('person_uid', '').astype(str) == str(q))
+    rows = df_clean[mask]
+    if rows.empty:
+        return jsonify({'error':'not found'}), 404
+    return jsonify(rows.to_dict(orient='records'))
+
+
+if __name__ == "__main__":
+    # bind 0.0.0.0 so it is reachable on LAN (if firewall / network allows)
+    app.run(host="0.0.0.0", port=8002, debug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
 WARNING:root:Historical profile file current_analysis.csv not found; history-based scenarios will fallback.
  * Serving Flask app 'app'
