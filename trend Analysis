@@ -1,1099 +1,363 @@
-from datetime import date, datetime, time
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import logging
-
-# IMPORTANT: import duration_report as a top-level module (file in same folder).
-from duration_report import run_for_date
-
-# try to load historical profile (current_analysis.csv) if present
-HIST_PATH = Path(__file__).parent / "current_analysis.csv"
-if HIST_PATH.exists():
-    try:
-        HIST_DF = pd.read_csv(HIST_PATH)
-        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
-    except Exception as e:
-        logging.warning("Failed to load historical profile: %s", e)
-        HIST_DF = pd.DataFrame()
-else:
-    logging.warning("Historical profile file current_analysis.csv not found; history-based scenarios will fallback.")
-    HIST_DF = pd.DataFrame()
-
-OUTDIR = Path("./outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO)
-
-
-def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per person-per-date features used by scenarios.
-    """
-    if swipes is None or swipes.empty:
-        return pd.DataFrame()
-
-    sw = swipes.copy()
-    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
-    sw['Date'] = sw['LocaleMessageTime'].dt.date
-
-    # create person_uid if missing (same logic as duration_report)
-    if 'person_uid' not in sw.columns:
-        def make_person_uid(row):
-            parts = []
-            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
-                v = row.get(c)
-                if pd.notna(v) and str(v).strip():
-                    parts.append(str(v).strip())
-            return "|".join(parts) if parts else None
-        sw['person_uid'] = sw.apply(make_person_uid, axis=1)
-
-    # columns we will use for aggregation (choose those present to avoid apply warnings)
-    sel_cols = [c for c in [
-        'LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-        'CardNumber', 'EmployeeID', 'ObjectName1', 'PersonnelType'
-    ] if c in sw.columns]
-
-    # aggregator for each person/date
-    def agg_swipe_group(g):
-        times = sorted(g['LocaleMessageTime'].dropna().tolist())
-        gaps = []
-        short_gap_count = 0
-        for i in range(1, len(times)):
-            s = (times[i] - times[i-1]).total_seconds()
-            gaps.append(s)
-            if s <= 5*60:
-                short_gap_count += 1
-        max_gap = int(max(gaps)) if gaps else 0
-        in_count = int((g.get('Direction') == 'InDirection').sum()) if 'Direction' in g.columns else 0
-        out_count = int((g.get('Direction') == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-        card_numbers = list(pd.unique(g['CardNumber'].dropna())) if 'CardNumber' in g.columns else []
-        card_number = card_numbers[0] if card_numbers else None
-
-        employee_id = None
-        employee_name = None
-        personnel_type = None
-        if 'EmployeeID' in g.columns:
-            vals = g['EmployeeID'].dropna()
-            employee_id = vals.iloc[0] if not vals.empty else None
-        if 'ObjectName1' in g.columns:
-            vals = g['ObjectName1'].dropna()
-            employee_name = vals.iloc[0] if not vals.empty else None
-        if 'PersonnelType' in g.columns:
-            vals = g['PersonnelType'].dropna()
-            personnel_type = vals.iloc[0] if not vals.empty else None
-
-        return pd.Series({
-            'CountSwipes': int(len(g)),
-            'MaxSwipeGapSeconds': max_gap,
-            'ShortGapCount': int(short_gap_count),
-            'InCount': in_count,
-            'OutCount': out_count,
-            'UniqueDoors': unique_doors,
-            'UniqueLocations': unique_locations,
-            'RejectionCount': rejection_count,
-            'CardNumber': card_number,
-            'EmployeeID': employee_id,
-            'EmployeeName': employee_name,
-            'PersonnelType': personnel_type
-        })
-
-    # Use only the selected columns in the groupby to avoid the FutureWarning
-    gb = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])
-    grouped = gb.apply(agg_swipe_group).reset_index()
-
-    # normalize durations side
-    dur = pd.DataFrame() if durations is None else durations.copy()
-    if not dur.empty and 'Date' in dur.columns:
-        dur['Date'] = pd.to_datetime(dur['Date']).dt.date
-
-    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
-
-    # helper to coalesce possible _x/_y duplicates created by merge
-    def coalesce_col(df, base, default=0):
-        if base in df.columns:
-            return
-        a = base + '_x'
-        b = base + '_y'
-        if a in df.columns:
-            df[base] = df[a]
-        elif b in df.columns:
-            df[base] = df[b]
-        else:
-            # create column with default scalar or series
-            df[base] = default
-
-    # coalesce likely duplicated fields coming from durations
-    for col in ['CountSwipes', 'DurationSeconds', 'FirstSwipe', 'LastSwipe', 'CardNumber', 'EmployeeID', 'EmployeeName', 'PersonnelType']:
-        coalesce_col(merged, col, default=np.nan if 'Swipe' in col else 0)
-
-    # ensure types and fill defaults
-    merged['DurationSeconds'] = merged.get('DurationSeconds', 0).fillna(0).astype(float)
-    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
-    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
-    merged['MaxSwipeGapSeconds'] = merged.get('MaxSwipeGapSeconds', 0).fillna(0).astype(int)
-    merged['ShortGapCount'] = merged.get('ShortGapCount', 0).fillna(0).astype(int)
-    merged['RejectionCount'] = merged.get('RejectionCount', 0).fillna(0).astype(int)
-    merged['UniqueLocations'] = merged.get('UniqueLocations', 0).fillna(0).astype(int)
-    merged['UniqueDoors'] = merged.get('UniqueDoors', 0).fillna(0).astype(int)
-
-    # ensure FirstSwipe/LastSwipe exist (they come from durations) and are datetime
-    for col in ['FirstSwipe', 'LastSwipe']:
-        if col not in merged.columns:
-            merged[col] = pd.NaT
-        else:
-            merged[col] = pd.to_datetime(merged[col], errors='coerce')
-
-    # easy boolean flags
-    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
-    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
-    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
-
-    # helper: map historical medians/stds for lookups (if available)
-    hist_map = {}
-    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
-        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
-
-    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: x in hist_map if pd.notna(x) else False)
-
-    return merged
-
-
-# ----------------- Scenarios -----------------
-def scenario_long_gap(row):
-    return (row.get('MaxSwipeGapSeconds') or 0) >= 90 * 60
-
-def scenario_short_duration(row):
-    return (row.get('DurationMinutes') or 0) < 240
-
-def scenario_coffee_badging(row):
-    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
-
-def scenario_low_swipe_count(row):
-    return (row.get('CountSwipes') or 0) <= 2 and (row.get('CountSwipes') or 0) > 0
-
-def scenario_single_door(row):
-    return (row.get('UniqueDoors') or 0) <= 1
-
-def scenario_only_in(row):
-    return int(row.get('OnlyIn', 0)) == 1
-
-def scenario_only_out(row):
-    return int(row.get('OnlyOut', 0)) == 1
-
-def scenario_overtime(row):
-    return (row.get('DurationMinutes') or 0) >= 10 * 60
-
-def scenario_very_long_duration(row):
-    return (row.get('DurationMinutes') or 0) >= 16 * 60
-
-def scenario_zero_swipes(row):
-    return int(row.get('CountSwipes', 0)) == 0
-
-def scenario_unusually_high_swipes(row):
-    cur = row.get('CountSwipes') or 0
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        try:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = float(rec.get('TotalSwipes_median', np.nan))
-            if np.isfinite(median) and median > 0:
-                return cur > 3 * median
-        except Exception:
-            pass
-    if 'TotalSwipes_median' in HIST_DF.columns and not HIST_DF.empty:
-        global_med = HIST_DF['TotalSwipes_median'].median()
-        if pd.notna(global_med) and global_med > 0:
-            return cur > 3 * global_med
-    return cur > 50
-
-def scenario_repeated_short_breaks(row):
-    return (row.get('ShortGapCount') or 0) >= 3
-
-def scenario_multiple_location_same_day(row):
-    return (row.get('UniqueLocations') or 0) > 1
-
-def scenario_weekend_activity(row):
-    try:
-        d = pd.to_datetime(row['Date'])
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-def scenario_repeated_rejection_count(row):
-    return (row.get('RejectionCount') or 0) >= 2
-
-def scenario_badge_sharing_suspected(row, full_df=None):
-    return False  # resolved later in run_trend_for_date
-
-def scenario_early_arrival_before_06(row):
-    fs = row.get('FirstSwipe')
-    if pd.isna(fs) or fs is None:
-        return False
-    try:
-        t = pd.to_datetime(fs).time()
-        return t < time(hour=6)
-    except Exception:
-        return False
-
-def scenario_late_exit_after_22(row):
-    ls = row.get('LastSwipe')
-    if pd.isna(ls) or ls is None:
-        return False
-    try:
-        t = pd.to_datetime(ls).time()
-        return t >= time(hour=22)
-    except Exception:
-        return False
-
-def scenario_shift_inconsistency(row):
-    empid = row.get('EmployeeID')
-    dur = row.get('DurationMinutes') or 0
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std):
-            return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
-    return False
-
-def scenario_trending_decline(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is None or HIST_DF.empty:
-        return False
-    if 'TrendingDecline' in HIST_DF.columns:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-        if not rec.empty:
-            val = rec.iloc[0].get('TrendingDecline')
-            return str(val).strip().lower() == 'yes' if pd.notna(val) else False
-    return False
-
-def scenario_consecutive_absent_days(row):
-    if row.get('CountSwipes') == 0:
-        empid = row.get('EmployeeID')
-        if HIST_DF is not None and not HIST_DF.empty and 'ConsecAbsent3Plus' in HIST_DF.columns:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-            if not rec.empty:
-                v = rec.iloc[0].get('ConsecAbsent3Plus')
-                return str(v).strip().lower() in ('yes', 'true', '1')
-        return False
-    return False
-
-def scenario_high_variance_duration(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std) and med > 0:
-            return (std / med) > 1.0
-    return False
-
-def scenario_short_duration_on_high_presence_days(row):
-    days_present = row.get('DaysPresentInWeek') or 0
-    dur = row.get('DurationMinutes') or 0
-    return (days_present >= 4) and (dur < 240)
-
-
-SCENARIOS = [
-    ("long_gap_>=90min", scenario_long_gap),
-    ("short_duration_<4h", scenario_short_duration),
-    ("coffee_badging", scenario_coffee_badging),
-    ("low_swipe_count_<=2", scenario_low_swipe_count),
-    ("single_door", scenario_single_door),
-    ("only_in", scenario_only_in),
-    ("only_out", scenario_only_out),
-    ("overtime_>=10h", scenario_overtime),
-    ("very_long_duration_>=16h", scenario_very_long_duration),
-    ("zero_swipes", scenario_zero_swipes),
-    ("unusually_high_swipes", scenario_unusually_high_swipes),
-    ("repeated_short_breaks", scenario_repeated_short_breaks),
-    ("multiple_location_same_day", scenario_multiple_location_same_day),
-    ("weekend_activity", scenario_weekend_activity),
-    ("repeated_rejection_count", scenario_repeated_rejection_count),
-    ("badge_sharing_suspected", scenario_badge_sharing_suspected),
-    ("early_arrival_before_06", scenario_early_arrival_before_06),
-    ("late_exit_after_22", scenario_late_exit_after_22),
-    ("shift_inconsistency", scenario_shift_inconsistency),
-    ("trending_decline", scenario_trending_decline),
-    ("consecutive_absent_days", scenario_consecutive_absent_days),
-    ("high_variance_duration", scenario_high_variance_duration),
-    ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days)
-]
-
-
-def run_trend_for_date(target_date: date, outdir: str = "./outputs"):
-    logging.info("run_trend_for_date: date=%s (Pune test)", target_date)
-    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city='Pune')
-    apac = results.get('apac', {})
-    swipes = apac.get('swipes', pd.DataFrame())
-    durations = apac.get('durations', pd.DataFrame())
-
-    features = compute_features(swipes, durations)
-    if features.empty:
-        logging.warning("run_trend_for_date: no features computed")
-        return pd.DataFrame()
-
-    # Build badge map (Date, CardNumber) => distinct person count
-    badge_map = {}
-    if 'CardNumber' in swipes.columns and 'person_uid' in swipes.columns and 'Date' in swipes.columns:
-        tmp = swipes[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
-        if not tmp.empty:
-            grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
-            badge_map = {(row.Date, row.CardNumber): row.distinct_users for row in grouped_card.itertuples(index=False)}
-
-    # Apply scenarios
-    for name, fn in SCENARIOS:
-        if name == "badge_sharing_suspected":
-            def badge_fn(r):
-                card = r.get('CardNumber')
-                d = r.get('Date')
-                if pd.isna(card) or card is None:
-                    return False
-                key = (d, card)
-                return badge_map.get(key, 0) > 1
-            features[name] = features.apply(badge_fn, axis=1)
-        else:
-            features[name] = features.apply(lambda r, f=fn: bool(f(r)), axis=1)
-
-    # Create reason text
-    def reasons_for_row(r):
-        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
-        return "; ".join(reasons) if reasons else None
-
-    features['Reasons'] = features.apply(reasons_for_row, axis=1)
-
-    # --- cleanup duplicate suffixed columns before saving ---
-    cols_to_drop = [c for c in features.columns if c.endswith("_x") or c.endswith("_y")]
-    if cols_to_drop:
-        # prefer non-suffixed version if exists; otherwise keep _x as canonical
-        for c in cols_to_drop:
-            base = c[:-2]
-            if base in features.columns:
-                # we already have base, drop the suffixed column
-                try:
-                    features.drop(columns=[c], inplace=True)
-                except Exception:
-                    pass
-            else:
-                # rename suffixed column to base (prefer _x over _y if both present)
-                try:
-                    features.rename(columns={c: base}, inplace=True)
-                except Exception:
-                    pass
-    # lastly drop any remaining duplicate-named columns (keep first)
-    features = features.loc[:, ~features.columns.duplicated()]
-
-    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
-    features.to_csv(out_csv, index=False)
-    logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(features))
-    return features
-
-
-if __name__ == "__main__":
-    today = datetime.now().date()
-    df = run_trend_for_date(today)
-    print("Completed; rows:", len(df))
-
-
-
-
-
-
-
-
-
-
-from flask import Flask, jsonify, request
-from datetime import datetime
-from pathlib import Path
-import logging
-import pandas as pd
-
-# Try to enable CORS if available; otherwise continue without it.
-try:
-    from flask_cors import CORS
-    _HAS_CORS = True
-except Exception:
-    CORS = None
-    _HAS_CORS = False
-
-# import runner (local)
-from trend_runner import run_trend_for_date
-
-app = Flask(__name__)
-if _HAS_CORS:
-    CORS(app)
-else:
-    logging.warning("flask_cors not available; continuing without CORS. Install Flask-Cors to enable cross-origin access from browser.")
-
-logging.basicConfig(level=logging.INFO)
-
-# Resolve output directory relative to this file
-BASE_DIR = Path(__file__).parent.resolve()
-DEFAULT_OUTDIR = BASE_DIR / "outputs"
-DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
-
-@app.route('/')
-def root():
-    return "Trend Analysis API — Pune test"
-
-@app.route('/run', methods=['GET', 'POST'])
-def run_trend():
-    # Accept date param (YYYY-MM-DD). If not provided, default to today.
-    date_str = None
-    if request.method == 'GET':
-        date_str = request.args.get('date')
-    else:
-        if request.is_json:
-            date_str = (request.json or {}).get('date')
-
-    if date_str:
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except Exception as e:
-            return jsonify({"error": f"Invalid date format: {e}"}), 400
-    else:
-        target_date = datetime.now().date()
-
-    # call runner with absolute outdir
-    outdir = str(DEFAULT_OUTDIR)
-    try:
-        df = run_trend_for_date(target_date, outdir=outdir)
-    except Exception as e:
-        logging.exception("run_trend_for_date failed")
-        return jsonify({"error": str(e)}), 500
-
-    if df is None or df.empty:
-        return jsonify({"message": "No records computed", "rows": 0}), 200
-
-    flagged = df[df['Reasons'].notna()] if 'Reasons' in df.columns else pd.DataFrame()
-    return jsonify({
-        "date": target_date.isoformat(),
-        "rows": int(len(df)),
-        "flagged_rows": int(len(flagged))
-    })
-
-@app.route('/latest', methods=['GET'])
-def latest_results():
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({"error": "no outputs found"}), 404
-    # read without parsing to keep response small and consistent
-    df = pd.read_csv(csvs[0])
-    sample = df.head(5).to_dict(orient='records') if not df.empty else []
-    return jsonify({
-        "file": csvs[0].name,
-        "rows": int(len(df)),
-        "sample": sample
-    })
-
-@app.route('/record', methods=['GET'])
-def get_record():
-    """
-    Debug endpoint:
-    /record?employee_id=329651
-    or
-    /record?person_uid=011A2336-...
-    If no query param provided, returns first 10 rows.
-    """
-    q = request.args.get('employee_id') or request.args.get('person_uid')
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({'error':'no outputs'}), 404
-    # parse date-like columns for easier inspection
-    try:
-        df = pd.read_csv(csvs[0], parse_dates=['FirstSwipe','LastSwipe'], infer_datetime_format=True)
-    except Exception:
-        df = pd.read_csv(csvs[0])
-    if q is None:
-        return jsonify(df.head(10).to_dict(orient='records'))
-    # cast to str for safe comparison (handles NaN)
-    mask = (df.get('EmployeeID', '').astype(str) == str(q)) | (df.get('person_uid', '').astype(str) == str(q))
-    rows = df[mask]
-    if rows.empty:
-        return jsonify({'error':'not found'}), 404
-    return jsonify(rows.to_dict(orient='records'))
-
-if __name__ == "__main__":
-    # bind 0.0.0.0 so it is reachable on LAN (if firewall / network allows)
-    app.run(host="0.0.0.0", port=8002, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- cleanup duplicate suffixed columns before saving ---
-# drop any duplicate suffixed columns like Name_x/Name_y keeping the coalesced canonical name (if present)
-cols_to_drop = [c for c in features.columns if c.endswith("_x") or c.endswith("_y")]
-if cols_to_drop:
-    # prefer non-suffixed version if exists; otherwise keep _x as canonical
-    for c in cols_to_drop:
-        base = c[:-2]
-        if base in features.columns:
-            # we already have base, drop the suffixed column
-            features.drop(columns=[c], inplace=True)
-        else:
-            # rename suffixed column to base (prefer _x over _y if both present)
-            if c.endswith("_x"):
-                features.rename(columns={c: base}, inplace=True)
-            else:
-                # if _y exists and _x does not, rename _y -> base
-                features.rename(columns={c: base}, inplace=True)
-# lastly drop any remaining duplicates of the same base (keep first)
-features = features.loc[:, ~features.columns.duplicated()]
-features.to_csv(out_csv, index=False)
-
-
-
-
-
-
-
-
-
-
-@app.route('/record', methods=['GET'])
-def get_record():
-    q = request.args.get('employee_id') or request.args.get('person_uid')
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({'error':'no outputs'}), 404
-    df = pd.read_csv(csvs[0], parse_dates=['FirstSwipe','LastSwipe'])
-    if q is None:
-        return jsonify(df.head(10).to_dict(orient='records'))
-    mask = (df['EmployeeID'].astype(str) == str(q)) | (df['person_uid'].astype(str) == str(q))
-    rows = df[mask]
-    if rows.empty:
-        return jsonify({'error':'not found'}), 404
-    return jsonify(rows.to_dict(orient='records'))
-
-
-
-
-
-Check Above Updattion Carefully and make API responce clean 
-
-and share me Fully Updated file 
-
-
-# backend/trend_runner.py
-from datetime import date, datetime, time
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import logging
-
-# IMPORTANT: import duration_report as a top-level module (file in same folder).
-from duration_report import run_for_date
-
-# try to load historical profile (current_analysis.csv) if present
-HIST_PATH = Path(__file__).parent / "current_analysis.csv"
-if HIST_PATH.exists():
-    try:
-        HIST_DF = pd.read_csv(HIST_PATH)
-        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
-    except Exception as e:
-        logging.warning("Failed to load historical profile: %s", e)
-        HIST_DF = pd.DataFrame()
-else:
-    logging.warning("Historical profile file current_analysis.csv not found; history-based scenarios will fallback.")
-    HIST_DF = pd.DataFrame()
-
-OUTDIR = Path("./outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO)
-
-
-def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per person-per-date features used by scenarios.
-    """
-    if swipes is None or swipes.empty:
-        return pd.DataFrame()
-
-    sw = swipes.copy()
-    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
-    sw['Date'] = sw['LocaleMessageTime'].dt.date
-
-    # create person_uid if missing (same logic as duration_report)
-    if 'person_uid' not in sw.columns:
-        def make_person_uid(row):
-            parts = []
-            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
-                v = row.get(c)
-                if pd.notna(v) and str(v).strip():
-                    parts.append(str(v).strip())
-            return "|".join(parts) if parts else None
-        sw['person_uid'] = sw.apply(make_person_uid, axis=1)
-
-    # columns we will use for aggregation (choose those present to avoid apply warnings)
-    sel_cols = [c for c in [
-        'LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-        'CardNumber', 'EmployeeID', 'ObjectName1', 'PersonnelType'
-    ] if c in sw.columns]
-
-    # aggregator for each person/date
-    def agg_swipe_group(g):
-        times = sorted(g['LocaleMessageTime'].dropna().tolist())
-        gaps = []
-        short_gap_count = 0
-        for i in range(1, len(times)):
-            s = (times[i] - times[i-1]).total_seconds()
-            gaps.append(s)
-            if s <= 5*60:
-                short_gap_count += 1
-        max_gap = int(max(gaps)) if gaps else 0
-        in_count = int((g.get('Direction') == 'InDirection').sum()) if 'Direction' in g.columns else 0
-        out_count = int((g.get('Direction') == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-        card_numbers = list(pd.unique(g['CardNumber'].dropna())) if 'CardNumber' in g.columns else []
-        card_number = card_numbers[0] if card_numbers else None
-
-        employee_id = None
-        employee_name = None
-        personnel_type = None
-        if 'EmployeeID' in g.columns:
-            vals = g['EmployeeID'].dropna()
-            employee_id = vals.iloc[0] if not vals.empty else None
-        if 'ObjectName1' in g.columns:
-            vals = g['ObjectName1'].dropna()
-            employee_name = vals.iloc[0] if not vals.empty else None
-        if 'PersonnelType' in g.columns:
-            vals = g['PersonnelType'].dropna()
-            personnel_type = vals.iloc[0] if not vals.empty else None
-
-        return pd.Series({
-            'CountSwipes': int(len(g)),
-            'MaxSwipeGapSeconds': max_gap,
-            'ShortGapCount': int(short_gap_count),
-            'InCount': in_count,
-            'OutCount': out_count,
-            'UniqueDoors': unique_doors,
-            'UniqueLocations': unique_locations,
-            'RejectionCount': rejection_count,
-            'CardNumber': card_number,
-            'EmployeeID': employee_id,
-            'EmployeeName': employee_name,
-            'PersonnelType': personnel_type
-        })
-
-    # Use only the selected columns in the groupby to avoid the FutureWarning
-    gb = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])
-    grouped = gb.apply(agg_swipe_group).reset_index()
-
-    # normalize durations side
-    dur = pd.DataFrame() if durations is None else durations.copy()
-    if not dur.empty and 'Date' in dur.columns:
-        dur['Date'] = pd.to_datetime(dur['Date']).dt.date
-
-    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
-
-    # helper to coalesce possible _x/_y duplicates created by merge
-    def coalesce_col(df, base, default=0):
-        if base in df.columns:
-            return
-        a = base + '_x'
-        b = base + '_y'
-        if a in df.columns:
-            df[base] = df[a]
-        elif b in df.columns:
-            df[base] = df[b]
-        else:
-            # create column with default scalar or series
-            df[base] = default
-
-    # coalesce likely duplicated fields coming from durations
-    for col in ['CountSwipes', 'DurationSeconds', 'FirstSwipe', 'LastSwipe', 'CardNumber', 'EmployeeID', 'EmployeeName', 'PersonnelType']:
-        coalesce_col(merged, col, default=np.nan if 'Swipe' in col else 0)
-
-    # ensure types and fill defaults
-    merged['DurationSeconds'] = merged.get('DurationSeconds', 0).fillna(0).astype(float)
-    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
-    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
-    merged['MaxSwipeGapSeconds'] = merged.get('MaxSwipeGapSeconds', 0).fillna(0).astype(int)
-    merged['ShortGapCount'] = merged.get('ShortGapCount', 0).fillna(0).astype(int)
-    merged['RejectionCount'] = merged.get('RejectionCount', 0).fillna(0).astype(int)
-    merged['UniqueLocations'] = merged.get('UniqueLocations', 0).fillna(0).astype(int)
-    merged['UniqueDoors'] = merged.get('UniqueDoors', 0).fillna(0).astype(int)
-
-    # ensure FirstSwipe/LastSwipe exist (they come from durations) and are datetime
-    for col in ['FirstSwipe', 'LastSwipe']:
-        if col not in merged.columns:
-            merged[col] = pd.NaT
-        else:
-            merged[col] = pd.to_datetime(merged[col], errors='coerce')
-
-    # easy boolean flags
-    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
-    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
-    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
-
-    # helper: map historical medians/stds for lookups (if available)
-    hist_map = {}
-    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
-        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
-
-    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: x in hist_map if pd.notna(x) else False)
-
-    return merged
-
-
-# ----------------- Scenarios -----------------
-def scenario_long_gap(row):
-    return (row.get('MaxSwipeGapSeconds') or 0) >= 90 * 60
-
-def scenario_short_duration(row):
-    return (row.get('DurationMinutes') or 0) < 240
-
-def scenario_coffee_badging(row):
-    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
-
-def scenario_low_swipe_count(row):
-    return (row.get('CountSwipes') or 0) <= 2 and (row.get('CountSwipes') or 0) > 0
-
-def scenario_single_door(row):
-    return (row.get('UniqueDoors') or 0) <= 1
-
-def scenario_only_in(row):
-    return int(row.get('OnlyIn', 0)) == 1
-
-def scenario_only_out(row):
-    return int(row.get('OnlyOut', 0)) == 1
-
-def scenario_overtime(row):
-    return (row.get('DurationMinutes') or 0) >= 10 * 60
-
-def scenario_very_long_duration(row):
-    return (row.get('DurationMinutes') or 0) >= 16 * 60
-
-def scenario_zero_swipes(row):
-    return int(row.get('CountSwipes', 0)) == 0
-
-def scenario_unusually_high_swipes(row):
-    cur = row.get('CountSwipes') or 0
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        try:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = float(rec.get('TotalSwipes_median', np.nan))
-            if np.isfinite(median) and median > 0:
-                return cur > 3 * median
-        except Exception:
-            pass
-    if 'TotalSwipes_median' in HIST_DF.columns and not HIST_DF.empty:
-        global_med = HIST_DF['TotalSwipes_median'].median()
-        if pd.notna(global_med) and global_med > 0:
-            return cur > 3 * global_med
-    return cur > 50
-
-def scenario_repeated_short_breaks(row):
-    return (row.get('ShortGapCount') or 0) >= 3
-
-def scenario_multiple_location_same_day(row):
-    return (row.get('UniqueLocations') or 0) > 1
-
-def scenario_weekend_activity(row):
-    try:
-        d = pd.to_datetime(row['Date'])
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-def scenario_repeated_rejection_count(row):
-    return (row.get('RejectionCount') or 0) >= 2
-
-def scenario_badge_sharing_suspected(row, full_df=None):
-    return False  # resolved later in run_trend_for_date
-
-def scenario_early_arrival_before_06(row):
-    fs = row.get('FirstSwipe')
-    if pd.isna(fs) or fs is None:
-        return False
-    try:
-        t = pd.to_datetime(fs).time()
-        return t < time(hour=6)
-    except Exception:
-        return False
-
-def scenario_late_exit_after_22(row):
-    ls = row.get('LastSwipe')
-    if pd.isna(ls) or ls is None:
-        return False
-    try:
-        t = pd.to_datetime(ls).time()
-        return t >= time(hour=22)
-    except Exception:
-        return False
-
-def scenario_shift_inconsistency(row):
-    empid = row.get('EmployeeID')
-    dur = row.get('DurationMinutes') or 0
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std):
-            return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
-    return False
-
-def scenario_trending_decline(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is None or HIST_DF.empty:
-        return False
-    if 'TrendingDecline' in HIST_DF.columns:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-        if not rec.empty:
-            val = rec.iloc[0].get('TrendingDecline')
-            return str(val).strip().lower() == 'yes' if pd.notna(val) else False
-    return False
-
-def scenario_consecutive_absent_days(row):
-    if row.get('CountSwipes') == 0:
-        empid = row.get('EmployeeID')
-        if HIST_DF is not None and not HIST_DF.empty and 'ConsecAbsent3Plus' in HIST_DF.columns:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-            if not rec.empty:
-                v = rec.iloc[0].get('ConsecAbsent3Plus')
-                return str(v).strip().lower() in ('yes', 'true', '1')
-        return False
-    return False
-
-def scenario_high_variance_duration(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std) and med > 0:
-            return (std / med) > 1.0
-    return False
-
-def scenario_short_duration_on_high_presence_days(row):
-    days_present = row.get('DaysPresentInWeek') or 0
-    dur = row.get('DurationMinutes') or 0
-    return (days_present >= 4) and (dur < 240)
-
-
-SCENARIOS = [
-    ("long_gap_>=90min", scenario_long_gap),
-    ("short_duration_<4h", scenario_short_duration),
-    ("coffee_badging", scenario_coffee_badging),
-    ("low_swipe_count_<=2", scenario_low_swipe_count),
-    ("single_door", scenario_single_door),
-    ("only_in", scenario_only_in),
-    ("only_out", scenario_only_out),
-    ("overtime_>=10h", scenario_overtime),
-    ("very_long_duration_>=16h", scenario_very_long_duration),
-    ("zero_swipes", scenario_zero_swipes),
-    ("unusually_high_swipes", scenario_unusually_high_swipes),
-    ("repeated_short_breaks", scenario_repeated_short_breaks),
-    ("multiple_location_same_day", scenario_multiple_location_same_day),
-    ("weekend_activity", scenario_weekend_activity),
-    ("repeated_rejection_count", scenario_repeated_rejection_count),
-    ("badge_sharing_suspected", scenario_badge_sharing_suspected),
-    ("early_arrival_before_06", scenario_early_arrival_before_06),
-    ("late_exit_after_22", scenario_late_exit_after_22),
-    ("shift_inconsistency", scenario_shift_inconsistency),
-    ("trending_decline", scenario_trending_decline),
-    ("consecutive_absent_days", scenario_consecutive_absent_days),
-    ("high_variance_duration", scenario_high_variance_duration),
-    ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days)
-]
-
-
-def run_trend_for_date(target_date: date, outdir: str = "./outputs"):
-    logging.info("run_trend_for_date: date=%s (Pune test)", target_date)
-    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city='Pune')
-    apac = results.get('apac', {})
-    swipes = apac.get('swipes', pd.DataFrame())
-    durations = apac.get('durations', pd.DataFrame())
-
-    features = compute_features(swipes, durations)
-    if features.empty:
-        logging.warning("run_trend_for_date: no features computed")
-        return pd.DataFrame()
-
-    # Build badge map (Date, CardNumber) => distinct person count
-    badge_map = {}
-    if 'CardNumber' in swipes.columns and 'person_uid' in swipes.columns and 'Date' in swipes.columns:
-        tmp = swipes[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
-        if not tmp.empty:
-            grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
-            badge_map = {(row.Date, row.CardNumber): row.distinct_users for row in grouped_card.itertuples(index=False)}
-
-    # Apply scenarios
-    for name, fn in SCENARIOS:
-        if name == "badge_sharing_suspected":
-            def badge_fn(r):
-                card = r.get('CardNumber')
-                d = r.get('Date')
-                if pd.isna(card) or card is None:
-                    return False
-                key = (d, card)
-                return badge_map.get(key, 0) > 1
-            features[name] = features.apply(badge_fn, axis=1)
-        else:
-            features[name] = features.apply(lambda r, f=fn: bool(f(r)), axis=1)
-
-
-            
-
-    # Create reason text
-    def reasons_for_row(r):
-        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
-        return "; ".join(reasons) if reasons else None
-
-    features['Reasons'] = features.apply(reasons_for_row, axis=1)
-
-    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
-    features.to_csv(out_csv, index=False)
-    logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(features))
-    return features
-
-
-if __name__ == "__main__":
-    today = datetime.now().date()
-    df = run_trend_for_date(today)
-    print("Completed; rows:", len(df))
-
-
-
-
-
-
-
-
-
-# backend/app.py
-from flask import Flask, jsonify, request
-from datetime import datetime
-from pathlib import Path
-import logging
-import pandas as pd
-
-# Try to enable CORS if available; otherwise continue without it.
-try:
-    from flask_cors import CORS
-    _HAS_CORS = True
-except Exception:
-    CORS = None
-    _HAS_CORS = False
-
-# import runner (local)
-from trend_runner import run_trend_for_date
-
-app = Flask(__name__)
-if _HAS_CORS:
-    CORS(app)
-else:
-    logging.warning("flask_cors not available; continuing without CORS. Install Flask-Cors to enable cross-origin access from browser.")
-
-logging.basicConfig(level=logging.INFO)
-
-# Resolve output directory relative to this file
-BASE_DIR = Path(__file__).parent.resolve()
-DEFAULT_OUTDIR = BASE_DIR / "outputs"
-DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
-
-@app.route('/')
-def root():
-    return "Trend Analysis API — Pune test"
-
-@app.route('/run', methods=['GET', 'POST'])
-def run_trend():
-    # Accept date param (YYYY-MM-DD). If not provided, default to today.
-    date_str = None
-    if request.method == 'GET':
-        date_str = request.args.get('date')
-    else:
-        if request.is_json:
-            date_str = (request.json or {}).get('date')
-
-    if date_str:
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except Exception as e:
-            return jsonify({"error": f"Invalid date format: {e}"}), 400
-    else:
-        target_date = datetime.now().date()
-
-    # call runner with absolute outdir
-    outdir = str(DEFAULT_OUTDIR)
-    try:
-        df = run_trend_for_date(target_date, outdir=outdir)
-    except Exception as e:
-        logging.exception("run_trend_for_date failed")
-        return jsonify({"error": str(e)}), 500
-
-    if df is None or df.empty:
-        return jsonify({"message": "No records computed", "rows": 0}), 200
-
-    flagged = df[df['Reasons'].notna()] if 'Reasons' in df.columns else pd.DataFrame()
-    return jsonify({
-        "date": target_date.isoformat(),
-        "rows": int(len(df)),
-        "flagged_rows": int(len(flagged))
-    })
-
-@app.route('/latest', methods=['GET'])
-def latest_results():
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({"error": "no outputs found"}), 404
-    df = pd.read_csv(csvs[0])
-    sample = df.head(5).to_dict(orient='records') if not df.empty else []
-    return jsonify({
-        "file": csvs[0].name,
-        "rows": int(len(df)),
-        "sample": sample
-    })
-
-if __name__ == "__main__":
-    # bind 0.0.0.0 so it is reachable on LAN (if firewall / network allows)
-    app.run(host="0.0.0.0", port=8002, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+When i Run API We got Below OutPut 
+http://10.199.46.101:8002/run?date=2025-10-20
+This APi not display Details need to Fix Also IF i want to Find Anomely for Range Which need to Work....
+also In API Responce There are Multiple Section are Visible as x Y remove x and Y keep API Responce Clean carefully ...
+
+alos Add one more Scenarion here Swipe Overlap 
+Means Continous swipe Overlap ..
+ex- Swapnil swipe badge again Mayur Swipe badge same door ....
+this Anomely 
+
+also add Swipe overlap Scenarion here and fix Claen and clear API responce
+
+
+http://10.199.46.101:8002/run?date=2025-10-20
+
+{
+  "date": "2025-10-20",
+  "flagged_rows": 60,
+  "rows": 60
+}
+
+
+
+
+
+http://10.199.46.101:8002/latest
+
+{
+  "file": "trend_pune_20251027.csv",
+  "rows": 542,
+  "sample": [
+    {
+      "CardNumber": 418980,
+      "CardNumber_x": 418980,
+      "CardNumber_y": 418980,
+      "CompanyName": NaN,
+      "CountSwipes": 11,
+      "CountSwipes_x": 11,
+      "CountSwipes_y": 11,
+      "Date": "2025-10-27",
+      "Duration": "4:45:19",
+      "DurationMinutes": 285.31666666666666,
+      "DurationSeconds": 17119.0,
+      "EmpHistoryPresent": false,
+      "EmployeeID": NaN,
+      "EmployeeID_x": NaN,
+      "EmployeeID_y": NaN,
+      "EmployeeIdentity": "01C7794B-1605-4CFD-96F8-C717B9B4DB76",
+      "EmployeeName": NaN,
+      "EmployeeName_x": NaN,
+      "EmployeeName_y": "Pune, VIS_PUN_161",
+      "FirstDirection": "InDirection",
+      "FirstDoor": "APAC_IN_PUN_PODIUM_GREEN_RECEPTION ENTRY-DOOR",
+      "FirstSwipe": "2025-10-27 09:12:06",
+      "InCount": 8,
+      "LastDirection": "InDirection",
+      "LastDoor": "APAC_IN_PUN_PODIUM_GREEN_RECEPTION ENTRY-DOOR",
+      "LastSwipe": "2025-10-27 13:57:25",
+      "MaxSwipeGapSeconds": 5438,
+      "OnlyIn": 0,
+      "OnlyOut": 0,
+      "OutCount": 3,
+      "PartitionName2": "APAC.Default",
+      "PersonnelType": NaN,
+      "PersonnelTypeName": "Visitor",
+      "PrimaryLocation": "Pune, India",
+      "Reasons": "long_gap_>=90min",
+      "RejectionCount": 0,
+      "ShortGapCount": 2,
+      "SingleDoor": 0,
+      "UniqueDoors": 6,
+      "UniqueLocations": 1,
+      "badge_sharing_suspected": false,
+      "coffee_badging": false,
+      "consecutive_absent_days": false,
+      "early_arrival_before_06": false,
+      "high_variance_duration": false,
+      "late_exit_after_22": false,
+      "long_gap_>=90min": true,
+      "low_swipe_count_<=2": false,
+      "multiple_location_same_day": false,
+      "only_in": false,
+      "only_out": false,
+      "overtime_>=10h": false,
+      "person_uid": "01C7794B-1605-4CFD-96F8-C717B9B4DB76",
+      "repeated_rejection_count": false,
+      "repeated_short_breaks": false,
+      "shift_inconsistency": false,
+      "short_duration_<4h": false,
+      "short_duration_on_high_presence_days": false,
+      "single_door": false,
+      "trending_decline": false,
+      "unusually_high_swipes": false,
+      "very_long_duration_>=16h": false,
+      "weekend_activity": false,
+      "zero_swipes": false
+    },
+    {
+      "CardNumber": 604916,
+      "CardNumber_x": 604916,
+      "CardNumber_y": 604916,
+      "CompanyName": "WU Srvcs India Private Ltd",
+      "CountSwipes": 7,
+      "CountSwipes_x": 7,
+      "CountSwipes_y": 7,
+      "Date": "2025-10-27",
+      "Duration": "3:03:05",
+      "DurationMinutes": 183.08333333333331,
+      "DurationSeconds": 10985.0,
+      "EmpHistoryPresent": false,
+      "EmployeeID": "320172",
+      "EmployeeID_x": "320172",
+      "EmployeeID_y": "320172",
+      "EmployeeIdentity": "01F0200F-299C-4B39-8283-7A71BDF45D2E",
+      "EmployeeName": NaN,
+      "EmployeeName_x": NaN,
+      "EmployeeName_y": "Kulkarni, Ketaki",
+      "FirstDirection": "InDirection",
+      "FirstDoor": "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 3-DOOR",
+      "FirstSwipe": "2025-10-27 10:26:56",
+      "InCount": 4,
+      "LastDirection": "OutDirection",
+      "LastDoor": "APAC_IN_PUN_PODIUM_ORANGE_KITCHENETTE FIRE EXIT-DOOR NEW",
+      "LastSwipe": "2025-10-27 13:30:01",
+      "MaxSwipeGapSeconds": 5218,
+      "OnlyIn": 0,
+      "OnlyOut": 0,
+      "OutCount": 3,
+      "PartitionName2": "APAC.Default",
+      "PersonnelType": NaN,
+      "PersonnelTypeName": "Employee",
+      "PrimaryLocation": "Pune - Business Bay",
+      "Reasons": "short_duration_<4h",
+      "RejectionCount": 0,
+      "ShortGapCount": 1,
+      "SingleDoor": 0,
+      "UniqueDoors": 4,
+      "UniqueLocations": 1,
+      "badge_sharing_suspected": false,
+      "coffee_badging": false,
+      "consecutive_absent_days": false,
+      "early_arrival_before_06": false,
+      "high_variance_duration": false,
+      "late_exit_after_22": false,
+      "long_gap_>=90min": false,
+      "low_swipe_count_<=2": false,
+      "multiple_location_same_day": false,
+      "only_in": false,
+      "only_out": false,
+      "overtime_>=10h": false,
+      "person_uid": "01F0200F-299C-4B39-8283-7A71BDF45D2E",
+      "repeated_rejection_count": false,
+      "repeated_short_breaks": false,
+      "shift_inconsistency": false,
+      "short_duration_<4h": true,
+      "short_duration_on_high_presence_days": false,
+      "single_door": false,
+      "trending_decline": false,
+      "unusually_high_swipes": false,
+      "very_long_duration_>=16h": false,
+      "weekend_activity": false,
+      "zero_swipes": false
+    },
+    {
+      "CardNumber": 410335,
+      "CardNumber_x": 410335,
+      "CardNumber_y": 410335,
+      "CompanyName": "Poona Security India Pvt. Ltd",
+      "CountSwipes": 26,
+      "CountSwipes_x": 26,
+      "CountSwipes_y": 26,
+      "Date": "2025-10-27",
+      "Duration": "5:32:05",
+      "DurationMinutes": 332.0833333333333,
+      "DurationSeconds": 19925.0,
+      "EmpHistoryPresent": false,
+      "EmployeeID": NaN,
+      "EmployeeID_x": NaN,
+      "EmployeeID_y": NaN,
+      "EmployeeIdentity": "021FD806-2EED-4393-A91A-E6B6D320C608",
+      "EmployeeName": NaN,
+      "EmployeeName_x": NaN,
+      "EmployeeName_y": "Gondavale, Nana",
+      "FirstDirection": "InDirection",
+      "FirstDoor": "APAC_IN_PUN_PODIUM_RED_RECEPTION TO WS ENTRY 1-DOOR NEW",
+      "FirstSwipe": "2025-10-27 01:23:37",
+      "InCount": 15,
+      "LastDirection": "OutDirection",
+      "LastDoor": "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4 -OUT DOOR",
+      "LastSwipe": "2025-10-27 06:55:42",
+      "MaxSwipeGapSeconds": 5090,
+      "OnlyIn": 0,
+      "OnlyOut": 0,
+      "OutCount": 11,
+      "PartitionName2": "APAC.Default",
+      "PersonnelType": NaN,
+      "PersonnelTypeName": "Property Management",
+      "PrimaryLocation": "Business Bay - Pune",
+      "Reasons": "repeated_short_breaks; early_arrival_before_06",
+      "RejectionCount": 0,
+      "ShortGapCount": 16,
+      "SingleDoor": 0,
+      "UniqueDoors": 15,
+      "UniqueLocations": 1,
+      "badge_sharing_suspected": false,
+      "coffee_badging": false,
+      "consecutive_absent_days": false,
+      "early_arrival_before_06": true,
+      "high_variance_duration": false,
+      "late_exit_after_22": false,
+      "long_gap_>=90min": false,
+      "low_swipe_count_<=2": false,
+      "multiple_location_same_day": false,
+      "only_in": false,
+      "only_out": false,
+      "overtime_>=10h": false,
+      "person_uid": "021FD806-2EED-4393-A91A-E6B6D320C608",
+      "repeated_rejection_count": false,
+      "repeated_short_breaks": true,
+      "shift_inconsistency": false,
+      "short_duration_<4h": false,
+      "short_duration_on_high_presence_days": false,
+      "single_door": false,
+      "trending_decline": false,
+      "unusually_high_swipes": false,
+      "very_long_duration_>=16h": false,
+      "weekend_activity": false,
+      "zero_swipes": false
+    },
+    {
+      "CardNumber": 234564,
+      "CardNumber_x": 234564,
+      "CardNumber_y": 234564,
+      "CompanyName": "WU Technology Engineering Services Private Limited",
+      "CountSwipes": 5,
+      "CountSwipes_x": 5,
+      "CountSwipes_y": 5,
+      "Date": "2025-10-27",
+      "Duration": "3:01:35",
+      "DurationMinutes": 181.58333333333331,
+      "DurationSeconds": 10895.0,
+      "EmpHistoryPresent": false,
+      "EmployeeID": "311035",
+      "EmployeeID_x": "311035",
+      "EmployeeID_y": "311035",
+      "EmployeeIdentity": "02AEB7B5-97E1-4F57-89AC-7EDCC08AA13A",
+      "EmployeeName": NaN,
+      "EmployeeName_x": NaN,
+      "EmployeeName_y": "Barua, Renuka",
+      "FirstDirection": "InDirection",
+      "FirstDoor": "APAC_IN_PUN_TOWER B_LIFT LOBBY DOOR",
+      "FirstSwipe": "2025-10-27 09:06:36",
+      "InCount": 3,
+      "LastDirection": "InDirection",
+      "LastDoor": "APAC_IN_PUN_TOWER B_ST5_WKS SIDE DOOR",
+      "LastSwipe": "2025-10-27 12:08:11",
+      "MaxSwipeGapSeconds": 10372,
+      "OnlyIn": 0,
+      "OnlyOut": 0,
+      "OutCount": 2,
+      "PartitionName2": "APAC.Default",
+      "PersonnelType": NaN,
+      "PersonnelTypeName": "Employee",
+      "PrimaryLocation": "Pune - Business Bay",
+      "Reasons": "long_gap_>=90min; short_duration_<4h",
+      "RejectionCount": 0,
+      "ShortGapCount": 2,
+      "SingleDoor": 0,
+      "UniqueDoors": 3,
+      "UniqueLocations": 1,
+      "badge_sharing_suspected": false,
+      "coffee_badging": false,
+      "consecutive_absent_days": false,
+      "early_arrival_before_06": false,
+      "high_variance_duration": false,
+      "late_exit_after_22": false,
+      "long_gap_>=90min": true,
+      "low_swipe_count_<=2": false,
+      "multiple_location_same_day": false,
+      "only_in": false,
+      "only_out": false,
+      "overtime_>=10h": false,
+      "person_uid": "02AEB7B5-97E1-4F57-89AC-7EDCC08AA13A",
+      "repeated_rejection_count": false,
+      "repeated_short_breaks": false,
+      "shift_inconsistency": false,
+      "short_duration_<4h": true,
+      "short_duration_on_high_presence_days": false,
+      "single_door": false,
+      "trending_decline": false,
+      "unusually_high_swipes": false,
+      "very_long_duration_>=16h": false,
+      "weekend_activity": false,
+      "zero_swipes": false
+    },
+    {
+      "CardNumber": 615630,
+      "CardNumber_x": 615630,
+      "CardNumber_y": 615630,
+      "CompanyName": "WU Srvcs India Private Ltd",
+      "CountSwipes": 14,
+      "CountSwipes_x": 14,
+      "CountSwipes_y": 14,
+      "Date": "2025-10-27",
+      "Duration": "4:39:48",
+      "DurationMinutes": 279.8,
+      "DurationSeconds": 16788.0,
+      "EmpHistoryPresent": false,
+      "EmployeeID": "327002",
+      "EmployeeID_x": "327002",
+      "EmployeeID_y": "327002",
+      "EmployeeIdentity": "0350AAE8-45CF-4EF5-9060-A5EA7035CAC4",
+      "EmployeeName": NaN,
+      "EmployeeName_x": NaN,
+      "EmployeeName_y": "Nawale, Siddhant Ajit",
+      "FirstDirection": "InDirection",
+      "FirstDoor": "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 3-DOOR",
+      "FirstSwipe": "2025-10-27 09:14:44",
+      "InCount": 10,
+      "LastDirection": "InDirection",
+      "LastDoor": "APAC_IN_PUN_PODIUM_YELLOW_MAIN LIFT LOBBY-DOOR NEW",
+      "LastSwipe": "2025-10-27 13:54:32",
+      "MaxSwipeGapSeconds": 6700,
+      "OnlyIn": 0,
+      "OnlyOut": 0,
+      "OutCount": 4,
+      "PartitionName2": "APAC.Default",
+      "PersonnelType": NaN,
+      "PersonnelTypeName": "Employee",
+      "PrimaryLocation": "Pune - Business Bay",
+      "Reasons": "long_gap_>=90min; repeated_short_breaks",
+      "RejectionCount": 0,
+      "ShortGapCount": 8,
+      "SingleDoor": 0,
+      "UniqueDoors": 6,
+      "UniqueLocations": 1,
+      "badge_sharing_suspected": false,
+      "coffee_badging": false,
+      "consecutive_absent_days": false,
+      "early_arrival_before_06": false,
+      "high_variance_duration": false,
+      "late_exit_after_22": false,
+      "long_gap_>=90min": true,
+      "low_swipe_count_<=2": false,
+      "multiple_location_same_day": false,
+      "only_in": false,
+      "only_out": false,
+      "overtime_>=10h": false,
+      "person_uid": "0350AAE8-45CF-4EF5-9060-A5EA7035CAC4",
+      "repeated_rejection_count": false,
+      "repeated_short_breaks": true,
+      "shift_inconsistency": false,
+      "short_duration_<4h": false,
+      "short_duration_on_high_presence_days": false,
+      "single_door": false,
+      "trending_decline": false,
+      "unusually_high_swipes": false,
+      "very_long_duration_>=16h": false,
+      "weekend_activity": false,
+      "zero_swipes": false
+    }
+  ]
+}
