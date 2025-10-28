@@ -1,1929 +1,422 @@
-# trend_runner.py
-from datetime import date, datetime, time, timedelta
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import logging
-
-# IMPORTANT: duration_report must exist and expose run_for_date(date, regions, outdir, city)
-from duration_report import run_for_date
-
-# historical profile (optional)
-HIST_PATH = Path(__file__).parent / "current_analysis.csv"
-if HIST_PATH.exists():
-    try:
-        HIST_DF = pd.read_csv(HIST_PATH)
-        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
-    except Exception as e:
-        logging.warning("Failed to load historical profile: %s", e)
-        HIST_DF = pd.DataFrame()
-else:
-    logging.warning("Historical profile file current_analysis.csv not found; history-based scenarios will fallback.")
-    HIST_DF = pd.DataFrame()
-
-OUTDIR = Path("./outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR = Path("./models")
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO)
-
-
-def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per person-per-date features used by scenarios.
-    Filters: keep only rows where personnel type/name indicates 'Employee' or 'Terminated Personnel'.
-    Returns DataFrame indexed by person_uid + Date with features columns.
-    """
-    if swipes is None or swipes.empty:
-        return pd.DataFrame()
-
-    sw = swipes.copy()
-    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
-    sw['Date'] = sw['LocaleMessageTime'].dt.date
-
-    # Filter personnel types: prefer PersonnelTypeName, fallback to PersonnelType
-    if 'PersonnelTypeName' in sw.columns:
-        sw = sw[sw['PersonnelTypeName'].isin(['Employee', 'Terminated Personnel'])]
-    elif 'PersonnelType' in sw.columns:
-        sw = sw[sw['PersonnelType'].isin(['Employee', 'Terminated Personnel'])]
-    # else: if no personnel column exists, we keep everything (can't filter)
-
-    if sw.empty:
-        logging.info("compute_features: no rows after PersonnelType filter")
-        return pd.DataFrame()
-
-    # ensure person_uid
-    if 'person_uid' not in sw.columns:
-        def make_person_uid(row):
-            parts = []
-            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
-                v = row.get(c)
-                if pd.notna(v) and str(v).strip():
-                    parts.append(str(v).strip())
-            return "|".join(parts) if parts else None
-        sw['person_uid'] = sw.apply(make_person_uid, axis=1)
-
-    sel_cols = [c for c in [
-        'LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-        'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName'
-    ] if c in sw.columns]
-
-    def agg_swipe_group(g):
-        times = sorted(g['LocaleMessageTime'].dropna().tolist())
-        gaps = []
-        short_gap_count = 0
-        for i in range(1, len(times)):
-            s = (times[i] - times[i-1]).total_seconds()
-            gaps.append(s)
-            if s <= 5*60:
-                short_gap_count += 1
-        max_gap = int(max(gaps)) if gaps else 0
-        in_count = int((g.get('Direction') == 'InDirection').sum()) if 'Direction' in g.columns else 0
-        out_count = int((g.get('Direction') == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-        card_numbers = list(pd.unique(g['CardNumber'].dropna())) if 'CardNumber' in g.columns else []
-        card_number = card_numbers[0] if card_numbers else None
-
-        # Name/id/personnel
-        employee_id = None
-        employee_name = None
-        personnel_type = None
-        if 'EmployeeID' in g.columns:
-            vals = g['EmployeeID'].dropna()
-            employee_id = vals.iloc[0] if not vals.empty else None
-        if 'EmployeeName' in g.columns:
-            vals = g['EmployeeName'].dropna()
-            if not vals.empty:
-                employee_name = vals.iloc[0]
-        if employee_name is None and 'ObjectName1' in g.columns:
-            vals = g['ObjectName1'].dropna()
-            if not vals.empty:
-                employee_name = vals.iloc[0]
-        if 'PersonnelTypeName' in g.columns:
-            vals = g['PersonnelTypeName'].dropna()
-            if not vals.empty:
-                personnel_type = vals.iloc[0]
-        elif 'PersonnelType' in g.columns:
-            vals = g['PersonnelType'].dropna()
-            if not vals.empty:
-                personnel_type = vals.iloc[0]
-
-        return pd.Series({
-            'CountSwipes': int(len(g)),
-            'MaxSwipeGapSeconds': max_gap,
-            'ShortGapCount': int(short_gap_count),
-            'InCount': in_count,
-            'OutCount': out_count,
-            'UniqueDoors': unique_doors,
-            'UniqueLocations': unique_locations,
-            'RejectionCount': rejection_count,
-            'CardNumber': card_number,
-            'EmployeeID': employee_id,
-            'EmployeeName': employee_name,
-            'PersonnelType': personnel_type
-        })
-
-    gb = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])
-    grouped = gb.apply(agg_swipe_group).reset_index()
-
-    dur = pd.DataFrame() if durations is None else durations.copy()
-    if not dur.empty and 'Date' in dur.columns:
-        dur['Date'] = pd.to_datetime(dur['Date']).dt.date
-
-    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
-
-    # coalesce helpers
-    def coalesce_field(df: pd.DataFrame, base: str, fallback_order: list = None, default=None):
-        if base in df.columns:
-            return
-        candidates = [base + '_x', base + '_y']
-        if fallback_order:
-            candidates = candidates + fallback_order
-        for c in candidates:
-            if c in df.columns:
-                df[base] = df[c]
-                return
-        df[base] = default
-
-    coalesce_field(merged, 'CountSwipes', default=0)
-    coalesce_field(merged, 'DurationSeconds', default=0)
-    coalesce_field(merged, 'FirstSwipe', default=pd.NaT)
-    coalesce_field(merged, 'LastSwipe', default=pd.NaT)
-    coalesce_field(merged, 'CardNumber', default=None)
-    coalesce_field(merged, 'EmployeeID', default=None, fallback_order=['ObjectName1'])
-    coalesce_field(merged, 'EmployeeName', fallback_order=['ObjectName1', 'EmployeeName_x', 'EmployeeName_y'], default=None)
-    coalesce_field(merged, 'PersonnelType', default=None)
-
-    merged['DurationSeconds'] = merged.get('DurationSeconds', 0).fillna(0).astype(float)
-    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
-    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
-    merged['MaxSwipeGapSeconds'] = merged.get('MaxSwipeGapSeconds', 0).fillna(0).astype(int)
-    merged['ShortGapCount'] = merged.get('ShortGapCount', 0).fillna(0).astype(int)
-    merged['RejectionCount'] = merged.get('RejectionCount', 0).fillna(0).astype(int)
-    merged['UniqueLocations'] = merged.get('UniqueLocations', 0).fillna(0).astype(int)
-    merged['UniqueDoors'] = merged.get('UniqueDoors', 0).fillna(0).astype(int)
-
-    for col in ['FirstSwipe', 'LastSwipe']:
-        if col not in merged.columns:
-            merged[col] = pd.NaT
-        else:
-            merged[col] = pd.to_datetime(merged[col], errors='coerce')
-
-    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
-    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
-    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
-
-    hist_map = {}
-    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
-        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
-    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: x in hist_map if pd.notna(x) else False)
-
-    return merged
-
-
-# ---------------- SCENARIOS ----------------
-def scenario_long_gap(row):
-    return (row.get('MaxSwipeGapSeconds') or 0) >= 90 * 60
-
-def scenario_short_duration(row):
-    return (row.get('DurationMinutes') or 0) < 240
-
-def scenario_coffee_badging(row):
-    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
-
-def scenario_low_swipe_count(row):
-    return (row.get('CountSwipes') or 0) <= 2 and (row.get('CountSwipes') or 0) > 0
-
-def scenario_single_door(row):
-    return (row.get('UniqueDoors') or 0) <= 1
-
-def scenario_only_in(row):
-    return int(row.get('OnlyIn', 0)) == 1
-
-def scenario_only_out(row):
-    return int(row.get('OnlyOut', 0)) == 1
-
-def scenario_overtime(row):
-    return (row.get('DurationMinutes') or 0) >= 10 * 60
-
-def scenario_very_long_duration(row):
-    return (row.get('DurationMinutes') or 0) >= 16 * 60
-
-def scenario_zero_swipes(row):
-    return int(row.get('CountSwipes', 0)) == 0
-
-def scenario_unusually_high_swipes(row):
-    cur = row.get('CountSwipes') or 0
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        try:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = float(rec.get('TotalSwipes_median', np.nan))
-            if np.isfinite(median) and median > 0:
-                return cur > 3 * median
-        except Exception:
-            pass
-    if 'TotalSwipes_median' in HIST_DF.columns and not HIST_DF.empty:
-        global_med = HIST_DF['TotalSwipes_median'].median()
-        if pd.notna(global_med) and global_med > 0:
-            return cur > 3 * global_med
-    return cur > 50
-
-def scenario_repeated_short_breaks(row):
-    return (row.get('ShortGapCount') or 0) >= 3
-
-def scenario_multiple_location_same_day(row):
-    return (row.get('UniqueLocations') or 0) > 1
-
-def scenario_weekend_activity(row):
-    try:
-        d = pd.to_datetime(row['Date'])
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-def scenario_repeated_rejection_count(row):
-    return (row.get('RejectionCount') or 0) >= 2
-
-def scenario_badge_sharing_suspected(row, full_df=None):
-    return False
-
-def scenario_early_arrival_before_06(row):
-    fs = row.get('FirstSwipe')
-    if pd.isna(fs) or fs is None:
-        return False
-    try:
-        t = pd.to_datetime(fs).time()
-        return t < time(hour=6)
-    except Exception:
-        return False
-
-def scenario_late_exit_after_22(row):
-    ls = row.get('LastSwipe')
-    if pd.isna(ls) or ls is None:
-        return False
-    try:
-        t = pd.to_datetime(ls).time()
-        return t >= time(hour=22)
-    except Exception:
-        return False
-
-def scenario_shift_inconsistency(row):
-    empid = row.get('EmployeeID')
-    dur = row.get('DurationMinutes') or 0
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std):
-            return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
-    return False
-
-def scenario_trending_decline(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is None or HIST_DF.empty:
-        return False
-    if 'TrendingDecline' in HIST_DF.columns:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-        if not rec.empty:
-            val = rec.iloc[0].get('TrendingDecline')
-            return str(val).strip().lower() == 'yes' if pd.notna(val) else False
-    return False
-
-def scenario_consecutive_absent_days(row):
-    if row.get('CountSwipes') == 0:
-        empid = row.get('EmployeeID')
-        if HIST_DF is not None and not HIST_DF.empty and 'ConsecAbsent3Plus' in HIST_DF.columns:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-            if not rec.empty:
-                v = rec.iloc[0].get('ConsecAbsent3Plus')
-                return str(v).strip().lower() in ('yes', 'true', '1')
-        return False
-    return False
-
-def scenario_high_variance_duration(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std) and med > 0:
-            return (std / med) > 1.0
-    return False
-
-def scenario_short_duration_on_high_presence_days(row):
-    days_present = row.get('DaysPresentInWeek') or 0
-    dur = row.get('DurationMinutes') or 0
-    return (days_present >= 4) and (dur < 240)
-
-def scenario_swipe_overlap(row):
-    return False
-
-SCENARIOS = [
-    ("long_gap_>=90min", scenario_long_gap),
-    ("short_duration_<4h", scenario_short_duration),
-    ("coffee_badging", scenario_coffee_badging),
-    ("low_swipe_count_<=2", scenario_low_swipe_count),
-    ("single_door", scenario_single_door),
-    ("only_in", scenario_only_in),
-    ("only_out", scenario_only_out),
-    ("overtime_>=10h", scenario_overtime),
-    ("very_long_duration_>=16h", scenario_very_long_duration),
-    ("zero_swipes", scenario_zero_swipes),
-    ("unusually_high_swipes", scenario_unusually_high_swipes),
-    ("repeated_short_breaks", scenario_repeated_short_breaks),
-    ("multiple_location_same_day", scenario_multiple_location_same_day),
-    ("weekend_activity", scenario_weekend_activity),
-    ("repeated_rejection_count", scenario_repeated_rejection_count),
-    ("badge_sharing_suspected", scenario_badge_sharing_suspected),
-    ("early_arrival_before_06", scenario_early_arrival_before_06),
-    ("late_exit_after_22", scenario_late_exit_after_22),
-    ("shift_inconsistency", scenario_shift_inconsistency),
-    ("trending_decline", scenario_trending_decline),
-    ("consecutive_absent_days", scenario_consecutive_absent_days),
-    ("high_variance_duration", scenario_high_variance_duration),
-    ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days),
-    ("swipe_overlap", scenario_swipe_overlap)
-]
-
-
-def run_trend_for_date(target_date: date, outdir: str = "./outputs", city='Pune'):
-    logging.info("run_trend_for_date: date=%s (city=%s)", target_date, city)
-    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city=city)
-    apac = results.get('apac', {})
-    swipes = apac.get('swipes', pd.DataFrame())
-    durations = apac.get('durations', pd.DataFrame())
-
-    # save raw swipes for evidence (filtered swipes if compute_features filters again)
-    try:
-        if swipes is not None and not swipes.empty:
-            sw_out = Path(outdir) / f"swipes_{city.lower().replace(' ','_')}_{target_date.strftime('%Y%m%d')}.csv"
-            swipes.to_csv(sw_out, index=False)
-            logging.info("Saved raw swipes to %s", sw_out)
-    except Exception as e:
-        logging.warning("Failed to save raw swipes: %s", e)
-
-    features = compute_features(swipes, durations)
-    if features.empty:
-        logging.warning("run_trend_for_date: no features computed")
-        return pd.DataFrame()
-
-    # badge map & swipe overlap maps (same approach — can be used to set flags)
-    badge_map = {}
-    if 'CardNumber' in swipes.columns and 'person_uid' in swipes.columns and 'Date' in swipes.columns:
-        tmp = swipes[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
-        if not tmp.empty:
-            grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
-            badge_map = {(row.Date, row.CardNumber): row.distinct_users for row in grouped_card.itertuples(index=False)}
-
-    swipe_overlap_map = {}
-    overlap_window_seconds = 2
-    if {'Door', 'LocaleMessageTime', 'person_uid', 'Date'}.issubset(swipes.columns):
-        tmp = swipes[['Door', 'LocaleMessageTime', 'person_uid', 'Date']].dropna()
-        if not tmp.empty:
-            tmp = tmp.sort_values(['Door', 'LocaleMessageTime'])
-            for (d, door), g in tmp.groupby(['Date', 'Door']):
-                items = list(g[['LocaleMessageTime', 'person_uid']].itertuples(index=False, name=None))
-                n = len(items)
-                j = 0
-                for i in range(n):
-                    t_i, uid_i = items[i]
-                    j = max(j, i+1)
-                    while j < n and (items[j][0] - t_i).total_seconds() <= overlap_window_seconds:
-                        uid_j = items[j][1]
-                        if uid_i != uid_j:
-                            swipe_overlap_map.setdefault((d, uid_i), set()).add(uid_j)
-                            swipe_overlap_map.setdefault((d, uid_j), set()).add(uid_i)
-                        j += 1
-
-    # Apply scenarios; special badge/sharing & swipe overlap handling
-    for name, fn in SCENARIOS:
-        if name == "badge_sharing_suspected":
-            def badge_fn(r):
-                card = r.get('CardNumber')
-                d = r.get('Date')
-                if pd.isna(card) or card is None:
-                    return False
-                return badge_map.get((d, card), 0) > 1
-            features[name] = features.apply(badge_fn, axis=1)
-        elif name == "swipe_overlap":
-            def overlap_flag_fn(r):
-                d = r.get('Date')
-                uid = r.get('person_uid')
-                return (d, uid) in swipe_overlap_map
-            features[name] = features.apply(overlap_flag_fn, axis=1)
-            def overlap_with_fn(r):
-                d = r.get('Date'); uid = r.get('person_uid')
-                if (d, uid) not in swipe_overlap_map:
-                    return None
-                return ";".join(sorted(str(o) for o in swipe_overlap_map[(d, uid)]))
-            features['OverlapWith'] = features.apply(overlap_with_fn, axis=1)
-        else:
-            features[name] = features.apply(lambda r, f=fn: bool(f(r)), axis=1)
-
-    # Create reason text
-    def reasons_for_row(r):
-        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
-        return "; ".join(reasons) if reasons else None
-    features['Reasons'] = features.apply(reasons_for_row, axis=1)
-
-    # cleanup suffixes
-    cols_to_drop = [c for c in features.columns if c.endswith("_x") or c.endswith("_y")]
-    if cols_to_drop:
-        for c in cols_to_drop:
-            base = c[:-2]
-            if base in features.columns:
-                try:
-                    features.drop(columns=[c], inplace=True)
-                except Exception:
-                    pass
-            else:
-                try:
-                    features.rename(columns={c: base}, inplace=True)
-                except Exception:
-                    pass
-    features = features.loc[:, ~features.columns.duplicated()]
-
-    # ensure booleans
-    for col in [name for name, _ in SCENARIOS]:
-        if col in features.columns:
-            features[col] = features[col].astype(bool)
-
-    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
-    # convert numpy types to native when saving
-    features.to_csv(out_csv, index=False)
-    logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(features))
-    return features
-
-
-# ---------------- training dataset builder ----------------
-def build_monthly_training(end_date: date = None, months: int = 3, min_unique_employees: int = 1000,
-                           outdir: str = "./outputs", city: str = "Pune"):
-    """
-    Aggregate daily feature CSVs into a person-month dataset ready for ML.
-    Label logic: for each scenario, label person-month as 1 if the person had >=1 day in that month where scenario flagged.
-    Aggregates numeric features via median/mean and counts.
-    """
-    if end_date is None:
-        end_date = datetime.now().date()
-    logging.info("build_monthly_training: end_date=%s months=%d min_unique=%d", end_date, months, min_unique_employees)
-    outdir = Path(outdir)
-    # build month windows (most recent 'months' months)
-    month_windows = []
-    cur = end_date.replace(day=1)
-    for _ in range(months):
-        start = cur
-        # compute last day
-        next_month = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
-        last = next_month - timedelta(days=1)
-        month_windows.append((start, last))
-        cur = (start - timedelta(days=1)).replace(day=1)
-
-    person_month_rows = []
-    unique_persons = set()
-
-    for start, last in month_windows:
-        # iterate days in month
-        d = start
-        month_dfs = []
-        while d <= last:
-            csv_path = outdir / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
-            if csv_path.exists():
-                try:
-                    df = pd.read_csv(csv_path)
-                    month_dfs.append(df)
-                except Exception:
-                    try:
-                        df = pd.read_csv(csv_path, dtype=str)
-                        month_dfs.append(df)
-                    except Exception as e:
-                        logging.warning("Failed reading %s: %s", csv_path, e)
-            d = d + timedelta(days=1)
-
-        if not month_dfs:
-            logging.info("No daily trend CSVs found for month %s - %s", start.isoformat(), last.isoformat())
-            continue
-
-        month_df = pd.concat(month_dfs, ignore_index=True)
-        # ensure person_uid exists
-        if 'person_uid' not in month_df.columns:
-            def make_person_uid(row):
-                parts = []
-                for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
-                    v = row.get(c)
-                    if pd.notna(v) and str(v).strip():
-                        parts.append(str(v).strip())
-                return "|".join(parts) if parts else None
-            month_df['person_uid'] = month_df.apply(make_person_uid, axis=1)
-
-        # convert boolean columns to int for aggregation if necessary
-        for name, _ in SCENARIOS:
-            if name in month_df.columns:
-                month_df[name] = month_df[name].astype(int)
-
-        # per-person aggregation for this month
-        agg_funcs = {
-            'CountSwipes': ['median', 'mean', 'sum'],
-            'DurationMinutes': ['median', 'mean', 'sum'],
-            'MaxSwipeGapSeconds': ['max', 'median'],
-            'ShortGapCount': ['sum'],
-            'UniqueDoors': ['median'],
-            'UniqueLocations': ['median'],
-            'RejectionCount': ['sum']
+C:\Users\W0024618\Desktop\Trend Analysis\frontend\index.html
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Trend Analysis — Dashboard</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <!-- React + ReactDOM + Babel (quick prototyping) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body { font-family: Inter, Roboto, Arial, sans-serif; margin: 0; padding: 0; background:#f6f7fb; color:#1f2937; }
+      .container { max-width:1200px; margin:24px auto; padding:20px; background:#fff; border-radius:8px; box-shadow:0 6px 18px rgba(16,24,40,0.06); }
+      header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+      header h1 { margin:0; font-size:20px; }
+      .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      input[type="date"] { padding:8px; border-radius:6px; border:1px solid #e2e8f0; }
+      button { padding:8px 12px; border-radius:6px; border:0; background:#2563eb; color:#fff; cursor:pointer; }
+      button.secondary { background:#64748b; }
+      button.ghost { background:transparent; color:#0f172a; border:1px solid #e2e8f0; }
+      .cards { display:flex; gap:12px; margin-top:16px; }
+      .card { flex:1; background:#f8fafc; padding:12px; border-radius:8px; text-align:center; }
+      .card h3 { margin:4px 0; font-size:18px; }
+      .card p { margin:0; color:#6b7280; }
+      .main { display:flex; gap:18px; margin-top:18px; }
+      .left { flex: 2; }
+      .right { flex: 1; min-width:260px; }
+      .chart-wrap { background:#fff; padding:10px; border-radius:8px; box-shadow: inset 0 0 0 1px #f1f5f9; }
+      table { width:100%; border-collapse:collapse; margin-top:12px; }
+      th, td { padding:8px 6px; border-bottom:1px solid #eef2f7; font-size:13px; vertical-align:middle; }
+      th { background:#fafafa; position:sticky; top:0; z-index:1; text-align:left; }
+      .small { font-size:12px; color:#475569; }
+      .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#e6f2ff; color:#075985; font-size:12px; cursor:pointer; margin:2px; }
+      .chip { display:inline-block; padding:6px 10px; border-radius:999px; background:#eef2ff; color:#034f84; font-size:13px; cursor:pointer; margin:3px; }
+      .searchbar { margin-top:12px; display:flex; gap:8px; align-items:center; }
+      .searchbar input { padding:8px; border-radius:6px; border:1px solid #e2e8f0; width:280px; }
+      .pagination { margin-top:10px; display:flex; gap:8px; align-items:center; justify-content:flex-start; }
+      .muted { color:#64748b; font-size:13px; }
+      .spinner { position:fixed; left:0; right:0; top:0; bottom:0; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.6); z-index:999; }
+      .modal { position:fixed; left:0; right:0; top:0; bottom:0; display:flex; align-items:center; justify-content:center; z-index:1000; }
+      .modal-inner { width:760px; max-width:95%; max-height:85%; overflow:auto; background:#fff; border-radius:8px; padding:16px; box-shadow:0 10px 40px rgba(2,6,23,0.3); }
+      .close-btn { float:right; background:#ef4444; color:#fff; border-radius:6px; padding:6px 8px; border:0; cursor:pointer; }
+      pre { white-space:pre-wrap; word-wrap:break-word; background:#0f172a; color:#fff; padding:12px; border-radius:8px; }
+      .row-click { cursor:pointer; }
+      .overlap-pill { display:inline-block; padding:4px 8px; border-radius:6px; background:#fff2dd; color:#92400e; font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      (function(){
+        const { useState, useEffect, useRef } = React;
+
+        const API_BASE = "http://10.199.45.239:8002";
+
+        function pad(n){ return n.toString().padStart(2,'0'); }
+        function formatDateISO(d){
+          if(!d) return "";
+          const dt = (d instanceof Date) ? d : new Date(d);
+          return dt.getFullYear() + "-" + pad(dt.getMonth()+1) + "-" + pad(dt.getDate());
         }
-        # include scenario counts: how many days in month flagged for scenario
-        scenario_cols = [name for name,_ in SCENARIOS if name in month_df.columns]
-        group_cols = ['person_uid']
-        grp = month_df.groupby(group_cols)
-
-        for person, g in grp:
-            row = {}
-            row['person_uid'] = person
-            # pick stable identifiers (EmployeeID/EmployeeName) from first non-null occurrence
-            row['EmployeeID'] = next((v for v in g.get('EmployeeID', []) if pd.notna(v)), None)
-            row['EmployeeName'] = next((v for v in g.get('EmployeeName', []) if pd.notna(v)), None)
-            row['MonthStart'] = start.isoformat()
-            row['MonthEnd'] = last.isoformat()
-            # numeric aggregates
-            for col, funcs in agg_funcs.items():
-                if col in g.columns:
-                    for f in funcs:
-                        key = f"{col}_{f}"
-                        try:
-                            val = getattr(g[col], f)()
-                            row[key] = float(val) if pd.notna(val) else None
-                        except Exception:
-                            row[key] = None
-                else:
-                    for f in funcs:
-                        row[f"{col}_{f}"] = None
-            # scenario labels: 1 if any day in month flagged for that scenario
-            for s in scenario_cols:
-                row[f"{s}_days"] = int(g[s].sum())
-                row[f"{s}_label"] = int(g[s].sum() > 0)
-            # counts
-            row['days_present'] = int(g.shape[0])
-            person_month_rows.append(row)
-            unique_persons.add(person)
-
-        if len(unique_persons) >= min_unique_employees:
-            logging.info("Reached min unique employees=%d, stopping aggregation early", min_unique_employees)
-            break
-
-    if not person_month_rows:
-        logging.warning("No person-month rows created (no data).")
-        return None
-
-    training_df = pd.DataFrame(person_month_rows)
-    # save CSV
-    train_out = outdir / "training_person_month.csv"
-    training_df.to_csv(train_out, index=False)
-    logging.info("Saved training CSV to %s (rows=%d unique_persons=%d)", train_out, len(training_df), len(unique_persons))
-    return train_out
-
-
-if __name__ == "__main__":
-    today = datetime.now().date()
-    df = run_trend_for_date(today)
-    print("Completed; rows:", len(df) if df is not None else 0)
-
-
-
-
-
-
-
-
-
-# app.py
-from flask import Flask, jsonify, request, send_from_directory
-from datetime import datetime, timedelta, date
-from pathlib import Path
-import logging
-import pandas as pd
-import numpy as np
-
-from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR
-
-# Try to enable CORS
-try:
-    from flask_cors import CORS
-    has_cors = True
-except Exception:
-    CORS = None
-    has_cors = False
-
-app = Flask(__name__, static_folder=None)
-if has_cors:
-    CORS(app)
-else:
-    logging.warning("flask_cors not available; continuing without CORS.")
-
-logging.basicConfig(level=logging.INFO)
-
-BASE_DIR = Path(__file__).parent.resolve()
-DEFAULT_OUTDIR = BASE_DIR / "outputs"
-DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
-
-def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
-    if df is None or df.empty:
-        return []
-    df = df.copy()
-    cols_to_suffix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
-    for c in cols_to_suffix:
-        base = c[:-2]
-        if base in df.columns:
-            try:
-                df.drop(columns=[c], inplace=True)
-            except Exception:
-                pass
-        else:
-            try:
-                df.rename(columns={c: base}, inplace=True)
-            except Exception:
-                pass
-    df = df.loc[:, ~df.columns.duplicated()]
-    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
-        if dtcol in df.columns:
-            try:
-                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
-                df[dtcol] = df[dtcol].dt.strftime('%Y-%m-%dT%H:%M:%S')
-            except Exception:
-                try:
-                    df[dtcol] = df[dtcol].astype(str)
-                except Exception:
-                    pass
-    df = df.where(pd.notnull(df), None)
-
-    def _to_python_scalar(x):
-        import numpy as _np
-        import pandas as _pd
-        if isinstance(x, _np.generic):
-            try:
-                return x.item()
-            except Exception:
-                return x
-        if isinstance(x, _pd.Timestamp):
-            try:
-                return x.to_pydatetime().isoformat()
-            except Exception:
-                return str(x)
-        return x
-
-    df = df.head(max_rows).applymap(_to_python_scalar)
-    return df.to_dict(orient='records')
-
-
-@app.route('/')
-def root():
-    return "Trend Analysis API — Pune test"
-
-
-@app.route('/run', methods=['GET', 'POST'])
-def run_trend():
-    params = {}
-    if request.method == 'GET':
-        params = request.args.to_dict()
-    else:
-        if request.is_json:
-            params = request.json or {}
-
-    date_str = params.get('date')
-    start_str = params.get('start')
-    end_str = params.get('end')
-
-    dates = []
-    try:
-        if date_str:
-            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-            dates = [dt]
-        elif start_str and end_str:
-            s = datetime.strptime(start_str, "%Y-%m-%d").date()
-            e = datetime.strptime(end_str, "%Y-%m-%d").date()
-            if e < s:
-                return jsonify({"error":"end must be >= start"}), 400
-            cur = s
-            while cur <= e:
-                dates.append(cur)
-                cur = cur + timedelta(days=1)
-        else:
-            dates = [datetime.now().date()]
-    except Exception as e:
-        return jsonify({"error": f"Invalid date format: {e}"}), 400
-
-    combined_rows = []
-    files = []
-    total_rows = 0
-    total_flagged = 0
-    samples = []
-
-    for d in dates:
-        try:
-            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
-        except Exception as e:
-            logging.exception("run_trend_for_date failed for %s", d)
-            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
-
-        csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
-        files.append(csv_path.name if csv_path.exists() else None)
-
-        if df is None or df.empty:
-            continue
-
-        if 'Reasons' not in df.columns:
-            df['Reasons'] = None
-
-        total_rows += len(df)
-        total_flagged += int(df['Reasons'].notna().sum())
-
-        flagged = df[df['Reasons'].notna()]
-        sample_df = flagged.head(10) if not flagged.empty else df.head(10)
-        samples.extend(_clean_sample_df(sample_df, max_rows=10))
-
-        combined_rows.append(df)
-
-    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
-
-    resp = {
-        "start_date": dates[0].isoformat() if dates else None,
-        "end_date": dates[-1].isoformat() if dates else None,
-        "files": [f for f in files if f],
-        "rows": int(total_rows),
-        "flagged_rows": int(total_flagged),
-        "sample": samples[:20]
-    }
-    return jsonify(resp)
-
-
-@app.route('/latest', methods=['GET'])
-def latest_results():
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({"error": "no outputs found"}), 404
-    latest = csvs[0]
-    try:
-        df = pd.read_csv(latest)
-    except Exception:
-        df = pd.read_csv(latest, dtype=str)
-    sample = _clean_sample_df(df, max_rows=5)
-    return jsonify({
-        "file": latest.name,
-        "rows": int(len(df)),
-        "sample": sample
-    })
-
-
-@app.route('/record', methods=['GET'])
-def get_record():
-    """
-    /record?employee_id=... or /record?person_uid=...
-    Returns matching aggregated trend rows and the raw swipe CSV filename (if present) for evidence.
-    """
-    q = request.args.get('employee_id') or request.args.get('person_uid')
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({'error':'no outputs'}), 404
-    try:
-        df = pd.read_csv(csvs[0], parse_dates=['FirstSwipe','LastSwipe'], infer_datetime_format=True)
-    except Exception:
-        df = pd.read_csv(csvs[0])
-    df_clean = pd.DataFrame(_clean_sample_df(df, max_rows=len(df)))
-    if q is None:
-        # return top 10 aggregated rows
-        return jsonify(df_clean.head(10).to_dict(orient='records'))
-    mask = (df_clean.get('EmployeeID', '').astype(str) == str(q)) | (df_clean.get('person_uid', '').astype(str) == str(q))
-    rows = df_clean[mask]
-    if rows.empty:
-        return jsonify({'error':'not found'}), 404
-
-    # also find corresponding raw swipe file (if exists)
-    # raw swipe file naming: swipes_pune_YYYYMMDD.csv -> try to list files for dates present in rows
-    dates = list({r.get('Date') for r in rows.to_dict(orient='records') if r.get('Date')})
-    raw_files = []
-    for d in dates:
-        try:
-            # date may be like '2025-10-08' or '2025-10-08T...' - normalize
-            dd = str(d)[:10]
-            raw_name = f"swipes_pune_{dd.replace('-','')}.csv"
-            fp = DEFAULT_OUTDIR / raw_name
-            if fp.exists():
-                raw_files.append(raw_name)
-        except Exception:
-            pass
-
-    return jsonify({
-        "aggregated_rows": rows.to_dict(orient='records'),
-        "raw_swipe_files": raw_files
-    })
-
-
-@app.route('/swipes/<filename>', methods=['GET'])
-def download_swipes(filename):
-    """
-    Serve raw swipe CSVs from outputs/ (filename should be the file name only).
-    """
-    fp = DEFAULT_OUTDIR / filename
-    if not fp.exists():
-        return jsonify({"error":"file not found"}), 404
-    return send_from_directory(str(DEFAULT_OUTDIR), filename, as_attachment=True)
-
-
-@app.route('/train', methods=['GET'])
-def build_training_endpoint():
-    """
-    Build monthly training CSV.
-    Query params:
-     - end_date=YYYY-MM-DD (defaults to today)
-     - months=N (default 3)
-     - min_unique=1000 (default)
-    Returns JSON with path to CSV on success.
-    """
-    end_date_str = request.args.get('end_date')
-    months = int(request.args.get('months') or 3)
-    min_unique = int(request.args.get('min_unique') or 1000)
-    try:
-        if end_date_str:
-            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-        else:
-            end_date = datetime.now().date()
-    except Exception as e:
-        return jsonify({"error": f"invalid end_date: {e}"}), 400
-
-    try:
-        csv_path = build_monthly_training(end_date=end_date, months=months, min_unique_employees=min_unique, outdir=str(DEFAULT_OUTDIR))
-        if csv_path is None:
-            return jsonify({"error":"no training CSV produced (no data)"}), 500
-        return jsonify({"training_csv": str(csv_path)})
-    except Exception as e:
-        logging.exception("build_monthly_training failed")
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8002, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-# ml_training.py
-"""
-Train one binary classifier per scenario using the training CSV produced by trend_runner.build_monthly_training.
-Usage:
-    python ml_training.py --input outputs/training_person_month.csv --models_dir models/
-Outputs:
-    models/<scenario>.joblib
-Requirements:
-    scikit-learn, joblib, pandas, numpy
-"""
-import argparse
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import logging
-
-logging.basicConfig(level=logging.INFO)
-
-try:
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import classification_report
-    import joblib
-except Exception as e:
-    logging.error("Required ML packages missing: %s", e)
-    logging.error("Install scikit-learn and joblib: pip install scikit-learn joblib")
-    raise
-
-DEFAULT_FEATURE_COLS = [
-    'CountSwipes_median', 'CountSwipes_mean', 'CountSwipes_sum',
-    'DurationMinutes_median', 'DurationMinutes_mean', 'DurationMinutes_sum',
-    'MaxSwipeGapSeconds_max', 'MaxSwipeGapSeconds_median',
-    'ShortGapCount_sum', 'UniqueDoors_median', 'UniqueLocations_median', 'RejectionCount_sum',
-    'days_present'
-]
-
-def auto_detect_scenarios(df):
-    scenario_labels = [c for c in df.columns if c.endswith('_label')]
-    scenarios = [c[:-6] for c in scenario_labels]
-    return scenarios
-
-def prepare_features(df, features=None):
-    if features is None:
-        features = DEFAULT_FEATURE_COLS
-    # ensure columns exist, fill missing with 0/median
-    X = df.copy()
-    for f in features:
-        if f not in X.columns:
-            X[f] = 0.0
-    X = X[features].fillna(0.0)
-    return X
-
-def train_one(df, scenario, features):
-    label_col = f"{scenario}_label"
-    if label_col not in df.columns:
-        logging.warning("Label %s not in dataframe, skipping", label_col)
-        return None
-    y = df[label_col].astype(int)
-    if y.sum() == 0:
-        logging.warning("No positive examples for %s; skipping model training", scenario)
-        return None
-    X = prepare_features(df, features)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict(X_test)
-    logging.info("Classification report for %s:\n%s", scenario, classification_report(y_test, y_pred, zero_division=0))
-    return clf
-
-def main(input_csv: Path, models_dir: Path, feature_cols=None):
-    if not input_csv.exists():
-        raise FileNotFoundError(f"input CSV not found: {input_csv}")
-    df = pd.read_csv(input_csv)
-    scenarios = auto_detect_scenarios(df)
-    if not scenarios:
-        logging.error("No scenarios ( *_label ) columns found in %s", input_csv)
-        return
-    models_dir.mkdir(parents=True, exist_ok=True)
-    for s in scenarios:
-        logging.info("Training for scenario: %s", s)
-        clf = train_one(df, s, feature_cols)
-        if clf is not None:
-            outp = models_dir / f"{s}.joblib"
-            joblib.dump({"model": clf, "features": (feature_cols or DEFAULT_FEATURE_COLS)}, outp)
-            logging.info("Saved model to %s", outp)
-        else:
-            logging.info("Skipped training for %s", s)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="training CSV (person-month) created by /train endpoint")
-    parser.add_argument("--models_dir", default="models", help="folder to save models")
-    parser.add_argument("--features", default=None, help="comma separated feature columns (optional)")
-    args = parser.parse_args()
-
-    input_csv = Path(args.input)
-    models_dir = Path(args.models_dir)
-    feature_cols = args.features.split(",") if args.features else None
-
-    main(input_csv, models_dir, feature_cols)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-For Pune Keep here Only EMployee Where Personnel Type is Employee or Peronnel type Terminated Personnel 
-Only keep this 
-Exclude other like Contractor or any 
-
-Also I want to train model for Each Scenarion
-
-Currently We Got API responce like 
-581
-Rows analysed
-580
-Flagged rows
-
-SO i want Build Logic basis on 
-
-Make Logic like 1000 EMployees data Analysed (Unique 1000) People over 20 People Flagged on Diffrent Diffrent Condtion 
-so fetch data for Month wise to Current and train model ...
-
-
-WITH AllSwipes AS (
-    SELECT
-        t1.ObjectName1 AS EmployeeName,
-        CASE
-            WHEN t2.Int1 = 0 THEN t2.Text12
-            ELSE CAST(t2.Int1 AS NVARCHAR)
-        END AS EmployeeID,
-        DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS LocaleMessageTime,
-        x.Value AS Direction,
-        CAST(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS DATE) AS SwipeDate
-    FROM
-        [ACVSUJournal_00010030].[dbo].[ACVSUJournalLog] AS t1
-    INNER JOIN [ACVSCore].[Access].[Personnel] AS t2
-        ON t1.ObjectIdentity1 = t2.GUID
-    INNER JOIN [ACVSCore].[Access].[PersonnelType] AS t3
-        ON t2.PersonnelTypeID = t3.ObjectID
-    INNER JOIN [ACVSUJournal_00010030].[dbo].[ACVSUJournalLogxmlShred] AS x
-        ON t1.XMLGuid = x.GUID
-    WHERE
-        t1.MessageType = 'CardAdmitted'
-        AND t2.Text5 IN ('Pune','Pune - Business Bay')
-        AND t1.PartitionName2 = 'APAC.Default'
-        AND t3.Name = 'Employee'
-        AND x.Value IN ('InDirection', 'OutDirection')
-        AND CAST(DATEADD(MINUTE, -1 * t1.MessageLocaleOffset, t1.MessageUTC) AS DATE) BETWEEN '2025-10-27' AND '2025-10-27'
-),
-
-SwipeGap AS (
-    SELECT
-        EmployeeID,
-        EmployeeName,
-        SwipeDate,
-        LocaleMessageTime AS CurrentSwipe,
-        LAG(LocaleMessageTime) OVER (PARTITION BY EmployeeID, SwipeDate ORDER BY LocaleMessageTime) AS PrevSwipe,
-        DATEDIFF(HOUR, LAG(LocaleMessageTime) OVER (PARTITION BY EmployeeID, SwipeDate ORDER BY LocaleMessageTime), LocaleMessageTime) AS GapHours
-    FROM AllSwipes
-),
-
-GapReport AS (
-    SELECT
-        EmployeeID,
-        EmployeeName,
-        SwipeDate,
-        PrevSwipe,
-        CurrentSwipe,
-        GapHours
-    FROM SwipeGap
-    WHERE GapHours > 6
-),
-
-DayDuration AS (
-    SELECT
-        EmployeeID,
-        SwipeDate,
-        MIN(LocaleMessageTime) AS FirstSwipe,
-        MAX(LocaleMessageTime) AS LastSwipe,
-        -- Duration in HH:MM format
-        RIGHT('0' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) / 60 AS VARCHAR), 2)
-        + ':' +
-        RIGHT('0' + CAST(DATEDIFF(MINUTE, MIN(LocaleMessageTime), MAX(LocaleMessageTime)) % 60 AS VARCHAR), 2) AS DurationHHMM
-    FROM AllSwipes
-    GROUP BY EmployeeID, SwipeDate
-)
-
-SELECT
-    g.EmployeeID,
-    g.EmployeeName,
-    g.SwipeDate,
-    g.PrevSwipe,
-    g.CurrentSwipe,
-    g.GapHours,
-    COUNT(*) OVER (PARTITION BY g.EmployeeID) AS RepeatCount,
-    d.DurationHHMM
-FROM GapReport g
-INNER JOIN DayDuration d
-    ON g.EmployeeID = d.EmployeeID AND g.SwipeDate = d.SwipeDate
-ORDER BY RepeatCount DESC, g.EmployeeName, g.SwipeDate;
-
-
-
-Refer above Query Carefully and and Logic this also
-Employee gaps between 2 swipes + duration
-Here build logic like 
-When Employee Swipe their badhe InDirection he came Office within he went out of office again after 5 to 6 hr later he came office we want to find that Employee 
-List also...
-also in Frontend We dont need JSON Reponce we need Details section also 
-If Someone is Highlight due to Swipe gap 
-then iN details display Swipe Records ..
-How We analyse data Explaination here why system Highlight their name and Evidanace also .....
-
-
-C:\Users\W0024618\Desktop\Trend Analysis\backend\trend_runner.py
-
-from datetime import date, datetime, time
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import logging
-
-# IMPORTANT: import duration_report as a top-level module (file in same folder).
-from duration_report import run_for_date
-
-# try to load historical profile (current_analysis.csv) if present
-HIST_PATH = Path(__file__).parent / "current_analysis.csv"
-if HIST_PATH.exists():
-    try:
-        HIST_DF = pd.read_csv(HIST_PATH)
-        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
-    except Exception as e:
-        logging.warning("Failed to load historical profile: %s", e)
-        HIST_DF = pd.DataFrame()
-else:
-    logging.warning("Historical profile file current_analysis.csv not found; history-based scenarios will fallback.")
-    HIST_DF = pd.DataFrame()
-
-OUTDIR = Path("./outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO)
-
-
-def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per person-per-date features used by scenarios.
-    """
-    if swipes is None or swipes.empty:
-        return pd.DataFrame()
-
-    sw = swipes.copy()
-    sw['LocaleMessageTime'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce')
-    sw['Date'] = sw['LocaleMessageTime'].dt.date
-
-    # ensure person_uid exists (same logic as duration_report)
-    if 'person_uid' not in sw.columns:
-        def make_person_uid(row):
-            parts = []
-            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
-                v = row.get(c)
-                if pd.notna(v) and str(v).strip():
-                    parts.append(str(v).strip())
-            return "|".join(parts) if parts else None
-        sw['person_uid'] = sw.apply(make_person_uid, axis=1)
-
-    # Choose the columns present in swipes for aggregation
-    sel_cols = [c for c in [
-        'LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-        'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType'
-    ] if c in sw.columns]
-
-    # aggregator
-    def agg_swipe_group(g):
-        times = sorted(g['LocaleMessageTime'].dropna().tolist())
-        gaps = []
-        short_gap_count = 0
-        for i in range(1, len(times)):
-            s = (times[i] - times[i-1]).total_seconds()
-            gaps.append(s)
-            if s <= 5*60:
-                short_gap_count += 1
-        max_gap = int(max(gaps)) if gaps else 0
-        in_count = int((g.get('Direction') == 'InDirection').sum()) if 'Direction' in g.columns else 0
-        out_count = int((g.get('Direction') == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-        card_numbers = list(pd.unique(g['CardNumber'].dropna())) if 'CardNumber' in g.columns else []
-        card_number = card_numbers[0] if card_numbers else None
-
-        # pick name/id/personnel from any available column (prefer the explicit ones)
-        employee_id = None
-        employee_name = None
-        personnel_type = None
-        if 'EmployeeID' in g.columns:
-            vals = g['EmployeeID'].dropna()
-            employee_id = vals.iloc[0] if not vals.empty else None
-        # prefer EmployeeName then ObjectName1
-        if 'EmployeeName' in g.columns:
-            vals = g['EmployeeName'].dropna()
-            if not vals.empty:
-                employee_name = vals.iloc[0]
-        if employee_name is None and 'ObjectName1' in g.columns:
-            vals = g['ObjectName1'].dropna()
-            if not vals.empty:
-                employee_name = vals.iloc[0]
-        if 'PersonnelType' in g.columns:
-            vals = g['PersonnelType'].dropna()
-            personnel_type = vals.iloc[0] if not vals.empty else None
-
-        return pd.Series({
-            'CountSwipes': int(len(g)),
-            'MaxSwipeGapSeconds': max_gap,
-            'ShortGapCount': int(short_gap_count),
-            'InCount': in_count,
-            'OutCount': out_count,
-            'UniqueDoors': unique_doors,
-            'UniqueLocations': unique_locations,
-            'RejectionCount': rejection_count,
-            'CardNumber': card_number,
-            'EmployeeID': employee_id,
-            'EmployeeName': employee_name,
-            'PersonnelType': personnel_type
-        })
-
-    # run groupby using selected columns (prevents pandas future warning)
-    gb = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])
-    grouped = gb.apply(agg_swipe_group).reset_index()
-
-    # normalize durations side
-    dur = pd.DataFrame() if durations is None else durations.copy()
-    if not dur.empty and 'Date' in dur.columns:
-        dur['Date'] = pd.to_datetime(dur['Date']).dt.date
-
-    # merge features with durations
-    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
-
-    # Coalesce function that consolidates _x/_y into base if needed
-    def coalesce_field(df: pd.DataFrame, base: str, fallback_order: list = None, default=None):
-        """
-        Ensure df[base] exists. Priority:
-         - if base exists, keep it
-         - else try base_x, base_y
-         - else if fallback_order provided, attempt those columns in order
-         - else set default
-        """
-        if base in df.columns:
-            return
-        candidates = [base + '_x', base + '_y']
-        if fallback_order:
-            candidates = candidates + fallback_order
-        for c in candidates:
-            if c in df.columns:
-                df[base] = df[c]
-                return
-        df[base] = default
-
-    # coalesce common fields (including EmployeeName variants)
-    coalesce_field(merged, 'CountSwipes', default=0)
-    coalesce_field(merged, 'DurationSeconds', default=0)
-    coalesce_field(merged, 'FirstSwipe', default=pd.NaT)
-    coalesce_field(merged, 'LastSwipe', default=pd.NaT)
-    coalesce_field(merged, 'CardNumber', default=None)
-    coalesce_field(merged, 'EmployeeID', default=None, fallback_order=['ObjectName1'])
-    # EmployeeName: prefer EmployeeName, then ObjectName1, then EmployeeName_x/_y, then EmployeeName_y
-    coalesce_field(merged, 'EmployeeName', fallback_order=['ObjectName1', 'EmployeeName_x', 'EmployeeName_y'], default=None)
-    coalesce_field(merged, 'PersonnelType', default=None)
-
-    # Now ensure types & defaults
-    merged['DurationSeconds'] = merged.get('DurationSeconds', 0).fillna(0).astype(float)
-    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
-    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
-    merged['MaxSwipeGapSeconds'] = merged.get('MaxSwipeGapSeconds', 0).fillna(0).astype(int)
-    merged['ShortGapCount'] = merged.get('ShortGapCount', 0).fillna(0).astype(int)
-    merged['RejectionCount'] = merged.get('RejectionCount', 0).fillna(0).astype(int)
-    merged['UniqueLocations'] = merged.get('UniqueLocations', 0).fillna(0).astype(int)
-    merged['UniqueDoors'] = merged.get('UniqueDoors', 0).fillna(0).astype(int)
-
-    # ensure FirstSwipe/LastSwipe exist and convert to datetime
-    for col in ['FirstSwipe', 'LastSwipe']:
-        if col not in merged.columns:
-            merged[col] = pd.NaT
-        else:
-            merged[col] = pd.to_datetime(merged[col], errors='coerce')
-
-    # boolean flags
-    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
-    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
-    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
-
-    # historical presence map
-    hist_map = {}
-    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
-        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
-    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: x in hist_map if pd.notna(x) else False)
-
-    return merged
-
-
-# ----------------- Scenarios -----------------
-def scenario_long_gap(row):
-    return (row.get('MaxSwipeGapSeconds') or 0) >= 90 * 60
-
-def scenario_short_duration(row):
-    return (row.get('DurationMinutes') or 0) < 240
-
-def scenario_coffee_badging(row):
-    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
-
-def scenario_low_swipe_count(row):
-    return (row.get('CountSwipes') or 0) <= 2 and (row.get('CountSwipes') or 0) > 0
-
-def scenario_single_door(row):
-    return (row.get('UniqueDoors') or 0) <= 1
-
-def scenario_only_in(row):
-    return int(row.get('OnlyIn', 0)) == 1
-
-def scenario_only_out(row):
-    return int(row.get('OnlyOut', 0)) == 1
-
-def scenario_overtime(row):
-    return (row.get('DurationMinutes') or 0) >= 10 * 60
-
-def scenario_very_long_duration(row):
-    return (row.get('DurationMinutes') or 0) >= 16 * 60
-
-def scenario_zero_swipes(row):
-    return int(row.get('CountSwipes', 0)) == 0
-
-def scenario_unusually_high_swipes(row):
-    cur = row.get('CountSwipes') or 0
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        try:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = float(rec.get('TotalSwipes_median', np.nan))
-            if np.isfinite(median) and median > 0:
-                return cur > 3 * median
-        except Exception:
-            pass
-    if 'TotalSwipes_median' in HIST_DF.columns and not HIST_DF.empty:
-        global_med = HIST_DF['TotalSwipes_median'].median()
-        if pd.notna(global_med) and global_med > 0:
-            return cur > 3 * global_med
-    return cur > 50
-
-def scenario_repeated_short_breaks(row):
-    return (row.get('ShortGapCount') or 0) >= 3
-
-def scenario_multiple_location_same_day(row):
-    return (row.get('UniqueLocations') or 0) > 1
-
-def scenario_weekend_activity(row):
-    try:
-        d = pd.to_datetime(row['Date'])
-        return d.weekday() >= 5
-    except Exception:
-        return False
-
-def scenario_repeated_rejection_count(row):
-    return (row.get('RejectionCount') or 0) >= 2
-
-def scenario_badge_sharing_suspected(row, full_df=None):
-    return False  # evaluated later using badge_map
-
-def scenario_early_arrival_before_06(row):
-    fs = row.get('FirstSwipe')
-    if pd.isna(fs) or fs is None:
-        return False
-    try:
-        t = pd.to_datetime(fs).time()
-        return t < time(hour=6)
-    except Exception:
-        return False
-
-def scenario_late_exit_after_22(row):
-    ls = row.get('LastSwipe')
-    if pd.isna(ls) or ls is None:
-        return False
-    try:
-        t = pd.to_datetime(ls).time()
-        return t >= time(hour=22)
-    except Exception:
-        return False
-
-def scenario_shift_inconsistency(row):
-    empid = row.get('EmployeeID')
-    dur = row.get('DurationMinutes') or 0
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std):
-            return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
-    return False
-
-def scenario_trending_decline(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is None or HIST_DF.empty:
-        return False
-    if 'TrendingDecline' in HIST_DF.columns:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-        if not rec.empty:
-            val = rec.iloc[0].get('TrendingDecline')
-            return str(val).strip().lower() == 'yes' if pd.notna(val) else False
-    return False
-
-def scenario_consecutive_absent_days(row):
-    if row.get('CountSwipes') == 0:
-        empid = row.get('EmployeeID')
-        if HIST_DF is not None and not HIST_DF.empty and 'ConsecAbsent3Plus' in HIST_DF.columns:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid]
-            if not rec.empty:
-                v = rec.iloc[0].get('ConsecAbsent3Plus')
-                return str(v).strip().lower() in ('yes', 'true', '1')
-        return False
-    return False
-
-def scenario_high_variance_duration(row):
-    empid = row.get('EmployeeID')
-    if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
-        rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-        med = rec.get('AvgDurationMins_median', np.nan)
-        std = rec.get('AvgDurationMins_std', np.nan)
-        if pd.notna(med) and pd.notna(std) and med > 0:
-            return (std / med) > 1.0
-    return False
-
-def scenario_short_duration_on_high_presence_days(row):
-    days_present = row.get('DaysPresentInWeek') or 0
-    dur = row.get('DurationMinutes') or 0
-    return (days_present >= 4) and (dur < 240)
-
-def scenario_swipe_overlap(row):
-    # boolean version - actual membership will be applied in run_trend_for_date
-    return False
-
-
-SCENARIOS = [
-    ("long_gap_>=90min", scenario_long_gap),
-    ("short_duration_<4h", scenario_short_duration),
-    ("coffee_badging", scenario_coffee_badging),
-    ("low_swipe_count_<=2", scenario_low_swipe_count),
-    ("single_door", scenario_single_door),
-    ("only_in", scenario_only_in),
-    ("only_out", scenario_only_out),
-    ("overtime_>=10h", scenario_overtime),
-    ("very_long_duration_>=16h", scenario_very_long_duration),
-    ("zero_swipes", scenario_zero_swipes),
-    ("unusually_high_swipes", scenario_unusually_high_swipes),
-    ("repeated_short_breaks", scenario_repeated_short_breaks),
-    ("multiple_location_same_day", scenario_multiple_location_same_day),
-    ("weekend_activity", scenario_weekend_activity),
-    ("repeated_rejection_count", scenario_repeated_rejection_count),
-    ("badge_sharing_suspected", scenario_badge_sharing_suspected),
-    ("early_arrival_before_06", scenario_early_arrival_before_06),
-    ("late_exit_after_22", scenario_late_exit_after_22),
-    ("shift_inconsistency", scenario_shift_inconsistency),
-    ("trending_decline", scenario_trending_decline),
-    ("consecutive_absent_days", scenario_consecutive_absent_days),
-    ("high_variance_duration", scenario_high_variance_duration),
-    ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days),
-    ("swipe_overlap", scenario_swipe_overlap)
-]
-
-
-def run_trend_for_date(target_date: date, outdir: str = "./outputs"):
-    logging.info("run_trend_for_date: date=%s (Pune test)", target_date)
-    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city='Pune')
-    apac = results.get('apac', {})
-    swipes = apac.get('swipes', pd.DataFrame())
-    durations = apac.get('durations', pd.DataFrame())
-
-    features = compute_features(swipes, durations)
-    if features.empty:
-        logging.warning("run_trend_for_date: no features computed")
-        return pd.DataFrame()
-
-    # Build badge map (Date, CardNumber) => distinct person count (badge-sharing)
-    badge_map = {}
-    if 'CardNumber' in swipes.columns and 'person_uid' in swipes.columns and 'Date' in swipes.columns:
-        tmp = swipes[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
-        if not tmp.empty:
-            grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
-            badge_map = {(row.Date, row.CardNumber): row.distinct_users for row in grouped_card.itertuples(index=False)}
-
-    # Build swipe-overlap details: map (Date, person_uid) -> set(other_person_uid)
-    swipe_overlap_map = {}
-    overlap_window_seconds = 2  # adjustable window for "simultaneous" swipes
-    if {'Door', 'LocaleMessageTime', 'person_uid', 'Date'}.issubset(swipes.columns):
-        tmp = swipes[['Door', 'LocaleMessageTime', 'person_uid', 'Date']].dropna(subset=['Door', 'LocaleMessageTime', 'person_uid'])
-        if not tmp.empty:
-            tmp = tmp.sort_values(['Door', 'LocaleMessageTime'])
-            for (d, door), g in tmp.groupby(['Date', 'Door']):
-                # list of tuples (time, uid)
-                items = list(g[['LocaleMessageTime', 'person_uid']].itertuples(index=False, name=None))
-                n = len(items)
-                j = 0
-                for i in range(n):
-                    t_i, uid_i = items[i]
-                    j = max(j, i+1)
-                    while j < n and (items[j][0] - t_i).total_seconds() <= overlap_window_seconds:
-                        uid_j = items[j][1]
-                        if uid_i != uid_j:
-                            swipe_overlap_map.setdefault((d, uid_i), set()).add(uid_j)
-                            swipe_overlap_map.setdefault((d, uid_j), set()).add(uid_i)
-                        j += 1
-
-    # Apply scenarios — special handling for badge_sharing and swipe_overlap
-    for name, fn in SCENARIOS:
-        if name == "badge_sharing_suspected":
-            def badge_fn(r):
-                card = r.get('CardNumber')
-                d = r.get('Date')
-                if pd.isna(card) or card is None:
-                    return False
-                return badge_map.get((d, card), 0) > 1
-            features[name] = features.apply(badge_fn, axis=1)
-        elif name == "swipe_overlap":
-            # boolean flag
-            def overlap_flag_fn(r):
-                d = r.get('Date')
-                uid = r.get('person_uid')
-                if pd.isna(uid) or d is None:
-                    return False
-                return (d, uid) in swipe_overlap_map
-            features[name] = features.apply(overlap_flag_fn, axis=1)
-            # create readable OverlapWith column listing other uids
-            def overlap_with_fn(r):
-                d = r.get('Date')
-                uid = r.get('person_uid')
-                if pd.isna(uid) or d is None:
-                    return None
-                others = swipe_overlap_map.get((d, uid), None)
-                if not others:
-                    return None
-                # join sorted uids
-                try:
-                    return ";".join(sorted(str(o) for o in others))
-                except Exception:
-                    return ";".join(str(o) for o in others)
-            features['OverlapWith'] = features.apply(overlap_with_fn, axis=1)
-        else:
-            features[name] = features.apply(lambda r, f=fn: bool(f(r)), axis=1)
-
-    # Create reason text
-    def reasons_for_row(r):
-        reasons = [name for name, _ in SCENARIOS if bool(r.get(name))]
-        return "; ".join(reasons) if reasons else None
-
-    features['Reasons'] = features.apply(reasons_for_row, axis=1)
-
-    # Coalesce employee name once more if merge produced weird suffixes
-    # prefer EmployeeName > ObjectName1 > EmployeeName_x/_y
-    for candidate in ('EmployeeName', 'ObjectName1', 'EmployeeName_x', 'EmployeeName_y'):
-        if candidate in features.columns and 'EmployeeName' not in features.columns:
-            features.rename(columns={candidate: 'EmployeeName'}, inplace=True)
-
-    # --- cleanup duplicate suffixed columns before saving ---
-    cols_to_drop = [c for c in features.columns if c.endswith("_x") or c.endswith("_y")]
-    if cols_to_drop:
-        for c in cols_to_drop:
-            base = c[:-2]
-            if base in features.columns:
-                try:
-                    features.drop(columns=[c], inplace=True)
-                except Exception:
-                    pass
-            else:
-                try:
-                    features.rename(columns={c: base}, inplace=True)
-                except Exception:
-                    pass
-    features = features.loc[:, ~features.columns.duplicated()]
-
-    # Ensure boolean columns are standard Python booleans (helps JSON output)
-    for col in [name for name, _ in SCENARIOS]:
-        if col in features.columns:
-            features[col] = features[col].astype(bool)
-
-    out_csv = Path(outdir) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
-    features.to_csv(out_csv, index=False)
-    logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(features))
-    return features
-
-
-if __name__ == "__main__":
-    today = datetime.now().date()
-    df = run_trend_for_date(today)
-    print("Completed; rows:", len(df))
-
-
-
-
-
-
-
-# backend/logic.py
-import pandas as pd
-import numpy as np
-import logging
-from pathlib import Path
-
-PROFILE_PATH = Path(__file__).parent / "current_analysis.csv"
-if PROFILE_PATH.exists():
-    try:
-        employee_profile = pd.read_csv(PROFILE_PATH)
-        logging.info("logic.py: loaded historical profile (%d rows)", len(employee_profile))
-    except Exception as e:
-        logging.warning("logic.py: failed to read current_analysis.csv: %s", e)
-        employee_profile = pd.DataFrame()
-else:
-    logging.warning("logic.py: current_analysis.csv not found; history-based checks will be limited.")
-    employee_profile = pd.DataFrame()
-
-def _safe_get_emp_hist(employee_id):
-    if employee_profile.empty or pd.isna(employee_id):
-        return pd.DataFrame()
-    return employee_profile[employee_profile['EmployeeID'] == employee_id]
-
-def flag_employee(row_dict):
-    employee_id = row_dict.get('EmployeeID')
-    personnel_type = row_dict.get('PersonnelType') or row_dict.get('PersonnelTypeName')
-    days_present = int(row_dict.get('DaysPresentInWeek') or 0)
-
-    logging.info("flag_employee: checking EmployeeID=%s", employee_id)
-
-    emp_hist = _safe_get_emp_hist(employee_id)
-    if emp_hist.empty:
-        return False, ["No historical trend data found"]
-
-    reasons = []
-
-    if pd.notnull(row_dict.get('InTime')) and pd.notnull(row_dict.get('OutTime')):
-        reasons.append("Coffee badging pattern detected (both InTime and OutTime present)")
-
-    if int(row_dict.get("OnlyIn", 0) or 0) == 1:
-        reasons.append("OnlyIn entry detected")
-    if int(row_dict.get("OnlyOut", 0) or 0) == 1:
-        reasons.append("OnlyOut entry detected")
-    if int(row_dict.get("SingleDoor", 0) or 0) == 1:
-        reasons.append("SingleDoor entry detected")
-
-    if personnel_type == "Employee":
-        is_defaulter = row_dict.get("Defaulter", "No")
-        if str(is_defaulter).strip().lower() == "yes":
-            reasons.append("Flagged as Defaulter by company policy")
-
-    metric_column_map = {
-        'DurationMinutes': ('AvgDurationMins_median', 'AvgDurationMins_std'),
-        'TotalSwipes': ('TotalSwipes_median', 'TotalSwipes_std')
-    }
-
-    for metric, (median_col, std_col) in metric_column_map.items():
-        try:
-            live_val = row_dict.get(metric)
-            if live_val is None or (isinstance(live_val, float) and np.isnan(live_val)):
-                reasons.append(f"{metric} missing or null in live data")
-                continue
-            if median_col in emp_hist.columns and std_col in emp_hist.columns:
-                median_val = float(emp_hist.iloc[0].get(median_col, np.nan))
-                std_val = float(emp_hist.iloc[0].get(std_col, np.nan))
-                if pd.notna(median_val) and pd.notna(std_val):
-                    buffer = 2.5 * std_val
-                    if live_val < median_val - buffer or live_val > median_val + buffer:
-                        reasons.append(f"Abnormal {metric}: {live_val} outside expected [{median_val-buffer:.1f}, {median_val+buffer:.1f}]")
-        except Exception as e:
-            reasons.append(f"Error analyzing {metric}: {e}")
-
-    try:
-        duration = float(row_dict.get('DurationMinutes') or 0)
-        if days_present < 3 and duration < 480:
-            reasons.append("Duration < 8 hours on limited office days")
-    except Exception as e:
-        reasons.append(f"Error checking duration logic: {e}")
-
-    return (len(reasons) > 0), reasons
-
-
-
-
-
-
-C:\Users\W0024618\Desktop\Trend Analysis\backend\app.py
-
-from flask import Flask, jsonify, request
-from datetime import datetime, timedelta
-from pathlib import Path
-import logging
-import pandas as pd
-import numpy as np
-
-# Try to enable CORS if available; otherwise continue without it.
-try:
-    from flask_cors import CORS
-    _HAS_CORS = True
-except Exception:
-    CORS = None
-    _HAS_CORS = False
-
-# import runner (local)
-from trend_runner import run_trend_for_date
-
-app = Flask(__name__)
-if _HAS_CORS:
-    CORS(app)
-else:
-    logging.warning("flask_cors not available; continuing without CORS. Install Flask-Cors to enable cross-origin access from browser.")
-
-logging.basicConfig(level=logging.INFO)
-
-# Resolve output directory relative to this file
-BASE_DIR = Path(__file__).parent.resolve()
-DEFAULT_OUTDIR = BASE_DIR / "outputs"
-DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
-
-
-def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
-    """
-    Return a clean JSON-serializable sample.  - drop any _x/_y duplicates and convert datetimes.
-    Important: replace NaN / NaT with None and convert numpy scalars to native Python types so
-    Flask/json can produce valid JSON.
-    """
-    if df is None or df.empty:
-        return []
-
-    # work on a copy
-    df = df.copy()
-
-    # drop _x/_y columns (prefer canonical base if present, otherwise rename _x/_y -> base)
-    cols_to_suffix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
-    if cols_to_suffix:
-        for c in cols_to_suffix:
-            base = c[:-2]
-            if base in df.columns:
-                # base exists, drop the suffixed column
-                try:
-                    df.drop(columns=[c], inplace=True)
-                except Exception:
-                    pass
-            else:
-                # rename suffixed column to base (prefer _x over _y if both present will be handled by dropping later)
-                try:
-                    df.rename(columns={c: base}, inplace=True)
-                except Exception:
-                    pass
-
-    # drop any duplicate-named columns preserving first occurrence
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    # convert known datetime columns to ISO strings (or None)
-    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
-        if dtcol in df.columns:
-            try:
-                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
-                # isoformat without timezone (consistent readable format)
-                df[dtcol] = df[dtcol].dt.strftime('%Y-%m-%dT%H:%M:%S')
-                # above returns NaN for NaT; will be converted to None below
-            except Exception:
-                # fall back to string conversion then nullify invalid
-                try:
-                    df[dtcol] = df[dtcol].astype(str)
-                except Exception:
-                    pass
-
-    # ensure all pandas / numpy NaN/NaT are replaced with Python None
-    df = df.where(pd.notnull(df), None)
-
-    # convert numpy scalar types to native Python types (e.g., numpy.int64 -> int)
-    # applymap is fine for small sample sizes
-    def _to_python_scalar(x):
-        # numpy scalar
-        if isinstance(x, np.generic):
-            try:
-                return x.item()
-            except Exception:
-                return x
-        # pandas Timestamp already converted to str above; but if any left, convert to iso string
-        if isinstance(x, pd.Timestamp):
-            try:
-                return x.to_pydatetime().isoformat()
-            except Exception:
-                return str(x)
-        return x
-
-    df = df.head(max_rows).applymap(_to_python_scalar)
-
-    # to_dict now produces JSON-serializable Python primitives (None instead of NaN)
-    return df.to_dict(orient='records')
-
-
-@app.route('/')
-def root():
-    return "Trend Analysis API — Pune test"
-
-
-@app.route('/run', methods=['GET', 'POST'])
-def run_trend():
-    """
-    /run?date=YYYY-MM-DD                 -> single date
-    /run?start=YYYY-MM-DD&end=YYYY-MM-DD -> date range inclusive
-    POST json: { "date": "..."} or { "start": "...", "end":"..." }
-    Returns summary + sample rows + list of generated files.
-    """
-    params = {}
-    if request.method == 'GET':
-        params = request.args.to_dict()
-    else:
-        if request.is_json:
-            params = request.json or {}
-
-    # parse date(s)
-    date_str = params.get('date')
-    start_str = params.get('start')
-    end_str = params.get('end')
-
-    dates = []
-    try:
-        if date_str:
-            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-            dates = [dt]
-        elif start_str and end_str:
-            s = datetime.strptime(start_str, "%Y-%m-%d").date()
-            e = datetime.strptime(end_str, "%Y-%m-%d").date()
-            if e < s:
-                return jsonify({"error":"end must be >= start"}), 400
-            cur = s
-            while cur <= e:
-                dates.append(cur)
-                cur = cur + timedelta(days=1)
-        else:
-            # default: today
-            dates = [datetime.now().date()]
-    except Exception as e:
-        return jsonify({"error": f"Invalid date format: {e}"}), 400
-
-    combined_rows = []
-    files = []
-    total_rows = 0
-    total_flagged = 0
-    samples = []
-
-    for d in dates:
-        try:
-            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
-        except Exception as e:
-            logging.exception("run_trend_for_date failed for %s", d)
-            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
-
-        csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
-        files.append(csv_path.name if csv_path.exists() else None)
-
-        if df is None or df.empty:
-            continue
-
-        # ensure Reasons column exists
-        if 'Reasons' not in df.columns:
-            df['Reasons'] = None
-
-        # count
-        total_rows += len(df)
-        total_flagged += int(df['Reasons'].notna().sum())
-
-        # sample top flagged first, else top rows
-        flagged = df[df['Reasons'].notna()]
-        sample_df = flagged.head(10) if not flagged.empty else df.head(10)
-        samples.extend(_clean_sample_df(sample_df, max_rows=10))
-
-        # keep combined rows if user wants full (we won't return full by default)
-        combined_rows.append(df)
-
-    # combine for convenience if needed
-    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
-
-    # produce response
-    resp = {
-        "start_date": dates[0].isoformat() if dates else None,
-        "end_date": dates[-1].isoformat() if dates else None,
-        "files": [f for f in files if f],
-        "rows": int(total_rows),
-        "flagged_rows": int(total_flagged),
-        "sample": samples[:20]  # limit sample size
-    }
-    return jsonify(resp)
-
-
-@app.route('/latest', methods=['GET'])
-def latest_results():
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({"error": "no outputs found"}), 404
-    latest = csvs[0]
-    try:
-        df = pd.read_csv(latest)
-    except Exception:
-        df = pd.read_csv(latest, dtype=str)
-    sample = _clean_sample_df(df, max_rows=5)
-    return jsonify({
-        "file": latest.name,
-        "rows": int(len(df)),
-        "sample": sample
-    })
-
-
-@app.route('/record', methods=['GET'])
-def get_record():
-    """
-    /record?employee_id=... or /record?person_uid=...
-    Returns matching rows from latest output (cleaned).
-    """
-    q = request.args.get('employee_id') or request.args.get('person_uid')
-    p = Path(DEFAULT_OUTDIR)
-    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
-    if not csvs:
-        return jsonify({'error':'no outputs'}), 404
-    try:
-        df = pd.read_csv(csvs[0], parse_dates=['FirstSwipe','LastSwipe'], infer_datetime_format=True)
-    except Exception:
-        df = pd.read_csv(csvs[0])
-    # clean suffixes and types
-    df_clean = pd.DataFrame(_clean_sample_df(df, max_rows=len(df)))
-    if q is None:
-        return jsonify(df_clean.head(10).to_dict(orient='records'))
-    mask = (df_clean.get('EmployeeID', '').astype(str) == str(q)) | (df_clean.get('person_uid', '').astype(str) == str(q))
-    rows = df_clean[mask]
-    if rows.empty:
-        return jsonify({'error':'not found'}), 404
-    return jsonify(rows.to_dict(orient='records'))
-
-
-if __name__ == "__main__":
-    # bind 0.0.0.0 so it is reachable on LAN (if firewall / network allows)
-    app.run(host="0.0.0.0", port=8002, debug=True)
+        function datesBetween(start, end){
+          var out = [];
+          var cur = new Date(start);
+          while(cur <= end){
+            out.push(new Date(cur));
+            cur.setDate(cur.getDate()+1);
+          }
+          return out;
+        }
+        function safeDateDisplay(val){
+          if(!val && val !== 0) return "";
+          try {
+            var d = (val instanceof Date) ? val : new Date(val);
+            if(isNaN(d.getTime())) return String(val);
+            return d.toLocaleString();
+          } catch(e) {
+            return String(val);
+          }
+        }
+        function sanitizeName(row){
+          return row.EmployeeName || row.EmployeeName_x || row.EmployeeName_y || row.person_uid || "";
+        }
+        function downloadCSV(rows, filename){
+          if(!rows || !rows.length) { alert("No rows to export"); return; }
+          var cols = Object.keys(rows[0]);
+          var lines = [cols.join(",")];
+          rows.forEach(function(r){
+            var row = cols.map(function(c){
+              var v = (r[c] === undefined || r[c] === null) ? "" : String(r[c]).replace(/\n/g,' ');
+              return JSON.stringify(v);
+            }).join(",");
+            lines.push(row);
+          });
+          var blob = new Blob([lines.join("\n")], {type:'text/csv'});
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a'); a.href = url; a.download = filename || 'export.csv'; a.click(); URL.revokeObjectURL(url);
+        }
+
+        function App(){
+          var yesterday = new Date();
+          yesterday.setDate(yesterday.getDate()-1);
+
+          const [dateFrom, setDateFrom] = useState(formatDateISO(yesterday));
+          const [dateTo, setDateTo] = useState(formatDateISO(new Date()));
+          const [loading, setLoading] = useState(false);
+          const [summary, setSummary] = useState({rows:0, flagged_rows:0, files:[], end_date:null});
+          const [rows, setRows] = useState([]);
+          const [reasonsCount, setReasonsCount] = useState({});
+          const [filterText, setFilterText] = useState("");
+          const [page, setPage] = useState(1);
+          const [selectedReason, setSelectedReason] = useState("");
+          const [modalRow, setModalRow] = useState(null);
+          const pageSize = 25;
+          const chartRef = useRef(null);
+          const chartInst = useRef(null);
+
+          useEffect(function(){
+            // load latest on mount
+            loadLatest();
+          }, []);
+
+          async function runForRange(){
+            setLoading(true);
+            setRows([]);
+            setSummary({rows:0, flagged_rows:0, files:[], end_date:null});
+            setReasonsCount({});
+            try {
+              var start = new Date(dateFrom);
+              var end = new Date(dateTo);
+              var dateList = datesBetween(start, end).map(d => formatDateISO(d));
+              var accRows = [];
+              var totalRows = 0, totalFlagged = 0, files = [];
+              for(var i=0;i<dateList.length;i++){
+                var d = dateList[i];
+                var url = API_BASE + "/run?date=" + d;
+                var r = await fetch(url, { method:'GET' });
+                if(!r.ok){
+                  var txt = await r.text();
+                  throw new Error("API returned " + r.status + ": " + txt);
+                }
+                var js = await r.json();
+                var sample = js.sample || [];
+                if(Array.isArray(sample) && sample.length) accRows = accRows.concat(sample);
+                if(typeof js.rows === 'number') totalRows += js.rows; else totalRows += (Array.isArray(sample) ? sample.length : 0);
+                totalFlagged += (js.flagged_rows || 0);
+                if(js.files) files = files.concat(js.files);
+              }
+              setRows(accRows);
+              setSummary({rows: totalRows, flagged_rows: totalFlagged, files: files, end_date: formatDateISO(new Date(dateTo))});
+              computeReasons(accRows);
+              setPage(1);
+            } catch(err){
+              alert("Error: " + err.message);
+              console.error(err);
+            } finally {
+              setLoading(false);
+            }
+          }
+
+          async function loadLatest(){
+            setLoading(true);
+            try{
+              var r = await fetch(API_BASE + "/latest");
+              if(!r.ok) throw new Error("latest failed: " + r.status);
+              var js = await r.json();
+              var sample = js.sample || [];
+              if(!Array.isArray(sample)) sample = [];
+              setRows(sample);
+              setSummary({rows: (js.rows || sample.length || 0), flagged_rows: (sample.filter(function(x){ return !!x.Reasons; }).length || 0), files:[js.file]});
+              computeReasons(sample);
+              setPage(1);
+            } catch(err){
+              alert("Error: " + err.message);
+              console.error(err);
+            } finally {
+              setLoading(false);
+            }
+          }
+
+          function computeReasons(dataRows){
+            var counts = {};
+            (dataRows || []).forEach(function(r){
+              if(!r.Reasons) return;
+              var parts = String(r.Reasons).split(";").map(function(s){ return s.trim(); }).filter(Boolean);
+              parts.forEach(function(p){ counts[p] = (counts[p] || 0) + 1; });
+            });
+            setReasonsCount(counts);
+            buildChart(counts);
+          }
+
+          function buildChart(counts){
+            var labels = Object.keys(counts).sort(function(a,b){ return counts[b] - counts[a]; });
+            var values = labels.map(function(l){ return counts[l]; });
+            var ctx = chartRef.current && chartRef.current.getContext ? chartRef.current.getContext('2d') : null;
+            if(!ctx) return;
+            try { if(chartInst.current) chartInst.current.destroy(); } catch(e){}
+            chartInst.current = new Chart(ctx, {
+              type:'bar',
+              data:{ labels: labels, datasets:[{ label:'Events', data: values, backgroundColor:'rgba(37,99,235,0.85)' }] },
+              options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, scales:{ y:{ beginAtZero:true } } }
+            });
+          }
+
+          // filtering & pagination
+          var filtered = (rows || []).filter(function(r){
+            var hay = (sanitizeName(r) + " " + (r.EmployeeID||"") + " " + (r.CardNumber||"") + " " + (r.Reasons||"")).toLowerCase();
+            var textOk = !filterText || hay.indexOf(filterText.toLowerCase()) !== -1;
+            var reasonOk = !selectedReason || (r.Reasons && ((";" + String(r.Reasons) + ";").indexOf(selectedReason) !== -1));
+            return textOk && reasonOk;
+          });
+          var totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+          var pageRows = filtered.slice((page-1)*pageSize, page*pageSize);
+
+          function exportFiltered(){
+            downloadCSV(filtered, "trend_filtered_export.csv");
+          }
+
+          // click a reason chip to filter
+          function onReasonClick(reason){
+            if(!reason) { setSelectedReason(""); return; }
+            if(selectedReason === reason) setSelectedReason(""); else setSelectedReason(reason);
+            setPage(1);
+          }
+
+          // show details modal
+          function openModal(row){
+            setModalRow(row);
+          }
+          function closeModal(){ setModalRow(null); }
+
+          // convenience counts for cards
+          var rowsCount = (summary && typeof summary.rows === 'number') ? summary.rows : (rows ? rows.length : 0);
+          var flaggedCount = (summary && typeof summary.flagged_rows === 'number') ? summary.flagged_rows : (rows ? rows.filter(function(r){ return !!r.Reasons; }).length : 0);
+          var flaggedPct = rowsCount ? Math.round((flaggedCount*100)/(rowsCount||1)) : 0;
+
+          // small helper to render overlap pill: OverlapWith field or swipe_overlap boolean
+          function renderOverlapCell(r){
+            var ov = r.OverlapWith || r.swipe_overlap || r.overlap_with || null;
+            if(ov && typeof ov === 'string'){
+              var parts = ov.split(";").map(function(s){ return s.trim(); }).filter(Boolean);
+              if(parts.length === 0) return <span className="muted">—</span>;
+              return <span className="overlap-pill" title={ov}>{parts.length} overlap</span>;
+            } else if(r.swipe_overlap === true || r.swipe_overlap === "True"){
+              return <span className="overlap-pill">overlap</span>;
+            }
+            return <span className="muted">—</span>;
+          }
+
+          return (
+            <div className="container" role="main" aria-live="polite">
+              { loading && <div className="spinner"><div style={{padding:16, background:'#fff', borderRadius:8, boxShadow:'0 4px 20px rgba(2,6,23,0.1)'}}>Loading…</div></div> }
+
+              <header>
+                <h1>Trend Analysis — Pune</h1>
+                <div className="controls">
+                  <label className="small">From</label>
+                  <input type="date" value={dateFrom} onChange={function(e){ setDateFrom(e.target.value); }} disabled={loading} />
+                  <label className="small">To</label>
+                  <input type="date" value={dateTo} onChange={function(e){ setDateTo(e.target.value); }} disabled={loading} />
+                  <button onClick={runForRange} disabled={loading}>Run (date/range)</button>
+                  <button className="secondary" onClick={loadLatest} disabled={loading}>Load latest</button>
+                  <button className="ghost" onClick={exportFiltered} disabled={loading}>Export filtered</button>
+                </div>
+              </header>
+
+              <div className="cards" aria-hidden={loading}>
+                <div className="card">
+                  <h3>{ (rowsCount !== undefined && rowsCount !== null) ? rowsCount : 0 }</h3>
+                  <p>Rows analysed</p>
+                </div>
+                <div className="card">
+                  <h3>{ (flaggedCount !== undefined && flaggedCount !== null) ? flaggedCount : 0 }</h3>
+                  <p>Flagged rows</p>
+                </div>
+                <div className="card">
+                  <h3>{ flaggedPct }%</h3>
+                  <p>Flagged rate</p>
+                </div>
+              </div>
+
+              <div style={{marginTop:12}}>
+                <strong>Top reasons (click to filter)</strong>
+                <div style={{marginTop:8}}>
+                  { Object.keys(reasonsCount).length === 0 && <span className="muted">No flags found</span> }
+                  { Object.entries(reasonsCount).sort(function(a,b){ return b[1]-a[1]; }).slice(0,18).map(function(kv){
+                      var name = kv[0], count = kv[1];
+                      var active = selectedReason === name;
+                      return <button key={name} className="chip" style={{background: active ? '#dbeafe' : undefined, border: active ? '1px solid #60a5fa' : undefined}} onClick={function(){ onReasonClick(name); }}>{name} <span style={{marginLeft:8, opacity:0.8}} className="small">({count})</span></button>;
+                  }) }
+                </div>
+              </div>
+
+              <div className="main">
+                <div className="left">
+                  <div className="chart-wrap" style={{height:260}}>
+                    <canvas ref={chartRef}></canvas>
+                  </div>
+
+                  <div className="searchbar">
+                    <input placeholder="Search name, employee id, card or reason..." value={filterText} onChange={function(e){ setFilterText(e.target.value); setPage(1); }} />
+                    <div className="muted">Showing { filtered.length } / { rows.length } rows</div>
+                  </div>
+
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Employee</th>
+                        <th className="small">ID</th>
+                        <th className="small">Card</th>
+                        <th className="small">Date</th>
+                        <th className="small">Duration</th>
+                        <th className="small">Reasons</th>
+                        <th className="small">Overlap</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      { pageRows.map(function(r, idx){
+                          var empName = sanitizeName(r);
+                          var displayDate = safeDateDisplay(r.Date || r.FirstSwipe || r.LastSwipe);
+                          var durText = r.Duration || (r.DurationMinutes ? Math.round(r.DurationMinutes) + " min" : "");
+                          return (
+                            <tr key={idx} className="row-click" onClick={function(){ openModal(r); }}>
+                              <td>{ empName || <span className="muted">—</span> }</td>
+                              <td className="small">{ r.EmployeeID || "" }</td>
+                              <td className="small">{ r.CardNumber || "" }</td>
+                              <td className="small">{ displayDate }</td>
+                              <td className="small">{ durText }</td>
+                              <td className="small">{ r.Reasons ? <span className="pill">{ r.Reasons }</span> : <span className="muted">OK</span> }</td>
+                              <td className="small">{ renderOverlapCell(r) }</td>
+                            </tr>
+                        );
+                      }) }
+                    </tbody>
+                  </table>
+
+                  <div className="pagination">
+                    <button onClick={function(){ setPage(function(p){ return Math.max(1,p-1); }); }} disabled={page<=1}>Prev</button>
+                    <div className="muted">Page { page } / { totalPages }</div>
+                    <button onClick={function(){ setPage(function(p){ return Math.min(totalPages,p+1); }); }} disabled={page>=totalPages}>Next</button>
+                  </div>
+                </div>
+
+                <aside className="right">
+                  <div style={{marginBottom:12}}>
+                    <strong>Files:</strong>
+                    <div className="muted">{ (summary.files || []).join(", ") }</div>
+                  </div>
+
+                  <div style={{marginBottom:12}}>
+                    <strong>Top reasons summary</strong>
+                    <ul>
+                      { Object.entries(reasonsCount).sort(function(a,b){ return b[1]-a[1]; }).slice(0,10).map(function(kv){
+                          return <li key={kv[0]}><b>{kv[1]}</b> — <span className="small">{kv[0]}</span></li>;
+                        }) }
+                      { Object.keys(reasonsCount).length === 0 && <div className="muted">No flags found</div> }
+                    </ul>
+                  </div>
+
+                  <div>
+                    <strong>Help</strong>
+                    <div className="small muted" style={{marginTop:6}}>
+                      - Click <b>Run</b> to trigger analysis for chosen date(s).<br/>
+                      - Range calls `/run?date=YYYY-MM-DD` for each date in the range sequentially.<br/>
+                      - Overlap participants are visible inside a row's JSON details (click the row).<br/>
+                      - Export filtered rows with the Export button.
+                    </div>
+                  </div>
+
+                  <div style={{marginTop:12}}>
+                    <strong>Raw JSON preview (first row)</strong>
+                    <pre>{ rows[0] ? JSON.stringify(rows[0], null, 2) : "No sample yet" }</pre>
+                  </div>
+                </aside>
+              </div>
+
+              { modalRow &&
+                <div className="modal" onClick={closeModal}>
+                  <div className="modal-inner" onClick={function(e){ e.stopPropagation(); }}>
+                    <button className="close-btn" onClick={closeModal}>Close</button>
+                    <h3>Details</h3>
+                    <div style={{marginTop:8}}>
+                      <strong>Name:</strong> { sanitizeName(modalRow) } <br/>
+                      <strong>EmployeeID:</strong> { modalRow.EmployeeID || "—" } <br/>
+                      <strong>Card:</strong> { modalRow.CardNumber || "—" } <br/>
+                      <strong>Date:</strong> { safeDateDisplay(modalRow.Date || modalRow.FirstSwipe) } <br/>
+                      <strong>Duration:</strong> { modalRow.Duration || (modalRow.DurationMinutes ? Math.round(modalRow.DurationMinutes) + " min" : "—") } <br/>
+                      <strong>Reasons:</strong> { modalRow.Reasons || "—" } <br/>
+                      <strong>OverlapWith:</strong> { modalRow.OverlapWith || modalRow.swipe_overlap || "—" } <br/>
+                    </div>
+                    <hr/>
+                    <h4>Full payload</h4>
+                    <pre>{ JSON.stringify(modalRow, null, 2) }</pre>
+                  </div>
+                </div>
+              }
+
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+      })();
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+
 
 
 
