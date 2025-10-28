@@ -1,3 +1,398 @@
+# --- insert these helper functions near top of file (after _normalize_id_val) ---
+
+import re
+
+_GUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$')
+
+def _looks_like_guid(s: object) -> bool:
+    """Return True if s looks like a GUID/UUID string."""
+    if s is None:
+        return False
+    try:
+        st = str(s).strip()
+        if not st:
+            return False
+        return bool(_GUID_RE.match(st))
+    except Exception:
+        return False
+
+def _looks_like_name(s: object) -> bool:
+    """Heuristic: treat as a plausible human name if it contains letters and not a GUID."""
+    if s is None:
+        return False
+    try:
+        st = str(s).strip()
+        if not st:
+            return False
+        # reject GUIDs and obviously numeric ids
+        if _looks_like_guid(st):
+            return False
+        # require at least one alphabetic character
+        return bool(re.search(r'[A-Za-z]', st))
+    except Exception:
+        return False
+
+def _pick_first_non_guid_value(series):
+    """Pick the first non-null, non-GUID value from a pandas Series (as str) or None."""
+    for v in series:
+        if v is None:
+            continue
+        try:
+            s = str(v).strip()
+            if not s:
+                continue
+            if _looks_like_guid(s):
+                continue
+            return s
+        except Exception:
+            continue
+    return None
+
+# --- replace compute_features with this implementation ---
+
+def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per person-per-date features used by scenarios.
+    Returns DataFrame per (person_uid, Date) with feature columns and normalized IDs/names.
+    This implementation follows the duration_report column conventions and avoids
+    treating GUIDs as EmployeeName/EmployeeID.
+    """
+    if swipes is None or swipes.empty:
+        return pd.DataFrame()
+
+    sw = swipes.copy()
+
+    # Build lowercase->actual column map for flexible column detection
+    cols_lower = {c.lower(): c for c in sw.columns}
+
+    # detect time column
+    time_candidates = ['localemessagetime', 'messagetime', 'timestamp', 'time', 'localemessagetimestamp']
+    found_time_col = next((cols_lower[c] for c in time_candidates if c in cols_lower), None)
+    if found_time_col:
+        sw['LocaleMessageTime'] = pd.to_datetime(sw[found_time_col], errors='coerce')
+        sw['Date'] = sw['LocaleMessageTime'].dt.date
+    else:
+        if 'Date' in sw.columns:
+            sw['Date'] = pd.to_datetime(sw['Date'], errors='coerce').dt.date
+        else:
+            sw['Date'] = None
+
+    # identify likely name, empid, card, door and direction columns (prefer canonical names)
+    name_candidates = ['employeename', 'objectname1', 'objectname', 'employee_name', 'name', 'object_name']
+    employeeid_candidates = ['employeeid', 'employeeidentity', 'employee_id', 'empid', 'id']
+    card_candidates = ['cardnumber', 'card', 'card_no']
+    door_candidates = ['door', 'doorname', 'door_name']
+    direction_candidates = ['direction', 'directionname', 'direction_name']
+
+    name_col = next((cols_lower[c] for c in name_candidates if c in cols_lower), None)
+    empid_col = next((cols_lower[c] for c in employeeid_candidates if c in cols_lower), None)
+    card_col = next((cols_lower[c] for c in card_candidates if c in cols_lower), None)
+    door_col = next((cols_lower[c] for c in door_candidates if c in cols_lower), None)
+    dir_col = next((cols_lower[c] for c in direction_candidates if c in cols_lower), None)
+
+    # Filter personnel types: prefer PersonnelTypeName, fallback to PersonnelType
+    if 'PersonnelTypeName' in sw.columns:
+        sw = sw[sw['PersonnelTypeName'].isin(['Employee', 'Terminated Personnel'])]
+    elif 'PersonnelType' in sw.columns:
+        sw = sw[sw['PersonnelType'].isin(['Employee', 'Terminated Personnel'])]
+    # else keep everything
+
+    if sw.empty:
+        logging.info("compute_features: no rows after PersonnelType filter")
+        return pd.DataFrame()
+
+    # ensure stable person_uid (canonical) - match duration_report logic: prefer EmployeeIdentity, but keep current canonical approach
+    if 'person_uid' not in sw.columns:
+        def make_person_uid_local(r):
+            # prefer canonical EmployeeID (normalized) then EmployeeIdentity then EmployeeName
+            empid_val = None
+            if empid_col and empid_col in r and pd.notna(r.get(empid_col)):
+                empid_val = r.get(empid_col)
+            elif 'EmployeeID' in r and pd.notna(r.get('EmployeeID')):
+                empid_val = r.get('EmployeeID')
+
+            empident_val = r.get('EmployeeIdentity') if 'EmployeeIdentity' in r else None
+            name_val = None
+            if name_col and name_col in r:
+                name_val = r.get(name_col)
+            elif 'EmployeeName' in r:
+                name_val = r.get('EmployeeName')
+            elif 'ObjectName1' in r:
+                name_val = r.get('ObjectName1')
+
+            return _canonical_person_uid({
+                'EmployeeID': empid_val,
+                'EmployeeIdentity': empident_val,
+                'EmployeeName': name_val
+            })
+        sw['person_uid'] = sw.apply(make_person_uid_local, axis=1)
+
+    # selection columns for aggregation: include discovered columns
+    sel_cols = set(['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
+                    'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
+                    'EmployeeIdentity'])
+    if name_col:
+        sel_cols.add(name_col)
+    if empid_col:
+        sel_cols.add(empid_col)
+    if card_col:
+        sel_cols.add(card_col)
+    if door_col:
+        sel_cols.add(door_col)
+    if dir_col:
+        sel_cols.add(dir_col)
+    sel_cols = [c for c in sel_cols if c in sw.columns]
+
+    def agg_swipe_group(g):
+        times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
+        gaps = []
+        short_gap_count = 0
+        for i in range(1, len(times)):
+            s = (times[i] - times[i-1]).total_seconds()
+            gaps.append(s)
+            if s <= 5*60:
+                short_gap_count += 1
+        max_gap = int(max(gaps)) if gaps else 0
+
+        # Direction counts (default to column names present)
+        in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
+        out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
+        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+
+        # pick first non-guid card number if present
+        card_numbers = []
+        if card_col and card_col in g.columns:
+            card_numbers = list(pd.unique(g[card_col].dropna()))
+        elif 'CardNumber' in g.columns:
+            card_numbers = list(pd.unique(g['CardNumber'].dropna()))
+        card_number = _normalize_id_val(card_numbers[0]) if card_numbers else None
+
+        # stable id/name from the group using discovered columns first
+        employee_id = None
+        employee_name = None
+        employee_identity = None
+        personnel_type = None
+
+        # Employee ID: prefer empid_col then EmployeeID column; ensure not GUID
+        if empid_col and empid_col in g.columns:
+            vals = g[empid_col].dropna().astype(str).map(lambda x: x.strip())
+            employee_id = _pick_first_non_guid_value(vals)
+            if employee_id is None:
+                # still try normalization: numeric-like string
+                if not vals.empty:
+                    employee_id = _normalize_id_val(vals.iloc[0])
+                    # if normalized id looks like a GUID, drop it
+                    if employee_id and _looks_like_guid(employee_id):
+                        employee_id = None
+        elif 'EmployeeID' in g.columns:
+            vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
+            employee_id = _pick_first_non_guid_value(vals)
+            if employee_id is None and not vals.empty:
+                employee_id = _normalize_id_val(vals.iloc[0])
+                if employee_id and _looks_like_guid(employee_id):
+                    employee_id = None
+
+        # Employee identity (raw GUID) - keep as identity but do not use as EmployeeID
+        if 'EmployeeIdentity' in g.columns:
+            vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
+            if not vals.empty:
+                employee_identity = vals.iloc[0]  # GUID is okay here
+
+        # Employee name: prefer discovered name columns but skip GUID-like values
+        candidate_name_vals = None
+        if name_col and name_col in g.columns:
+            candidate_name_vals = g[name_col].dropna().astype(str).map(lambda x: x.strip())
+        elif 'EmployeeName' in g.columns:
+            candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
+        elif 'ObjectName1' in g.columns:
+            candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+
+        if candidate_name_vals is not None and not candidate_name_vals.empty:
+            # pick first value that looks like a real name (not GUID)
+            employee_name = _pick_first_non_guid_value(candidate_name_vals)
+            # final fallback: if candidate has alphabetic characters, even if it's not first non-guid, accept it
+            if employee_name is None:
+                for v in candidate_name_vals:
+                    if _looks_like_name(v):
+                        employee_name = str(v).strip()
+                        break
+
+        # personnel type
+        if 'PersonnelTypeName' in g.columns:
+            vals = g['PersonnelTypeName'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        elif 'PersonnelType' in g.columns:
+            vals = g['PersonnelType'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+
+        # First/Last swipe times
+        first_swipe = None
+        last_swipe = None
+        if times:
+            first_swipe = times[0]
+            last_swipe = times[-1]
+
+        return pd.Series({
+            'CountSwipes': int(len(g)),
+            'MaxSwipeGapSeconds': max_gap,
+            'ShortGapCount': int(short_gap_count),
+            'InCount': in_count,
+            'OutCount': out_count,
+            'UniqueDoors': unique_doors,
+            'UniqueLocations': unique_locations,
+            'RejectionCount': rejection_count,
+            'CardNumber': card_number,
+            'EmployeeID': employee_id,
+            'EmployeeIdentity': employee_identity,
+            'EmployeeName': employee_name,
+            'PersonnelType': personnel_type,
+            'FirstSwipe': first_swipe,
+            'LastSwipe': last_swipe
+        })
+
+    grouped = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])
+    grouped = grouped.apply(agg_swipe_group).reset_index()
+
+    dur = pd.DataFrame() if durations is None else durations.copy()
+    if not dur.empty and 'Date' in dur.columns:
+        dur['Date'] = pd.to_datetime(dur['Date'], errors='coerce').dt.date
+
+    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
+
+    # coalesce helpers (ensure column existence)
+    def ensure_col(df, col, default=None):
+        if col not in df.columns:
+            df[col] = default
+
+    ensure_col(merged, 'DurationSeconds', 0)
+    ensure_col(merged, 'FirstSwipe', pd.NaT)
+    ensure_col(merged, 'LastSwipe', pd.NaT)
+    ensure_col(merged, 'CountSwipes', 0)
+    ensure_col(merged, 'MaxSwipeGapSeconds', 0)
+    ensure_col(merged, 'ShortGapCount', 0)
+    ensure_col(merged, 'RejectionCount', 0)
+    ensure_col(merged, 'UniqueLocations', 0)
+    ensure_col(merged, 'UniqueDoors', 0)
+    ensure_col(merged, 'CardNumber', None)
+    ensure_col(merged, 'EmployeeID', None)
+    ensure_col(merged, 'EmployeeName', None)
+    ensure_col(merged, 'EmployeeIdentity', None)
+    ensure_col(merged, 'PersonnelType', None)
+
+    # If EmployeeName is missing or a GUID, try to get a better name from durations (durations typically has EmployeeName)
+    if 'EmployeeName' in merged.columns and 'EmployeeName_y' in merged.columns:
+        # if merged has suffix columns from merge, prefer the durations value if the grouped employee name is empty or GUID-like
+        def choose_best_name(row):
+            gname = row.get('EmployeeName')
+            dname = row.get('EmployeeName_y')
+            if _looks_like_name(gname):
+                return str(gname).strip()
+            if _looks_like_name(dname):
+                return str(dname).strip()
+            # if grouped name exists but is GUID-like, prefer duration's name if available
+            if gname and not _looks_like_guid(gname):
+                return str(gname).strip()
+            if dname:
+                return str(dname).strip()
+            return None
+        merged['EmployeeName'] = merged.apply(choose_best_name, axis=1)
+        # drop suffix if present
+        try:
+            merged.drop(columns=[c for c in merged.columns if c.endswith('_y') or c.endswith('_x')], inplace=True)
+        except Exception:
+            pass
+    else:
+        # fallback: try to use 'EmployeeName' from durations if our EmployeeName is missing/invalid
+        if 'EmployeeName' in merged.columns and not dur.empty:
+            def fill_name_from_dur(row):
+                gname = row.get('EmployeeName')
+                if _looks_like_name(gname):
+                    return gname
+                # try find matching row in durations (person_uid + date) - already merged, so duration name may be in other columns
+                for cand in ('EmployeeName', 'EmployeeName_y', 'EmployeeName_x'):
+                    if cand in row and _looks_like_name(row[cand]):
+                        return row[cand]
+                return None
+            merged['EmployeeName'] = merged.apply(fill_name_from_dur, axis=1)
+
+    # numeric normalization for EmployeeID: ensure not GUIDs, convert floats like '320172.0' -> '320172'
+    def normalize_empid(v):
+        if v is None:
+            return None
+        try:
+            s = str(v).strip()
+            if s == '' or s.lower() == 'nan':
+                return None
+            if _looks_like_guid(s):
+                return None
+            # strip .0 integer floats
+            try:
+                if '.' in s:
+                    f = float(s)
+                    if math.isfinite(f) and f.is_integer():
+                        return str(int(f))
+            except Exception:
+                pass
+            return s
+        except Exception:
+            return None
+
+    merged['EmployeeID'] = merged['EmployeeID'].apply(normalize_empid)
+
+    # numeric normalization
+    merged['DurationSeconds'] = pd.to_numeric(merged['DurationSeconds'], errors='coerce').fillna(0).astype(float)
+    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
+    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
+    merged['MaxSwipeGapSeconds'] = merged['MaxSwipeGapSeconds'].fillna(0).astype(int)
+    merged['ShortGapCount'] = merged['ShortGapCount'].fillna(0).astype(int)
+    merged['RejectionCount'] = merged['RejectionCount'].fillna(0).astype(int)
+    merged['UniqueLocations'] = merged['UniqueLocations'].fillna(0).astype(int)
+    merged['UniqueDoors'] = merged['UniqueDoors'].fillna(0).astype(int)
+
+    # ensure FirstSwipe/LastSwipe are datetimes
+    for col in ['FirstSwipe', 'LastSwipe']:
+        try:
+            merged[col] = pd.to_datetime(merged[col], errors='coerce')
+        except Exception:
+            merged[col] = pd.NaT
+
+    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
+    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
+    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
+
+    # EmpHistoryPresent
+    hist_map = {}
+    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
+        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
+    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: _normalize_id_val(x) in hist_map if pd.notna(x) else False)
+
+    # normalize string columns for safe downstream use; EmployeeName keep as readable-only
+    for c in ['EmployeeID', 'CardNumber', 'EmployeeIdentity', 'PersonnelType']:
+        if c in merged.columns:
+            merged[c] = merged[c].apply(lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v))) else str(v).strip())
+
+    # EmployeeName: keep None if empty; otherwise string. Avoid returning GUID as name.
+    if 'EmployeeName' in merged.columns:
+        merged['EmployeeName'] = merged['EmployeeName'].apply(lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v)) or _looks_like_guid(v)) else str(v).strip())
+
+    return merged
+
+
+
+
+
+
+
+
+
+
+
+
+
 Still Employee ID and Employee name are Null
 
 Refer Duration page line by line and fix Employee Name and EMployee ID logic strickly.....
