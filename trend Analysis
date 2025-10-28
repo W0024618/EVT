@@ -1,3 +1,219 @@
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.json or {}
+
+    date_str = params.get('date')
+    start_str = params.get('start')
+    end_str = params.get('end')
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            dates = [datetime.now().date()]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    combined_rows = []
+    files = []
+    samples = []
+
+    for d in dates:
+        try:
+            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+        if df is None or df.empty:
+            continue
+
+        # ensure Reasons column exists
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        # Save a small sample (prefer flagged rows)
+        flagged = df[df['Reasons'].notna()]
+        sample_df = flagged.head(10) if not flagged.empty else df.head(10)
+        samples.extend(_clean_sample_df(sample_df, max_rows=10))
+
+        combined_rows.append(df)
+
+    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+
+    # --- NEW: compute unique persons analysed and unique flagged persons ---
+    # Determine best identifier column to count unique persons
+    id_col = None
+    for candidate in ('person_uid', 'EmployeeID', 'EmployeeIdentity'):
+        if candidate in combined_df.columns:
+            id_col = candidate
+            break
+
+    if id_col is None:
+        # fallback: each row is treated as unique person instance
+        analysis_count = int(len(combined_df))
+        flagged_count = int(combined_df['Reasons'].notna().sum()) if 'Reasons' in combined_df.columns else 0
+    else:
+        # normalize to strings for counting (handle numbers / NaN)
+        ids = combined_df[id_col].astype(str).replace({'nan': ''})
+        # count non-empty unique ids
+        unique_ids = ids[ids.str.strip() != ''].unique()
+        analysis_count = int(len(unique_ids))
+
+        # flagged unique count: persons who have any non-null Reasons
+        if 'Reasons' in combined_df.columns:
+            flagged_df = combined_df[combined_df['Reasons'].notna()]
+            flagged_ids = flagged_df[id_col].astype(str).replace({'nan': ''})
+            flagged_count = int(len(flagged_ids[flagged_ids.str.strip() != ''].unique()))
+        else:
+            flagged_count = 0
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "files": files,
+        # keep legacy totals too (total aggregated rows across days)
+        "aggregated_rows_total": int(len(combined_df)),
+        # new: unique persons analysed and unique persons flagged
+        "rows": analysis_count,            # number of unique people analysed
+        "flagged_rows": flagged_count,     # number of unique people flagged
+        "sample": samples[:20]
+    }
+    return jsonify(resp)
+
+
+
+
+
+
+
+
+
+@app.route('/record', methods=['GET'])
+def get_record():
+    """
+    /record?employee_id=... or /record?person_uid=...
+    Returns matching aggregated trend rows and the raw swipe CSV filename(s) (if present) for evidence.
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': []}), 200
+
+    # read latest aggregated CSV (keep original types for robust lookup)
+    latest = csvs[0]
+    try:
+        df = pd.read_csv(latest, parse_dates=['FirstSwipe', 'LastSwipe'], infer_datetime_format=True)
+    except Exception:
+        df = pd.read_csv(latest, dtype=str)
+
+    # If no query provided, return top N cleaned aggregated rows (like before)
+    if q is None:
+        cleaned = _clean_sample_df(df, max_rows=10)
+        return jsonify({'aggregated_rows': cleaned, 'raw_swipe_files': []}), 200
+
+    # normalize lookup key to string (strip decimals etc)
+    q_str = str(q).strip()
+    # make helper series for EmployeeID and person_uid as strings
+    def normalize_series(s):
+        return s.fillna('').astype(str).str.strip()
+
+    found_mask = pd.Series(False, index=df.index)
+
+    if 'EmployeeID' in df.columns:
+        emp_series = normalize_series(df['EmployeeID'])
+        found_mask = found_mask | (emp_series == q_str)
+
+    if 'person_uid' in df.columns:
+        uid_series = normalize_series(df['person_uid'])
+        found_mask = found_mask | (uid_series == q_str)
+
+    # also attempt numeric equivalence: e.g. q=320172 matches 320172.0
+    if not found_mask.any():
+        try:
+            q_numeric = float(q_str)
+            if 'EmployeeID' in df.columns:
+                found_mask = found_mask | (pd.to_numeric(df['EmployeeID'], errors='coerce') == q_numeric)
+        except Exception:
+            pass
+
+    matched = df[found_mask]
+    if matched.empty:
+        # Return empty arrays (200) instead of 404 to avoid frontend fetch errors.
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': []}), 200
+
+    # CLEAN the matched rows for JSON output
+    cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+
+    # find corresponding raw swipe files for the dates present in matched rows
+    raw_files = []
+    # use matched rows Date column where possible; normalize to YYYYMMDD
+    date_vals = set()
+    if 'Date' in matched.columns:
+        try:
+            date_vals.update([ str(pd.to_datetime(d).date())[:10] for d in matched['Date'].dropna().unique() ])
+        except Exception:
+            # fallback: try to parse FirstSwipe if Date missing
+            pass
+    # fallback: use FirstSwipe/LastSwipe columns if Date not present
+    if not date_vals:
+        for col in ('FirstSwipe', 'LastSwipe'):
+            if col in matched.columns:
+                try:
+                    vals = pd.to_datetime(matched[col].dropna(), errors='coerce')
+                    date_vals.update([ str(d.date())[:10] for d in vals if not pd.isna(d) ])
+                except Exception:
+                    pass
+
+    for d in date_vals:
+        try:
+            dd = d[:10]
+            raw_name = f"swipes_pune_{dd.replace('-','')}.csv"
+            fp = DEFAULT_OUTDIR / raw_name
+            if fp.exists():
+                raw_files.append(raw_name)
+        except Exception:
+            pass
+
+    return jsonify({
+        "aggregated_rows": cleaned_matched,
+        "raw_swipe_files": raw_files
+    }), 200
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 lets Fix API Responce here 
 http://10.199.45.239:8002/run?date=2025-10-08
 {
