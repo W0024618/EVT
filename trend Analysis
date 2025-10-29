@@ -1,3 +1,872 @@
+# ----------------- START OF FILE: app.py -----------------
+from flask import Flask, jsonify, request, send_from_directory
+from datetime import datetime, timedelta, date
+from pathlib import Path
+import logging
+import pandas as pd
+import numpy as np
+import joblib
+import math
+import re
+
+from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR
+
+MODELS_DIR = Path(__file__).parent / "models"
+_loaded_models = {}
+
+def load_model(name):
+    if name in _loaded_models:
+        return _loaded_models[name]
+    p = MODELS_DIR / f"{name}.joblib"
+    if not p.exists():
+        return None
+    data = joblib.load(p)
+    _loaded_models[name] = data
+    return data
+
+# Try to enable CORS
+try:
+    from flask_cors import CORS
+    has_cors = True
+except Exception:
+    CORS = None
+    has_cors = False
+
+app = Flask(__name__, static_folder=None)
+if has_cors:
+    CORS(app)
+else:
+    logging.warning("flask_cors not available; continuing without CORS.")
+
+logging.basicConfig(level=logging.INFO)
+
+BASE_DIR = Path(__file__).parent.resolve()
+DEFAULT_OUTDIR = BASE_DIR / "outputs"
+DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+
+def _to_python_scalar(x):
+    """
+    Convert numpy/pandas scalar types to built-in Python types and
+    convert NaN-like values to None so JSON is safe.
+    """
+    try:
+        import pandas as _pd
+        if isinstance(x, _pd.Timestamp):
+            return x.to_pydatetime().isoformat()
+    except Exception:
+        pass
+
+    try:
+        import numpy as _np
+        if isinstance(x, _np.generic):
+            v = x.item()
+            if isinstance(v, float) and _np.isnan(v):
+                return None
+            return v
+    except Exception:
+        pass
+
+    try:
+        if isinstance(x, float) and math.isnan(x):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(x, (datetime,)):
+        return x.isoformat()
+    if isinstance(x, (bool, int, str, type(None), float)):
+        # convert floats NaN handled above
+        return x
+    try:
+        # fallback to string
+        return str(x)
+    except Exception:
+        return None
+
+
+_uuid_like_re = re.compile(r'^[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}$')
+
+def _looks_like_guid(s):
+    try:
+        if not s or not isinstance(s, str):
+            return False
+        s = s.strip()
+        return bool(_uuid_like_re.match(s)) or s.startswith('name:') or s.startswith('emp:') or s.startswith('uid:')
+    except Exception:
+        return False
+
+
+# Placeholder tokens (keep consistent with trend_runner expectations)
+_PLACEHOLDER_STRS = set(['', 'nan', 'na', 'n/a', '-', '—', '–', 'none', 'null'])
+
+def _is_placeholder_str(s: object) -> bool:
+    try:
+        if s is None:
+            return True
+        st = str(s).strip().lower()
+        return st in _PLACEHOLDER_STRS
+    except Exception:
+        return False
+
+
+_CARD_XML_RE = re.compile(r'<Card>([^<]+)</Card>', re.IGNORECASE | re.DOTALL)
+def _extract_card_from_xml_text(txt):
+    try:
+        if not txt or not isinstance(txt, str):
+            return None
+        m = _CARD_XML_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r'CHUID.*?Card.*?[:=]\s*([0-9A-Za-z\-\_]+)', txt, re.IGNORECASE | re.DOTALL)
+        if m2:
+            return m2.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_field_from_record(record: dict, candidate_tokens: list):
+    """
+    Search a single row `record` (dict) for likely columns listed in candidate_tokens.
+    Return first non-placeholder value found (converted to Python scalar), else None.
+
+    This helper is used to prefer the schema columns you specified:
+      - EmployeeID: Int1 (ACVSCore.Access.Personnel.Int1)
+      - CardNumber: CardNumber (ACVSCore.Access.Credential.CardNumber)
+    but it will also look for common alternates (Text12, CHUID, Card, etc.).
+    """
+    if record is None:
+        return None
+
+    # 1) exact key matches (case-sensitive & common casing)
+    for key in candidate_tokens:
+        if key in record:
+            v = record.get(key)
+            if v is None:
+                continue
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            sval = str(v).strip()
+            if sval and not _is_placeholder_str(sval):
+                return _to_python_scalar(v)
+
+    # 2) case-insensitive contains match
+    lower_keys = {k.lower(): k for k in record.keys()}
+    for tok in candidate_tokens:
+        tok_l = tok.lower()
+        for lk, orig_key in lower_keys.items():
+            if tok_l in lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                if isinstance(v, float) and math.isnan(v):
+                    continue
+                sval = str(v).strip()
+                if sval and not _is_placeholder_str(sval):
+                    return _to_python_scalar(v)
+
+    # 3) xml / value parsing fallback for CardNumber
+    # if candidate_tokens refers to Card-like tokens, try parse xml-like fields
+    card_like = any(tok.lower() in ('cardnumber', 'chuid', 'card') for tok in candidate_tokens)
+    if card_like:
+        for lk, orig_key in lower_keys.items():
+            if 'xml' in lk or 'xmlmessage' in lk or 'xml_msg' in lk or 'msg' in lk or 'value' == lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                try:
+                    txt = str(v)
+                    extracted = _extract_card_from_xml_text(txt)
+                    if extracted and not _is_placeholder_str(extracted):
+                        return _to_python_scalar(extracted)
+                except Exception:
+                    continue
+
+    # 4) final fallback: first non-placeholder value (avoid GUID-like values only if caller expects human id)
+    for k, v in record.items():
+        if v is None:
+            continue
+        if isinstance(v, float) and math.isnan(v):
+            continue
+        sval = str(v).strip()
+        if sval and not _is_placeholder_str(sval):
+            return _to_python_scalar(v)
+
+    return None
+
+
+def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
+    """
+    Clean a dataframe for JSON output (convert NaN -> None, pandas types -> native, format datetimes).
+    Also ensure EmployeeName fallback uses EmployeeID first and avoid showing GUIDs as names.
+
+    Enhanced to use schema hints:
+      - Prefer Int1 for EmployeeID (Personnel.Int1).
+      - Prefer CardNumber (Credential.CardNumber) for CardNumber.
+      - Explicitly reject GUID-like values for EmployeeID/CardNumber.
+    """
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+
+    # remove duplicate suffix columns
+    cols_to_fix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    for c in cols_to_fix:
+        base = c[:-2]
+        if base in df.columns:
+            try:
+                df.drop(columns=[c], inplace=True)
+            except Exception:
+                pass
+        else:
+            try:
+                df.rename(columns={c: base}, inplace=True)
+            except Exception:
+                pass
+
+    # Date normalization
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            df['Date'] = df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+        except Exception:
+            pass
+
+    # Datetime columns to ISO strings
+    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
+        if dtcol in df.columns:
+            try:
+                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
+                df[dtcol] = df[dtcol].apply(lambda t: t.to_pydatetime().isoformat() if pd.notna(t) else None)
+            except Exception:
+                try:
+                    df[dtcol] = df[dtcol].astype(str).replace('NaT', None)
+                except Exception:
+                    pass
+
+    # Replace NaN/inf -> None
+    df = df.where(pd.notnull(df), None)
+
+    # Convert records to safe Python types
+    rows = df.head(max_rows).to_dict(orient='records')
+    cleaned = []
+    for r in rows:
+        out = {}
+        for k, v in r.items():
+            out[k] = _to_python_scalar(v)
+
+        # Typical fields
+        emp_name = out.get('EmployeeName')
+        emp_id = out.get('EmployeeID') or out.get('EmployeeIdentity')
+        person_uid = out.get('person_uid')
+
+        # ----- Schema-aware fallback resolution -----
+        # Prefer Personnel.Int1 as EmployeeID when missing (do NOT use EmployeeIdentity/person_uid)
+        if not emp_id:
+            emp_tokens = ['Int1', 'Text12', 'EmployeeID', 'empid', 'id']
+            resolved_emp = _resolve_field_from_record(r, emp_tokens)
+            if resolved_emp is not None:
+                try:
+                    s = str(resolved_emp).strip()
+                    # remove trailing .0 for floats
+                    if '.' in s:
+                        f = float(s)
+                        if math.isfinite(f) and f.is_integer():
+                            s = str(int(f))
+                    # If the resolved value looks like a GUID, do NOT use it as EmployeeID
+                    if _looks_like_guid(s):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = s
+                        emp_id = s
+                except Exception:
+                    if _looks_like_guid(resolved_emp):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = resolved_emp
+                        emp_id = resolved_emp
+
+        # Prefer Credential.CardNumber / CHUID / Card as CardNumber when missing — reject GUIDs/placeholders
+        if out.get('CardNumber') in (None, '', 'nan'):
+            card_tokens = ['CardNumber', 'CHUID', 'Card', 'card_no', 'cardnum']
+            resolved_card = _resolve_field_from_record(r, card_tokens)
+            if resolved_card is not None:
+                try:
+                    cs = str(resolved_card).strip()
+                    if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                        out['CardNumber'] = None
+                    else:
+                        out['CardNumber'] = cs
+                except Exception:
+                    out['CardNumber'] = None
+
+        # final safety: ensure EmployeeID/CardNumber are not GUID-like tokens
+        if 'EmployeeID' in out and isinstance(out['EmployeeID'], str) and _looks_like_guid(out['EmployeeID']):
+            out['EmployeeID'] = None
+        if 'CardNumber' in out and isinstance(out['CardNumber'], str) and _looks_like_guid(out['CardNumber']):
+            out['CardNumber'] = None
+
+        # If EmployeeName empty or looks like a GUID, prefer EmployeeID (human id) over GUIDs
+        if (emp_name in (None, '', 'nan')) or (isinstance(emp_name, str) and _looks_like_guid(emp_name)):
+            if emp_id not in (None, '', 'nan') and not _looks_like_guid(emp_id):
+                out['EmployeeName'] = str(emp_id)
+            else:
+                out['EmployeeName'] = None
+
+        cleaned.append(out)
+    return cleaned
+
+
+@app.route('/')
+def root():
+    return "Trend Analysis API — Pune test"
+
+
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.json or {}
+
+    date_str = params.get('date')
+    start_str = params.get('start')
+    end_str = params.get('end')
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            dates = [datetime.now().date()]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    combined_rows = []
+    files = []
+    samples = []
+
+    for d in dates:
+        try:
+            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+        if df is None or df.empty:
+            continue
+
+        # Ensure IsFlagged exists; Reasons only when flagged
+        if 'IsFlagged' not in df.columns:
+            df['IsFlagged'] = False
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        # Prefer sample of flagged rows (makes QA easier); else generic sample
+        flagged = df[df['IsFlagged'] == True]
+        sample_df = flagged.head(10) if not flagged.empty else df.head(10)
+        samples.extend(_clean_sample_df(sample_df, max_rows=10))
+
+        combined_rows.append(df)
+
+    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+
+    # Determine best identifier column to count unique persons (priority)
+    id_candidates = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'Int1']
+    id_col = next((c for c in id_candidates if c in combined_df.columns), None)
+
+    def _norm_id_val(v):
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '' or s.lower() == 'nan':
+            return None
+        # convert floats like "320172.0" -> "320172"
+        try:
+            if '.' in s:
+                f = float(s)
+                if math.isfinite(f) and f.is_integer():
+                    s = str(int(f))
+        except Exception:
+            pass
+        return s
+
+    if id_col is None or combined_df.empty:
+        analysis_count = int(len(combined_df))
+        flagged_count = int(combined_df['IsFlagged'].sum()) if 'IsFlagged' in combined_df.columns else 0
+    else:
+        # if Int1 exists in combined_df, prefer it when normalizing ids
+        ids_series = combined_df[id_col].apply(_norm_id_val)
+        unique_ids = set([x for x in ids_series.unique() if x])
+        analysis_count = int(len(unique_ids))
+
+        # flagged unique persons (using IsFlagged)
+        if 'IsFlagged' in combined_df.columns:
+            flagged_series = combined_df.loc[combined_df['IsFlagged'] == True, id_col].apply(_norm_id_val)
+            flagged_unique = set([x for x in flagged_series.unique() if x])
+            flagged_count = int(len(flagged_unique))
+        else:
+            flagged_count = 0
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "files": files,
+        # legacy totals
+        "aggregated_rows_total": int(len(combined_df)),
+        # new semantics (distinct persons)
+        "rows": int(analysis_count),
+        "flagged_rows": int(flagged_count),
+        "sample": samples[:20]
+    }
+    return jsonify(resp)
+
+
+@app.route('/latest', methods=['GET'])
+def latest_results():
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({"error": "no outputs found"}), 404
+    latest = csvs[0]
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        df = pd.read_csv(latest, dtype=str)
+    sample = _clean_sample_df(df, max_rows=5)
+    return jsonify({
+        "file": latest.name,
+        "rows": int(len(df)),
+        "sample": sample
+    })
+
+
+@app.route('/record', methods=['GET'])
+def get_record():
+    """
+    /record?employee_id=... or /record?person_uid=...
+    Returns matching aggregated trend rows and filtered raw swipe rows (only for flagged persons).
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+    try:
+        latest = csvs[0]
+        try:
+            df = pd.read_csv(latest, parse_dates=['FirstSwipe','LastSwipe'], infer_datetime_format=True)
+        except Exception:
+            df = pd.read_csv(latest, dtype=str)
+    except Exception:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    if q is None:
+        cleaned = _clean_sample_df(df, max_rows=10)
+        return jsonify({'aggregated_rows': cleaned, 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    q_str = str(q).strip()
+
+    def normalize_series(s):
+        if s is None:
+            return pd.Series([None]*len(df))
+        s = s.fillna('').astype(str).str.strip()
+        def _norm_val(v):
+            if not v:
+                return ''
+            try:
+                if '.' in v:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv.is_integer():
+                        return str(int(fv))
+            except Exception:
+                pass
+            return v
+        return s.map(_norm_val)
+
+    found_mask = pd.Series(False, index=df.index)
+
+    if 'EmployeeID' in df.columns:
+        emp_series = normalize_series(df['EmployeeID'])
+        found_mask = found_mask | (emp_series == q_str)
+
+    if 'person_uid' in df.columns:
+        uid_series = normalize_series(df['person_uid'])
+        found_mask = found_mask | (uid_series == q_str)
+
+    # also check Int1 (Personnel.Int1) if present in CSV
+    if 'Int1' in df.columns and not found_mask.any():
+        int1_series = normalize_series(df['Int1'])
+        found_mask = found_mask | (int1_series == q_str)
+
+    if not found_mask.any():
+        # try numeric equivalence
+        try:
+            q_numeric = float(q_str)
+            if 'EmployeeID' in df.columns:
+                emp_numeric = pd.to_numeric(df['EmployeeID'], errors='coerce')
+                found_mask = found_mask | (emp_numeric == q_numeric)
+            if 'Int1' in df.columns and not found_mask.any():
+                int_numeric = pd.to_numeric(df['Int1'], errors='coerce')
+                found_mask = found_mask | (int_numeric == q_numeric)
+        except Exception:
+            pass
+
+    matched = df[found_mask]
+    if matched.empty:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+
+    # Resolve raw swipe file names by Date
+    raw_files = set()
+    date_vals = set()
+    if 'Date' in matched.columns:
+        try:
+            dates_parsed = pd.to_datetime(matched['Date'], errors='coerce').dropna().dt.date.unique()
+            for d in dates_parsed:
+                date_vals.add(str(d.isoformat()))
+        except Exception:
+            pass
+
+    if not date_vals:
+        for col in ('FirstSwipe', 'LastSwipe'):
+            if col in matched.columns:
+                try:
+                    vals = pd.to_datetime(matched[col], errors='coerce').dropna().dt.date.unique()
+                    for d in vals:
+                        date_vals.add(str(d.isoformat()))
+                except Exception:
+                    pass
+
+    # build filtered raw swipe rows ONLY for flagged persons
+    raw_swipes_out = []
+    # pick first matched row to decide identifiers to filter raw swipes
+    for idx, agg_row in matched.iterrows():
+        # gather the identifying values
+        person_uid = agg_row.get('person_uid') if 'person_uid' in agg_row else None
+        empid = agg_row.get('EmployeeID') if 'EmployeeID' in agg_row else None
+        # also check Int1 in aggregated row if present
+        if (not empid) and 'Int1' in agg_row:
+            empid = agg_row.get('Int1')
+        card = agg_row.get('CardNumber') if 'CardNumber' in agg_row else None
+
+        # determine date string(s) to look for raw files using Date / FirstSwipe / LastSwipe
+        dates_for_row = set()
+        if 'Date' in agg_row and pd.notna(agg_row['Date']):
+            try:
+                d = pd.to_datetime(agg_row['Date']).date()
+                dates_for_row.add(d.isoformat())
+            except Exception:
+                pass
+        for col in ('FirstSwipe','LastSwipe'):
+            if col in agg_row and pd.notna(agg_row[col]):
+                try:
+                    d = pd.to_datetime(agg_row[col]).date()
+                    dates_for_row.add(d.isoformat())
+                except Exception:
+                    pass
+
+        # only fetch raw swipe evidence when this aggregated row is flagged
+        is_flagged = bool(agg_row.get('IsFlagged', False))
+        if not is_flagged:
+            continue
+
+        for d in dates_for_row:
+            try:
+                dd = d[:10]
+                raw_name = f"swipes_pune_{dd.replace('-','')}.csv"
+                fp = DEFAULT_OUTDIR / raw_name
+                if not fp.exists():
+                    continue
+                raw_files.add(raw_name)
+                # read the raw swipe CSV (try to parse datetimes if possible)
+                try:
+                    raw_df = pd.read_csv(fp, parse_dates=['LocaleMessageTime'], infer_datetime_format=True)
+                except Exception:
+                    try:
+                        raw_df = pd.read_csv(fp, dtype=str)
+                    except Exception:
+                        continue
+
+                # normalize columns names to lowercase for searching
+                cols_lower = {c.lower(): c for c in raw_df.columns}
+
+                # candidate column names (schema-aware)
+                tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+                # prefer Int1 / EmployeeID / EmployeeIdentity
+                emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+                name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+                # prefer CardNumber (Credential.CardNumber) - include 'value' fallback
+                card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+                door_col = cols_lower.get('door') or cols_lower.get('doorname') or None
+                dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or None
+                note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+
+                # build filter mask: match person_uid OR empid OR card (whichever present)
+                mask = pd.Series(False, index=raw_df.index)
+                if person_uid is not None and 'person_uid' in raw_df.columns:
+                    mask = mask | (raw_df['person_uid'].astype(str).str.strip() == str(person_uid).strip())
+                if emp_col:
+                    if empid is not None:
+                        # compare after stripping (normalize numeric float .0)
+                        try:
+                            cmp_val = str(empid).strip()
+                            # if empid looks numeric with .0 convert
+                            if '.' in cmp_val:
+                                fv = float(cmp_val)
+                                if math.isfinite(fv) and fv.is_integer():
+                                    cmp_val = str(int(fv))
+                        except Exception:
+                            cmp_val = str(empid).strip()
+                        mask = mask | (raw_df[emp_col].astype(str).str.strip() == cmp_val)
+                if card_col and card is not None:
+                    mask = mask | (raw_df[card_col].astype(str).str.strip() == str(card).strip())
+
+                # Also attempt to match by EmployeeName if agg has name and no other match
+                if (not mask.any()) and name_col and 'EmployeeName' in agg_row and pd.notna(agg_row.get('EmployeeName')):
+                    mask = mask | (raw_df[name_col].astype(str).str.strip() == str(agg_row.get('EmployeeName')).strip())
+
+                # Also filter by date: ensure the timestamp's date equals dd
+                if tcol and tcol in raw_df.columns:
+                    try:
+                        raw_df[tcol] = pd.to_datetime(raw_df[tcol], errors='coerce')
+                        mask = mask & (raw_df[tcol].dt.date == pd.to_datetime(dd).date())
+                    except Exception:
+                        pass
+
+                filtered = raw_df[mask]
+                if filtered.empty:
+                    # additional attempt: try matching where card is embedded inside xml/value fields
+                    # e.g., if aggregated card exists but not matched by direct column, search xml columns
+                    if card is not None:
+                        for c in raw_df.columns:
+                            cl = c.lower()
+                            if 'xml' in cl or 'msg' in cl or 'value' == cl:
+                                try:
+                                    # extract card from each cell and compare
+                                    vals = raw_df[c].dropna().astype(str)
+                                    match_mask = vals.apply(lambda x: (_extract_card_from_xml_text(x) == str(card).strip()))
+                                    if match_mask.any():
+                                        filtered = raw_df.loc[match_mask.index[match_mask]]
+                                        break
+                                except Exception:
+                                    continue
+                    if filtered.empty:
+                        continue
+
+                # Convert filtered rows into the standardized output structure requested by frontend
+                for _, r in filtered.iterrows():
+                    out = {}
+                    # EmployeeName
+                    if name_col and name_col in raw_df.columns:
+                        out['EmployeeName'] = _to_python_scalar(r.get(name_col))
+                    else:
+                        out['EmployeeName'] = _to_python_scalar(agg_row.get('EmployeeName') or agg_row.get('person_uid'))
+
+                    # EmployeeID: prefer Int1 in raw file, then EmployeeID, then fallback to aggregated value
+                    emp_val = None
+                    if 'int1' in cols_lower and cols_lower.get('int1') in raw_df.columns:
+                        emp_val = _to_python_scalar(r.get(cols_lower.get('int1')))
+                    elif emp_col and emp_col in raw_df.columns:
+                        emp_val = _to_python_scalar(r.get(emp_col))
+                    else:
+                        # fallback: try other likely tokens in the raw row
+                        possible_emp = None
+                        for cand in ('Int1','Text12','EmployeeID','EmployeeIdentity','empid','id'):
+                            if cand.lower() in cols_lower:
+                                possible_emp = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                                if possible_emp not in (None, '', 'nan'):
+                                    break
+                        emp_val = possible_emp if possible_emp not in (None, '', 'nan') else _to_python_scalar(agg_row.get('EmployeeID'))
+
+                    # Normalize employee value and reject GUIDs
+                    if emp_val is not None:
+                        try:
+                            s = str(emp_val).strip()
+                            if '.' in s:
+                                f = float(s)
+                                if math.isfinite(f) and f.is_integer():
+                                    s = str(int(f))
+                            if _looks_like_guid(s) or _is_placeholder_str(s):
+                                emp_val = None
+                            else:
+                                emp_val = s
+                        except Exception:
+                            if _looks_like_guid(emp_val):
+                                emp_val = None
+                    out['EmployeeID'] = emp_val
+
+                    # CardNumber: prefer CardNumber in raw file, then CHUID/Card, value, then aggregated value (and xml extraction)
+                    card_val = None
+                    if 'cardnumber' in cols_lower and cols_lower.get('cardnumber') in raw_df.columns:
+                        card_val = _to_python_scalar(r.get(cols_lower.get('cardnumber')))
+                    elif card_col and card_col in raw_df.columns:
+                        card_val = _to_python_scalar(r.get(card_col))
+                    else:
+                        # fallback: value or xml extraction
+                        possible_card = None
+                        for cand in ('CardNumber','CHUID','Card','card_no','cardnum','value','xmlmessage'):
+                            if cand.lower() in cols_lower:
+                                possible_card = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                                if possible_card not in (None, '', 'nan'):
+                                    break
+                        # if possible_card still None or looks like xml, try extracting
+                        if possible_card in (None, '', 'nan'):
+                            for c in raw_df.columns:
+                                cl = c.lower()
+                                if 'xml' in cl or 'msg' in cl or 'value' == cl:
+                                    try:
+                                        txt = r.get(c)
+                                        extracted = _extract_card_from_xml_text(str(txt)) if txt is not None else None
+                                        if extracted:
+                                            possible_card = extracted
+                                            break
+                                    except Exception:
+                                        continue
+                        card_val = possible_card if possible_card not in (None, '', 'nan') else _to_python_scalar(agg_row.get('CardNumber'))
+
+                    # Normalize card and reject GUIDs/placeholders
+                    if card_val is not None:
+                        try:
+                            cs = str(card_val).strip()
+                            if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                                card_val = None
+                            else:
+                                card_val = cs
+                        except Exception:
+                            card_val = None
+                    out['CardNumber'] = card_val
+
+                    # Date and Time
+                    if tcol and tcol in raw_df.columns:
+                        ts = r.get(tcol)
+                        try:
+                            ts_py = pd.to_datetime(ts)
+                            out['Date'] = ts_py.date().isoformat()
+                            out['Time'] = ts_py.time().isoformat()
+                        except Exception:
+                            txt = str(r.get(tcol))
+                            out['Date'] = txt[:10]
+                            out['Time'] = txt[11:19] if len(txt) >= 19 else txt
+                    else:
+                        out['Date'] = d
+                        out['Time'] = None
+
+                    # Door
+                    if door_col and door_col in raw_df.columns:
+                        out['Door'] = _to_python_scalar(r.get(door_col))
+                    else:
+                        out['Door'] = None
+
+                    # Direction
+                    if dir_col and dir_col in raw_df.columns:
+                        out['Direction'] = _to_python_scalar(r.get(dir_col))
+                    else:
+                        out['Direction'] = _to_python_scalar(r.get('Direction')) if 'Direction' in r else None
+
+                    # Note (rejection / source)
+                    if note_col and note_col in raw_df.columns:
+                        out['Note'] = _to_python_scalar(r.get(note_col))
+                    else:
+                        out['Note'] = None
+
+                    out['_source'] = raw_name
+                    raw_swipes_out.append(out)
+            except Exception as e:
+                logging.exception("Error processing raw swipe file for date %s: %s", d, e)
+                continue
+
+    return jsonify({
+        "aggregated_rows": cleaned_matched,
+        "raw_swipe_files": sorted(list(raw_files)),
+        "raw_swipes": raw_swipes_out
+    }), 200
+
+
+@app.route('/swipes/<filename>', methods=['GET'])
+def download_swipes(filename):
+    """
+    Serve raw swipe CSVs from outputs/ (filename should be the file name only).
+    """
+    fp = DEFAULT_OUTDIR / filename
+    if not fp.exists():
+        return jsonify({"error":"file not found"}), 404
+    # send file
+    return send_from_directory(str(DEFAULT_OUTDIR), filename, as_attachment=True)
+
+
+@app.route('/train', methods=['GET'])
+def build_training_endpoint():
+    end_date_str = request.args.get('end_date')
+    months = int(request.args.get('months') or 3)
+    min_unique = int(request.args.get('min_unique') or 1000)
+    try:
+        if end_date_str:
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        else:
+            end_date = datetime.now().date()
+    except Exception as e:
+        return jsonify({"error": f"invalid end_date: {e}"}), 400
+
+    try:
+        csv_path = build_monthly_training(end_date=end_date, months=months, min_unique_employees=min_unique, outdir=str(DEFAULT_OUTDIR))
+        if csv_path is None:
+            return jsonify({"error":"no training CSV produced (no data)"}), 500
+        return jsonify({"training_csv": str(csv_path)})
+    except Exception as e:
+        logging.exception("build_monthly_training failed")
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8002, debug=True)
+# ----------------- END OF FILE: app.py -----------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 refer below Query only for Employee Card and Employee EmployeeID 
 check how logic work for card number and EMployee ID and upadte this logic in trend runner and app.py file 
 
