@@ -1,3 +1,336 @@
+    # --- AFTER computing features = compute_features(swipes, durations)
+    features = compute_features(swipes, durations)
+    if features.empty:
+        logging.warning("run_trend_for_date: no features computed")
+        return pd.DataFrame()
+
+    # ===== START FIX: reconcile zero CountSwipes with raw swipe files =====
+    try:
+        if swipes is not None and not swipes.empty and 'person_uid' in swipes.columns:
+            tsw = swipes.copy()
+            # Ensure LocaleMessageTime is datetime and Date is date
+            if 'LocaleMessageTime' in tsw.columns:
+                tsw['LocaleMessageTime'] = pd.to_datetime(tsw['LocaleMessageTime'], errors='coerce')
+            else:
+                # try common time columns
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in tsw.columns:
+                        tsw['LocaleMessageTime'] = pd.to_datetime(tsw[cand], errors='coerce')
+                        break
+            if 'Date' not in tsw.columns:
+                if 'LocaleMessageTime' in tsw.columns:
+                    tsw['Date'] = tsw['LocaleMessageTime'].dt.date
+                else:
+                    # try to parse a Date-like column
+                    for cand in ('date','Date'):
+                        if cand in tsw.columns:
+                            try:
+                                tsw['Date'] = pd.to_datetime(tsw[cand], errors='coerce').dt.date
+                            except Exception:
+                                tsw['Date'] = None
+                            break
+
+            # Build lookup maps keyed by (person_uid, Date)
+            try:
+                grp = tsw.dropna(subset=['person_uid', 'Date']).groupby(['person_uid', 'Date'])
+                counts = grp.size().to_dict()  # (person_uid, date) -> count
+                firsts = grp['LocaleMessageTime'].min().to_dict()
+                lasts = grp['LocaleMessageTime'].max().to_dict()
+            except Exception:
+                counts = {}
+                firsts = {}
+                lasts = {}
+
+            # For any feature row with CountSwipes == 0, try to populate from raw swipes
+            def _fix_row_by_raw(idx, row):
+                key = (row.get('person_uid'), row.get('Date'))
+                if key in counts and (row.get('CountSwipes', 0) == 0 or pd.isna(row.get('CountSwipes'))):
+                    try:
+                        c = int(counts.get(key, 0))
+                        features.at[idx, 'CountSwipes'] = c
+                        # set first/last swipe if available and not set
+                        f = firsts.get(key)
+                        l = lasts.get(key)
+                        if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
+                            features.at[idx, 'FirstSwipe'] = pd.to_datetime(f)
+                        if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
+                            features.at[idx, 'LastSwipe'] = pd.to_datetime(l)
+                        # recompute DurationSeconds/DurationMinutes
+                        try:
+                            fs = features.at[idx, 'FirstSwipe']
+                            ls = features.at[idx, 'LastSwipe']
+                            if pd.notna(fs) and pd.notna(ls):
+                                dursec = (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds()
+                                dursec = max(0, dursec)
+                                features.at[idx, 'DurationSeconds'] = float(dursec)
+                                features.at[idx, 'DurationMinutes'] = float(dursec / 60.0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+            for ix, r in features[features['CountSwipes'].fillna(0).astype(int) == 0].iterrows():
+                try:
+                    _fix_row_by_raw(ix, r)
+                except Exception:
+                    logging.debug("Failed to reconcile row %s with raw swipes", ix)
+    except Exception:
+        logging.exception("Error while reconciling aggregated features with raw swipes (zero-swipe fix).")
+    # ===== END FIX =====
+
+
+
+
+
+
+
+
+
+
+import io
+from flask import send_file
+try:
+    # optional import; used for styling
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
+@app.route('/record/export', methods=['GET'])
+def export_record_excel():
+    """
+    /record/export?employee_id=...&date=YYYY-MM-DD  OR /record/export?person_uid=...&date=YYYY-MM-DD
+    Produces an Excel file (xlsx) filtered for the requested employee and date (if provided).
+    Two sheets:
+      - "Details — Evidence": EmployeeName, EmployeeID, Door, Direction, Date, LocaleMessageTime, SwipeGapSeconds, PartitionName2
+      - "Swipe timeline": Employee Name, Employee ID, Card, Date, Time, Door, Direction, Note, SwipeGapSeconds
+    Applies formatting: bold header, header thick border, center alignment, borders for all cells.
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    date_str = request.args.get('date')  # optional 'YYYY-MM-DD' (single date)
+    if not q:
+        return jsonify({"error":"employee_id or person_uid is required"}), 400
+
+    # Determine list of raw swipe files to scan. If date provided, restrict to that date only.
+    files_to_scan = []
+    p = Path(DEFAULT_OUTDIR)
+    if date_str:
+        try:
+            dd = pd.to_datetime(date_str).date()
+            target = dd.strftime("%Y%m%d")
+            candidates = list(p.glob(f"swipes_*_{target}.csv"))
+            files_to_scan = candidates
+        except Exception:
+            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
+    else:
+        # scan all swipes files (most recent first)
+        files_to_scan = sorted(p.glob("swipes_*.csv"), reverse=True)
+
+    if not files_to_scan:
+        return jsonify({"error":"no raw swipe files found for requested date / outputs"}), 404
+
+    all_rows = []
+    for fp in files_to_scan:
+        try:
+            raw_df = pd.read_csv(fp, dtype=str, parse_dates=['LocaleMessageTime'], infer_datetime_format=True)
+        except Exception:
+            try:
+                raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+
+        # normalize column names
+        cols_lower = {c.lower(): c for c in raw_df.columns}
+        # pick possible columns
+        tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or None
+        emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+        name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+        card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+        door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+        dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+        note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+        person_uid_col = cols_lower.get('person_uid')
+
+        # build mask matching requested q: try person_uid, emp_col, card, name
+        mask = pd.Series(False, index=raw_df.index)
+        if person_uid_col and person_uid_col in raw_df.columns:
+            mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
+        if emp_col and emp_col in raw_df.columns:
+            mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
+        # try matching numeric equivalence
+        if not mask.any() and emp_col and emp_col in raw_df.columns:
+            try:
+                q_numeric = float(q)
+                emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                mask = mask | (emp_numeric == q_numeric)
+            except Exception:
+                pass
+        # also try name match if nothing matched
+        if not mask.any() and name_col and name_col in raw_df.columns:
+            mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
+
+        if not mask.any():
+            # nothing to include from this file
+            continue
+
+        filtered = raw_df[mask].copy()
+        if filtered.empty:
+            continue
+
+        # ensure timestamp col exists and parsed
+        if tcol and tcol in filtered.columns:
+            try:
+                filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+            except Exception:
+                pass
+
+        # compute swipe gaps (seconds)
+        if tcol and tcol in filtered.columns:
+            filtered = filtered.sort_values(by=tcol)
+            filtered['_prev_ts'] = filtered[tcol].shift(1)
+            try:
+                filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+            except Exception:
+                filtered['_swipe_gap_seconds'] = 0.0
+        else:
+            filtered['_swipe_gap_seconds'] = 0.0
+
+        # normalize columns into common shape and append rows
+        for _, r in filtered.iterrows():
+            row = {}
+            row['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in filtered.columns else None
+            # EmployeeID attempts: Int1/Text12/EmployeeID
+            emp_val = None
+            if emp_col and emp_col in filtered.columns:
+                emp_val = _to_python_scalar(r.get(emp_col))
+            else:
+                # fallbacks
+                for cand in ('int1','text12','employeeid','employee_identity','employeeidentity'):
+                    if cand in cols_lower and cols_lower[cand] in filtered.columns:
+                        emp_val = _to_python_scalar(r.get(cols_lower[cand]))
+                        if emp_val:
+                            break
+            row['EmployeeID'] = emp_val
+            row['Card'] = _to_python_scalar(r.get(card_col)) if card_col and card_col in filtered.columns else None
+
+            # Date and Time
+            if tcol and tcol in filtered.columns:
+                ts = r.get(tcol)
+                try:
+                    ts_py = pd.to_datetime(ts)
+                    row['Date'] = ts_py.date().isoformat()
+                    row['Time'] = ts_py.time().isoformat()
+                    row['LocaleMessageTime'] = ts_py.isoformat()
+                except Exception:
+                    txt = str(r.get(tcol))
+                    row['Date'] = txt[:10]
+                    row['Time'] = txt[11:19] if len(txt) >= 19 else None
+                    row['LocaleMessageTime'] = txt
+            else:
+                row['Date'] = None
+                row['Time'] = None
+                row['LocaleMessageTime'] = None
+
+            row['Door'] = _to_python_scalar(r.get(door_col)) if door_col and door_col in filtered.columns else None
+            row['Direction'] = _to_python_scalar(r.get(dir_col)) if dir_col and dir_col in filtered.columns else None
+            row['Note'] = _to_python_scalar(r.get(note_col)) if note_col and note_col in filtered.columns else None
+            row['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
+            row['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
+            row['_source_file'] = fp.name
+            all_rows.append(row)
+
+    if not all_rows:
+        return jsonify({"error":"no swipe rows matched the requested employee/date"}), 404
+
+    df_out = pd.DataFrame(all_rows)
+
+    # Build two sheets as requested
+    details_cols = ['EmployeeName','EmployeeID','Door','Direction','Date','LocaleMessageTime','SwipeGapSeconds','PartitionName2','_source_file']
+    timeline_cols = ['EmployeeName','EmployeeID','Card','Date','Time','Door','Direction','Note','SwipeGapSeconds','_source_file']
+
+    details_df = df_out[[c for c in details_cols if c in df_out.columns]].copy()
+    timeline_df = df_out[[c for c in timeline_cols if c in df_out.columns]].copy()
+
+    # Create excel in-memory
+    output = io.BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            details_df.to_excel(writer, sheet_name='Details — Evidence', index=False)
+            timeline_df.to_excel(writer, sheet_name='Swipe timeline', index=False)
+            writer.save()
+            output.seek(0)
+    except Exception as e:
+        logging.exception("Failed to create Excel: %s", e)
+        return jsonify({"error":"failed to create excel"}), 500
+
+    # If openpyxl available, apply formatting (bold header, center align, borders)
+    if OPENPYXL_AVAILABLE:
+        try:
+            wb = load_workbook(output)
+            thin = Side(border_style="thin", color="000000")
+            thick = Side(border_style="medium", color="000000")
+            for ws in wb.worksheets:
+                # header styling
+                header = ws[1]
+                for cell in header:
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = Border(top=thick, left=thick, right=thick, bottom=thick)
+                # data rows: center & thin border
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                # autosize columns (best-effort)
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        try:
+                            v = str(cell.value) if cell.value is not None else ""
+                        except Exception:
+                            v = ""
+                        if len(v) > max_len:
+                            max_len = len(v)
+                    # limit column width
+                    width = min(max(10, max_len + 2), 50)
+                    ws.column_dimensions[col_letter].width = width
+            # write back to bytes
+            out2 = io.BytesIO()
+            wb.save(out2)
+            out2.seek(0)
+            return send_file(out2, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            logging.exception("Excel styling failed, returning raw file")
+            output.seek(0)
+            return send_file(output, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        # fallback: return raw excel binary without styling
+        output.seek(0)
+        return send_file(output, as_attachment=True,
+                         download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Details — Evidence
 Name: Vishwakarma, Anilkumar Ramlal
 EmployeeID: 327576
