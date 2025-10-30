@@ -1,824 +1,144 @@
-    # --- AFTER computing features = compute_features(swipes, durations)
-    features = compute_features(swipes, durations)
-    if features.empty:
-        logging.warning("run_trend_for_date: no features computed")
-        return pd.DataFrame()
-
-    # ===== START FIX: reconcile zero CountSwipes with raw swipe files =====
-    try:
-        if swipes is not None and not swipes.empty and 'person_uid' in swipes.columns:
-            tsw = swipes.copy()
-            # Ensure LocaleMessageTime is datetime and Date is date
-            if 'LocaleMessageTime' in tsw.columns:
-                tsw['LocaleMessageTime'] = pd.to_datetime(tsw['LocaleMessageTime'], errors='coerce')
-            else:
-                # try common time columns
-                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
-                    if cand in tsw.columns:
-                        tsw['LocaleMessageTime'] = pd.to_datetime(tsw[cand], errors='coerce')
-                        break
-            if 'Date' not in tsw.columns:
-                if 'LocaleMessageTime' in tsw.columns:
-                    tsw['Date'] = tsw['LocaleMessageTime'].dt.date
-                else:
-                    # try to parse a Date-like column
-                    for cand in ('date','Date'):
-                        if cand in tsw.columns:
-                            try:
-                                tsw['Date'] = pd.to_datetime(tsw[cand], errors='coerce').dt.date
-                            except Exception:
-                                tsw['Date'] = None
-                            break
-
-            # Build lookup maps keyed by (person_uid, Date)
-            try:
-                grp = tsw.dropna(subset=['person_uid', 'Date']).groupby(['person_uid', 'Date'])
-                counts = grp.size().to_dict()  # (person_uid, date) -> count
-                firsts = grp['LocaleMessageTime'].min().to_dict()
-                lasts = grp['LocaleMessageTime'].max().to_dict()
-            except Exception:
-                counts = {}
-                firsts = {}
-                lasts = {}
-
-            # For any feature row with CountSwipes == 0, try to populate from raw swipes
-            def _fix_row_by_raw(idx, row):
-                key = (row.get('person_uid'), row.get('Date'))
-                if key in counts and (row.get('CountSwipes', 0) == 0 or pd.isna(row.get('CountSwipes'))):
-                    try:
-                        c = int(counts.get(key, 0))
-                        features.at[idx, 'CountSwipes'] = c
-                        # set first/last swipe if available and not set
-                        f = firsts.get(key)
-                        l = lasts.get(key)
-                        if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
-                            features.at[idx, 'FirstSwipe'] = pd.to_datetime(f)
-                        if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
-                            features.at[idx, 'LastSwipe'] = pd.to_datetime(l)
-                        # recompute DurationSeconds/DurationMinutes
-                        try:
-                            fs = features.at[idx, 'FirstSwipe']
-                            ls = features.at[idx, 'LastSwipe']
-                            if pd.notna(fs) and pd.notna(ls):
-                                dursec = (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds()
-                                dursec = max(0, dursec)
-                                features.at[idx, 'DurationSeconds'] = float(dursec)
-                                features.at[idx, 'DurationMinutes'] = float(dursec / 60.0)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-            for ix, r in features[features['CountSwipes'].fillna(0).astype(int) == 0].iterrows():
-                try:
-                    _fix_row_by_raw(ix, r)
-                except Exception:
-                    logging.debug("Failed to reconcile row %s with raw swipes", ix)
-    except Exception:
-        logging.exception("Error while reconciling aggregated features with raw swipes (zero-swipe fix).")
-    # ===== END FIX =====
-
-
-
-
-
-
-
-
-
-
-import io
-from flask import send_file
-try:
-    # optional import; used for styling
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font, Alignment, Border, Side
-    OPENPYXL_AVAILABLE = True
-except Exception:
-    OPENPYXL_AVAILABLE = False
-
-@app.route('/record/export', methods=['GET'])
-def export_record_excel():
-    """
-    /record/export?employee_id=...&date=YYYY-MM-DD  OR /record/export?person_uid=...&date=YYYY-MM-DD
-    Produces an Excel file (xlsx) filtered for the requested employee and date (if provided).
-    Two sheets:
-      - "Details — Evidence": EmployeeName, EmployeeID, Door, Direction, Date, LocaleMessageTime, SwipeGapSeconds, PartitionName2
-      - "Swipe timeline": Employee Name, Employee ID, Card, Date, Time, Door, Direction, Note, SwipeGapSeconds
-    Applies formatting: bold header, header thick border, center alignment, borders for all cells.
-    """
-    q = request.args.get('employee_id') or request.args.get('person_uid')
-    date_str = request.args.get('date')  # optional 'YYYY-MM-DD' (single date)
-    if not q:
-        return jsonify({"error":"employee_id or person_uid is required"}), 400
-
-    # Determine list of raw swipe files to scan. If date provided, restrict to that date only.
-    files_to_scan = []
-    p = Path(DEFAULT_OUTDIR)
-    if date_str:
-        try:
-            dd = pd.to_datetime(date_str).date()
-            target = dd.strftime("%Y%m%d")
-            candidates = list(p.glob(f"swipes_*_{target}.csv"))
-            files_to_scan = candidates
-        except Exception:
-            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
-    else:
-        # scan all swipes files (most recent first)
-        files_to_scan = sorted(p.glob("swipes_*.csv"), reverse=True)
-
-    if not files_to_scan:
-        return jsonify({"error":"no raw swipe files found for requested date / outputs"}), 404
-
-    all_rows = []
-    for fp in files_to_scan:
-        try:
-            raw_df = pd.read_csv(fp, dtype=str, parse_dates=['LocaleMessageTime'], infer_datetime_format=True)
-        except Exception:
-            try:
-                raw_df = pd.read_csv(fp, dtype=str)
-            except Exception:
-                continue
-
-        # normalize column names
-        cols_lower = {c.lower(): c for c in raw_df.columns}
-        # pick possible columns
-        tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or None
-        emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
-        name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
-        card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
-        door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
-        dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
-        note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
-        person_uid_col = cols_lower.get('person_uid')
-
-        # build mask matching requested q: try person_uid, emp_col, card, name
-        mask = pd.Series(False, index=raw_df.index)
-        if person_uid_col and person_uid_col in raw_df.columns:
-            mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
-        if emp_col and emp_col in raw_df.columns:
-            mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
-        # try matching numeric equivalence
-        if not mask.any() and emp_col and emp_col in raw_df.columns:
-            try:
-                q_numeric = float(q)
-                emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
-                mask = mask | (emp_numeric == q_numeric)
-            except Exception:
-                pass
-        # also try name match if nothing matched
-        if not mask.any() and name_col and name_col in raw_df.columns:
-            mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
-
-        if not mask.any():
-            # nothing to include from this file
-            continue
-
-        filtered = raw_df[mask].copy()
-        if filtered.empty:
-            continue
-
-        # ensure timestamp col exists and parsed
-        if tcol and tcol in filtered.columns:
-            try:
-                filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
-            except Exception:
-                pass
-
-        # compute swipe gaps (seconds)
-        if tcol and tcol in filtered.columns:
-            filtered = filtered.sort_values(by=tcol)
-            filtered['_prev_ts'] = filtered[tcol].shift(1)
-            try:
-                filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
-            except Exception:
-                filtered['_swipe_gap_seconds'] = 0.0
-        else:
-            filtered['_swipe_gap_seconds'] = 0.0
-
-        # normalize columns into common shape and append rows
-        for _, r in filtered.iterrows():
-            row = {}
-            row['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in filtered.columns else None
-            # EmployeeID attempts: Int1/Text12/EmployeeID
-            emp_val = None
-            if emp_col and emp_col in filtered.columns:
-                emp_val = _to_python_scalar(r.get(emp_col))
-            else:
-                # fallbacks
-                for cand in ('int1','text12','employeeid','employee_identity','employeeidentity'):
-                    if cand in cols_lower and cols_lower[cand] in filtered.columns:
-                        emp_val = _to_python_scalar(r.get(cols_lower[cand]))
-                        if emp_val:
-                            break
-            row['EmployeeID'] = emp_val
-            row['Card'] = _to_python_scalar(r.get(card_col)) if card_col and card_col in filtered.columns else None
-
-            # Date and Time
-            if tcol and tcol in filtered.columns:
-                ts = r.get(tcol)
-                try:
-                    ts_py = pd.to_datetime(ts)
-                    row['Date'] = ts_py.date().isoformat()
-                    row['Time'] = ts_py.time().isoformat()
-                    row['LocaleMessageTime'] = ts_py.isoformat()
-                except Exception:
-                    txt = str(r.get(tcol))
-                    row['Date'] = txt[:10]
-                    row['Time'] = txt[11:19] if len(txt) >= 19 else None
-                    row['LocaleMessageTime'] = txt
-            else:
-                row['Date'] = None
-                row['Time'] = None
-                row['LocaleMessageTime'] = None
-
-            row['Door'] = _to_python_scalar(r.get(door_col)) if door_col and door_col in filtered.columns else None
-            row['Direction'] = _to_python_scalar(r.get(dir_col)) if dir_col and dir_col in filtered.columns else None
-            row['Note'] = _to_python_scalar(r.get(note_col)) if note_col and note_col in filtered.columns else None
-            row['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
-            row['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
-            row['_source_file'] = fp.name
-            all_rows.append(row)
-
-    if not all_rows:
-        return jsonify({"error":"no swipe rows matched the requested employee/date"}), 404
-
-    df_out = pd.DataFrame(all_rows)
-
-    # Build two sheets as requested
-    details_cols = ['EmployeeName','EmployeeID','Door','Direction','Date','LocaleMessageTime','SwipeGapSeconds','PartitionName2','_source_file']
-    timeline_cols = ['EmployeeName','EmployeeID','Card','Date','Time','Door','Direction','Note','SwipeGapSeconds','_source_file']
-
-    details_df = df_out[[c for c in details_cols if c in df_out.columns]].copy()
-    timeline_df = df_out[[c for c in timeline_cols if c in df_out.columns]].copy()
-
-    # Create excel in-memory
-    output = io.BytesIO()
-    try:
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            details_df.to_excel(writer, sheet_name='Details — Evidence', index=False)
-            timeline_df.to_excel(writer, sheet_name='Swipe timeline', index=False)
-            writer.save()
-            output.seek(0)
-    except Exception as e:
-        logging.exception("Failed to create Excel: %s", e)
-        return jsonify({"error":"failed to create excel"}), 500
-
-    # If openpyxl available, apply formatting (bold header, center align, borders)
-    if OPENPYXL_AVAILABLE:
-        try:
-            wb = load_workbook(output)
-            thin = Side(border_style="thin", color="000000")
-            thick = Side(border_style="medium", color="000000")
-            for ws in wb.worksheets:
-                # header styling
-                header = ws[1]
-                for cell in header:
-                    cell.font = Font(bold=True)
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                    cell.border = Border(top=thick, left=thick, right=thick, bottom=thick)
-                # data rows: center & thin border
-                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                    for cell in row:
-                        cell.alignment = Alignment(horizontal="center", vertical="center")
-                        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
-                # autosize columns (best-effort)
-                for col in ws.columns:
-                    max_len = 0
-                    col_letter = col[0].column_letter
-                    for cell in col:
-                        try:
-                            v = str(cell.value) if cell.value is not None else ""
-                        except Exception:
-                            v = ""
-                        if len(v) > max_len:
-                            max_len = len(v)
-                    # limit column width
-                    width = min(max(10, max_len + 2), 50)
-                    ws.column_dimensions[col_letter].width = width
-            # write back to bytes
-            out2 = io.BytesIO()
-            wb.save(out2)
-            out2.seek(0)
-            return send_file(out2, as_attachment=True,
-                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
-                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception:
-            logging.exception("Excel styling failed, returning raw file")
-            output.seek(0)
-            return send_file(output, as_attachment=True,
-                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
-                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    else:
-        # fallback: return raw excel binary without styling
-        output.seek(0)
-        return send_file(output, as_attachment=True,
-                         download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Details — Evidence
-Name: Vishwakarma, Anilkumar Ramlal
-EmployeeID: 327576
-Card: 615765
-Date: 29/10/2025, 05:30:00
-Duration: 18:02:10
-
-
-Available evidence files
-swipes_pune_20251008.csv — Download
-swipes_pune_20251029.csv — Download
-
-
-
-When i export this Evidance tab 
-
-We got all Employee Data  here again 
-When i download file we got below column 
-EmployeeName	Door	EmployeeID	Int1	Text12	XmlMessage	XmlShredValue	CardNumber	PersonnelTypeName	EmployeeIdentity	PartitionName2	LocaleMessageTime	MessageType	Direction	CompanyName	PrimaryLocation	person_uid
-
-
-We dont need all Column heere
-
-
-EmployeeName EmployeeID 	Door  Direction  LocaleMessage date  LocaleMessageTime  swipe Gap Diffrance   PartitionName2
-
-alos When export in excel add Excel fromatting add all border center align , thick border , bold header ...
-
-also export only 
-Details — Evidence
-Name: Vishwakarma, Anilkumar Ramlal
-EmployeeID: 327576 this Employee data here 
-
-
-Swipe timeline (filtered for this person/date)
-Employee Name	Employee ID	Card	Date	Time	Door	Direction	Note
-
-also here add Swipe gap time carefully and add note here ..
-
-also check why we got zero swipe Scearion if Employee have multiple swipe fix this Scenario.
-
-
-
-
-Check each file line by line and upadte only necessary thing dont make unnecessary changes...
-
-
-
-# backend/duration_report.py
-from __future__ import annotations
-
-import logging
-import os
-import re
-import warnings
-from datetime import date, datetime, timedelta
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-
-import pandas as pd
-
-try:
-    import pyodbc
-except Exception:
-    pyodbc = None
-
-# ODBC driver name (override with environment variable if needed)
-ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
-
-# REGION configuration - databases list used to build UNION queries
-REGION_CONFIG = {
-    "apac": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUPNQ0986V",
-        "databases": [
-            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
-            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
-        ],
-        "partitions": ["APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur", "IN.HYD"]
-    },
-    "emea": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUFRA0986V",
-        "databases": [
-            "ACVSUJournal_00011029","ACVSUJournal_00011028","ACVSUJournal_00011027",
-            "ACVSUJournal_00011026","ACVSUJournal_00011025","ACVSUJournal_00011024",
-            "ACVSUJournal_00011023"
-        ],
-        "partitions": ["LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid"]
-    },
-    "laca": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUSJO0986V",
-        "databases": [
-            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
-            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
-        ],
-        "partitions": ["AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City"]
-    },
-    "namer": {
-        "user": "GSOC_Test",
-        "password": "Westernccure@2025",
-        "server": "SRVWUDEN0891V",
-        "databases": [
-            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
-            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
-        ],
-        "partitions": ["Denver", "Austin Texas", "Miami", "New York"],
-        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
-    }
+check each below file line by line carefully and fix the issue and share me updated file so i can easily swap file each other also dont make any logical 
+changes in file 
+
+
+
+# backend/config/door_zone.py
+from typing import Optional
+
+# canonical map (converted from your JSON). Keep keys exactly as in your raw Door+Direction
+DOOR_ZONE_MAP = {
+  "APAC_IN_PUN_PODIUM_RED_IDF ROOM-02-RESTRICTED DOOR___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_ST2 DOOR 1 (RED)___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_RED_MAIN LIFT LOBBY ENTRY 1-DOOR___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_RED_MAIN LIFT LOBBY ENTRY 1-DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_PODIUM_ST 1-DOOR 1 (RED)___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_ST 1-DOOR 1 (RED)___OutDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_RED_RECEPTION TO WS ENTRY 1-DOOR NEW___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_RED_RECEPTION TO WS ENTRY 1-DOOR NEW___OutDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_RED_RECREATION AREA FIRE EXIT 1-DOOR NEW___InDirection": "Red Zone",
+  "APAC_IN_PUN_PODIUM_RED_RECREATION AREA FIRE EXIT 1-DOOR NEW___OutDirection": "East Outdoor Area",
+  "APAC_IN_PUN_PODIUM_ST2 DOOR 2 (YELLOW)___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_MDF RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_IT STORE ROOM-DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_REPRO STORE-DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_CONTROL PANEL ROOM-DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_PREACTION ROOM-DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_TESTING LAB-DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_RECEPTION ENTRY-DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_RECEPTION ENTRY-DOOR___OutDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_YELLOW_MAIN LIFT LOBBY-DOOR NEW___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_MAIN LIFT LOBBY-DOOR NEW___OutDirection": "Out of office",
+  "APAC_IN_PUN_PODIUM_ST 1 DOOR 2 (YELLOW)___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_ST 1 DOOR 2 (YELLOW)___OutDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_FIRE EXIT 1-DOOR NEW___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_YELLOW_FIRE EXIT 1-DOOR NEW___OutDirection": "East Outdoor Area",
+  "APAC_IN_PUN_PODIUM_GREEN-_IDF ROOM 1-RESTRICTED DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN_UPS ENTRY 1-DOOR RESTRICTED DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN_UPS ENTRY 2-DOOR RESTRICTED DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN_LOCKER HR STORE 3-DOOR RESTRICTED DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_ST4 DOOR 2 (GREEN)___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_ST4 DOOR 2 (GREEN)___OutDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN-MAIN LIFT LOBBY-DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN-MAIN LIFT LOBBY-DOOR___OutDirection": "East Outdoor Area",
+  "APAC_IN_PUN_PODIUM_ST3 DOOR 2 (GREEN)___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN_RECEPTION ENTRY-DOOR___InDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_GREEN_RECEPTION ENTRY-DOOR___OutDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_ST4 DOOR 1 (ORANGE)___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ST4 DOOR 1 (ORANGE)___OutDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_RECEPTION ENTRY-DOOR___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_RECEPTION ENTRY-DOOR___OutDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_ST3_DOOR 1 (ORANGE)___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_MAIN LIFT LOBBY-DOOR___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_MAIN LIFT LOBBY-DOOR___OutDirection": "Green Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE-IDF ROOM 3-RESTRICTED DOOR___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_KITCHENETTE FIRE EXIT-DOOR NEW___InDirection": "Orange Zone",
+  "APAC_IN_PUN_PODIUM_ORANGE_KITCHENETTE FIRE EXIT-DOOR NEW___OutDirection": "West Outdoor Area",
+  "APAC_IN_PUN_PODIUM_GSOC DOOR RESTRICTED DOOR___InDirection": "Yellow Zone",
+  "APAC_IN_PUN_PODIUM_MAIN PODIUM RIGHT ENTRY-DOOR NEW___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_MAIN PODIUM RIGHT ENTRY-DOOR NEW___OutDirection": "Assembly Area",
+  "APAC_IN_PUN_PODIUM_MAIN PODIUM LEFT ENTRY-DOOR NEW___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_MAIN PODIUM LEFT ENTRY-DOOR NEW___OutDirection": "Assembly Area",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 1-DOOR___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 2-DOOR___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 3-DOOR___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4-DOOR___InDirection": "Reception Area",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 2 -OUT DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN-PODIUM_P-1 TURNSTILE 3 -OUT DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4 -OUT DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_PODIUM_P-1 TURNSTILE 1-OUT DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_2NDFLR_IDF ROOM_10:05:86 RESTRICTED DOOR___InDirection": "2nd Floor, Pune",
+  "APAC_IN_PUN_2NDFLR_UPS/ELEC ROOM RESTRICTED DOOR___InDirection": "2nd Floor, Pune",
+  "APAC_IN_PUN_2NDFLR_RECPTION TO WORKSTATION DOOR___InDirection": "2nd Floor, Pune",
+  "APAC_IN_PUN_2NDFLR_RECPTION TO WORKSTATION DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_2NDFLR_LIFTLOBBY TO RECEPTION EMTRY DOOR___InDirection": "2nd Floor, Pune",
+  "APAC_IN_PUN_2NDFLR_LIFTLOBBY TO RECEPTION EMTRY DOOR___OutDirection": "2nd Floor, Pune",
+  "APAC_IN_PUN_TOWER B_MAIN RECEPTION DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_MAIN RECEPTION DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_TOWER B_LIFT LOBBY DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_LIFT LOBBY DOOR___OutDirection": "Out of office",
+  "APAC_IN_PUN_TOWER B_ST6_GYM SIDE DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST6_GYM SIDE DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST6_WKS SIDE DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST6_WKS SIDE DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST5_KAPIL DEV DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST5_KAPIL DEV DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST5_WKS SIDE DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_ST5_WKS SIDE DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_RECEPTION LEFT DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_RECEPTION LEFT DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_RECEPTION RIGHT DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_RECEPTION RIGHT DOOR___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_IBMS ROOM___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_UPS ROOM___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_MDF ROOM___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_PAC ROOM___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_IT STORE ROOM___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_GYM ROOM___InDirection": "Tower B GYM",
+  "APAC_IN_PUN_TOWER B_GYM ROOM___OutDirection": "Tower B GYM",
+  "APAC_IN_PUN_TOWER B_SITE OPS STORE___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_INNOVATION CENTER___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_INNOVATION CENTER___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_MOBILE LAB___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_MOBILE LAB___OutDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_CEC DOOR___InDirection": "Tower B",
+  "APAC_IN_PUN_TOWER B_CEC DOOR___OutDirection": "Tower B",
 }
 
+# zones considered break areas
+BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area", "Reception Area"])
 
+# canonical out-of-office label
+OUT_OF_OFFICE_ZONE = "Out of office"
 
-GENERIC_SQL_TEMPLATE = r"""
-SELECT
-    t1.[ObjectName1] AS EmployeeName,
-    t1.[ObjectName2] AS Door,
-    -- prefer contractor text12 else Int1 (match original logic)
-    CASE WHEN t3.[Name] IN ('Contractor','Terminated Contractor') THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
-    t2.[Int1] AS Int1,
-    t2.[Text12] AS Text12,
-    -- expose raw XML & shredded value so downstream code can attempt robust extraction
-    t_xml.XmlMessage AS XmlMessage,
-    sc.value AS XmlShredValue,
-    -- CardNumber: try CHUID/Card inside XmlMessage, fallback to shredded value, then text12/int1
-    COALESCE(
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
-      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
-      sc.value,
-      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
-      t2.[Text12]
-    ) AS CardNumber,
-    t3.[Name] AS PersonnelTypeName,
-    t1.ObjectIdentity1 AS EmployeeIdentity,
-    t1.PartitionName2,
-    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
-    t1.MessageType,
-    t5d.value AS Direction,
-    t2.Text4 AS CompanyName,
-    t2.Text5 AS PrimaryLocation
-FROM [{db}].dbo.ACVSUJournalLog AS t1
-LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
-LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
-LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
-  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
-LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
-  ON t1.XmlGUID = t_xml.GUID
-LEFT JOIN (
-  SELECT GUID, value
-  FROM [{db}].dbo.ACVSUJournalLogxmlShred
-  WHERE Name IN ('Card','CHUID')
-) AS sc
-  ON t1.XmlGUID = sc.GUID
-WHERE t1.MessageType = 'CardAdmitted'
-  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
-  {region_filter}
-"""
-# Helpers
-def _split_db_name(dbname: str):
-    m = re.match(r"^(.*?)(\d+)$", dbname)
-    if not m:
-        return dbname, None
-    return m.group(1), m.group(2)
-
-def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
-    prefix, digits = _split_db_name(db_base)
-    if digits is None:
-        return [db_base]
-    width = len(digits)
-    try:
-        cur = int(digits)
-    except Exception:
-        return [db_base]
-    out = []
-    for i in range(last_n):
-        num = cur - i
-        if num < 0:
-            break
-        out.append(f"{prefix}{str(num).zfill(width)}")
-    return out
-
-def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
-    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
-        return rc["databases"]
-    base_db = rc.get("database")
-    if not base_db:
-        return []
-    last_n = int(rc.get("last_n_databases", 1) or 1)
-    if last_n <= 1:
-        return [base_db]
-    return _expand_databases_from_base(base_db, last_n)
-
-def _connect_master(rc: Dict[str, Any]):
-    if pyodbc is None:
-        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+def map_door_to_zone(door: Optional[str], direction: Optional[str] = None) -> Optional[str]:
+    """
+    Map door + direction (exact key if available) to zone. If exact match not found,
+    uses substring-based heuristics.
+    """
+    if door is None:
         return None
-    try:
-        conn_str = (
-            f"DRIVER={{{ODBC_DRIVER}}};"
-            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
-            "TrustServerCertificate=Yes;"
-        )
-        return pyodbc.connect(conn_str, autocommit=True)
-    except Exception:
-        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
-        return None
-
-def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
-    if not candidates:
-        return []
-    master_conn = _connect_master(rc)
-    if master_conn is None:
-        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
-        return candidates
-    try:
-        exists = []
-        cursor = master_conn.cursor()
-        for db in candidates:
-            try:
-                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
-                row = cursor.fetchone()
-                if row and row[0] and int(row[0]) > 0:
-                    exists.append(db)
-            except Exception:
-                logging.exception("Error checking existence for database %s", db)
-        cursor.close()
-        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
-        return exists if exists else candidates
-    finally:
-        try:
-            master_conn.close()
-        except Exception:
-            pass
-
-def build_region_query(region_key: str, target_date: date) -> str:
-    rc = REGION_CONFIG[region_key]
-    date_str = target_date.strftime("%Y-%m-%d")
-    region_filter = ""
-
-    if region_key in ("apac", "emea", "laca"):
-        partitions = rc.get("partitions", [])
-        parts_sql = ", ".join(f"'{p}'" for p in partitions)
-        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
-    elif region_key == "namer":
-        likes = rc.get("logical_like", [])
-        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
-        region_filter = f"AND ({like_sql})"
-    else:
-        region_filter = ""
-
-    candidates = _get_candidate_databases(rc)
-    if not candidates:
-        candidates = [rc.get("database")]
-
-    valid_dbs = _filter_existing_databases(rc, candidates)
-
-    union_parts = []
-    for dbname in valid_dbs:
-        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
-
-    if not union_parts:
-        dbname = rc.get("database")
-        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
-
-    sql = "\nUNION ALL\n".join(union_parts)
-    return sql
-    
-# DB connection & fetch
-def get_connection(region_key: str):
-    if pyodbc is None:
-        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
-
-    rc = REGION_CONFIG[region_key]
-    # use first database in list if present
-    db = rc.get("databases", [rc.get("database")])[0]
-    conn_str = (
-        f"DRIVER={{{ODBC_DRIVER}}};"
-        f"SERVER={rc['server']};DATABASE={db};UID={rc['user']};PWD={rc['password']};"
-        "TrustServerCertificate=Yes;"
-    )
-    return pyodbc.connect(conn_str, autocommit=True)
-
-def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
-    sql = build_region_query(region_key, target_date)
-    logging.info("Built SQL for region %s, date %s", region_key, target_date)
-    cols = [
-    "EmployeeName", "Door", "EmployeeID", "Int1", "Text12", "XmlMessage", "XmlShredValue", "CardNumber",
-    "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "MessageType",
-    "Direction", "CompanyName", "PrimaryLocation"
-]
-
-    if pyodbc is None:
-        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
-        return pd.DataFrame(columns=cols)
-
-    conn = None
-    try:
-        conn = get_connection(region_key)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
-            df = pd.read_sql(sql, conn)
-    except Exception:
-        logging.exception("Failed to run query for region %s", region_key)
-        df = pd.DataFrame(columns=cols)
-    finally:
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
-
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-
-    try:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-    except Exception:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
-
-    # maintain person_uid same as compute logic
-    def make_person_uid(row):
-        eid = row.get("EmployeeIdentity")
-        if pd.notna(eid) and str(eid).strip() != "":
-            return str(eid).strip()
-        pieces = [
-            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
-            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
-            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
-        ]
-        joined = "|".join([p for p in pieces if p])
-        return joined or None
-
-    if not df.empty:
-        df['person_uid'] = df.apply(make_person_uid, axis=1)
-
-    return df[cols + (['person_uid'] if 'person_uid' in df.columns else [])]
-
-# compute durations (unchanged largely)
-def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
-    out_cols = [
-        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
-        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
-        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
-        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
-    ]
-
-    if swipes_df is None or swipes_df.empty:
-        return pd.DataFrame(columns=out_cols)
-
-    df = swipes_df.copy()
-    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
-                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"]
-    for col in expected:
-        if col not in df.columns:
-            df[col] = None
-
-    if df["LocaleMessageTime"].dtype == object:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-
-    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
-    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
-
-    df["Date"] = df["LocaleMessageTime"].dt.date
-
-    df["person_uid"] = df.apply(
-        lambda row: row["person_uid"]
-        if pd.notna(row.get("person_uid")) and str(row.get("person_uid")).strip() != ""
-        else "|".join([str(row.get(c)).strip() for c in ["EmployeeID", "CardNumber", "EmployeeName"] if pd.notna(row.get(c)) and str(row.get(c)).strip() != ""]),
-        axis=1
-    )
-    df = df[df["person_uid"].notna()].copy()
-
-    try:
-        df = df.sort_values("LocaleMessageTime")
-        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
-            FirstSwipe=("LocaleMessageTime", "first"),
-            LastSwipe=("LocaleMessageTime", "last"),
-            FirstDoor=("Door", "first"),
-            LastDoor=("Door", "last"),
-            CountSwipes=("LocaleMessageTime", "count"),
-            EmployeeIdentity=("EmployeeIdentity", "first"),
-            EmployeeID=("EmployeeID", "first"),
-            EmployeeName=("EmployeeName", "first"),
-            CardNumber=("CardNumber", "first"),
-            PersonnelTypeName=("PersonnelTypeName", "first"),
-            PartitionName2=("PartitionName2", "first"),
-            CompanyName=("CompanyName", "first"),
-            PrimaryLocation=("PrimaryLocation", "first"),
-            FirstDirection=("Direction", "first"),
-            LastDirection=("Direction", "last")
-        ).reset_index()
-    except Exception:
-        def agg_for_group(g):
-            g_sorted = g.sort_values("LocaleMessageTime")
-            first = g_sorted.iloc[0]
-            last = g_sorted.iloc[-1]
-            return pd.Series({
-                "person_uid": first["person_uid"],
-                "EmployeeIdentity": first.get("EmployeeIdentity"),
-                "EmployeeID": first.get("EmployeeID"),
-                "EmployeeName": first.get("EmployeeName"),
-                "CardNumber": first.get("CardNumber"),
-                "Date": first["Date"],
-                "FirstSwipe": first["LocaleMessageTime"],
-                "LastSwipe": last["LocaleMessageTime"],
-                "FirstDoor": first.get("Door"),
-                "LastDoor": last.get("Door"),
-                "CountSwipes": int(len(g_sorted)),
-                "PersonnelTypeName": first.get("PersonnelTypeName"),
-                "PartitionName2": first.get("PartitionName2"),
-                "CompanyName": first.get("CompanyName"),
-                "PrimaryLocation": first.get("PrimaryLocation"),
-                "FirstDirection": first.get("Direction"),
-                "LastDirection": last.get("Direction")
-            })
-        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
-
-    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
-    grouped["Duration"] = grouped["DurationSeconds"].apply(
-        lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s >= 0 else None
-    )
-
-    for c in out_cols:
-        if c not in grouped.columns:
-            grouped[c] = None
-
-    return grouped[out_cols]
-
-# runner helper: run_for_date
-def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
-    outdir_path = Path(outdir)
-    outdir_path.mkdir(parents=True, exist_ok=True)
-
-    results: Dict[str, Any] = {}
-    for r in regions:
-        r = r.lower()
-        if r not in REGION_CONFIG:
-            logging.warning("Unknown region '%s' - skipping", r)
-            continue
-        logging.info("Fetching swipes for region %s on %s", r, target_date)
-        try:
-            swipes = fetch_swipes_for_region(r, target_date)
-        except Exception:
-            logging.exception("Failed fetching swipes for region %s", r)
-            swipes = pd.DataFrame()
-
-        # optional city filter
-        if city and not swipes.empty:
-            city_l = str(city).strip().lower()
-            mask_parts = []
-            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
-                if col in swipes.columns:
-                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
-            if mask_parts:
-                combined_mask = mask_parts[0]
-                for m in mask_parts[1:]:
-                    combined_mask = combined_mask | m
-                swipes = swipes[combined_mask].copy()
-
-        try:
-            durations = compute_daily_durations(swipes)
-        except Exception:
-            logging.exception("Failed computing durations for region %s", r)
-            durations = pd.DataFrame()
-
-        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
-        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
-        try:
-            durations.to_csv(csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing durations CSV for %s", r)
-        try:
-            swipes.to_csv(swipes_csv_path, index=False)
-        except Exception:
-            logging.exception("Failed writing swipes CSV for %s", r)
-
-        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
-        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
-        results[r] = {"swipes": swipes, "durations": durations}
-
-    return results
-
-
+    k_raw = (str(door).strip() + (f"___{str(direction).strip()}" if direction else "")).upper()
+    # try exact key
+    if k_raw in DOOR_ZONE_MAP:
+        return DOOR_ZONE_MAP[k_raw]
+    # try without direction
+    door_only = str(door).strip().upper()
+    if door_only in DOOR_ZONE_MAP:
+        return DOOR_ZONE_MAP[door_only]
+    # substring fallback (case-insensitive)
+    s = door_only.lower()
+    for key, zone in DOOR_ZONE_MAP.items():
+        if key.lower() in s or s in key.lower():
+            return zone
+    # direction fallback
+    if direction and "out" in str(direction).lower():
+        return OUT_OF_OFFICE_ZONE
+    if "reception" in s or "lobby" in s:
+        return "Reception Area"
+    if "outdoor" in s or "fire exit" in s or "exit" in s:
+        return "East Outdoor Area"
+    return "Working Area"
 
 
 
@@ -836,9 +156,12 @@ import numpy as np
 import joblib
 import math
 import re
+import io
 
 from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR
 from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+
+
 
 MODELS_DIR = Path(__file__).parent / "models"
 _loaded_models = {}
@@ -872,6 +195,18 @@ logging.basicConfig(level=logging.INFO)
 BASE_DIR = Path(__file__).parent.resolve()
 DEFAULT_OUTDIR = BASE_DIR / "outputs"
 DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+
+from flask import send_file
+try:
+    # optional import; used for styling
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
+
 
 
 def _to_python_scalar(x):
@@ -1683,6 +1018,226 @@ def get_record():
     }), 200
 
 
+@app.route('/record/export', methods=['GET'])
+def export_record_excel():
+    """
+    /record/export?employee_id=...&date=YYYY-MM-DD  OR /record/export?person_uid=...&date=YYYY-MM-DD
+    Produces an Excel file (xlsx) filtered for the requested employee and date (if provided).
+    Two sheets:
+      - "Details — Evidence": EmployeeName, EmployeeID, Door, Direction, Date, LocaleMessageTime, SwipeGapSeconds, PartitionName2
+      - "Swipe timeline": Employee Name, Employee ID, Card, Date, Time, Door, Direction, Note, SwipeGapSeconds
+    Applies formatting: bold header, header thick border, center alignment, borders for all cells.
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    date_str = request.args.get('date')  # optional 'YYYY-MM-DD' (single date)
+    if not q:
+        return jsonify({"error":"employee_id or person_uid is required"}), 400
+
+    # Determine list of raw swipe files to scan. If date provided, restrict to that date only.
+    files_to_scan = []
+    p = Path(DEFAULT_OUTDIR)
+    if date_str:
+        try:
+            dd = pd.to_datetime(date_str).date()
+            target = dd.strftime("%Y%m%d")
+            candidates = list(p.glob(f"swipes_*_{target}.csv"))
+            files_to_scan = candidates
+        except Exception:
+            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
+    else:
+        # scan all swipes files (most recent first)
+        files_to_scan = sorted(p.glob("swipes_*.csv"), reverse=True)
+
+    if not files_to_scan:
+        return jsonify({"error":"no raw swipe files found for requested date / outputs"}), 404
+
+    all_rows = []
+    for fp in files_to_scan:
+        try:
+            raw_df = pd.read_csv(fp, dtype=str, parse_dates=['LocaleMessageTime'], infer_datetime_format=True)
+        except Exception:
+            try:
+                raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+
+        # normalize column names
+        cols_lower = {c.lower(): c for c in raw_df.columns}
+        # pick possible columns
+        tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or None
+        emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+        name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+        card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+        door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+        dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+        note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+        person_uid_col = cols_lower.get('person_uid')
+
+        # build mask matching requested q: try person_uid, emp_col, card, name
+        mask = pd.Series(False, index=raw_df.index)
+        if person_uid_col and person_uid_col in raw_df.columns:
+            mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
+        if emp_col and emp_col in raw_df.columns:
+            mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
+        # try matching numeric equivalence
+        if not mask.any() and emp_col and emp_col in raw_df.columns:
+            try:
+                q_numeric = float(q)
+                emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                mask = mask | (emp_numeric == q_numeric)
+            except Exception:
+                pass
+        # also try name match if nothing matched
+        if not mask.any() and name_col and name_col in raw_df.columns:
+            mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
+
+        if not mask.any():
+            # nothing to include from this file
+            continue
+
+        filtered = raw_df[mask].copy()
+        if filtered.empty:
+            continue
+
+        # ensure timestamp col exists and parsed
+        if tcol and tcol in filtered.columns:
+            try:
+                filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+            except Exception:
+                pass
+
+        # compute swipe gaps (seconds)
+        if tcol and tcol in filtered.columns:
+            filtered = filtered.sort_values(by=tcol)
+            filtered['_prev_ts'] = filtered[tcol].shift(1)
+            try:
+                filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+            except Exception:
+                filtered['_swipe_gap_seconds'] = 0.0
+        else:
+            filtered['_swipe_gap_seconds'] = 0.0
+
+        # normalize columns into common shape and append rows
+        for _, r in filtered.iterrows():
+            row = {}
+            row['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in filtered.columns else None
+            # EmployeeID attempts: Int1/Text12/EmployeeID
+            emp_val = None
+            if emp_col and emp_col in filtered.columns:
+                emp_val = _to_python_scalar(r.get(emp_col))
+            else:
+                # fallbacks
+                for cand in ('int1','text12','employeeid','employee_identity','employeeidentity'):
+                    if cand in cols_lower and cols_lower[cand] in filtered.columns:
+                        emp_val = _to_python_scalar(r.get(cols_lower[cand]))
+                        if emp_val:
+                            break
+            row['EmployeeID'] = emp_val
+            row['Card'] = _to_python_scalar(r.get(card_col)) if card_col and card_col in filtered.columns else None
+
+            # Date and Time
+            if tcol and tcol in filtered.columns:
+                ts = r.get(tcol)
+                try:
+                    ts_py = pd.to_datetime(ts)
+                    row['Date'] = ts_py.date().isoformat()
+                    row['Time'] = ts_py.time().isoformat()
+                    row['LocaleMessageTime'] = ts_py.isoformat()
+                except Exception:
+                    txt = str(r.get(tcol))
+                    row['Date'] = txt[:10]
+                    row['Time'] = txt[11:19] if len(txt) >= 19 else None
+                    row['LocaleMessageTime'] = txt
+            else:
+                row['Date'] = None
+                row['Time'] = None
+                row['LocaleMessageTime'] = None
+
+            row['Door'] = _to_python_scalar(r.get(door_col)) if door_col and door_col in filtered.columns else None
+            row['Direction'] = _to_python_scalar(r.get(dir_col)) if dir_col and dir_col in filtered.columns else None
+            row['Note'] = _to_python_scalar(r.get(note_col)) if note_col and note_col in filtered.columns else None
+            row['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
+            row['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
+            row['_source_file'] = fp.name
+            all_rows.append(row)
+
+    if not all_rows:
+        return jsonify({"error":"no swipe rows matched the requested employee/date"}), 404
+
+    df_out = pd.DataFrame(all_rows)
+
+    # Build two sheets as requested
+    details_cols = ['EmployeeName','EmployeeID','Door','Direction','Date','LocaleMessageTime','SwipeGapSeconds','PartitionName2','_source_file']
+    timeline_cols = ['EmployeeName','EmployeeID','Card','Date','Time','Door','Direction','Note','SwipeGapSeconds','_source_file']
+
+    details_df = df_out[[c for c in details_cols if c in df_out.columns]].copy()
+    timeline_df = df_out[[c for c in timeline_cols if c in df_out.columns]].copy()
+
+    # Create excel in-memory
+    output = io.BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            details_df.to_excel(writer, sheet_name='Details — Evidence', index=False)
+            timeline_df.to_excel(writer, sheet_name='Swipe timeline', index=False)
+            writer.save()
+            output.seek(0)
+    except Exception as e:
+        logging.exception("Failed to create Excel: %s", e)
+        return jsonify({"error":"failed to create excel"}), 500
+
+    # If openpyxl available, apply formatting (bold header, center align, borders)
+    if OPENPYXL_AVAILABLE:
+        try:
+            wb = load_workbook(output)
+            thin = Side(border_style="thin", color="000000")
+            thick = Side(border_style="medium", color="000000")
+            for ws in wb.worksheets:
+                # header styling
+                header = ws[1]
+                for cell in header:
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = Border(top=thick, left=thick, right=thick, bottom=thick)
+                # data rows: center & thin border
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                # autosize columns (best-effort)
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        try:
+                            v = str(cell.value) if cell.value is not None else ""
+                        except Exception:
+                            v = ""
+                        if len(v) > max_len:
+                            max_len = len(v)
+                    # limit column width
+                    width = min(max(10, max_len + 2), 50)
+                    ws.column_dimensions[col_letter].width = width
+            # write back to bytes
+            out2 = io.BytesIO()
+            wb.save(out2)
+            out2.seek(0)
+            return send_file(out2, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            logging.exception("Excel styling failed, returning raw file")
+            output.seek(0)
+            return send_file(output, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        # fallback: return raw excel binary without styling
+        output.seek(0)
+        return send_file(output, as_attachment=True,
+                         download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.route('/swipes/<filename>', methods=['GET'])
 def download_swipes(filename):
     """
@@ -1723,6 +1278,454 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+
+
+
+
+# backend/duration_report.py
+from __future__ import annotations
+
+import logging
+import os
+import re
+import warnings
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# ODBC driver name (override with environment variable if needed)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# REGION configuration - databases list used to build UNION queries
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUPNQ0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["APAC.Default", "JP.Tokyo", "PH.Manila", "MY.Kuala Lumpur", "IN.HYD"]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUFRA0986V",
+        "databases": [
+            "ACVSUJournal_00011029","ACVSUJournal_00011028","ACVSUJournal_00011027",
+            "ACVSUJournal_00011026","ACVSUJournal_00011025","ACVSUJournal_00011024",
+            "ACVSUJournal_00011023"
+        ],
+        "partitions": ["LT.Vilnius", "AUT.Vienna", "IE.DUblin", "DU.Abu Dhab", "ES.Madrid"]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUSJO0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition", "MX.Mexico City"]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccure@2025",
+        "server": "SRVWUDEN0891V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["Denver", "Austin Texas", "Miami", "New York"],
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+
+
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    -- prefer contractor text12 else Int1 (match original logic)
+    CASE WHEN t3.[Name] IN ('Contractor','Terminated Contractor') THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[Int1] AS Int1,
+    t2.[Text12] AS Text12,
+    -- expose raw XML & shredded value so downstream code can attempt robust extraction
+    t_xml.XmlMessage AS XmlMessage,
+    sc.value AS XmlShredValue,
+    -- CardNumber: try CHUID/Card inside XmlMessage, fallback to shredded value, then text12/int1
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'
+  {region_filter}
+"""
+# Helpers
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        likes = rc.get("logical_like", [])
+        like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+        region_filter = f"AND ({like_sql})"
+    else:
+        region_filter = ""
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date=date_str, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+    
+# DB connection & fetch
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    # use first database in list if present
+    db = rc.get("databases", [rc.get("database")])[0]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={db};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+    "EmployeeName", "Door", "EmployeeID", "Int1", "Text12", "XmlMessage", "XmlShredValue", "CardNumber",
+    "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "MessageType",
+    "Direction", "CompanyName", "PrimaryLocation"
+]
+
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = None
+    try:
+        conn = get_connection(region_key)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
+            df = pd.read_sql(sql, conn)
+    except Exception:
+        logging.exception("Failed to run query for region %s", region_key)
+        df = pd.DataFrame(columns=cols)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    # maintain person_uid same as compute logic
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    if not df.empty:
+        df['person_uid'] = df.apply(make_person_uid, axis=1)
+
+    return df[cols + (['person_uid'] if 'person_uid' in df.columns else [])]
+
+# compute durations (unchanged largely)
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    if df["LocaleMessageTime"].dtype == object:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+
+    df["Date"] = df["LocaleMessageTime"].dt.date
+
+    df["person_uid"] = df.apply(
+        lambda row: row["person_uid"]
+        if pd.notna(row.get("person_uid")) and str(row.get("person_uid")).strip() != ""
+        else "|".join([str(row.get(c)).strip() for c in ["EmployeeID", "CardNumber", "EmployeeName"] if pd.notna(row.get(c)) and str(row.get(c)).strip() != ""]),
+        axis=1
+    )
+    df = df[df["person_uid"].notna()].copy()
+
+    try:
+        df = df.sort_values("LocaleMessageTime")
+        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
+            FirstSwipe=("LocaleMessageTime", "first"),
+            LastSwipe=("LocaleMessageTime", "last"),
+            FirstDoor=("Door", "first"),
+            LastDoor=("Door", "last"),
+            CountSwipes=("LocaleMessageTime", "count"),
+            EmployeeIdentity=("EmployeeIdentity", "first"),
+            EmployeeID=("EmployeeID", "first"),
+            EmployeeName=("EmployeeName", "first"),
+            CardNumber=("CardNumber", "first"),
+            PersonnelTypeName=("PersonnelTypeName", "first"),
+            PartitionName2=("PartitionName2", "first"),
+            CompanyName=("CompanyName", "first"),
+            PrimaryLocation=("PrimaryLocation", "first"),
+            FirstDirection=("Direction", "first"),
+            LastDirection=("Direction", "last")
+        ).reset_index()
+    except Exception:
+        def agg_for_group(g):
+            g_sorted = g.sort_values("LocaleMessageTime")
+            first = g_sorted.iloc[0]
+            last = g_sorted.iloc[-1]
+            return pd.Series({
+                "person_uid": first["person_uid"],
+                "EmployeeIdentity": first.get("EmployeeIdentity"),
+                "EmployeeID": first.get("EmployeeID"),
+                "EmployeeName": first.get("EmployeeName"),
+                "CardNumber": first.get("CardNumber"),
+                "Date": first["Date"],
+                "FirstSwipe": first["LocaleMessageTime"],
+                "LastSwipe": last["LocaleMessageTime"],
+                "FirstDoor": first.get("Door"),
+                "LastDoor": last.get("Door"),
+                "CountSwipes": int(len(g_sorted)),
+                "PersonnelTypeName": first.get("PersonnelTypeName"),
+                "PartitionName2": first.get("PartitionName2"),
+                "CompanyName": first.get("CompanyName"),
+                "PrimaryLocation": first.get("PrimaryLocation"),
+                "FirstDirection": first.get("Direction"),
+                "LastDirection": last.get("Direction")
+            })
+        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(
+        lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s >= 0 else None
+    )
+
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    return grouped[out_cols]
+
+# runner helper: run_for_date
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+    for r in regions:
+        r = r.lower()
+        if r not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", r, target_date)
+        try:
+            swipes = fetch_swipes_for_region(r, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", r)
+            swipes = pd.DataFrame()
+
+        # optional city filter
+        if city and not swipes.empty:
+            city_l = str(city).strip().lower()
+            mask_parts = []
+            for col in ("PartitionName2", "PrimaryLocation", "Door", "EmployeeName"):
+                if col in swipes.columns:
+                    mask_parts.append(swipes[col].fillna("").astype(str).str.lower().str.contains(city_l, na=False))
+            if mask_parts:
+                combined_mask = mask_parts[0]
+                for m in mask_parts[1:]:
+                    combined_mask = combined_mask | m
+                swipes = swipes[combined_mask].copy()
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", r)
+            durations = pd.DataFrame()
+
+        csv_path = outdir_path / f"{r}_duration_{target_date.strftime('%Y%m%d')}.csv"
+        swipes_csv_path = outdir_path / f"{r}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+        try:
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", r)
+        try:
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", r)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", r, csv_path, len(durations))
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", r, swipes_csv_path, len(swipes))
+        results[r] = {"swipes": swipes, "durations": durations}
+
+    return results
 
 
 
@@ -2716,10 +2719,86 @@ def run_trend_for_date(target_date: date, outdir: str = "./outputs", city='Pune'
     except Exception as e:
         logging.warning("Failed to save raw swipes: %s", e)
 
+       # --- AFTER computing features = compute_features(swipes, durations)
     features = compute_features(swipes, durations)
     if features.empty:
         logging.warning("run_trend_for_date: no features computed")
         return pd.DataFrame()
+  
+      # ===== START FIX: reconcile zero CountSwipes with raw swipe files =====
+    try:
+        if swipes is not None and not swipes.empty and 'person_uid' in swipes.columns:
+            tsw = swipes.copy()
+            # Ensure LocaleMessageTime is datetime and Date is date
+            if 'LocaleMessageTime' in tsw.columns:
+                tsw['LocaleMessageTime'] = pd.to_datetime(tsw['LocaleMessageTime'], errors='coerce')
+            else:
+                # try common time columns
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in tsw.columns:
+                        tsw['LocaleMessageTime'] = pd.to_datetime(tsw[cand], errors='coerce')
+                        break
+            if 'Date' not in tsw.columns:
+                if 'LocaleMessageTime' in tsw.columns:
+                    tsw['Date'] = tsw['LocaleMessageTime'].dt.date
+                else:
+                    # try to parse a Date-like column
+                    for cand in ('date','Date'):
+                        if cand in tsw.columns:
+                            try:
+                                tsw['Date'] = pd.to_datetime(tsw[cand], errors='coerce').dt.date
+                            except Exception:
+                                tsw['Date'] = None
+                            break
+
+            # Build lookup maps keyed by (person_uid, Date)
+            try:
+                grp = tsw.dropna(subset=['person_uid', 'Date']).groupby(['person_uid', 'Date'])
+                counts = grp.size().to_dict()  # (person_uid, date) -> count
+                firsts = grp['LocaleMessageTime'].min().to_dict()
+                lasts = grp['LocaleMessageTime'].max().to_dict()
+            except Exception:
+                counts = {}
+                firsts = {}
+                lasts = {}
+
+            # For any feature row with CountSwipes == 0, try to populate from raw swipes
+            def _fix_row_by_raw(idx, row):
+                key = (row.get('person_uid'), row.get('Date'))
+                if key in counts and (row.get('CountSwipes', 0) == 0 or pd.isna(row.get('CountSwipes'))):
+                    try:
+                        c = int(counts.get(key, 0))
+                        features.at[idx, 'CountSwipes'] = c
+                        # set first/last swipe if available and not set
+                        f = firsts.get(key)
+                        l = lasts.get(key)
+                        if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
+                            features.at[idx, 'FirstSwipe'] = pd.to_datetime(f)
+                        if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
+                            features.at[idx, 'LastSwipe'] = pd.to_datetime(l)
+                        # recompute DurationSeconds/DurationMinutes
+                        try:
+                            fs = features.at[idx, 'FirstSwipe']
+                            ls = features.at[idx, 'LastSwipe']
+                            if pd.notna(fs) and pd.notna(ls):
+                                dursec = (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds()
+                                dursec = max(0, dursec)
+                                features.at[idx, 'DurationSeconds'] = float(dursec)
+                                features.at[idx, 'DurationMinutes'] = float(dursec / 60.0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+            for ix, r in features[features['CountSwipes'].fillna(0).astype(int) == 0].iterrows():
+                try:
+                    _fix_row_by_raw(ix, r)
+                except Exception:
+                    logging.debug("Failed to reconcile row %s with raw swipes", ix)
+    except Exception:
+        logging.exception("Error while reconciling aggregated features with raw swipes (zero-swipe fix).")
+    # ===== END FIX =====
+
 
     # Build badge map and swipe overlap maps for higher-severity scenarios
     badge_map = {}
@@ -3020,6 +3099,592 @@ if __name__ == "__main__":
 
 
 
-  
+
+
+
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Trend Analysis — Dashboard</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <!-- React + ReactDOM + Babel (quick prototyping) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body { font-family: Inter, Roboto, Arial, sans-serif; margin: 0; padding: 0; background:#f6f7fb; color:#1f2937; }
+      .container { max-width:1200px; margin:24px auto; padding:20px; background:#fff; border-radius:8px; box-shadow:0 6px 18px rgba(16,24,40,0.06); }
+      header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+      header h1 { margin:0; font-size:20px; }
+      .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      input[type="date"] { padding:8px; border-radius:6px; border:1px solid #e2e8f0; }
+      button { padding:8px 12px; border-radius:6px; border:0; background:#2563eb; color:#fff; cursor:pointer; }
+      button.secondary { background:#64748b; }
+      button.ghost { background:transparent; color:#0f172a; border:1px solid #e2e8f0; }
+      .cards { display:flex; gap:12px; margin-top:16px; }
+      .card { flex:1; background:#f8fafc; padding:12px; border-radius:8px; text-align:center; }
+      .card h3 { margin:4px 0; font-size:18px; }
+      .card p { margin:0; color:#6b7280; }
+      .main { display:flex; gap:18px; margin-top:18px; }
+      .left { flex: 2; }
+      .right { flex: 1; min-width:260px; }
+      .chart-wrap { background:#fff; padding:10px; border-radius:8px; box-shadow: inset 0 0 0 1px #f1f5f9; }
+      table { width:100%; border-collapse:collapse; margin-top:12px; }
+      th, td { padding:8px 6px; border-bottom:1px solid #eef2f7; font-size:13px; vertical-align:middle; }
+      th { background:#fafafa; position:sticky; top:0; z-index:1; text-align:left; }
+      .small { font-size:12px; color:#475569; }
+      .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#e6f2ff; color:#075985; font-size:12px; cursor:pointer; margin:2px; }
+      .chip { display:inline-block; padding:6px 10px; border-radius:999px; background:#eef2ff; color:#034f84; font-size:13px; cursor:pointer; margin:3px; }
+      .searchbar { margin-top:12px; display:flex; gap:8px; align-items:center; }
+      .searchbar input { padding:8px; border-radius:6px; border:1px solid #e2e8f0; width:280px; }
+      .pagination { margin-top:10px; display:flex; gap:8px; align-items:center; justify-content:flex-start; }
+      .muted { color:#64748b; font-size:13px; }
+      .spinner { position:fixed; left:0; right:0; top:0; bottom:0; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.6); z-index:999; }
+      .modal { position:fixed; left:0; right:0; top:0; bottom:0; display:flex; align-items:center; justify-content:center; z-index:1000; }
+      .modal-inner { width:900px; max-width:95%; max-height:85%; overflow:auto; background:#fff; border-radius:8px; padding:16px; box-shadow:0 10px 40px rgba(2,6,23,0.3); }
+      .close-btn { float:right; background:#ef4444; color:#fff; border-radius:6px; padding:6px 8px; border:0; cursor:pointer; }
+      pre { white-space:pre-wrap; word-wrap:break-word; background:#0f172a; color:#fff; padding:12px; border-radius:8px; }
+      .row-click { cursor:pointer; }
+      .overlap-pill { display:inline-block; padding:4px 8px; border-radius:6px; background:#fff2dd; color:#92400e; font-size:12px; }
+      .evidence-table { width:100%; border-collapse:collapse; margin-top:8px; }
+      .evidence-table th, .evidence-table td { padding:6px 8px; border:1px solid #e6edf3; font-size:13px; text-align:left; }
+      .gap-flag { background:#fff5f0; color:#9a3412; padding:4px 6px; border-radius:6px; display:inline-block; margin-left:8px; }
+      .explain { background:#f8fafc; padding:10px; border-radius:8px; margin-top:8px; }
+      .evidence-btn { padding:6px 8px; background:#0ea5a4; color:#fff; border-radius:6px; border:0; cursor:pointer; }
+      .flagged-row { background: linear-gradient(90deg,#fffaf0,#fff); }
+      .highlight-swipe { background:#fffbeb; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      (function(){
+        const { useState, useEffect, useRef } = React;
+
+        // CHANGE THIS IF YOUR API HOST DIFFERS
+        const API_BASE = "http://10.199.45.239:8002";
+
+        const SCENARIO_EXPLANATIONS = {
+          "long_gap_>=90min": "Long gap between swipes (>= 90 minutes) — could indicate long out-of-office break.",
+          "short_duration_<4h": "Short total duration in office (< 4 hours).",
+          "coffee_badging": "Frequent short badge cycles (>=4) with short duration — possible 'coffee badging'.",
+          "low_swipe_count_<=2": "Low swipe count (<=2) for the day.",
+          "single_door": "All swipes used the same door — single-door behavior.",
+          "only_in": "Only IN swipe(s) recorded for the day.",
+          "only_out": "Only OUT swipe(s) recorded for the day.",
+          "overtime_>=10h": "Long duration (>=10 hours) — overtime.",
+          "very_long_duration_>=16h": "Very long duration (>=16 hours) — suspiciously long presence.",
+          "zero_swipes": "No swipes recorded.",
+          "unusually_high_swipes": "Unusually high number of swipes versus historical median.",
+          "repeated_short_breaks": "Multiple short breaks within the day.",
+          "multiple_location_same_day": "Swipes recorded at multiple locations same day.",
+          "weekend_activity": "Activity recorded on weekend.",
+          "repeated_rejection_count": "Several card rejections.",
+          "badge_sharing_suspected": "Badge sharing suspected (same card used by multiple persons on same day).",
+          "early_arrival_before_06": "First swipe before 06:00.",
+          "late_exit_after_22": "Last swipe after 22:00.",
+          "shift_inconsistency": "Duration inconsistent with historical shift patterns.",
+          "trending_decline": "Historical trending decline flagged.",
+          "consecutive_absent_days": "Marked absent for consecutive days historically.",
+          "high_variance_duration": "High variance in durations historically.",
+          "short_duration_on_high_presence_days": "Short duration even though employee usually attends many days.",
+          "swipe_overlap": "Simultaneous swipe(s) near the same time with other uid(s) (possible tailgating or collusion)."
+        };
+
+        function pad(n){ return n.toString().padStart(2,'0'); }
+        function formatDateISO(d){
+          if(!d) return "";
+          const dt = (d instanceof Date) ? d : new Date(d);
+          return dt.getFullYear() + "-" + pad(dt.getMonth()+1) + "-" + pad(dt.getDate());
+        }
+        function datesBetween(start, end){
+          var out = [];
+          var cur = new Date(start);
+          while(cur <= end){
+            out.push(new Date(cur));
+            cur.setDate(cur.getDate()+1);
+          }
+          return out;
+        }
+        function safeDateDisplay(val){
+          if(!val && val !== 0) return "";
+          try {
+            var d = (val instanceof Date) ? val : new Date(val);
+            if(isNaN(d.getTime())) return String(val);
+            return d.toLocaleString();
+          } catch(e) {
+            return String(val);
+          }
+        }
+        function sanitizeName(row){
+          return row.EmployeeName || row.EmployeeName_x || row.EmployeeName_y || row.person_uid || "";
+        }
+        function downloadCSV(rows, filename){
+          if(!rows || !rows.length) { alert("No rows to export"); return; }
+          var cols = Object.keys(rows[0]);
+          var lines = [cols.join(",")];
+          rows.forEach(function(r){
+            var row = cols.map(function(c){
+              var v = (r[c] === undefined || r[c] === null) ? "" : String(r[c]).replace(/\n/g,' ');
+              return JSON.stringify(v);
+            }).join(",");
+            lines.push(row);
+          });
+          var blob = new Blob([lines.join("\n")], {type:'text/csv'});
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a'); a.href = url; a.download = filename || 'export.csv'; a.click(); URL.revokeObjectURL(url);
+        }
+
+        function App(){
+          var yesterday = new Date();
+          yesterday.setDate(yesterday.getDate()-1);
+
+          const [dateFrom, setDateFrom] = useState(formatDateISO(yesterday));
+          const [dateTo, setDateTo] = useState(formatDateISO(new Date()));
+          const [loading, setLoading] = useState(false);
+          const [summary, setSummary] = useState({rows:0, flagged_rows:0, files:[], end_date:null});
+          const [rows, setRows] = useState([]);
+          const [reasonsCount, setReasonsCount] = useState({});
+          const [filterText, setFilterText] = useState("");
+          const [page, setPage] = useState(1);
+          const [selectedReason, setSelectedReason] = useState("");
+          const [modalRow, setModalRow] = useState(null);
+          const [modalDetails, setModalDetails] = useState(null); // {aggregated_rows, raw_swipes, raw_swipe_files}
+          const [modalLoading, setModalLoading] = useState(false);
+          const pageSize = 25;
+          const chartRef = useRef(null);
+          const chartInst = useRef(null);
+
+          useEffect(function(){
+            // load latest on mount
+            loadLatest();
+          }, []);
+
+          async function runForRange(){
+            setLoading(true);
+            setRows([]);
+            setSummary({rows:0, flagged_rows:0, files:[], end_date:null});
+            setReasonsCount({});
+            try {
+              var start = new Date(dateFrom);
+              var end = new Date(dateTo);
+              var dateList = datesBetween(start, end).map(d => formatDateISO(d));
+              var accRows = [];
+              var totalRows = 0, totalFlagged = 0, files = [];
+              for(var i=0;i<dateList.length;i++){
+                var d = dateList[i];
+                var url = API_BASE + "/run?date=" + d;
+                var r = await fetch(url, { method:'GET' });
+                if(!r.ok){
+                  var txt = await r.text();
+                  throw new Error("API returned " + r.status + ": " + txt);
+                }
+                var js = await r.json();
+                var sample = js.sample || [];
+                if(Array.isArray(sample) && sample.length) accRows = accRows.concat(sample);
+                if(typeof js.rows === 'number') totalRows += js.rows; else totalRows += (Array.isArray(sample) ? sample.length : 0);
+                totalFlagged += (js.flagged_rows || 0);
+                if(js.files) files = files.concat(js.files);
+              }
+              setRows(accRows);
+              setSummary({rows: totalRows, flagged_rows: totalFlagged, files: files, end_date: formatDateISO(new Date(dateTo))});
+              computeReasons(accRows);
+              setPage(1);
+            } catch(err){
+              alert("Error: " + err.message);
+              console.error(err);
+            } finally {
+              setLoading(false);
+            }
+          }
+
+          async function loadLatest(){
+            setLoading(true);
+            try{
+              var r = await fetch(API_BASE + "/latest");
+              if(!r.ok) throw new Error("latest failed: " + r.status);
+              var js = await r.json();
+              var sample = js.sample || [];
+              if(!Array.isArray(sample)) sample = [];
+              setRows(sample);
+              setSummary({rows: (js.rows || sample.length || 0), flagged_rows: (sample.filter(function(x){ return !!x.Reasons; }).length || 0), files:[js.file]});
+              computeReasons(sample);
+              setPage(1);
+            } catch(err){
+              alert("Error: " + err.message + (err.message === 'latest failed: 0' ? " (check backend/CORS)" : ""));
+              console.error(err);
+            } finally {
+              setLoading(false);
+            }
+          }
+
+          function computeReasons(dataRows){
+            var counts = {};
+            (dataRows || []).forEach(function(r){
+              if(!r.Reasons) return;
+              var parts = String(r.Reasons).split(";").map(function(s){ return s.trim(); }).filter(Boolean);
+              parts.forEach(function(p){ counts[p] = (counts[p] || 0) + 1; });
+            });
+            setReasonsCount(counts);
+            buildChart(counts);
+          }
+
+          function buildChart(counts){
+            var labels = Object.keys(counts).sort(function(a,b){ return counts[b] - counts[a]; });
+            var values = labels.map(function(l){ return counts[l]; });
+            var ctx = chartRef.current && chartRef.current.getContext ? chartRef.current.getContext('2d') : null;
+            if(!ctx) return;
+            try { if(chartInst.current) chartInst.current.destroy(); } catch(e){}
+            chartInst.current = new Chart(ctx, {
+              type:'bar',
+              data:{ labels: labels, datasets:[{ label:'Events', data: values, backgroundColor:'rgba(37,99,235,0.85)' }] },
+              options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, scales:{ y:{ beginAtZero:true } } }
+            });
+          }
+
+          // filtering & pagination
+          var filtered = (rows || []).filter(function(r){
+            var hay = (sanitizeName(r) + " " + (r.EmployeeID||"") + " " + (r.CardNumber||"") + " " + (r.Reasons||"")).toLowerCase();
+            var textOk = !filterText || hay.indexOf(filterText.toLowerCase()) !== -1;
+            var reasonOk = !selectedReason || (r.Reasons && ((";" + String(r.Reasons) + ";").indexOf(selectedReason) !== -1));
+            return textOk && reasonOk;
+          });
+          var totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+          var pageRows = filtered.slice((page-1)*pageSize, page*pageSize);
+
+          function exportFiltered(){
+            downloadCSV(filtered, "trend_filtered_export.csv");
+          }
+
+          function onReasonClick(reason){
+            if(!reason) { setSelectedReason(""); return; }
+            if(selectedReason === reason) setSelectedReason(""); else setSelectedReason(reason);
+            setPage(1);
+          }
+
+          // open evidence modal (explicit Evidence button)
+          async function openEvidence(row){
+            setModalRow(row);
+            setModalDetails(null);
+            setModalLoading(true);
+            try {
+              const q = encodeURIComponent(row.EmployeeID || row.person_uid || "");
+              const resp = await fetch(API_BASE + "/record?employee_id=" + q);
+              if(!resp.ok){
+                const txt = await resp.text();
+                throw new Error("record failed: " + resp.status + " - " + txt);
+              }
+              const js = await resp.json();
+              // js.raw_swipes is already filtered and shaped by backend
+              const details = { aggregated_rows: js.aggregated_rows || [], raw_swipe_files: js.raw_swipe_files || [], raw_swipes: js.raw_swipes || [] };
+              setModalDetails(details);
+            } catch(e){
+              alert("Failed loading details: " + e.message);
+              console.error(e);
+            } finally {
+              setModalLoading(false);
+            }
+          }
+
+          function closeModal(){ setModalRow(null); setModalDetails(null); }
+
+          // convenience counts for cards
+          var rowsCount = (summary && typeof summary.rows === 'number') ? summary.rows : (rows ? rows.length : 0);
+          var flaggedCount = (summary && typeof summary.flagged_rows === 'number') ? summary.flagged_rows : (rows ? rows.filter(function(r){ return !!r.Reasons; }).length : 0);
+          var flaggedPct = rowsCount ? Math.round((flaggedCount*100)/(rowsCount||1)) : 0;
+
+          function renderOverlapCell(r){
+            var ov = r.OverlapWith || r.swipe_overlap || r.overlap_with || null;
+            if(ov && typeof ov === 'string'){
+              var parts = ov.split(";").map(function(s){ return s.trim(); }).filter(Boolean);
+              if(parts.length === 0) return <span className="muted">—</span>;
+              return <span className="overlap-pill" title={ov}>{parts.length} overlap</span>;
+            }
+            return <span className="muted">—</span>;
+          }
+
+          function renderReasonChips(reasonText){
+            if(!reasonText) return <span className="muted">—</span>;
+            const parts = String(reasonText).split(";").map(s=>s.trim()).filter(Boolean);
+            return parts.map((p,idx)=>(<span key={idx} className="pill" title={SCENARIO_EXPLANATIONS[p] || p}>{p}</span>));
+          }
+
+          function renderReasonExplanations(reasonText){
+            if(!reasonText) return <div className="muted">No flags</div>;
+            const parts = String(reasonText).split(";").map(s=>s.trim()).filter(Boolean);
+            return (
+              <div>
+                {parts.map((p,idx)=>(
+                  <div key={idx} style={{marginBottom:6}}>
+                    <b>{p}</b> — <span className="small">{ SCENARIO_EXPLANATIONS[p] || "No explanation available." }</span>
+                  </div>
+                ))}
+              </div>
+            );
+          }
+
+          function renderSwipeTimeline(details){
+            if(!details || !details.raw_swipes || details.raw_swipes.length === 0){
+              return <div className="muted">No raw swipe evidence available (person not flagged or raw file missing).</div>;
+            }
+            // sort by Date+Time
+            let all = details.raw_swipes.slice();
+            all.sort(function(a,b){
+              const at = a.Date && a.Time ? new Date(a.Date + "T" + a.Time) : null;
+              const bt = b.Date && b.Time ? new Date(b.Date + "T" + b.Time) : null;
+              if(at && bt) return at - bt;
+              if(at) return -1;
+              if(bt) return 1;
+              return 0;
+            });
+
+            // If aggregated row contains FirstSwipe/LastSwipe we can highlight those matching entries
+            let aggFirst = null, aggLast = null;
+            if(modalRow && modalRow.FirstSwipe) aggFirst = new Date(modalRow.FirstSwipe);
+            if(modalRow && modalRow.LastSwipe) aggLast = new Date(modalRow.LastSwipe);
+
+            return (
+              <div>
+                <table className="evidence-table">
+                  <thead>
+                    <tr>
+                      <th>Employee Name</th><th>Employee ID</th><th>Card</th><th>Date</th><th>Time</th><th>Door</th><th>Direction</th><th>Note</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    { all.map(function(rObj, idx){
+                        const r = rObj;
+                        let highlight = false;
+                        try {
+                          if(aggFirst && r.Date && r.Time){
+                            highlight = highlight || (Math.abs(new Date(r.Date + "T" + r.Time) - aggFirst) <= 1500);
+                          }
+                          if(aggLast && r.Date && r.Time){
+                            highlight = highlight || (Math.abs(new Date(r.Date + "T" + r.Time) - aggLast) <= 1500);
+                          }
+                        } catch(e){}
+                        return (
+                          <tr key={idx} className={highlight ? 'highlight-swipe' : ''}>
+                            <td className="small">{ r.EmployeeName || '-' }</td>
+                            <td className="small">{ r.EmployeeID || '-' }</td>
+                            <td className="small">{ r.CardNumber || '-' }</td>
+                            <td className="small">{ r.Date || '-' }</td>
+                            <td className="small">{ r.Time || '-' }</td>
+                            <td className="small">{ r.Door || '-' }</td>
+                            <td className="small">{ r.Direction || '-' }</td>
+                            <td className="small">{ r.Note || '-' } { r._source ? <span className="muted">({r._source})</span> : null }</td>
+                          </tr>
+                        );
+                      }) }
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
+
+          return (
+            <div className="container" role="main" aria-live="polite">
+              { loading && <div className="spinner"><div style={{padding:16, background:'#fff', borderRadius:8, boxShadow:'0 4px 20px rgba(2,6,23,0.1)'}}>Loading…</div></div> }
+
+              <header>
+                <h1>Trend Analysis — Pune</h1>
+                <div className="controls">
+                  <label className="small">From</label>
+                  <input type="date" value={dateFrom} onChange={function(e){ setDateFrom(e.target.value); }} disabled={loading} />
+                  <label className="small">To</label>
+                  <input type="date" value={dateTo} onChange={function(e){ setDateTo(e.target.value); }} disabled={loading} />
+                  <button onClick={runForRange} disabled={loading}>Run (date/range)</button>
+                  <button className="secondary" onClick={loadLatest} disabled={loading}>Load latest</button>
+                  <button className="ghost" onClick={exportFiltered} disabled={loading}>Export filtered</button>
+                </div>
+              </header>
+
+              <div className="cards" aria-hidden={loading}>
+                <div className="card">
+                  <h3>{ (rowsCount !== undefined && rowsCount !== null) ? rowsCount : 0 }</h3>
+                  <p>Rows analysed</p>
+                </div>
+                <div className="card">
+                  <h3>{ (flaggedCount !== undefined && flaggedCount !== null) ? flaggedCount : 0 }</h3>
+                  <p>Flagged rows</p>
+                </div>
+                <div className="card">
+                  <h3>{ flaggedPct }%</h3>
+                  <p>Flagged rate</p>
+                </div>
+              </div>
+
+              <div style={{marginTop:12}}>
+                <strong>Top reasons (click to filter)</strong>
+                <div style={{marginTop:8}}>
+                  { Object.keys(reasonsCount).length === 0 && <span className="muted">No flags found</span> }
+                  { Object.entries(reasonsCount).sort(function(a,b){ return b[1]-a[1]; }).slice(0,18).map(function(kv){
+                      var name = kv[0], count = kv[1];
+                      var active = selectedReason === name;
+                      return <button key={name} className="chip" style={{background: active ? '#dbeafe' : undefined, border: active ? '1px solid #60a5fa' : undefined}} onClick={function(){ onReasonClick(name); }}>{name} <span style={{marginLeft:8, opacity:0.8}} className="small">({count})</span></button>;
+                  }) }
+                </div>
+              </div>
+
+              <div className="main">
+                <div className="left">
+                  <div className="chart-wrap" style={{height:260}}>
+                    <canvas ref={chartRef}></canvas>
+                  </div>
+
+                  <div className="searchbar">
+                    <input placeholder="Search name, employee id, card or reason..." value={filterText} onChange={function(e){ setFilterText(e.target.value); setPage(1); }} />
+                    <div className="muted">Showing { filtered.length } / { rows.length } rows</div>
+                  </div>
+
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Employee</th>
+                        <th className="small">ID</th>
+                        <th className="small">Card</th>
+                        <th className="small">Date</th>
+                        <th className="small">Duration</th>
+                        <th className="small">Reasons</th>
+                        <th className="small">Overlap</th>
+                        <th className="small">Evidence</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      { pageRows.map(function(r, idx){
+                          var empName = sanitizeName(r);
+                          var displayDate = safeDateDisplay(r.Date || r.FirstSwipe || r.LastSwipe);
+                          var durText = r.Duration || (r.DurationMinutes ? Math.round(r.DurationMinutes) + " min" : "");
+                          var flagged = r.Reasons && String(r.Reasons).trim();
+                          return (
+                            <tr key={idx} className={ flagged ? "flagged-row" : "" }>
+                              <td className="row-click" onClick={function(){ openEvidence(r); }}>{ empName || <span className="muted">—</span> }</td>
+                              <td className="small">{ r.EmployeeID || "" }</td>
+                              <td className="small">{ r.CardNumber || "" }</td>
+                              <td className="small">{ displayDate }</td>
+                              <td className="small">{ durText }</td>
+                              <td className="small">{ renderReasonChips(r.Reasons) }</td>
+                              <td className="small">{ renderOverlapCell(r) }</td>
+                              <td className="small">
+                                <button className="evidence-btn" onClick={function(){ openEvidence(r); }}>Evidence</button>
+                              </td>
+                            </tr>
+                        );
+                      }) }
+                    </tbody>
+                  </table>
+
+                  <div className="pagination">
+                    <button onClick={function(){ setPage(function(p){ return Math.max(1,p-1); }); }} disabled={page<=1}>Prev</button>
+                    <div className="muted">Page { page } / { totalPages }</div>
+                    <button onClick={function(){ setPage(function(p){ return Math.min(totalPages,p+1); }); }} disabled={page>=totalPages}>Next</button>
+                  </div>
+                </div>
+
+                <aside className="right">
+                  <div style={{marginBottom:12}}>
+                    <strong>Files:</strong>
+                    <div className="muted">{ (summary.files || []).join(", ") }</div>
+                  </div>
+
+                  <div style={{marginBottom:12}}>
+                    <strong>Top reasons summary</strong>
+                    <ul>
+                      { Object.entries(reasonsCount).sort(function(a,b){ return b[1]-a[1]; }).slice(0,10).map(function(kv){
+                          return <li key={kv[0]}><b>{kv[1]}</b> — <span className="small">{kv[0]}</span></li>;
+                        }) }
+                      { Object.keys(reasonsCount).length === 0 && <div className="muted">No flags found</div> }
+                    </ul>
+                  </div>
+
+                  <div>
+                    <strong>Help</strong>
+                    <div className="small muted" style={{marginTop:6}}>
+                      - Click <b>Run</b> to trigger analysis for chosen date(s).<br/>
+                      - Range calls `/run?date=YYYY-MM-DD` for each date in the range sequentially.<br/>
+                      - Click the Evidence button to view raw swipe evidence filtered to the selected person/date.<br/>
+                      - If you see CORS errors, enable Flask-Cors on the backend or run the frontend from the same host as API.
+                    </div>
+                  </div>
+                </aside>
+              </div>
+
+              { modalRow &&
+                <div className="modal" onClick={closeModal}>
+                  <div className="modal-inner" onClick={function(e){ e.stopPropagation(); }}>
+                    <button className="close-btn" onClick={closeModal}>Close</button>
+                    <h3>Details — Evidence</h3>
+
+                    { modalLoading && <div className="muted">Loading evidence…</div> }
+
+                    <div style={{marginTop:8}}>
+                      <strong>Name:</strong> { sanitizeName(modalRow) } <br/>
+                      <strong>EmployeeID:</strong> { modalRow.EmployeeID || "—" } <br/>
+                      <strong>Card:</strong> { modalRow.CardNumber || "—" } <br/>
+                      <strong>Date:</strong> { safeDateDisplay(modalRow.Date || modalRow.FirstSwipe) } <br/>
+                      <strong>Duration:</strong> { modalRow.Duration || (modalRow.DurationMinutes ? Math.round(modalRow.DurationMinutes) + " min" : "—") } <br/>
+                      <strong>Reasons:</strong> { renderReasonChips(modalRow.Reasons) } <br/>
+                      <strong>OverlapWith:</strong> { modalRow.OverlapWith || modalRow.swipe_overlap || "—" } <br/>
+                    </div>
+
+                    <div className="explain">
+                      <strong>Why highlighted</strong>
+                      <div style={{marginTop:6}}>
+                        { renderReasonExplanations(modalRow.Reasons) }
+                      </div>
+                    </div>
+
+                    <hr/>
+
+                    <h4>Available evidence files</h4>
+                    <div style={{marginTop:8}}>
+                      { modalDetails && modalDetails.raw_swipe_files && modalDetails.raw_swipe_files.length > 0
+                        ? <div>
+                            <ul>
+                              { modalDetails.raw_swipe_files.map((f,i)=>(
+                                <li key={i}><b>{f}</b> — <button onClick={function(){ window.location = API_BASE + "/swipes/" + encodeURIComponent(f); }}>Download</button></li>
+                              )) }
+                            </ul>
+                          </div>
+                        : <div className="muted">No raw swipe files found for this person/date.</div>
+                      }
+                    </div>
+
+                    <div style={{marginTop:12}}>
+                      <strong>Swipe timeline (filtered for this person/date)</strong>
+                      <div style={{marginTop:8}}>
+                        { modalDetails ? renderSwipeTimeline(modalDetails) : <div className="muted">Evidence not loaded yet.</div> }
+                      </div>
+                    </div>
+
+                    <hr/>
+                    <div style={{marginTop:8}}>
+                      <label><input type="checkbox" id="showraw" onChange={function(e){
+                        const el = document.getElementById('rawpayload');
+                        if(el) el.style.display = e.target.checked ? 'block' : 'none';
+                      }} /> Show raw aggregated JSON</label>
+                      <div id="rawpayload" style={{display:'none', marginTop:8}}><pre>{ JSON.stringify(modalRow, null, 2) }</pre></div>
+                    </div>
+
+                  </div>
+                </div>
+              }
+
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+      })();
+    </script>
+  </body>
+</html>
+
 
 
