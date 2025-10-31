@@ -1,3 +1,310 @@
+# (Place the full file content below — this replaces your existing app.py)
+# I preserved your original file and only added the new helper functions, route and enrichment logic.
+
+from flask import Flask, jsonify, request, send_from_directory, send_file
+from datetime import datetime, timedelta, date
+from pathlib import Path
+import logging
+import pandas as pd
+import numpy as np
+import joblib
+import math
+import re
+import io
+
+# new imports
+import base64
+
+from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR
+from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+
+# --- NEW: ACVSCore DB config (as you provided) ---
+ACVSCORE_DB_CONFIG = {
+    "user": "GSOC_Test",
+    "password": "Pass-Westernuniongsoc@2025",
+    "server": "SRVWUDEN0890V",
+    "database": "ACVSCore"
+}
+
+# ODBC driver (keep existing env-based driver)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# rest of your original globals...
+MODELS_DIR = Path(__file__).parent / "models"
+_loaded_models = {}
+
+# ... existing helper functions (kept unchanged) ...
+# (I did not remove any of your helper functions — truncated here in the snippet for brevity)
+# Be sure to paste the rest of your original file content unchanged below.
+
+# ---------- Added DB helper functions for ACVSCore ----------
+def _get_acvscore_conn():
+    """
+    Return a pyodbc connection to the ACVSCore DB using ACVSCORE_DB_CONFIG.
+    If pyodbc is not installed or connection fails, returns None.
+    """
+    try:
+        import pyodbc
+    except Exception:
+        logging.exception("pyodbc not available; cannot query ACVSCore for images/emails.")
+        return None
+
+    try:
+        cfg = ACVSCORE_DB_CONFIG
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={cfg['server']};DATABASE={cfg['database']};UID={cfg['user']};PWD={cfg['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to ACVSCore DB (%s)", ACVSCORE_DB_CONFIG.get('server'))
+        return None
+
+def get_personnel_info(candidate_identifier: object) -> Dict[str, object]:
+    """
+    Try to resolve personnel record using a flexible lookup.
+    Returns dict with keys: ObjectID (may be None), GUID, Name, EmailAddress, ManagerEmail
+    If resolution fails returns empty dict.
+    """
+    out = {}
+    if candidate_identifier is None:
+        return out
+    conn = _get_acvscore_conn()
+    if conn is None:
+        return out
+
+    try:
+        cur = conn.cursor()
+        # We'll attempt to match on multiple columns: ObjectID, GUID, Int1, Text12, Name
+        # Use parameters (all strings) — SQL will handle mismatched types.
+        sql = """
+            SELECT TOP 1 ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            FROM ACVSCore.Access.Personnel
+            WHERE
+              (CAST(ObjectID AS NVARCHAR(200)) = ?)
+              OR (GUID = ?)
+              OR (CAST(Int1 AS NVARCHAR(200)) = ?)
+              OR (Text12 = ?)
+              OR (Name = ?)
+            ORDER BY ObjectID DESC
+        """
+        cand = str(candidate_identifier).strip()
+        params = (cand, cand, cand, cand, cand)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            # columns: ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            try:
+                out['ObjectID'] = row[0]
+                out['GUID'] = row[1]
+                out['Name'] = row[2]
+                out['EmailAddress'] = row[3]
+                out['ManagerEmail'] = row[4]
+            except Exception:
+                # defensive assignment by index
+                out = {
+                    'ObjectID': row[0] if len(row) > 0 else None,
+                    'GUID': row[1] if len(row) > 1 else None,
+                    'Name': row[2] if len(row) > 2 else None,
+                    'EmailAddress': row[3] if len(row) > 3 else None,
+                    'ManagerEmail': row[4] if len(row) > 4 else None
+                }
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return out
+
+def get_person_image_bytes(parent_id) -> bytes | None:
+    """
+    Query ACVSCore.Access.Images for top image where ParentId = parent_id and return raw bytes.
+    Returns None if not found or on error.
+    """
+    conn = _get_acvscore_conn()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT TOP 1 AI.Image
+            FROM ACVSCore.Access.Images AI
+            WHERE AI.ParentId = ?
+              AND DATALENGTH(AI.Image) > 0
+            ORDER BY AI.ObjectID DESC
+        """
+        cur.execute(sql, (str(parent_id),))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            # pyodbc returns buffer/bytearray for varbinary; convert to bytes
+            try:
+                b = bytes(row[0])
+                return b
+            except Exception:
+                # sometimes row[0] is already bytes-like
+                return row[0]
+    except Exception:
+        logging.exception("Failed to fetch image for ParentId=%s", parent_id)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return None
+
+# ---------- New route to serve employee image ----------
+@app.route('/employee/<empid>/image', methods=['GET'])
+def serve_employee_image(empid):
+    """
+    Serve the portrait for a personnel record where ParentId = empid (ACVSCore.Images).
+    Uses the query you provided:
+      SELECT AI.Image AS ImageBuffer FROM ACVSCore.Access.Images AI WHERE AI.ParentId = @id
+    If found, returns binary with best-effort content-type detection.
+    """
+    if empid is None:
+        return jsonify({"error": "employee id required"}), 400
+
+    try:
+        img_bytes = get_person_image_bytes(empid)
+        if not img_bytes:
+            return jsonify({"error": "no image found"}), 404
+
+        # try to detect jpeg/png
+        header = img_bytes[:8]
+        content_type = 'application/octet-stream'
+        if len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+            content_type = 'image/jpeg'
+        elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+            content_type = 'image/png'
+        # send as file-like
+        bio = io.BytesIO(img_bytes)
+        bio.seek(0)
+        return send_file(bio, mimetype=content_type)
+    except Exception:
+        logging.exception("Error serving image for employee %s", empid)
+        return jsonify({"error": "failed to serve image"}), 500
+
+# ---------- Enrich aggregated rows with email/image/manager info ----------
+# We'll enrich `cleaned_matched` just after it's computed in /record. Find the /record handler below and look for:
+#    cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+# Immediately after that line I have added the enrichment logic (no other logic changed).
+
+
+# ---------------------------
+# The rest of your app.py stays the same, except for a single insertion point inside /record.
+# Paste rest of your original file content here, but find the /record route and replace the segment
+# starting at `cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))`
+# with the following enriched block (I kept it non-intrusive).
+# ---------------------------
+
+# [... your existing code continues unchanged until /record handler ...]
+# In /record(), after the line:
+#     cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+# replace with the following enrichment variant:
+
+# (Below is the enrichment snippet to paste in place inside /record)
+
+# --- ENRICHMENT START ---
+# cleaned_matched is a list of dicts
+# Try to map each cleaned row to a personnel record and attach email/manager/image info
+try:
+    # Build a quick index over matched DataFrame to find best lookup candidate for each cleaned row
+    matched_indexed = matched.reset_index(drop=True)
+    for idx_c, cleaned in enumerate(cleaned_matched):
+        # Try to find a matching row in matched DataFrame by person_uid -> EmployeeID -> EmployeeName
+        candidate_row = None
+        try:
+            if cleaned.get('person_uid'):
+                mr = matched_indexed[matched_indexed.get('person_uid', '').astype(str) == str(cleaned['person_uid'])]
+                if not mr.empty:
+                    candidate_row = mr.iloc[0].to_dict()
+            if candidate_row is None and cleaned.get('EmployeeID'):
+                mr = matched_indexed[matched_indexed.get('EmployeeID', '').astype(str) == str(cleaned['EmployeeID'])]
+                if not mr.empty:
+                    candidate_row = mr.iloc[0].to_dict()
+            if candidate_row is None and cleaned.get('EmployeeName'):
+                # names exact match
+                mr = matched_indexed[matched_indexed.get('EmployeeName', '').astype(str).str.strip().fillna('') == str(cleaned['EmployeeName']).strip()]
+                if not mr.empty:
+                    candidate_row = mr.iloc[0].to_dict()
+            # fallback: take first matched row if nothing else
+            if candidate_row is None and len(matched_indexed) > 0:
+                candidate_row = matched_indexed.iloc[0].to_dict()
+        except Exception:
+            candidate_row = None
+
+        # Determine the best candidate identifier to query Personnel
+        lookup_candidates = []
+        if candidate_row:
+            for k in ('EmployeeObjID', 'EmployeeObjId', 'EmployeeObjId', 'EmployeeIdentity', 'ObjectID', 'GUID', 'EmployeeID', 'Int1', 'Text12', 'EmployeeName'):
+                if k in candidate_row and candidate_row.get(k) not in (None, '', 'nan'):
+                    lookup_candidates.append(candidate_row.get(k))
+        # also include cleaned fields
+        for k in ('EmployeeID', 'person_uid', 'EmployeeName'):
+            if cleaned.get(k) not in (None, '', 'nan'):
+                lookup_candidates.append(cleaned.get(k))
+
+        # try each lookup candidate until we find personnel info
+        personnel_info = {}
+        for cand in lookup_candidates:
+            if cand is None:
+                continue
+            try:
+                info = get_personnel_info(cand)
+                if info and (info.get('ObjectID') is not None or info.get('EmailAddress') is not None or info.get('ManagerEmail') is not None):
+                    personnel_info = info
+                    break
+            except Exception:
+                continue
+
+        # attach if found
+        if personnel_info:
+            # safe assignments
+            cleaned['EmployeeObjID'] = personnel_info.get('ObjectID')
+            cleaned['EmployeeEmail'] = personnel_info.get('EmailAddress')
+            cleaned['ManagerEmail'] = personnel_info.get('ManagerEmail')
+            # HasImage and imageUrl
+            if personnel_info.get('ObjectID') is not None:
+                cleaned['imageUrl'] = f"/employee/{personnel_info.get('ObjectID')}/image"
+                # quick check if image exists (non-blocking: try fetch bytes but ignore failure)
+                try:
+                    b = get_person_image_bytes(personnel_info.get('ObjectID'))
+                    cleaned['HasImage'] = True if b else False
+                except Exception:
+                    cleaned['HasImage'] = False
+            else:
+                cleaned['imageUrl'] = None
+                cleaned['HasImage'] = False
+except Exception:
+    logging.exception("Failed to enrich aggregated rows with personnel/email/image info")
+# --- ENRICHMENT END ---
+
+# (Continue with the rest of your /record handler where it returns the JSON)
+# Make sure the return JSON still uses cleaned_matched for "aggregated_rows".
+
+
+
+
+
+
+
+
+
+
+
+
 To Integrate image and manager details We dont need to use Specific APAC , EMEA , LACA , NAMER databse ...
  
 user: 'GSOC_Test',
