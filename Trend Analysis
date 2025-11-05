@@ -1,3 +1,257 @@
+def scenario_unusually_high_swipes(row):
+    """
+    Flag unusually high swipes *only* when accompanied by short total duration.
+    Logic:
+      - Prefer per-employee median from HIST_DF if available.
+      - If current swipes > 3 * median and DurationMinutes < 60 -> True (suspicious)
+      - If current swipes > 3 * median but DurationMinutes >= 60 -> False (benign)
+      - If no reliable median available, fall back to global median or numeric threshold.
+    """
+    cur = int(row.get('CountSwipes') or 0)
+    dur = float(row.get('DurationMinutes') or 0.0)
+    empid = row.get('EmployeeID')
+
+    # helper to get median for employee
+    try:
+        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+            median = rec.get('TotalSwipes_median', np.nan)
+            if pd.notna(median) and median > 0:
+                # suspicious only if many swipes AND short duration
+                return (cur > 3 * float(median)) and (dur < 60)
+    except Exception:
+        pass
+
+    # fallback to global median from HIST_DF if available
+    try:
+        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+            global_med = HIST_DF['TotalSwipes_median'].median()
+            if pd.notna(global_med) and global_med > 0:
+                return (cur > 3 * float(global_med)) and (dur < 60)
+    except Exception:
+        pass
+
+    # final fallback numeric threshold: very large counts but only suspicious if short duration
+    return (cur > 50) and (dur < 60)
+
+
+
+
+
+
+
+
+
+
+
+def scenario_high_swipes_benign(row):
+    """
+    Helper scenario: marks cases where swipes are unusually high but duration is long.
+    This lets ML see 'high volume but long presence' as a benign feature.
+    """
+    cur = int(row.get('CountSwipes') or 0)
+    dur = float(row.get('DurationMinutes') or 0.0)
+    empid = row.get('EmployeeID')
+    try:
+        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+            median = rec.get('TotalSwipes_median', np.nan)
+            if pd.notna(median) and median > 0:
+                return (cur > 3 * float(median)) and (dur >= 60)
+    except Exception:
+        pass
+    try:
+        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+            global_med = HIST_DF['TotalSwipes_median'].median()
+            if pd.notna(global_med) and global_med > 0:
+                return (cur > 3 * float(global_med)) and (dur >= 60)
+    except Exception:
+        pass
+    return (cur > 50) and (dur >= 60)
+
+
+
+
+
+
+
+
+
+    ("high_swipes_benign", scenario_high_swipes_benign),
+
+
+
+
+    "high_swipes_benign": 0.1,
+
+
+
+
+
+
+
+
+
+def build_90day_training(end_date: date = None, window_days: int = 90, outdir: str = "./outputs",
+                         min_unique_employees: int = 100, city: str = "Pune"):
+    """
+    Build a per-person training CSV aggregated across the last `window_days` days.
+    Output: outdir/training_person_90day.csv (or with window_days in name)
+    Each row aggregates medians/means/sums for numeric metrics and creates binary labels
+    for each scenario if the scenario occurred at least once in the window for that person.
+    """
+    if end_date is None:
+        end_date = datetime.now().date()
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    logging.info("build_90day_training: end_date=%s window_days=%d", end_date, window_days)
+
+    # read trend CSVs within window (uses existing helper)
+    df = _read_past_trend_csvs(outdir=str(outdir), window_days=window_days, target_date=end_date)
+    if df is None or df.empty:
+        logging.warning("No trend CSVs found in %s for window ending %s", outdir, end_date)
+        return None
+
+    # ensure Date is date
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    # ensure person_uid exists (fallback to EmployeeID/EmployeeIdentity)
+    if 'person_uid' not in df.columns:
+        def make_person_uid_local(row):
+            parts = []
+            for c in ('EmployeeIdentity', 'EmployeeID', 'EmployeeName'):
+                v = row.get(c)
+                if pd.notna(v) and str(v).strip():
+                    parts.append(str(v).strip())
+            return "|".join(parts) if parts else None
+        df['person_uid'] = df.apply(make_person_uid_local, axis=1)
+
+    # choose scenario columns (boolean daily indicators) existing in df
+    scenario_names = [name for name, _ in SCENARIOS if name in df.columns]
+
+    # aggregate per person_uid
+    agg_funcs = {
+        'CountSwipes': ['median', 'mean', 'sum'],
+        'DurationMinutes': ['median', 'mean', 'sum'],
+        'MaxSwipeGapSeconds': ['max', 'median'],
+        'ShortGapCount': ['sum'],
+        'UniqueDoors': ['median'],
+        'UniqueLocations': ['median'],
+        'RejectionCount': ['sum']
+    }
+
+    # ensure numeric columns exist
+    for col in ['CountSwipes', 'DurationMinutes', 'MaxSwipeGapSeconds', 'ShortGapCount', 'UniqueDoors', 'UniqueLocations', 'RejectionCount']:
+        if col not in df.columns:
+            df[col] = 0
+
+    group_cols = ['person_uid']
+    grp = df.groupby(group_cols, sort=False)
+
+    person_rows = []
+    unique_persons = set()
+
+    for person, g in grp:
+        row = {}
+        row['person_uid'] = person
+        # prefer EmployeeID if available
+        row['EmployeeID'] = next((v for v in g.get('EmployeeID', []) if pd.notna(v) and not _is_placeholder_str(v)), None)
+        row['EmployeeName'] = next((v for v in g.get('EmployeeName', []) if pd.notna(v) and not _is_placeholder_str(v)), None)
+        row['days_present'] = int(g.shape[0])
+
+        # numeric aggregates
+        for col, funcs in agg_funcs.items():
+            if col in g.columns:
+                for f in funcs:
+                    key = f"{col}_{f}"
+                    try:
+                        val = getattr(g[col], f)()
+                        row[key] = float(val) if pd.notna(val) else None
+                    except Exception:
+                        row[key] = None
+            else:
+                for f in funcs:
+                    row[f"{col}_{f}"] = None
+
+        # scenario labels: if scenario column exists in daily rows, label = sum > 0
+        for s in scenario_names:
+            try:
+                s_count = int(g[s].astype(int).sum()) if s in g.columns else 0
+            except Exception:
+                s_count = int((g[s].sum()) if s in g.columns else 0)
+            row[f"{s}_days"] = s_count
+            row[f"{s}_label"] = int(s_count > 0)
+
+        person_rows.append(row)
+        unique_persons.add(person)
+
+        # early stop if dataset large
+        if len(unique_persons) >= min_unique_employees:
+            logging.info("Reached min unique employees=%d; stopping early", min_unique_employees)
+            break
+
+    if not person_rows:
+        logging.warning("No aggregated person rows were created.")
+        return None
+
+    training_df = pd.DataFrame(person_rows)
+    out_name = f"training_person_{window_days}day_{end_date.strftime('%Y%m%d')}.csv"
+    out_path = outdir / out_name
+    training_df.to_csv(out_path, index=False)
+    logging.info("Saved 90-day training CSV to %s (rows=%d)", out_path, len(training_df))
+    return out_path
+
+
+
+
+
+
+
+
+
+
+# scripts/generate_90_days.py
+from datetime import date, timedelta
+from trend_runner import run_trend_for_date
+
+OUTDIR = "./outputs"
+CITY = "Pune"
+
+end = date.today()
+start = end - timedelta(days=89)  # inclusive 90 days
+
+d = start
+while d <= end:
+    try:
+        print("Processing", d)
+        run_trend_for_date(d, outdir=OUTDIR, city=CITY)
+    except Exception as e:
+        print("Failed for", d, e)
+    d = d + timedelta(days=1)
+
+
+
+
+python scripts/generate_90_days.py
+
+
+
+python ml_training.py --input outputs/training_person_90day_20251105.csv --models_dir models --features "CountSwipes_median,CountSwipes_mean,CountSwipes_sum,DurationMinutes_median,DurationMinutes_mean,DurationMinutes_sum,MaxSwipeGapSeconds_max,MaxSwipeGapSeconds_median,ShortGapCount_sum,UniqueDoors_median,UniqueLocations_median,RejectionCount_sum,days_present"
+
+
+
+
+
+
+
+
+
+
+
 Check below each file line by line and fix the issue carefully dont make unnecessary changes
 
 # backend/trend_runner.py
