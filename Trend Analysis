@@ -1,3 +1,291 @@
+/* hide close button by class or id */
+.modal .close-btn { display: none !important; }
+
+
+
+# Replace the existing /chatbot/query route with this function.
+# It depends on some internal helpers from trend_runner (these exist in your file).
+from flask import request
+import re
+import difflib
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# attempt to import helpers from trend_runner (they exist in that module)
+try:
+    from trend_runner import _read_past_trend_csvs, _normalize_id_val, SCENARIO_EXPLANATIONS
+except Exception:
+    # best-effort fallbacks if internals move
+    _read_past_trend_csvs = None
+    _normalize_id_val = None
+    SCENARIO_EXPLANATIONS = {}
+
+# helper to load the most recent single trend CSV (fast for "today" queries)
+def _load_latest_trend_df(outdir: Path):
+    csvs = sorted(outdir.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return None, None
+    latest = csvs[0]
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        try:
+            df = pd.read_csv(latest, dtype=str)
+        except Exception:
+            return None, None
+    return df, latest.name
+
+# helper: find person rows across recent days (useful for "last N days")
+def _find_person_rows(identifier: str, days: int = 90, outdir: Path = DEFAULT_OUTDIR):
+    # normalize token (strip ".0" floats etc)
+    if _normalize_id_val:
+        norm = _normalize_id_val(identifier)
+    else:
+        norm = str(identifier).strip()
+        if '.' in norm:
+            try:
+                f = float(norm)
+                if f.is_integer():
+                    norm = str(int(f))
+            except Exception:
+                pass
+    # read past trend CSVs using trend_runner helper when available
+    today = datetime.now().date()
+    try:
+        if _read_past_trend_csvs:
+            past = _read_past_trend_csvs(str(outdir), days, today)
+        else:
+            # fallback: read files manually
+            files = sorted(Path(outdir).glob("trend_pune_*.csv"), reverse=True)
+            dfs = []
+            cutoff = today - timedelta(days=days)
+            for fp in files:
+                try:
+                    tmp = pd.read_csv(fp, parse_dates=['Date'])
+                    tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                    tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                    dfs.append(tmp)
+                except Exception:
+                    try:
+                        tmp = pd.read_csv(fp, dtype=str)
+                        if 'Date' in tmp.columns:
+                            tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                            tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                            dfs.append(tmp)
+                    except Exception:
+                        continue
+            past = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    except Exception:
+        past = pd.DataFrame()
+
+    if past is None or past.empty:
+        return pd.DataFrame()
+
+    # search by EmployeeID, person_uid, EmployeeIdentity, CardNumber, Int1/Text12 if present
+    match_mask = pd.Series(False, index=past.index)
+    for col in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+        if col in past.columns:
+            try:
+                match_mask = match_mask | (past[col].astype(str).fillna('').str.strip() == str(norm).strip())
+            except Exception:
+                continue
+
+    # also try numeric equality
+    if not match_mask.any():
+        try:
+            qnum = float(norm)
+            for col in ('EmployeeID','Int1'):
+                if col in past.columns:
+                    try:
+                        numcol = pd.to_numeric(past[col], errors='coerce')
+                        match_mask = match_mask | (numcol == qnum)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # fuzzy name match if nothing matched above
+    if not match_mask.any() and 'EmployeeName' in past.columns:
+        names = past['EmployeeName'].dropna().astype(str).unique().tolist()
+        close = difflib.get_close_matches(str(identifier), names, n=5, cutoff=0.7)
+        if close:
+            match_mask = match_mask | past['EmployeeName'].astype(str).isin(close)
+
+    return past[match_mask].copy()
+
+# simple sentence builder for scenario codes -> human text
+def _explain_scenario_code(code):
+    if not code:
+        return None
+    code = str(code).strip()
+    # prefer full mapping if available
+    if code in SCENARIO_EXPLANATIONS:
+        try:
+            # SCENARIO_EXPLANATIONS lambdas expect a row; we can't run them here safely.
+            # But we can return a friendly mapping key -> sentence fallback.
+            # If mapping is a callable, call with empty dict to get neutral sentence.
+            fn = SCENARIO_EXPLANATIONS.get(code)
+            try:
+                txt = fn({})
+                return txt
+            except Exception:
+                return code.replace("_", " ").replace(">= ", "≥ ")
+        except Exception:
+            return code.replace("_", " ").replace(">= ", "≥ ")
+    # fallback readable version
+    return code.replace("_", " ").replace(">=", "≥")
+
+@app.route('/chatbot/query', methods=['POST'])
+def chatbot_query():
+    """
+    Improved chatbot query handler.
+    Payload: { "q": "<free text query>", "top_k": 5, "lang": "en" }
+    Recognised intents:
+      - who is high risk today / who is low risk today
+      - show me <EmployeeID|name> last <N> days
+      - explain <scenario_code>
+      - trend details for today / top reasons today
+    Returns: { "answer": "<nl text>", "evidence": [ {source, snippet}, ... ] }
+    """
+    payload = request.get_json(force=True)
+    q = (payload.get('q') or '').strip()
+    if not q:
+        return jsonify({"error":"query text 'q' required"}), 400
+
+    lang = payload.get('lang')  # optional, frontend can provide (we will echo answer in same language string)
+    q_l = q.lower().strip()
+
+    # intent: who is high/low risk today
+    if re.search(r"\bwho is (high|low) risk\b", q_l) or re.search(r"\b(high|low) risk (people|persons|people) (today)?\b", q_l):
+        want = 'high' if 'high' in q_l else 'low' if 'low' in q_l else None
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer": "No trend data available.", "evidence": []})
+        # ensure RiskLevel column exists
+        if 'RiskLevel' not in df.columns:
+            # try to map RiskScore to label if RiskScore present
+            if 'RiskScore' in df.columns:
+                df['RiskLevel'] = df['RiskScore'].apply(lambda s: map_score_to_label(float(s))[1] if s is not None else 'Low')
+            else:
+                df['RiskLevel'] = df.get('RiskLevel', 'Low')
+
+        if want == 'high':
+            sel = df[df['RiskLevel'].astype(str).str.lower() == 'high']
+        elif want == 'low':
+            sel = df[df['RiskLevel'].astype(str).str.lower() == 'low']
+        else:
+            sel = df
+
+        names = sel['EmployeeName'].dropna().astype(str).unique().tolist()
+        if not names:
+            ans = f"No {want} risk persons found in the latest data." if want else "No persons found."
+            return jsonify({"answer": ans, "evidence": []})
+        else:
+            # limit list length
+            ans = f"{want.capitalize()} risk persons today: " + ", ".join(names[:40])
+            sample = _clean_sample_df(sel.head(10), max_rows=10)
+            return jsonify({"answer": ans, "evidence": sample})
+
+    # intent: explain <scenario>
+    m = re.match(r".*\bexplain\s+([A-Za-z0-9_\-]+)\b.*", q_l)
+    if m:
+        code = m.group(1).strip()
+        explanation = _explain_scenario_code(code)
+        ans = f"Explanation for '{code}': {explanation}"
+        return jsonify({"answer": ans, "evidence": []})
+
+    # intent: trend details for today — top reasons
+    if 'trend details' in q_l or 'top reasons' in q_l or 'trend details for today' in q_l:
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer":"No trend data available.","evidence":[]})
+        # aggregate Reasons column
+        if 'Reasons' in df.columns:
+            reasons = {}
+            for v in df['Reasons'].dropna().astype(str):
+                for part in re.split(r'[;,\|]', v):
+                    key = part.strip()
+                    if key:
+                        reasons[key] = reasons.get(key, 0) + 1
+            # sort
+            top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:10]
+            if not top:
+                return jsonify({"answer":"No reason counts available today.","evidence":[]})
+            ans = "Top reasons today: " + ", ".join([f"{k} ({c})" for k,c in top])
+            # include small evidence of rows where those reasons occurred
+            sample = []
+            try:
+                top_reasons = [k for k,_ in top]
+                mask = df['Reasons'].astype(str).apply(lambda s: any(tr in s for tr in top_reasons))
+                sample_df = df[mask].head(10)
+                sample = _clean_sample_df(sample_df, max_rows=10)
+            except Exception:
+                sample = []
+            return jsonify({"answer": ans, "evidence": sample})
+
+    # intent: show me <id|name> last N days
+    m = re.match(r".*\bshow (?:me )?([A-Za-z0-9\-\:\s]+?) (?:for )?(?:last )?(\d+)\s*days\b", q_l)
+    if not m:
+        # also accept "show me 320172 last 90 days" or "show 320172 last 90 days" (looser)
+        m = re.match(r".*\b(show|display)\s+(?:me\s+)?([A-Za-z0-9\-\:\s]+?)\s+last\s+(\d+)\s*days\b", q_l)
+    if m:
+        if len(m.groups()) == 2:
+            identifier, days = m.group(1).strip(), int(m.group(2))
+        else:
+            # if earlier regex produced different groups
+            identifier = m.group(1).strip()
+            days = int(m.group(2))
+        # find person rows in past `days`
+        rows = _find_person_rows(identifier, days=days, outdir=DEFAULT_OUTDIR)
+        if rows is None or rows.empty:
+            return jsonify({"answer": f"No records found for '{identifier}' in last {days} days.", "evidence": []})
+        # prepare textual summary
+        flagged = rows[rows.get('IsFlagged', False) == True] if 'IsFlagged' in rows.columns else pd.DataFrame()
+        flagged_count = int(len(flagged))
+        total_days = int(len(rows))
+        latest_row = rows.sort_values('Date', ascending=False).iloc[0].to_dict()
+        name = latest_row.get('EmployeeName') or latest_row.get('person_uid') or latest_row.get('EmployeeID')
+        ans = f"Found {total_days} day(s) for {name} in the last {days} days. Flagged days: {flagged_count}."
+        sample = _clean_sample_df(rows.sort_values('Date', ascending=False).head(10), max_rows=10)
+        return jsonify({"answer": ans, "evidence": sample})
+
+    # fallback: try to detect single-employee "show me <id|name> last 90 days" shorter forms
+    m2 = re.match(r".*\bshow (?:me )?([A-Za-z0-9\-\:\s]+)\b.*(90|30|7)\s*days?", q_l)
+    if m2:
+        identifier = m2.group(1).strip()
+        days = int(m2.group(2))
+        rows = _find_person_rows(identifier, days=days, outdir=DEFAULT_OUTDIR)
+        if rows is None or rows.empty:
+            return jsonify({"answer": f"No records found for '{identifier}' in last {days} days.", "evidence": []})
+        flagged = rows[rows.get('IsFlagged', False) == True] if 'IsFlagged' in rows.columns else pd.DataFrame()
+        ans = f"Found {len(rows)} day(s) for {identifier}. Flagged days: {len(flagged)}."
+        sample = _clean_sample_df(rows.sort_values('Date', ascending=False).head(10), max_rows=10)
+        return jsonify({"answer": ans, "evidence": sample})
+
+    # last fallback: try simple heuristics like "who is present today" or "present today"
+    if 'present today' in q_l or 'who is present today' in q_l:
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer":"No trend data available.","evidence":[]})
+        if 'PresentToday' in df.columns:
+            present = df[df['PresentToday'] == True]
+            names = present['EmployeeName'].dropna().unique().tolist()
+            ans = f"Present today: {', '.join(names[:40]) if names else 'None'}"
+            sample = _clean_sample_df(present.head(10), max_rows=10)
+            return jsonify({"answer": ans, "evidence": sample})
+        else:
+            return jsonify({"answer":"PresentToday field not available in latest trends.","evidence":[]})
+
+    # final graceful fallback with helpful hint
+    hint = "I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last 90 days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+    return jsonify({"answer": f"I can help with trend & risk questions. I recognized: {q}. Try: {hint}", "evidence":[]})
+
+
+
+
+
+
+
 # backend/app.py
 from flask import Flask, jsonify, request, send_from_directory
 from datetime import datetime, timedelta, date
