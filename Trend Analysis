@@ -1,1 +1,460 @@
+        # Long-break flag threshold: use 240 minutes (4 hours).
+        # HR requested strict "greater than 4 hour" requirement for short->long->short pattern.
+        LONG_BREAK_FLAG_MINUTES = 240
+
+
+
+
+
+            # look for the pattern anywhere in sequence (triplet: short work -> long out -> short work)
+            for i in range(len(seq)-2):
+                a = seq[i]     # first work
+                b = seq[i+1]   # long out
+                c = seq[i+2]   # short work
+                # short work: < 60 min; long out: >= LONG_BREAK_FLAG_MINUTES; short return: < 60 min
+                if (a[0] == 'work' and a[1] < 60) and \
+                   (b[0] in ('out_of_office','break') and b[1] >= LONG_BREAK_FLAG_MINUTES) and \
+                   (c[0] == 'work' and c[1] < 60):
+                    pattern_flag = True
+                    seq_fragment = [a, b, c]
+                    pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
+                    break
+
+
+
+
+
+
+
+
+
+
+
+def _read_scenario_counts_by_person(outdir: str, window_days: int, target_date: date, scenario_col: str):
+    """
+    Return dict mapping normalized identifier -> count of days where scenario_col == True
+    in the window (target_date - window_days .. target_date-1).
+    Keys include normalized EmployeeID/person_uid/plain numeric tokens (same normalization as compute_violation_days_map).
+    """
+    df = _read_past_trend_csvs(outdir, window_days, target_date)
+    if df is None or df.empty or scenario_col not in df.columns:
+        return {}
+
+    # normalize Date
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    id_cols = [c for c in ('person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12') if c in df.columns]
+
+    out = defaultdict(int)
+    # consider only rows where scenario_col is truthy
+    q = df[df[scenario_col] == True] if df[scenario_col].dtype == bool else df[df[scenario_col].astype(str).str.lower() == 'true']
+    for _, r in q.iterrows():
+        for col in id_cols:
+            try:
+                raw = r.get(col)
+                if raw in (None, '', float('nan')):
+                    continue
+                norm = _normalize_id_val(raw)
+                if norm:
+                    out[str(norm)] += 1
+                    # also store stripped prefix variant
+                    stripped = _strip_uid_prefix(str(norm))
+                    if stripped != str(norm):
+                        out[str(stripped)] += 1
+            except Exception:
+                continue
+        # fallback Int1/Text12 fields
+        for fallback in ('Int1', 'Text12'):
+            if fallback in r and r.get(fallback) not in (None, '', 'nan'):
+                try:
+                    norm = _normalize_id_val(r.get(fallback))
+                    if norm:
+                        out[str(norm)] += 1
+                except Exception:
+                    continue
+    return dict(out)
+
+
+
+
+
+
+
+
+
+
+    # ----- New: compute historical scenario counts and weekly short-duration patterns -----
+    try:
+        # read scenario counts for pattern shortstay_longout_repeat
+        hist_pattern_counts = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'shortstay_longout_repeat')
+        # repeated_short_breaks counts
+        hist_rep_breaks = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'repeated_short_breaks')
+        # short_duration_<4h counts (scenario name "short_duration_<4h" exists in SCENARIOS)
+        hist_short_duration = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'short_duration_<4h')
+
+        def get_hist_count_for_row(row, hist_map):
+            # check several identifiers used historically
+            for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                if k in row and row.get(k) not in (None, '', float('nan')):
+                    try:
+                        norm = _normalize_id_val(row.get(k))
+                        if norm and str(norm) in hist_map:
+                            return int(hist_map.get(str(norm), 0))
+                        stripped = _strip_uid_prefix(str(norm)) if norm else None
+                        if stripped and str(stripped) in hist_map:
+                            return int(hist_map.get(str(stripped), 0))
+                    except Exception:
+                        continue
+            return 0
+
+        features['HistPatternShortLongCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
+        features['HistRepeatedShortBreakCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
+        features['HistShortDurationCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
+
+        # escalate: if PatternShortLong repeat count >=3 -> high risk
+        pat_mask = features['HistPatternShortLongCount90'].fillna(0).astype(int) >= 3
+        if pat_mask.any():
+            features.loc[pat_mask, 'RiskScore'] = 5
+            features.loc[pat_mask, 'RiskLevel'] = 'High'
+            features.loc[pat_mask, 'IsFlagged'] = True
+
+        # repeated_short_breaks: if history > 5 -> force High (example of heavy violator)
+        rep_mask = features['HistRepeatedShortBreakCount90'].fillna(0).astype(int) >= 5
+        if rep_mask.any():
+            features.loc[rep_mask, 'RiskScore'] = 5
+            features.loc[rep_mask, 'RiskLevel'] = 'High'
+            features.loc[rep_mask, 'IsFlagged'] = True
+
+    except Exception:
+        logging.exception("Failed to compute historical scenario counts.")
+
+
+
+
+
+
+
+
+
+def scenario_behaviour_shift(row, hist_df=None, minutes_threshold=180):
+    """
+    Flag when today's first swipe time deviates from historical median by more than minutes_threshold (default 180 minutes = 3 hours).
+    hist_df (optional) can be passed externally to speed up lookups; otherwise uses HIST_DF if present.
+    """
+    try:
+        if pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None:
+            return False
+        first_ts = pd.to_datetime(row.get('FirstSwipe'))
+        # compute minutes since midnight for today's first swipe
+        today_minutes = first_ts.hour * 60 + first_ts.minute
+        empid = row.get('EmployeeID')
+        # try HIST_DF fallback
+        hist = hist_df if hist_df is not None else (HIST_DF if (HIST_DF is not None and not HIST_DF.empty) else None)
+        if hist is None or hist.empty or empid is None:
+            # no historical baseline -> cannot decide
+            return False
+        try:
+            rec = hist[hist['EmployeeID'] == empid]
+            if rec.empty:
+                return False
+            # support median field name variants, prefer 'FirstSwipeMinutes_median' if present
+            if 'FirstSwipeMinutes_median' in rec.columns:
+                median_min = rec.iloc[0].get('FirstSwipeMinutes_median')
+            else:
+                # fallback: if HIST_DF has 'AvgFirstSwipeMins_median' or similar
+                median_min = rec.iloc[0].get('AvgFirstSwipeMins_median', None)
+            if pd.isna(median_min) or median_min is None:
+                return False
+            diff = abs(today_minutes - float(median_min))
+            return diff >= int(minutes_threshold)
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+
+
+
+
+
+
+    ("behaviour_shift", scenario_behaviour_shift),
+
+
+"behaviour_shift": lambda r: "Significant change in arrival time compared to historical baseline — behaviour shift detected."
+
+
+
+
+
+
+
+
+
+
+OVERRIDES_FILE = DEFAULT_OUTDIR / "overrides.csv"
+
+def _load_overrides():
+    if not OVERRIDES_FILE.exists():
+        return {}
+    try:
+        df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+        out = {}
+        for _, r in df.iterrows():
+            emp = str(r.get('EmployeeID') or r.get('person_uid') or '').strip()
+            if not emp:
+                continue
+            out[emp] = {
+                'level': str(r.get('OverrideLevel') or '').strip(),
+                'reason': str(r.get('Reason') or '').strip(),
+                'ts': str(r.get('Timestamp') or '').strip()
+            }
+        return out
+    except Exception:
+        return {}
+
+def _save_override(employee_key, level, reason):
+    now = datetime.now().isoformat()
+    row = {'EmployeeID': employee_key, 'OverrideLevel': level, 'Reason': reason or '', 'Timestamp': now}
+    try:
+        if OVERRIDES_FILE.exists():
+            df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+            df = df.append(row, ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df.to_csv(OVERRIDES_FILE, index=False)
+        return True
+    except Exception:
+        logging.exception("Failed to save override")
+        return False
+
+
+
+
+
+
+
+
+@app.route('/override', methods=['POST'])
+def set_override():
+    """
+    POST JSON: { "employee_id": "<EmployeeID or person_uid>", "level": "Low|Medium|High|Clear", "reason": "justification text" }
+    Saves override to outputs/overrides.csv. Run-time uses this file to adjust RiskLevel display.
+    """
+    try:
+        payload = request.get_json(force=True)
+        emp = payload.get('employee_id')
+        level = payload.get('level')
+        reason = payload.get('reason', '')
+        if not emp or not level:
+            return jsonify({'error':'employee_id and level required'}), 400
+        ok = _save_override(str(emp).strip(), str(level).strip(), str(reason).strip())
+        if not ok:
+            return jsonify({'error':'failed to save override'}), 500
+        return jsonify({'status':'ok'}), 200
+    except Exception as e:
+        logging.exception("Override save error")
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # --- Apply overrides (if any) to force risklevel/isFlagged changes ---
+    try:
+        overrides = _load_overrides()
+        if overrides:
+            def apply_override(r):
+                # Check identifier variants
+                keys = []
+                for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+                    v = r.get(k)
+                    if v not in (None, '', float('nan')):
+                        keys.append(str(v).strip())
+                for k in keys:
+                    if k in overrides:
+                        entry = overrides[k]
+                        lvl = entry.get('level')
+                        if lvl:
+                            # enforce RiskLevel and IsFlagged
+                            try:
+                                r['RiskLevel'] = lvl
+                                if lvl.lower() == 'low':
+                                    r['IsFlagged'] = False
+                                else:
+                                    r['IsFlagged'] = True
+                                # optional: set RiskScore mapping
+                                map_lvl = {'low':1, 'low medium':2, 'medium':3, 'medium high':4, 'high':5}
+                                r['RiskScore'] = map_lvl.get(lvl.lower(), r.get('RiskScore', 1))
+                            except Exception:
+                                pass
+                            return r
+                return r
+            features = features.apply(lambda rr: apply_override(rr), axis=1)
+    except Exception:
+        logging.exception("Failed applying overrides")
+
+
+
+
+
+
+
+
+        # bring forward historical per-scenario counts if present (these are daily fields aggregated across the window)
+        row['HistPatternShortLongCount90'] = int(g.get('HistPatternShortLongCount90', pd.Series([0])).sum()) if 'HistPatternShortLongCount90' in g else 0
+        row['HistRepeatedShortBreakCount90'] = int(g.get('HistRepeatedShortBreakCount90', pd.Series([0])).sum()) if 'HistRepeatedShortBreakCount90' in g else 0
+        row['HistShortDurationCount90'] = int(g.get('HistShortDurationCount90', pd.Series([0])).sum()) if 'HistShortDurationCount90' in g else 0
+
+
+
+
+
+
+def _compute_weeks_with_threshold(df, person_col='person_uid', date_col='Date', scenario_col='short_duration_<4h', threshold_days=3, lookback_weeks=8):
+    """
+    Return dict person_uid -> max_consecutive_weeks meeting threshold_days for scenario_col
+    df expected to include Date as date type and scenario_col boolean.
+    """
+    out = {}
+    if df is None or df.empty or scenario_col not in df.columns:
+        return out
+    try:
+        dd = df.copy()
+        dd['Date'] = pd.to_datetime(dd[date_col], errors='coerce').dt.date
+        # compute ISO year-week
+        dd['year_week'] = dd['Date'].apply(lambda d: (d.isocalendar()[0], d.isocalendar()[1]) if d else (None, None))
+        # Build per person-week counts
+        grp = dd[dd[scenario_col] == True].groupby([person_col, 'year_week']).size().reset_index(name='cnt')
+        # collect last lookback_weeks weeks values for each person
+        for person, g in grp.groupby(person_col):
+            # sort by year_week
+            weeks = sorted([ (yw, int(cnt)) for yw, cnt in zip(g['year_week'], g['cnt']) if yw is not None ])
+            # transform to list of (year, week, cnt) then determine consecutive weeks that meet threshold
+            week_map = { (y,w): cnt for (y,w),cnt in zip(g['year_week'], g['cnt'])}
+            # get the list of week keys sorted
+            wk_keys = sorted(week_map.keys())
+            # compute max consecutive runs
+            max_run = 0
+            cur_run = 0
+            prev = None
+            for y,w in wk_keys:
+                cnt = week_map.get((y,w), 0)
+                if cnt >= threshold_days:
+                    if prev is None:
+                        cur_run = 1
+                    else:
+                        # check consecutive week
+                        # naive next-week calculation:
+                        py, pw = prev
+                        # increment which handles year boundary
+                        from datetime import date as _date
+                        try:
+                            d1 = _date.fromisocalendar(py, pw, 1)
+                            d2 = _date.fromisocalendar(y, w, 1)
+                            diff_weeks = int((d2 - d1).days / 7)
+                        except Exception:
+                            diff_weeks = 1 if (y,w) != prev else 0
+                        if diff_weeks == 1:
+                            cur_run += 1
+                        else:
+                            cur_run = 1
+                    prev = (y,w)
+                else:
+                    prev = (y,w)
+                    cur_run = 0
+                max_run = max(max_run, cur_run)
+            out[person] = max_run
+    except Exception:
+        logging.exception("Failed computing weeks with threshold")
+    return out
+
+
+
+
+
+
+
+
+
+    try:
+        past_df = _read_past_trend_csvs(outdir, VIOLATION_WINDOW_DAYS, target_date)
+        week_runs = _compute_weeks_with_threshold(past_df, person_col='person_uid', date_col='Date', scenario_col='short_duration_<4h', threshold_days=3)
+        # attach to features
+        def get_week_run(r):
+            # prefer EmployeeID or person_uid
+            for k in ('person_uid', 'EmployeeID'):
+                if k in r and r.get(k):
+                    key = str(r.get(k))
+                    if key in week_runs:
+                        return int(week_runs[key])
+            return 0
+        features['ConsecWeeksShort4hrs'] = features.apply(get_week_run, axis=1)
+        # escalate: 1 run -> Low-Medium note, 2+ consecutive weeks -> bump score (increase RiskScore by 1)
+        mask1 = features['ConsecWeeksShort4hrs'] >= 1
+        mask2 = features['ConsecWeeksShort4hrs'] >= 2
+        if mask1.any():
+            # add a small score bump for 1-week occurrence
+            features.loc[mask1, 'AnomalyScore'] = features.loc[mask1, 'AnomalyScore'] + 0.5
+        if mask2.any():
+            features.loc[mask2, 'AnomalyScore'] = features.loc[mask2, 'AnomalyScore'] + 1.0
+    except Exception:
+        logging.exception("Failed to compute weekly short-duration runs")
+
+
+
+
+
+
+@app.route('/chatbot/query', methods=['POST'])
+def chatbot_query():
+    """
+    Minimal skeleton:
+    Payload: { "q": "Show me Swapnil trend last 90 days", "top_k": 5 }
+    Returns: { "answer": "...", "evidence": [ {source, snippet}, ... ] }
+    NOTE: This is a retrieval-first skeleton. You need to wire an embedding+vector DB to make it useful.
+    """
+    payload = request.get_json(force=True)
+    q = payload.get('q')
+    if not q:
+        return jsonify({"error":"query text 'q' required"}), 400
+
+    # Simple canned responses for common patterns (fallback)
+    q_l = q.strip().lower()
+    if "high risk today" in q_l or "who is high risk today" in q_l:
+        # read latest aggregated file and return high risk names (fast fallback)
+        p = Path(DEFAULT_OUTDIR)
+        csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+        if not csvs:
+            return jsonify({"answer":"No data available", "evidence": []})
+        latest = csvs[0]
+        try:
+            df = pd.read_csv(latest)
+            df_high = df[df.get('RiskLevel', '').astype(str).str.lower() == 'high']
+            names = df_high['EmployeeName'].dropna().unique().tolist()
+            return jsonify({"answer": f"High risk persons today: {', '.join(names[:20]) if names else 'None'}", "evidence": []})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # fallback: echo with a hint
+    return jsonify({"answer": f"I can help with trend & risk questions. I recognized: {q}. Try: 'Show me <EmployeeID> last 90 days' or 'Who is high risk today'.", "evidence": []})
+
+
+
+
+
+
 
