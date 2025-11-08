@@ -1,3 +1,293 @@
+# backend/trend_runner.py
+# <--- file unchanged above this point; full original content retained except for the new block below --->
+
+# ------------------------------
+# ### CACHE: 90-day combined cache helpers
+# ------------------------------
+from datetime import datetime as _datetime
+
+_CACHE_FILENAME = "trend_pune_90day_cache.csv"
+_CACHE_META = "trend_pune_90day_cache_meta.txt"
+_CACHE_REFRESH_SECONDS = 60 * 60 * 6  # refresh every 6 hours by default
+
+def _cache_paths_for_outdir(outdir: str):
+    p = Path(outdir)
+    return p / _CACHE_FILENAME, p / _CACHE_META
+
+def build_90day_cache(outdir: str = str(OUTDIR), window_days: int = 90):
+    """
+    Build (or rebuild) a combined cache CSV containing the last `window_days` days of
+    trend_pune_*.csv (up to today). Returns (df, start_date, end_date) or (None, None, None)
+    if no data found.
+    """
+    outdir_p = Path(outdir)
+    outdir_p.mkdir(parents=True, exist_ok=True)
+    target_date = _datetime.now().date() + timedelta(days=1)  # make helper include today
+    try:
+        df = _read_past_trend_csvs(str(outdir_p), window_days, target_date)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df is None or df.empty:
+        # remove stale cache if exists
+        cpath, mpath = _cache_paths_for_outdir(outdir)
+        try:
+            if cpath.exists():
+                cpath.unlink()
+            if mpath.exists():
+                mpath.unlink()
+        except Exception:
+            pass
+        return None, None, None
+
+    # ensure Date column is date type and normalized
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    # determine start/end present in this combined df
+    try:
+        present_dates = sorted([d for d in pd.Series(df['Date'].dropna().unique())])
+        start = present_dates[0] if present_dates else None
+        end = present_dates[-1] if present_dates else None
+    except Exception:
+        start = None
+        end = None
+
+    # write combined cache CSV (safe write)
+    cpath, mpath = _cache_paths_for_outdir(outdir)
+    try:
+        # convert Date to ISO strings to be robust on read
+        df_to_write = df.copy()
+        if 'Date' in df_to_write.columns:
+            try:
+                df_to_write['Date'] = df_to_write['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+            except Exception:
+                pass
+        df_to_write.to_csv(cpath, index=False)
+        # write meta
+        with open(mpath, "w", encoding="utf8") as f:
+            f.write(f"{start.isoformat() if start else ''}\n")
+            f.write(f"{end.isoformat() if end else ''}\n")
+            f.write(f"{_datetime.now().isoformat()}\n")
+    except Exception:
+        logging.exception("Failed to write 90-day cache to %s", cpath)
+        return df, start, end
+
+    logging.info("Built 90-day cache %s (%s -> %s, rows=%d)", cpath, start, end, len(df))
+    return df, start, end
+
+def read_90day_cache(outdir: str = str(OUTDIR), window_days: int = 90, force_refresh: bool = False):
+    """
+    Load the 90-day combined cache if present and fresh; otherwise (re)build it.
+    Returns (df, start_date, end_date) where df has Date as datetime.date values.
+    If no cache and no data available returns (None, None, None).
+    """
+    outdir_p = Path(outdir)
+    cpath, mpath = _cache_paths_for_outdir(outdir)
+
+    # if cache exists and not forced refresh, check modification time to decide whether to use it
+    try:
+        if cpath.exists() and mpath.exists() and not force_refresh:
+            meta_mtime = cpath.stat().st_mtime
+            # if cache is older than refresh interval, rebuild
+            age = _datetime.now().timestamp() - meta_mtime
+            if age > _CACHE_REFRESH_SECONDS:
+                # rebuild
+                return build_90day_cache(outdir=outdir, window_days=window_days)
+            # try to read cache
+            try:
+                df = pd.read_csv(cpath)
+                if 'Date' in df.columns:
+                    try:
+                        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+                    except Exception:
+                        pass
+                # read meta if available
+                start = None
+                end = None
+                try:
+                    if mpath.exists():
+                        with open(mpath, "r", encoding="utf8") as f:
+                            lines = [l.strip() for l in f.readlines()]
+                            if len(lines) >= 2:
+                                start = pd.to_datetime(lines[0]).date() if lines[0] else None
+                                end = pd.to_datetime(lines[1]).date() if lines[1] else None
+                except Exception:
+                    start = None
+                    end = None
+                return df, start, end
+            except Exception:
+                logging.exception("Failed to read existing 90-day cache; will rebuild.")
+                return build_90day_cache(outdir=outdir, window_days=window_days)
+        else:
+            # build new cache
+            return build_90day_cache(outdir=outdir, window_days=window_days)
+    except Exception:
+        logging.exception("Error in read_90day_cache; attempting to build cache")
+        return build_90day_cache(outdir=outdir, window_days=window_days)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# backend/app.py
+# <--- file unchanged above this point; full original content retained except for the small edits below --->
+
+# Add the new helper import from trend_runner
+from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR, read_90day_cache
+
+# ... rest of file unchanged until route /run ...
+
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.json or {}
+
+    date_str = params.get('date')
+    start_str = params.get('start')
+    end_str = params.get('end')
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            # default: include yesterday and today so previous-day evidence gets generated by default
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            dates = [yesterday, today]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    combined_rows = []
+    files = []
+
+    # ---------- TRY CACHE FAST-PATH ----------
+    try:
+        cache_df, cache_start, cache_end = read_90day_cache(str(DEFAULT_OUTDIR), window_days=90)
+    except Exception:
+        cache_df = None
+        cache_start = None
+        cache_end = None
+
+    use_cache = False
+    if cache_df is not None and not cache_df.empty and cache_start and cache_end:
+        try:
+            # check all requested dates are inside cache window (inclusive)
+            all_in = all((d >= cache_start and d <= cache_end) for d in dates)
+            if all_in:
+                use_cache = True
+        except Exception:
+            use_cache = False
+
+    if use_cache:
+        # filter cached df to requested dates
+        try:
+            # ensure Date column is date type
+            if 'Date' in cache_df.columns:
+                try:
+                    cache_df['Date'] = pd.to_datetime(cache_df['Date'], errors='coerce').dt.date
+                except Exception:
+                    pass
+            # select rows for requested dates
+            dates_set = set(dates)
+            filtered = cache_df[cache_df['Date'].isin(dates_set)].copy()
+            if not filtered.empty:
+                combined_rows.append(filtered)
+                files.append(Path(DEFAULT_OUTDIR).name + "/" + _CACHE_FILENAME if '_CACHE_FILENAME' in globals() else "trend_pune_90day_cache.csv")
+            else:
+                # if cache present but no rows for requested dates, fallback to per-date generation
+                use_cache = False
+        except Exception:
+            logging.exception("Cache fast-path failed; falling back to per-date generation.")
+            use_cache = False
+
+    if not use_cache:
+        # original per-date behaviour
+        for d in dates:
+            try:
+                df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+            except Exception as e:
+                logging.exception("run_trend_for_date failed for %s", d)
+                return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+            csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
+            if csv_path.exists():
+                files.append(csv_path.name)
+
+            if df is None or df.empty:
+                continue
+
+            # Ensure IsFlagged exists; Reasons only when flagged
+            if 'IsFlagged' not in df.columns:
+                df['IsFlagged'] = False
+            if 'Reasons' not in df.columns:
+                df['Reasons'] = None
+
+            combined_rows.append(df)
+
+    # ... rest of the function continues unchanged (dedupe, sample creation, response) ...
+    # Note: the rest of the existing code expects combined_rows list and will proceed exactly as before.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now check below 2 file carefully and Update only necessary snippet and share me updated file ...
 
 
