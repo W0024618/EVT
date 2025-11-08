@@ -1,3 +1,171 @@
+# IMPORTANT: duration_report must exist and expose run_for_date(date, regions, outdir, city)
+from duration_report import run_for_date, compute_daily_durations
+# alias imported function so local wrapper does not shadow it
+from config.door_zone import map_door_to_zone as config_map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+
+
+
+
+
+
+
+
+
+def run_trend_for_date(target_date: date, outdir: str = "./outputs", city='Pune', as_dict: bool = False):
+    logging.info("run_trend_for_date: date=%s (city=%s)", target_date, city)
+    results = run_for_date(target_date, regions=['apac'], outdir=outdir, city=city)
+    apac = results.get('apac', {})
+    swipes = apac.get('swipes', pd.DataFrame())
+    durations = apac.get('durations', pd.DataFrame())
+
+    # save raw swipes for evidence (full raw) — keep original timestamps in saved raw file
+    try:
+        if swipes is not None and not swipes.empty:
+            sw_out = Path(outdir) / f"swipes_{city.lower().replace(' ','_')}_{target_date.strftime('%Y%m%d')}.csv"
+            swipes.to_csv(sw_out, index=False)
+            logging.info("Saved raw swipes to %s", sw_out)
+    except Exception as e:
+        logging.warning("Failed to save raw swipes: %s", e)
+
+    # --- Special handling for Pune: start day at 02:00 (2 AM) instead of midnight ---
+    use_pune_2am_boundary = False
+    try:
+        if city and isinstance(city, str) and 'pun' in city.strip().lower():
+            use_pune_2am_boundary = True
+    except Exception:
+        use_pune_2am_boundary = False
+
+    # If Pune: create shifted copies for grouping (shift timestamps BACK by 2 hours for grouping)
+    # We will compute durations from the shifted swipes so Date boundaries align with 02:00.
+    sw_for_features = swipes.copy() if swipes is not None else pd.DataFrame()
+    durations_for_features = durations.copy() if durations is not None else pd.DataFrame()
+
+    if use_pune_2am_boundary and (sw_for_features is not None) and (not sw_for_features.empty):
+        try:
+            # ensure LocaleMessageTime parsed
+            if 'LocaleMessageTime' in sw_for_features.columns:
+                sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features['LocaleMessageTime'], errors='coerce')
+            else:
+                # try other timestamp columns defensively
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_for_features.columns:
+                        sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features[cand], errors='coerce')
+                        break
+            # shift timestamps backward by 2 hours so the 'date' computed from them moves the day boundary to 02:00
+            sw_for_features['LocaleMessageTime'] = sw_for_features['LocaleMessageTime'] - pd.Timedelta(hours=2)
+
+            # recompute durations using shifted swipes so FirstSwipe/LastSwipe/Duration match 02:00-day boundary
+            try:
+                durations_for_features = compute_daily_durations(sw_for_features)
+            except Exception:
+                logging.exception("Failed to recompute durations for Pune 2AM boundary; falling back to original durations.")
+                durations_for_features = durations.copy() if durations is not None else pd.DataFrame()
+        except Exception:
+            logging.exception("Failed preparing shifted swipes for Pune 2AM logic; using original swipes/durations.")
+            sw_for_features = swipes.copy() if swipes is not None else pd.DataFrame()
+            durations_for_features = durations.copy() if durations is not None else pd.DataFrame()
+
+    # compute features using possibly-shifted data (so grouping uses 02:00 boundary for Pune)
+    features = compute_features(sw_for_features, durations_for_features)
+    if features.empty:
+        logging.warning("run_trend_for_date: no features computed")
+        if as_dict:
+            return {'rows': 0, 'flagged_rows': 0, 'sample': [], 'reasons_count': {}, 'risk_counts': {}, 'aggregated_unique_persons': 0}
+        return pd.DataFrame()
+
+    # If we used a shifted timeline for grouping (Pune), restore FirstSwipe/LastSwipe displayed times by adding 2 hours
+    # (this preserves the 02:00-based grouping but shows original times to user)
+    if use_pune_2am_boundary:
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in features.columns:
+                try:
+                    features[dtcol] = pd.to_datetime(features[dtcol], errors='coerce') + pd.Timedelta(hours=2)
+                except Exception:
+                    # if values are strings or malformed, attempt safe add-by-parsing row-by-row
+                    def _add2h_safe(v):
+                        try:
+                            t = pd.to_datetime(v, errors='coerce')
+                            if pd.isna(t):
+                                return v
+                            return t + pd.Timedelta(hours=2)
+                        except Exception:
+                            return v
+                    features[dtcol] = features[dtcol].apply(_add2h_safe)
+
+    # (rest of function unchanged) ----- continue with existing logic -----
+    # ----- New: compute historical scenario counts and weekly short-duration patterns -----
+    try:
+        # read scenario counts for pattern shortstay_longout_repeat
+        hist_pattern_counts = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'shortstay_longout_repeat')
+        # repeated_short_breaks counts
+        hist_rep_breaks = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'repeated_short_breaks')
+        # short_duration_<4h counts (scenario name "short_duration_<4h" exists in SCENARIOS)
+        hist_short_duration = _read_scenario_counts_by_person(outdir, VIOLATION_WINDOW_DAYS, target_date, 'short_duration_<4h')
+
+        def get_hist_count_for_row(row, hist_map):
+            # check several identifiers used historically
+            for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                if k in row and row.get(k) not in (None, '', float('nan')):
+                    try:
+                        norm = _normalize_id_val(row.get(k))
+                        if norm and str(norm) in hist_map:
+                            return int(hist_map.get(str(norm), 0))
+                        stripped = _strip_uid_prefix(str(norm)) if norm else None
+                        if stripped and str(stripped) in hist_map:
+                            return int(hist_map.get(str(stripped), 0))
+                    except Exception:
+                        continue
+            return 0
+
+        features['HistPatternShortLongCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
+        features['HistRepeatedShortBreakCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
+        features['HistShortDurationCount90'] = features.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
+
+        # escalate: if PatternShortLong repeat count >=3 -> high risk
+        pat_mask = features['HistPatternShortLongCount90'].fillna(0).astype(int) >= 3
+        if pat_mask.any():
+            features.loc[pat_mask, 'RiskScore'] = 5
+            features.loc[pat_mask, 'RiskLevel'] = 'High'
+            features.loc[pat_mask, 'IsFlagged'] = True
+
+        # repeated_short_breaks: if history > 5 -> force High (example of heavy violator)
+        rep_mask = features['HistRepeatedShortBreakCount90'].fillna(0).astype(int) >= 5
+        if rep_mask.any():
+            features.loc[rep_mask, 'RiskScore'] = 5
+            features.loc[rep_mask, 'RiskLevel'] = 'High'
+            features.loc[rep_mask, 'IsFlagged'] = True
+
+    except Exception:
+        logging.exception("Failed to compute historical scenario counts.")
+    # ... (the rest of run_trend_for_date remains the same as before) ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Vishwakarma, Anilkumar Ramlal	327576	615765	2025-10-08	00:17:46	00:00:00	APAC_IN_PUN_PODIUM_ST4 DOOR 1 (ORANGE)	InDirection	Orange Zone
 
 Here Flagged date is 2025-10-08	
