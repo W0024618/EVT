@@ -1,40 +1,3398 @@
-Currently It display like 
+Check below Backend and Frontend file carefully and fix the issue and share me updated Snippets so i can easily swap file each other
 
-Gaddam, John Pascal -  Long gap between swipes (~4 hr 33 min).
-This may indicate an extended out-of-office absence. 
-Overtime detected (>=10 hours). Very long presence (>=16 hours).
-Many short gaps between swipes — repeated short breaks pattern. 
-First swipe earlier than 06:00. Last swipe after 22:00 (22:20:19).
+# backend/app.py
+from flask import Flask, jsonify, request, send_from_directory, send_file
+from datetime import datetime, timedelta, date
+from pathlib import Path
+import logging
+import pandas as pd
+import numpy as np
+import joblib
+import math
+import re
+import io
+import base64
+import os
+import difflib
+from typing import Optional, List, Dict, Any
+
+from duration_report import REGION_CONFIG
+from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR, read_90day_cache
+from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+
+# ---------- Ensure outputs directory exists early (so OVERRIDES_FILE can be defined safely) ----------
+BASE_DIR = Path(__file__).parent.resolve()
+DEFAULT_OUTDIR = BASE_DIR / "outputs"
+DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+OVERRIDES_FILE = DEFAULT_OUTDIR / "overrides.csv"
+
+def _load_overrides():
+    if not OVERRIDES_FILE.exists():
+        return {}
+    try:
+        df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+        out = {}
+        for _, r in df.iterrows():
+            emp = str(r.get('EmployeeID') or r.get('person_uid') or '').strip()
+            if not emp:
+                continue
+            out[emp] = {
+                'level': str(r.get('OverrideLevel') or '').strip(),
+                'reason': str(r.get('Reason') or '').strip(),
+                'ts': str(r.get('Timestamp') or '').strip()
+            }
+        return out
+    except Exception:
+        logging.exception("Failed reading overrides file")
+        return {}
+
+def _save_override(employee_key, level, reason):
+    now = datetime.now().isoformat()
+    row = {'EmployeeID': employee_key, 'OverrideLevel': level, 'Reason': reason or '', 'Timestamp': now}
+    try:
+        if OVERRIDES_FILE.exists():
+            df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df.to_csv(OVERRIDES_FILE, index=False)
+        return True
+    except Exception:
+        logging.exception("Failed to save override")
+        return False
+
+# ODBC driver (keep existing env-based driver)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# Backoff / connector helper for ACVSCore (restored so image lookups work)
+_acvscore_backoff = {"ts": None, "failed": False}
+_ACVSCORE_BACKOFF_SECONDS = 20
+
+def _get_acvscore_conn():
+    """
+    Try to connect to ACVSCore by reusing credentials from REGION_CONFIG.
+    Loops through REGION_CONFIG entries and attempts:
+      1) SQL auth (UID/PWD) to database "ACVSCore" using region server + credentials
+      2) If SQL auth fails on that server, try Trusted_Connection (Windows auth) as a fallback
+    Returns first successful pyodbc connection or None.
+    Implements a short backoff after recent failure to reduce log noise.
+    """
+    try:
+        import pyodbc
+    except Exception:
+        logging.exception("pyodbc not installed; ACVSCore lookups unavailable.")
+        return None
+
+    # basic backoff: skip attempts if we just failed recently
+    from datetime import datetime
+    now = datetime.now().timestamp()
+    last = _acvscore_backoff.get("ts")
+    if last and _acvscore_backoff.get("failed") and (now - last) < _ACVSCORE_BACKOFF_SECONDS:
+        logging.debug("Skipping ACVSCore connection attempt (backoff active).")
+        return None
+
+    tried = []
+    for region_key, rc in (REGION_CONFIG or {}).items():
+        server = rc.get("server")
+        user = rc.get("user")
+        pwd = rc.get("password")
+        if not server:
+            continue
+
+        # Try SQL auth first if credentials present
+        if user and pwd:
+            tried.append(f"{region_key}@{server}(sql)")
+            conn_str = (
+                f"DRIVER={{{ODBC_DRIVER}}};"
+                f"SERVER={server};DATABASE=ACVSCore;UID={user};PWD={pwd};"
+                "TrustServerCertificate=Yes;"
+            )
+            try:
+                conn = pyodbc.connect(conn_str, autocommit=True, timeout=5)
+                logging.info("Connected to ACVSCore on server %s using REGION_CONFIG[%s] (sql auth).", server, region_key)
+                _acvscore_backoff["ts"] = None
+                _acvscore_backoff["failed"] = False
+                return conn
+            except Exception as e:
+                logging.debug("SQL auth to %s failed: %s", server, e)
+
+        # Try Trusted Connection fallback on same server
+        tried.append(f"{region_key}@{server}(trusted)")
+        conn_str_trusted = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={server};DATABASE=ACVSCore;Trusted_Connection=yes;"
+            "TrustServerCertificate=Yes;"
+        )
+        try:
+            conn = pyodbc.connect(conn_str_trusted, autocommit=True, timeout=5)
+            logging.info("Connected to ACVSCore on server %s using REGION_CONFIG[%s] (trusted connection).", server, region_key)
+            _acvscore_backoff["ts"] = None
+            _acvscore_backoff["failed"] = False
+            return conn
+        except Exception as e:
+            logging.debug("Trusted connection to %s failed: %s", server, e)
+            continue
+
+    # Fallback: if a global ACVSCORE_DB_CONFIG exists, try it (safe check)
+    try:
+        if 'ACVSCORE_DB_CONFIG' in globals() and isinstance(globals().get('ACVSCORE_DB_CONFIG'), dict):
+            cfg = globals().get('ACVSCORE_DB_CONFIG')
+            server = cfg.get('server')
+            user = cfg.get('user')
+            pwd = cfg.get('password')
+            database = cfg.get('database', 'ACVSCore')
+            tried.append(f"ACVSCORE_DB_CONFIG@{server}")
+            try:
+                conn_str = (
+                    f"DRIVER={{{ODBC_DRIVER}}};"
+                    f"SERVER={server};DATABASE={database};UID={user};PWD={pwd};"
+                    "TrustServerCertificate=Yes;"
+                )
+                conn = pyodbc.connect(conn_str, autocommit=True, timeout=5)
+                logging.info("Connected to ACVSCore using ACVSCORE_DB_CONFIG (%s).", server)
+                _acvscore_backoff["ts"] = None
+                _acvscore_backoff["failed"] = False
+                return conn
+            except Exception as e:
+                logging.debug("ACVSCORE_DB_CONFIG connection failed: %s", e)
+    except Exception:
+        logging.debug("ACVSCORE_DB_CONFIG fallback not available or failed.")
+
+    # record failure to backoff
+    _acvscore_backoff["ts"] = now
+    _acvscore_backoff["failed"] = True
+    logging.error("Failed to connect to ACVSCore using REGION_CONFIG servers. Tried: %s", tried)
+    return None
+
+MODELS_DIR = Path(__file__).parent / "models"
+_loaded_models = {}
+
+def load_model(name):
+    if name in _loaded_models:
+        return _loaded_models[name]
+    p = MODELS_DIR / f"{name}.joblib"
+    if not p.exists():
+        return None
+    data = joblib.load(p)
+    _loaded_models[name] = data
+    return data
+
+def get_personnel_info(candidate_identifier: object) -> Dict[str, Any]:
+    """
+    Try to resolve personnel record using a flexible lookup.
+    Returns dict with keys: ObjectID (may be None), GUID, Name, EmailAddress, ManagerEmail
+    If resolution fails returns empty dict.
+    """
+    out: Dict[str, Any] = {}
+    if candidate_identifier is None:
+        return out
+    try:
+        conn = _get_acvscore_conn()
+    except Exception:
+        conn = None
+    if conn is None:
+        return out
+
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT TOP 1 ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            FROM ACVSCore.Access.Personnel
+            WHERE
+              (CAST(ObjectID AS NVARCHAR(200)) = ?)
+              OR (GUID = ?)
+              OR (CAST(Int1 AS NVARCHAR(200)) = ?)
+              OR (Text12 = ?)
+              OR (Name = ?)
+            ORDER BY ObjectID DESC
+        """
+        cand = str(candidate_identifier).strip()
+        params = (cand, cand, cand, cand, cand)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            try:
+                out['ObjectID'] = row[0]
+                out['GUID'] = row[1]
+                out['Name'] = row[2]
+                out['EmailAddress'] = row[3]
+                out['ManagerEmail'] = row[4]
+            except Exception:
+                out = {
+                    'ObjectID': row[0] if len(row) > 0 else None,
+                    'GUID': row[1] if len(row) > 1 else None,
+                    'Name': row[2] if len(row) > 2 else None,
+                    'EmailAddress': row[3] if len(row) > 3 else None,
+                    'ManagerEmail': row[4] if len(row) > 4 else None
+                }
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return out
+
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    """
+    Query ACVSCore.Access.Images for top image where ParentId = parent_id and return raw bytes.
+    Returns None if not found or on error.
+    """
+    try:
+        conn = _get_acvscore_conn()
+    except Exception:
+        conn = None
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT TOP 1 AI.Image
+            FROM ACVSCore.Access.Images AI
+            WHERE AI.ParentId = ?
+              AND DATALENGTH(AI.Image) > 0
+            ORDER BY AI.ObjectID DESC
+        """
+        cur.execute(sql, (str(parent_id),))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            try:
+                b = bytes(row[0])
+                return b
+            except Exception:
+                return row[0]
+    except Exception:
+        logging.exception("Failed to fetch image for ParentId=%s", parent_id)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return None
+
+# ---------- New route to serve employee image ----------
+# We'll import send_file earlier where used; define route after app created.
+
+# Try to enable CORS
+try:
+    from flask_cors import CORS
+    has_cors = True
+except Exception:
+    CORS = None
+    has_cors = False
+
+app = Flask(__name__, static_folder=None)
+if has_cors:
+    CORS(app)
+else:
+    logging.warning("flask_cors not available; continuing without CORS.")
+
+logging.basicConfig(level=logging.INFO)
+
+# optional import; used for styling
+try:
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
+def _to_python_scalar(x):
+    """
+    Convert numpy/pandas scalar types to built-in Python types and
+    convert NaN-like values to None so JSON is safe.
+    """
+    try:
+        import pandas as _pd
+        if isinstance(x, _pd.Timestamp):
+            return x.to_pydatetime().isoformat()
+    except Exception:
+        pass
+
+    try:
+        import numpy as _np
+        if isinstance(x, _np.generic):
+            v = x.item()
+            if isinstance(v, float) and _np.isnan(v):
+                return None
+            return v
+    except Exception:
+        pass
+
+    try:
+        if isinstance(x, float) and math.isnan(x):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(x, (datetime,)):
+        return x.isoformat()
+    if isinstance(x, (bool, int, str, type(None), float)):
+        return x
+    try:
+        return str(x)
+    except Exception:
+        return None
+
+_uuid_like_re = re.compile(r'^[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}$')
+
+def _looks_like_guid(s):
+    try:
+        if not s or not isinstance(s, str):
+            return False
+        s = s.strip()
+        return bool(_uuid_like_re.match(s)) or s.startswith('name:') or s.startswith('emp:') or s.startswith('uid:')
+    except Exception:
+        return False
+
+# Helper: format seconds to HH:MM:SS
+def format_seconds_to_hms(seconds):
+    try:
+        if seconds is None:
+            return None
+        s = int(float(seconds))
+        if s < 0:
+            s = 0
+        hh = s // 3600
+        mm = (s % 3600) // 60
+        ss = s % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    except Exception:
+        return None
+
+_PLACEHOLDER_STRS = set(['', 'nan', 'na', 'n/a', '-', '—', '–', 'none', 'null'])
+
+def _is_placeholder_str(s: object) -> bool:
+    try:
+        if s is None:
+            return True
+        st = str(s).strip().lower()
+        return st in _PLACEHOLDER_STRS
+    except Exception:
+        return False
+
+def _replace_placeholder_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace common placeholder literal strings (e.g. 'nan', 'None', 'null', '-', 'n/a') in object/string columns with None.
+    This prevents 'nan' strings showing up in JSON and ensures downstream logic treats them as missing values.
+    Operates in-place on object columns and returns the dataframe (for chaining).
+    """
+    if df is None or df.empty:
+        return df
+    # operate only on object (string) columns to avoid corrupting numeric columns
+    for col in df.columns:
+        try:
+            if df[col].dtype == object:
+                df[col] = df[col].apply(lambda x: None if (isinstance(x, str) and x.strip().lower() in _PLACEHOLDER_STRS) else x)
+        except Exception:
+            # defensive: skip columns that error
+            continue
+    return df
+
+_CARD_XML_RE = re.compile(r'<Card>([^<]+)</Card>', re.IGNORECASE | re.DOTALL)
+def _extract_card_from_xml_text(txt):
+    try:
+        if not txt or not isinstance(txt, str):
+            return None
+        m = _CARD_XML_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r'CHUID.*?Card.*?[:=]\s*([0-9A-Za-z\-\_]+)', txt, re.IGNORECASE | re.DOTALL)
+        if m2:
+            return m2.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+def _resolve_field_from_record(record: dict, candidate_tokens: list):
+    if record is None:
+        return None
+
+    for key in candidate_tokens:
+        if key in record:
+            v = record.get(key)
+            if v is None:
+                continue
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            sval = str(v).strip()
+            if sval and not _is_placeholder_str(sval):
+                return _to_python_scalar(v)
+
+    lower_keys = {k.lower(): k for k in record.keys()}
+    for tok in candidate_tokens:
+        tok_l = tok.lower()
+        for lk, orig_key in lower_keys.items():
+            if tok_l in lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                if isinstance(v, float) and math.isnan(v):
+                    continue
+                sval = str(v).strip()
+                if sval and not _is_placeholder_str(sval):
+                    return _to_python_scalar(v)
+
+    card_like = any(tok.lower() in ('cardnumber', 'chuid', 'card') for tok in candidate_tokens)
+    if card_like:
+        for lk, orig_key in lower_keys.items():
+            if 'xml' in lk or 'xmlmessage' in lk or 'xml_msg' in lk or 'msg' in lk or 'value' == lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                try:
+                    txt = str(v)
+                    extracted = _extract_card_from_xml_text(txt)
+                    if extracted and not _is_placeholder_str(extracted):
+                        return _to_python_scalar(extracted)
+                except Exception:
+                    continue
+
+    for k, v in record.items():
+        if v is None:
+            continue
+        if isinstance(v, float) and math.isnan(v):
+            continue
+        sval = str(v).strip()
+        if sval and not _is_placeholder_str(sval):
+            return _to_python_scalar(v)
+
+    return None
+
+def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+
+    cols_to_fix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    for c in cols_to_fix:
+        base = c[:-2]
+        if base in df.columns:
+            try:
+                df.drop(columns=[c], inplace=True)
+            except Exception:
+                pass
+        else:
+            try:
+                df.rename(columns={c: base}, inplace=True)
+            except Exception:
+                pass
+
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            df['Date'] = df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+        except Exception:
+            pass
+
+    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
+        if dtcol in df.columns:
+            try:
+                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
+                df[dtcol] = df[dtcol].apply(lambda t: t.to_pydatetime().isoformat() if pd.notna(t) else None)
+            except Exception:
+                try:
+                    df[dtcol] = df[dtcol].astype(str).replace('NaT', None)
+                except Exception:
+                    pass
+
+    # convert NaN -> None
+    df = df.where(pd.notnull(df), None)
+
+    rows = df.head(max_rows).to_dict(orient='records')
+    cleaned = []
+    for r in rows:
+        out = {}
+        for k, v in r.items():
+            out[k] = _to_python_scalar(v)
+
+        emp_name = out.get('EmployeeName')
+        emp_id = out.get('EmployeeID') or out.get('EmployeeIdentity')
+        person_uid = out.get('person_uid')
+
+        if not emp_id:
+            emp_tokens = ['Int1', 'Text12', 'EmployeeID', 'empid', 'id']
+            resolved_emp = _resolve_field_from_record(r, emp_tokens)
+            if resolved_emp is not None:
+                try:
+                    s = str(resolved_emp).strip()
+                    if '.' in s:
+                        f = float(s)
+                        if math.isfinite(f) and f.is_integer():
+                            s = str(int(f))
+                    if _looks_like_guid(s):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = s
+                        emp_id = s
+                except Exception:
+                    if _looks_like_guid(resolved_emp):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = resolved_emp
+                        emp_id = resolved_emp
+
+        if out.get('CardNumber') in (None, '', 'nan'):
+            card_tokens = ['CardNumber', 'CHUID', 'Card', 'card_no', 'cardnum']
+            resolved_card = _resolve_field_from_record(r, card_tokens)
+            if resolved_card is not None:
+                try:
+                    cs = str(resolved_card).strip()
+                    if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                        out['CardNumber'] = None
+                    else:
+                        out['CardNumber'] = cs
+                except Exception:
+                    out['CardNumber'] = None
+
+        if 'EmployeeID' in out and isinstance(out['EmployeeID'], str) and _looks_like_guid(out['EmployeeID']):
+            out['EmployeeID'] = None
+        if 'CardNumber' in out and isinstance(out['CardNumber'], str) and _looks_like_guid(out['CardNumber']):
+            out['CardNumber'] = None
+
+        if (emp_name in (None, '', 'nan')) or (isinstance(emp_name, str) and _looks_like_guid(emp_name)):
+            if emp_id not in (None, '', 'nan') and not _looks_like_guid(emp_id):
+                out['EmployeeName'] = str(emp_id)
+            else:
+                out['EmployeeName'] = None
+
+        cleaned.append(out)
+    return cleaned
+
+@app.route('/')
+def root():
+    return "Trend Analysis API — Pune test"
+
+# ---------------- Single run endpoint (merged & deduped) ----------------
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.json or {}
+
+    date_str = params.get('date')
+    start_str = params.get('start')
+    end_str = params.get('end')
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            dates = [yesterday, today]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    combined_rows = []
+    files = []
+
+    # ---------- TRY CACHE FAST-PATH ----------
+    try:
+        cache_df, cache_start, cache_end = read_90day_cache(str(DEFAULT_OUTDIR), window_days=90)
+    except Exception:
+        cache_df = None
+        cache_start = None
+        cache_end = None
+
+    use_cache = False
+    if cache_df is not None and not cache_df.empty and cache_start and cache_end:
+        try:
+            all_in = all((d >= cache_start and d <= cache_end) for d in dates)
+            if all_in:
+                use_cache = True
+        except Exception:
+            use_cache = False
+
+    if use_cache:
+        try:
+            if 'Date' in cache_df.columns:
+                try:
+                    cache_df['Date'] = pd.to_datetime(cache_df['Date'], errors='coerce').dt.date
+                except Exception:
+                    pass
+            dates_set = set(dates)
+            filtered = cache_df[cache_df['Date'].isin(dates_set)].copy()
+            if not filtered.empty:
+                combined_rows.append(filtered)
+                files.append(Path(DEFAULT_OUTDIR).name + "/" + (_CACHE_FILENAME if '_CACHE_FILENAME' in globals() else "trend_pune_90day_cache.csv"))
+            else:
+                use_cache = False
+        except Exception:
+            logging.exception("Cache fast-path failed; falling back to per-date generation.")
+            use_cache = False
+
+    if not use_cache:
+        for d in dates:
+            try:
+                df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+            except Exception as e:
+                logging.exception("run_trend_for_date failed for %s", d)
+                return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+            csv_path = DEFAULT_OUTDIR / f"trend_pune_{d.strftime('%Y%m%d')}.csv"
+            if csv_path.exists():
+                files.append(csv_path.name)
+
+            if df is None or df.empty:
+                continue
+
+            if 'IsFlagged' not in df.columns:
+                df['IsFlagged'] = False
+            if 'Reasons' not in df.columns:
+                df['Reasons'] = None
+
+            combined_rows.append(df)
+
+    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+
+    # Normalize placeholder literal strings (e.g. 'nan') in string columns to actual None
+    combined_df = _replace_placeholder_strings(combined_df)
+
+    # ---------- Dedupe + aggregate (same as previous logic) ----------
+    def _norm_id_val_local(v):
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '' or s.lower() == 'nan':
+            return None
+        try:
+            if '.' in s:
+                f = float(s)
+                if math.isfinite(f) and f.is_integer():
+                    s = str(int(f))
+        except Exception:
+            pass
+        return s
+
+    def _aggregate_group(g):
+        if 'AnomalyScore' in g.columns and not g['AnomalyScore'].isnull().all():
+            try:
+                idx = g['AnomalyScore'].astype(float).idxmax()
+                base = g.loc[idx].to_dict()
+            except Exception:
+                base = g.iloc[0].to_dict()
+        else:
+            if 'Date' in g.columns:
+                try:
+                    g_dates = pd.to_datetime(g['Date'], errors='coerce')
+                    if not g_dates.isnull().all():
+                        idx = g_dates.idxmax()
+                        base = g.loc[idx].to_dict()
+                    else:
+                        base = g.iloc[0].to_dict()
+                except Exception:
+                    base = g.iloc[0].to_dict()
+            else:
+                base = g.iloc[0].to_dict()
+
+        reasons_set = set()
+        explanations_set = []
+        for _, row in g.iterrows():
+            r = row.get('Reasons')
+            if r:
+                parts = [x.strip() for x in re.split(r'[;|,]', str(r)) if x and x.strip()]
+                for p in parts:
+                    if p and not _is_placeholder_str(p):
+                        reasons_set.add(p)
+            ex = row.get('Explanation')
+            if ex and isinstance(ex, str):
+                for seg in [s.strip() for s in re.split(r'(?<=[\.\?\!])\s+', ex) if s and s.strip()]:
+                    if seg not in explanations_set:
+                        explanations_set.append(seg)
+
+        reasons_combined = "; ".join(sorted(reasons_set)) if reasons_set else (base.get('Reasons') if not _is_placeholder_str(base.get('Reasons')) else None)
+        explanation_combined = " ".join([s if s.endswith('.') else s + '.' for s in explanations_set]) if explanations_set else base.get('Explanation')
+
+        is_flagged_any = False
+        if 'IsFlagged' in g.columns:
+            try:
+                is_flagged_any = bool(g['IsFlagged'].any())
+            except Exception:
+                is_flagged_any = any([bool(r.get('IsFlagged')) for _, r in g.iterrows()])
+
+        base['Reasons'] = reasons_combined
+        base['Explanation'] = explanation_combined
+        base['IsFlagged'] = bool(is_flagged_any)
+        return base
+
+    deduped_df = pd.DataFrame()
+    if not combined_df.empty:
+        id_candidates = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'Int1']
+        id_col = next((c for c in id_candidates if c in combined_df.columns), None)
+
+        if id_col is None:
+            deduped_df = combined_df.copy()
+        else:
+            combined_df['_norm_id'] = combined_df[id_col].apply(_norm_id_val_local)
+            if 'person_uid' in combined_df.columns:
+                combined_df['_norm_id'] = combined_df['_norm_id'].fillna(combined_df['person_uid'].astype(str).replace('nan','').replace('None',''))
+            combined_df['_norm_id'] = combined_df['_norm_id'].apply(lambda x: x if (x is not None and str(x).strip()!='') else None)
+            grouped = []
+
+            non_null_mask = combined_df['_norm_id'].notna()
+            if non_null_mask.any():
+                for nid, g in combined_df[non_null_mask].groupby('_norm_id'):
+                    try:
+                        aggregated = _aggregate_group(g)
+                        if isinstance(aggregated, dict):
+                            aggregated['_norm_id'] = nid
+                        else:
+                            try:
+                                aggregated = dict(aggregated)
+                                aggregated['_norm_id'] = nid
+                            except Exception:
+                                pass
+                        grouped.append(aggregated)
+                    except Exception:
+                        row = g.iloc[0].to_dict()
+                        row['_norm_id'] = nid
+                        grouped.append(row)
+
+            noid_rows = combined_df[~non_null_mask]
+            for _, r in noid_rows.iterrows():
+                grouped.append(r.to_dict())
+
+            if grouped:
+                try:
+                    deduped_df = pd.DataFrame(grouped)
+                except Exception:
+                    deduped_df = combined_df.copy()
+            else:
+                deduped_df = combined_df.copy()
+    else:
+        deduped_df = combined_df.copy()
+
+    # Final safety: ensure IsFlagged/Reasons exist
+    if 'IsFlagged' not in deduped_df.columns:
+        deduped_df['IsFlagged'] = False
+    if 'Reasons' not in deduped_df.columns:
+        deduped_df['Reasons'] = None
+    if 'Explanation' not in deduped_df.columns:
+        deduped_df['Explanation'] = None
+
+    # ----------------- Build sample / counts / response -----------------
+    flagged = pd.DataFrame()
+    max_rows_to_send = 10
+    samples = []
+    reasons_count = {}
+    risk_counts = { "Low":0, "Low Medium":0, "Medium":0, "Medium High":0, "High":0 }
+    raw_unique_person_uids = 0
+    analysis_count = 0
+    flagged_count = 0
+    flagged_rate_pct = 0.0
+
+    try:
+        try:
+            if not combined_df.empty:
+                if 'person_uid' in combined_df.columns:
+                    raw_ids = combined_df['person_uid'].dropna().astype(str).apply(lambda s: _norm_id_val_local(s))
+                    raw_ids = raw_ids[raw_ids.fillna('').astype(str).str.strip() != '']
+                    raw_unique_person_uids = int(raw_ids.nunique())
+                elif id_col and id_col in combined_df.columns:
+                    raw_ids = combined_df[id_col].dropna().astype(str).apply(lambda s: _norm_id_val_local(s))
+                    raw_ids = raw_ids[raw_ids.fillna('').astype(str).str.strip() != '']
+                    raw_unique_person_uids = int(raw_ids.nunique())
+                else:
+                    raw_unique_person_uids = int(len(combined_df))
+            else:
+                raw_unique_person_uids = 0
+        except Exception:
+            raw_unique_person_uids = int(len(combined_df)) if combined_df is not None else 0
+
+        try:
+            if not deduped_df.empty and 'IsFlagged' in deduped_df.columns:
+                flagged = deduped_df[deduped_df['IsFlagged'] == True].copy()
+            else:
+                flagged = pd.DataFrame()
+        except Exception:
+            flagged = pd.DataFrame()
+
+        MAX_SAMPLE = 2000
+        if not flagged.empty:
+            sample_df_for_output = flagged.copy()
+        else:
+            sample_df_for_output = deduped_df.copy() if not deduped_df.empty else pd.DataFrame()
+
+        try:
+            max_rows_to_send = min(int(len(sample_df_for_output)), MAX_SAMPLE) if sample_df_for_output is not None else 10
+        except Exception:
+            max_rows_to_send = min(10, MAX_SAMPLE)
+
+        try:
+            samples = _clean_sample_df(sample_df_for_output, max_rows=max_rows_to_send)
+        except Exception:
+            samples = _clean_sample_df(deduped_df.head(10), max_rows=10) if not deduped_df.empty else []
+
+        reasons_count = {}
+        try:
+            if not flagged.empty and 'Reasons' in flagged.columns:
+                for v in flagged['Reasons'].dropna().astype(str):
+                    for part in re.split(r'[;,\|]', v):
+                        key = part.strip()
+                        if key and not _is_placeholder_str(key):
+                            reasons_count[key] = reasons_count.get(key, 0) + 1
+        except Exception:
+            logging.exception("Failed computing reasons_count for response")
+            reasons_count = {}
+
+        risk_counts = { "Low":0, "Low Medium":0, "Medium":0, "Medium High":0, "High":0 }
+        try:
+            if not flagged.empty and 'RiskLevel' in flagged.columns:
+                for v in flagged['RiskLevel'].fillna('').astype(str):
+                    if v:
+                        risk_counts[v] = risk_counts.get(v, 0) + 1
+        except Exception:
+            logging.exception("Failed computing risk_counts for response")
+            risk_counts = { "Low":0, "Low Medium":0, "Medium":0, "Medium High":0, "High":0 }
+
+        try:
+            if not deduped_df.empty:
+                if '_norm_id' in deduped_df.columns:
+                    ac_series = deduped_df['_norm_id'].dropna().astype(str).str.strip()
+                    ac_series = ac_series[ac_series != '']
+                    analysis_count = int(ac_series.nunique())
+                elif 'person_uid' in deduped_df.columns:
+                    ac_series = deduped_df['person_uid'].dropna().astype(str).apply(lambda s: _norm_id_val_local(s))
+                    ac_series = ac_series[ac_series.fillna('').astype(str).str.strip() != '']
+                    analysis_count = int(ac_series.nunique()) if len(ac_series) > 0 else int(len(deduped_df))
+                else:
+                    analysis_count = int(len(deduped_df))
+            else:
+                analysis_count = 0
+        except Exception:
+            analysis_count = int(len(deduped_df)) if deduped_df is not None else 0
+
+        try:
+            flagged_count = int(len(flagged)) if flagged is not None else 0
+            flagged_rate_pct = float((flagged_count / analysis_count * 100.0) if analysis_count and analysis_count > 0 else 0.0)
+        except Exception:
+            flagged_count = int(len(flagged)) if flagged is not None else 0
+            flagged_rate_pct = 0.0
+
+    except Exception:
+        logging.exception("Failed preparing sample / counts; falling back to safe defaults.")
+        if not samples:
+            samples = _clean_sample_df(deduped_df.head(10), max_rows=10) if not deduped_df.empty else []
+        reasons_count = reasons_count or {}
+        risk_counts = risk_counts or { "Low":0, "Low Medium":0, "Medium":0, "Medium High":0, "High":0 }
+        raw_unique_person_uids = raw_unique_person_uids or (int(len(combined_df)) if combined_df is not None else 0)
+        analysis_count = analysis_count or (int(len(deduped_df)) if deduped_df is not None else 0)
+        flagged_count = flagged_count or 0
+        flagged_rate_pct = flagged_rate_pct or 0.0
+
+    try:
+        flagged_persons_cleaned = _clean_sample_df(flagged, max_rows=max_rows_to_send) if (flagged is not None and not flagged.empty) else (samples if samples else [])
+    except Exception:
+        flagged_persons_cleaned = samples if samples else []
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "aggregated_rows_total_raw": int(len(combined_df)),
+        "aggregated_unique_persons": int(analysis_count),
+        "rows": int(analysis_count),
+        "flagged_rows": int(flagged_count),
+        "flagged_rate_percent": float(flagged_rate_pct),
+        "files": files,
+        "sample": (samples[:max_rows_to_send] if isinstance(samples, list) else samples),
+        "reasons_count": reasons_count,
+        "risk_counts": risk_counts,
+        "flagged_persons": (flagged_persons_cleaned[:max_rows_to_send] if isinstance(flagged_persons_cleaned, list) else flagged_persons_cleaned),
+        "_raw_unique_person_uids": int(raw_unique_person_uids)
+    }
+
+    return jsonify(resp)
 
 
-In Explanation 
-First swipe earlier than 06:00. Last swipe after 22:00 (22:20:19).
- Very long presence (>=16 hours).
+@app.route('/latest', methods=['GET'])
+def latest_results():
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({"error": "no outputs found"}), 404
+    latest = csvs[0]
+    # try to infer the date from the filename (trend_pune_YYYYMMDD.csv)
+    start_date_iso = None
+    end_date_iso = None
+    try:
+        m = re.search(r'(\d{8})', latest.name)
+        if m:
+            ymd = m.group(1)
+            dt = datetime.strptime(ymd, "%Y%m%d").date()
+            start_date_iso = dt.isoformat()
+            end_date_iso = dt.isoformat()
+    except Exception:
+        start_date_iso = None
+        end_date_iso = None
 
-Check this two reason and updated Raw Entry ...
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        df = pd.read_csv(latest, dtype=str)
 
-Gaddam, John Pascal	325804	615897	2025-11-05	21:27:33	00:21:36	APAC_IN_PUN_PODIUM_RED_MAIN LIFT LOBBY ENTRY 1-DOOR	InDirection	Red Zone	- (swipes_pune_20251105.csv)
-Gaddam, John Pascal	325804	615897	2025-11-05	00:08:40	00:00:00	APAC_IN_PUN_PODIUM_RED_RECEPTION TO WS ENTRY 1-DOOR NEW	OutDirection	Reception Area	- (swipes_pune_20251106.csv)
-Gaddam, John Pascal	325804	615897	2025-11-05	00:10:06	00:01:26	APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4 -OUT DOOR	OutDirection	Out of office	- (swipes_pune_20251106.csv)
-Gaddam, John Pascal	325804	615897	2025-11-06	14:00:19	13:50:13	APAC_IN_PUN_PODIUM_P-1 TURNSTILE 3-DOOR	InDirection	Reception Area	- (swipes_pune_20251106.csv)
+    # normalize placeholder strings
+    df = _replace_placeholder_strings(df)
+
+    # try to compute unique persons (use same id preference as run_trend)
+    id_candidates = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'Int1']
+    id_col = next((c for c in id_candidates if c in df.columns), None)
+
+    def _norm_val_for_latest(v):
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '' or s.lower() == 'nan':
+            return None
+        try:
+            if '.' in s:
+                fv = float(s)
+                if math.isfinite(fv) and fv.is_integer():
+                    s = str(int(fv))
+        except Exception:
+            pass
+        return s
+
+    if id_col is None:
+        unique_persons = int(len(df))
+    else:
+        ids_series = df[id_col].apply(_norm_val_for_latest) if id_col in df.columns else pd.Series([None]*len(df))
+        if id_col != 'person_uid' and 'person_uid' in df.columns:
+            ids_series = ids_series.fillna(df['person_uid'].astype(str).replace('nan','').replace('None',''))
+        unique_persons = int(len(set([x for x in ids_series.unique() if x])))
+
+    sample = _clean_sample_df(df, max_rows=5)
+    resp = {
+        "file": latest.name,
+        "rows_raw": int(len(df)),
+        "rows": unique_persons,
+        "sample": sample,
+        # new: what date the latest file represents (helpful for frontend)
+        "start_date": start_date_iso,
+        "end_date": end_date_iso
+    }
+    return jsonify(resp)
 
 
-Check three Entry here 
-Gaddam, John Pascal	325804	615897	2025-11-05	00:10:06	00:01:26	APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4 -OUT DOOR	OutDirection	Out of office	- (swipes_pune_20251106.csv)
+@app.route('/record', methods=['GET'])
+def get_record():
+    """
+    /record?employee_id=... or /record?person_uid=...
+    Returns matching aggregated trend rows and filtered raw swipe rows (only for flagged persons).
+    Updated: read ALL trend CSVs (not just the latest), so previous days are included.
+    Also add Zone and SwipeGap (seconds) to raw_swipes returned as evidence.
 
-Gaddam John left office at 12 :10 am it is Actual 6th November ENtry but dur to day Boundry it display in 5th November ..
+    New behaviour:
+      - By default, raw_swipes are returned only for aggregated rows where IsFlagged == True
+      - Set include_unflagged=1 (or true/yes) to also fetch evidence for unflagged aggregated rows.
+      - If an aggregated row has no Date/FirstSwipe/LastSwipe, we fall back to scanning all swipes files.
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    include_unflagged = str(request.args.get('include_unflagged', '')).lower() in ('1', 'true', 'yes')
 
-so Can we make like Dont display here 2025-11-05	00:10:06 5th November .. Display here 6th November ... and In note column add Comment 5th OUt like ..
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
 
-and Gaddam, John Pascal	325804	615897	2025-11-06	14:00:19	13:50:13	APAC_IN_PUN_PODIUM_P-1 TURNSTILE 3-DOOR	InDirection	Reception Area	- (swipes_pune_20251106.csv)
+    # Read all CSVs (concat) so /record will search previous days too
+    df_list = []
+    for fp in csvs:
+        try:
+            # removed deprecated infer_datetime_format argument
+            tmp = pd.read_csv(fp, parse_dates=['FirstSwipe','LastSwipe'])
+        except Exception:
+            try:
+                tmp = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+        df_list.append(tmp)
+    if not df_list:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+    df = pd.concat(df_list, ignore_index=True)
 
-For this Entry dont display gap 14:00 display 0 gap 
-and Highlight this Entry as Green as a New Day 
+    # normalize placeholder literal strings
+    df = _replace_placeholder_strings(df)
 
-and 
-Gaddam, John Pascal	325804	615897	2025-11-05	00:08:40	00:00:00	APAC_IN_PUN_PODIUM_RED_RECEPTION TO WS ENTRY 1-DOOR NEW	OutDirection	Reception Area	- (swipes_pune_20251106.csv)
-Gaddam, John Pascal	325804	615897	2025-11-05	00:10:06	00:01:26	APAC_IN_PUN_PODIUM_P-1 TURNSTILE 4 -OUT DOOR	OutDirection	Out of office	- (swipes_pune_20251106.csv)
+    if q is None:
+        cleaned = _clean_sample_df(df, max_rows=10)
+        return jsonify({'aggregated_rows': cleaned, 'raw_swipe_files': [], 'raw_swipes': []}), 200
 
-This two Entry in  in 5th day attendance without any colour 
+    q_str = str(q).strip()
 
-For This Which file need to Update 
+    def normalize_series(s):
+        if s is None:
+            return pd.Series([''] * len(df))
+        s = s.fillna('').astype(str).str.strip()
+        def _norm_val(v):
+            if not v:
+                return ''
+            try:
+                if '.' in v:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv.is_integer():
+                        return str(int(fv))
+            except Exception:
+                pass
+            return v
+        return s.map(_norm_val)
+
+    found_mask = pd.Series(False, index=df.index)
+
+    if 'EmployeeID' in df.columns:
+        emp_series = normalize_series(df['EmployeeID'])
+        found_mask = found_mask | (emp_series == q_str)
+
+    if 'person_uid' in df.columns:
+        uid_series = normalize_series(df['person_uid'])
+        found_mask = found_mask | (uid_series == q_str)
+
+    # also check Int1 (Personnel.Int1) if present in CSV
+    if 'Int1' in df.columns and not found_mask.any():
+        int1_series = normalize_series(df['Int1'])
+        found_mask = found_mask | (int1_series == q_str)
+
+    if not found_mask.any():
+        # try numeric equivalence
+        try:
+            q_numeric = float(q_str)
+            if 'EmployeeID' in df.columns:
+                emp_numeric = pd.to_numeric(df['EmployeeID'], errors='coerce')
+                found_mask = found_mask | (emp_numeric == q_numeric)
+            if 'Int1' in df.columns and not found_mask.any():
+                int_numeric = pd.to_numeric(df['Int1'], errors='coerce')
+                found_mask = found_mask | (int_numeric == q_numeric)
+        except Exception:
+            pass
+
+    matched = df[found_mask]
+    if matched.empty:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+
+
+    # --- ENRICHMENT START ---
+    # cleaned_matched is a list of dicts
+    # Try to map each cleaned row to a personnel record and attach email/manager/image info
+    try:
+        # Build a quick index over matched DataFrame to find best lookup candidate for each cleaned row
+        matched_indexed = matched.reset_index(drop=True)
+        for idx_c, cleaned in enumerate(cleaned_matched):
+            # Try to find a matching row in matched DataFrame by person_uid -> EmployeeID -> EmployeeName
+            candidate_row = None
+            try:
+                if cleaned.get('person_uid'):
+                    if 'person_uid' in matched_indexed.columns:
+                        mr = matched_indexed[matched_indexed.get('person_uid', '').astype(str) == str(cleaned['person_uid'])]
+                        if not mr.empty:
+                            candidate_row = mr.iloc[0].to_dict()
+                if candidate_row is None and cleaned.get('EmployeeID'):
+                    if 'EmployeeID' in matched_indexed.columns:
+                        mr = matched_indexed[matched_indexed.get('EmployeeID', '').astype(str) == str(cleaned['EmployeeID'])]
+                        if not mr.empty:
+                            candidate_row = mr.iloc[0].to_dict()
+                if candidate_row is None and cleaned.get('EmployeeName'):
+                    # names exact match (defensive)
+                    if 'EmployeeName' in matched_indexed.columns:
+                        mr = matched_indexed[matched_indexed.get('EmployeeName', '').astype(str).str.strip().fillna('') == str(cleaned['EmployeeName']).strip()]
+                        if not mr.empty:
+                            candidate_row = mr.iloc[0].to_dict()
+                # fallback: take first matched row if nothing else
+                if candidate_row is None and len(matched_indexed) > 0:
+                    candidate_row = matched_indexed.iloc[0].to_dict()
+            except Exception:
+                candidate_row = None
+
+            # Determine the best candidate identifier to query Personnel
+            lookup_candidates = []
+            if candidate_row:
+                for k in ('EmployeeObjID', 'EmployeeObjId', 'EmployeeIdentity', 'ObjectID', 'GUID', 'EmployeeID', 'Int1', 'Text12', 'EmployeeName'):
+                    if k in candidate_row and candidate_row.get(k) not in (None, '', 'nan'):
+                        lookup_candidates.append(candidate_row.get(k))
+            # also include cleaned fields
+            for k in ('EmployeeID', 'person_uid', 'EmployeeName'):
+                if cleaned.get(k) not in (None, '', 'nan'):
+                    lookup_candidates.append(cleaned.get(k))
+
+            # try each lookup candidate until we find personnel info
+            personnel_info = {}
+            for cand in lookup_candidates:
+                if cand is None:
+                    continue
+                try:
+                    info = get_personnel_info(cand)
+                    if info and (info.get('ObjectID') is not None or info.get('EmailAddress') is not None or info.get('ManagerEmail') is not None):
+                        personnel_info = info
+                        break
+                except Exception:
+                    continue
+
+            # attach if found
+            if personnel_info:
+                # safe assignments
+                cleaned['EmployeeObjID'] = personnel_info.get('ObjectID')
+                cleaned['EmployeeEmail'] = personnel_info.get('EmailAddress')
+                cleaned['ManagerEmail'] = personnel_info.get('ManagerEmail')
+                # HasImage and imageUrl
+                if personnel_info.get('ObjectID') is not None:
+                    cleaned['imageUrl'] = f"/employee/{personnel_info.get('ObjectID')}/image"
+                    # quick check if image exists (non-blocking: try fetch bytes but ignore failure)
+                    try:
+                        b = get_person_image_bytes(personnel_info.get('ObjectID'))
+                        cleaned['HasImage'] = True if b else False
+                    except Exception:
+                        cleaned['HasImage'] = False
+                else:
+                    cleaned['imageUrl'] = None
+                    cleaned['HasImage'] = False
+    except Exception:
+        logging.exception("Failed to enrich aggregated rows with personnel/email/image info")
+    # --- ENRICHMENT END ---
+
+
+    # Resolve raw swipe file names by Date (collect all dates present in matched rows)
+    raw_files = set()
+    raw_swipes_out = []
+
+    # Helper to add and dedupe swipe rows
+    seen_swipe_keys = set()
+    def _append_swipe(out_row, source_name):
+        # create a dedupe key (date,time,door,direction,card)
+        key = (
+            out_row.get('Date') or '',
+            out_row.get('Time') or '',
+            (out_row.get('Door') or '').strip(),
+            (out_row.get('Direction') or '').strip(),
+            (out_row.get('CardNumber') or out_row.get('Card') or '').strip()
+        )
+        if key in seen_swipe_keys:
+            return
+        seen_swipe_keys.add(key)
+        out_row['_source'] = source_name
+        raw_swipes_out.append(out_row)
+
+    # iterate matched aggregated rows and search raw swipe files
+    for idx, agg_row in matched.iterrows():
+        person_uid = agg_row.get('person_uid') if 'person_uid' in agg_row else None
+        empid = agg_row.get('EmployeeID') if 'EmployeeID' in agg_row else None
+        if (not empid) and 'Int1' in agg_row:
+            empid = agg_row.get('Int1')
+        card = agg_row.get('CardNumber') if 'CardNumber' in agg_row else None
+
+        # build dates_for_row from Date / FirstSwipe / LastSwipe (include original raw-date where available)
+        dates_for_row = set()
+        if 'Date' in agg_row and pd.notna(agg_row['Date']):
+            try:
+                d = pd.to_datetime(agg_row['Date']).date()
+                dates_for_row.add(d.isoformat())
+            except Exception:
+                pass
+        for col in ('FirstSwipe','LastSwipe'):
+            if col in agg_row and pd.notna(agg_row[col]):
+                try:
+                    d = pd.to_datetime(agg_row[col]).date()
+                    dates_for_row.add(d.isoformat())
+                except Exception:
+                    pass
+
+        # If the aggregated row contains 'OriginalLocaleMessageTime' (produced for Pune 2am shift), include that date too
+        if 'OriginalLocaleMessageTime' in agg_row and pd.notna(agg_row['OriginalLocaleMessageTime']):
+            try:
+                orig_d = pd.to_datetime(agg_row['OriginalLocaleMessageTime']).date()
+                dates_for_row.add(orig_d.isoformat())
+            except Exception:
+                pass
+
+
+        # If aggregated row is not flagged and include_unflagged is False, skip fetching raw evidence
+        is_flagged = bool(agg_row.get('IsFlagged', False))
+        if (not is_flagged) and (not include_unflagged):
+            continue
+
+        # If no dates found, fallback to scanning all swipes files (so we don't miss evidence)
+        dates_to_scan = dates_for_row or {None}
+
+        for d in dates_to_scan:
+            try:
+                if d is None:
+                    # scan all swipes files
+                    candidates = list(Path(DEFAULT_OUTDIR).glob(f"swipes_*.csv"))
+                else:
+                    dd = d[:10]  # 'YYYY-MM-DD'
+                    target = dd.replace('-', '')
+                    candidates = list(Path(DEFAULT_OUTDIR).glob(f"swipes_*_{target}.csv"))
+
+                if not candidates:
+                    continue
+
+                for fp in candidates:
+                    raw_name = fp.name
+                    raw_files.add(raw_name)
+                    try:
+                        # removed deprecated infer_datetime_format argument
+                        raw_df = pd.read_csv(fp, parse_dates=['LocaleMessageTime'])
+                    except Exception:
+                        try:
+                            raw_df = pd.read_csv(fp, dtype=str)
+                        except Exception:
+                            continue
+
+                    # normalize placeholder strings in raw_df as well (object columns)
+                    raw_df = _replace_placeholder_strings(raw_df)
+
+                    cols_lower = {c.lower(): c for c in raw_df.columns}
+                    tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+                    emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+                    name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+                    card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+                    door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+                    dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+                    note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+
+                    # build filter mask
+                    mask = pd.Series(False, index=raw_df.index)
+                    if person_uid is not None and 'person_uid' in raw_df.columns:
+                        mask = mask | (raw_df['person_uid'].astype(str).str.strip() == str(person_uid).strip())
+                    if emp_col:
+                        if empid is not None:
+                            try:
+                                cmp_val = str(empid).strip()
+                                if '.' in cmp_val:
+                                    fv = float(cmp_val)
+                                    if math.isfinite(fv) and fv.is_integer():
+                                        cmp_val = str(int(fv))
+                            except Exception:
+                                cmp_val = str(empid).strip()
+                            mask = mask | (raw_df[emp_col].astype(str).str.strip() == cmp_val)
+                    if card_col and card is not None:
+                        mask = mask | (raw_df[card_col].astype(str).str.strip() == str(card).strip())
+
+                    if (not mask.any()) and name_col and 'EmployeeName' in agg_row and pd.notna(agg_row.get('EmployeeName')):
+                        mask = mask | (raw_df[name_col].astype(str).str.strip() == str(agg_row.get('EmployeeName')).strip())
+
+                    # filter by date if possible
+                    if d is not None and tcol and tcol in raw_df.columns:
+                        try:
+                            raw_df[tcol] = pd.to_datetime(raw_df[tcol], errors='coerce')
+                            mask = mask & (raw_df[tcol].dt.date == pd.to_datetime(d).date())
+                        except Exception:
+                            pass
+
+                    filtered = raw_df[mask].copy()
+                    if filtered.empty:
+                        # xml value fallback for embedded card values
+                        if card is not None:
+                            for ccol in raw_df.columns:
+                                cl = ccol.lower()
+                                if 'xml' in cl or 'msg' in cl or 'value' == cl:
+                                    try:
+                                        vals = raw_df[ccol].dropna().astype(str)
+                                        match_mask = vals.apply(lambda x: (_extract_card_from_xml_text(x) == str(card).strip()))
+                                        if match_mask.any():
+                                            idxs = match_mask.index[match_mask]
+                                            filtered = raw_df.loc[idxs].copy()
+                                            break
+                                    except Exception:
+                                        continue
+                        if filtered.empty:
+                            continue
+
+                    # enrich filtered rows and append to output (deduped)
+                    try:
+                        if tcol and tcol in filtered.columns:
+                            filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+                        else:
+                            if 'localemessagetime' in filtered.columns:
+                                filtered['localemessagetime'] = pd.to_datetime(filtered['localemessagetime'], errors='coerce')
+                                tcol = 'localemessagetime'
+                    except Exception:
+                        pass
+
+                    if tcol and tcol in filtered.columns:
+                        filtered = filtered.sort_values(by=tcol)
+                        filtered['_prev_ts'] = filtered[tcol].shift(1)
+                        try:
+                            filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+                        except Exception:
+                            filtered['_swipe_gap_seconds'] = 0.0
+                    else:
+                        filtered['_swipe_gap_seconds'] = 0.0
+
+                    try:
+                        if door_col and door_col in filtered.columns:
+                            if dir_col and dir_col in filtered.columns:
+                                filtered['_zone'] = filtered.apply(lambda rr: map_door_to_zone(rr.get(door_col), rr.get(dir_col)), axis=1)
+                            else:
+                                filtered['_zone'] = filtered[door_col].apply(lambda dv: map_door_to_zone(dv, None))
+                        else:
+                            if 'PartitionName2' in filtered.columns:
+                                filtered['_zone'] = filtered['PartitionName2'].fillna('').astype(str).apply(lambda x: x if x else None)
+                            else:
+                                filtered['_zone'] = None
+                    except Exception:
+                        filtered['_zone'] = None
+
+                    # normalize and append
+                    for _, r in filtered.iterrows():
+                        out = {}
+                        out['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in raw_df.columns else _to_python_scalar(agg_row.get('EmployeeName') or agg_row.get('person_uid'))
+
+                        # EmployeeID
+                        emp_val = None
+                        if 'int1' in cols_lower and cols_lower.get('int1') in raw_df.columns:
+                            emp_val = _to_python_scalar(r.get(cols_lower.get('int1')))
+                        elif emp_col and emp_col in raw_df.columns:
+                            emp_val = _to_python_scalar(r.get(emp_col))
+                        else:
+                            possible_emp = None
+                            for cand in ('Int1','Text12','EmployeeID','EmployeeIdentity','empid','id'):
+                                if cand.lower() in cols_lower:
+                                    possible_emp = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                                    if possible_emp not in (None, '', 'nan'):
+                                        break
+                            emp_val = possible_emp if possible_emp not in (None, '', 'nan') else _to_python_scalar(agg_row.get('EmployeeID'))
+
+                        if emp_val is not None:
+                            try:
+                                s = str(emp_val).strip()
+                                if '.' in s:
+                                    f = float(s)
+                                    if math.isfinite(f) and f.is_integer():
+                                        s = str(int(f))
+                                if _looks_like_guid(s) or _is_placeholder_str(s):
+                                    emp_val = None
+                                else:
+                                    emp_val = s
+                            except Exception:
+                                if _looks_like_guid(emp_val):
+                                    emp_val = None
+                        out['EmployeeID'] = emp_val
+
+                        # CardNumber
+                        card_val = None
+                        if 'cardnumber' in cols_lower and cols_lower.get('cardnumber') in raw_df.columns:
+                            card_val = _to_python_scalar(r.get(cols_lower.get('cardnumber')))
+                        elif card_col and card_col in raw_df.columns:
+                            card_val = _to_python_scalar(r.get(card_col))
+                        else:
+                            possible_card = None
+                            for cand in ('CardNumber','CHUID','Card','card_no','cardnum','value','xmlmessage'):
+                                if cand.lower() in cols_lower:
+                                    possible_card = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                                    if possible_card not in (None, '', 'nan'):
+                                        break
+                            if possible_card in (None, '', 'nan'):
+                                for ccc in raw_df.columns:
+                                    cl = ccc.lower()
+                                    if 'xml' in cl or 'msg' in cl or 'value' == cl:
+                                        try:
+                                            txt = r.get(ccc)
+                                            extracted = _extract_card_from_xml_text(str(txt)) if txt is not None else None
+                                            if extracted:
+                                                possible_card = extracted
+                                                break
+                                        except Exception:
+                                            continue
+                            card_val = possible_card if possible_card not in (None, '', 'nan') else _to_python_scalar(agg_row.get('CardNumber'))
+
+                        if card_val is not None:
+                            try:
+                                cs = str(card_val).strip()
+                                if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                                    card_val = None
+                                else:
+                                    card_val = cs
+                            except Exception:
+                                card_val = None
+                        out['CardNumber'] = card_val
+
+                        # timestamp -> Date/Time
+                        if tcol and tcol in raw_df.columns:
+                            ts = r.get(tcol)
+                            try:
+                                ts_py = pd.to_datetime(ts)
+                                out['Date'] = ts_py.date().isoformat()
+                                out['Time'] = ts_py.time().isoformat()
+                            except Exception:
+                                txt = str(r.get(tcol))
+                                out['Date'] = txt[:10]
+                                out['Time'] = txt[11:19] if len(txt) >= 19 else txt
+                        else:
+                            out['Date'] = d if d is not None else None
+                            out['Time'] = None
+
+                        out['Door'] = _to_python_scalar(r.get(door_col)) if (door_col and door_col in filtered.columns) else None
+                        out['Direction'] = _to_python_scalar(r.get(dir_col)) if (dir_col and dir_col in filtered.columns) else _to_python_scalar(r.get('Direction')) if 'Direction' in r else None
+                        out['Note'] = _to_python_scalar(r.get(note_col)) if (note_col and note_col in filtered.columns) else None
+
+                        try:
+                            out['Zone'] = _to_python_scalar(r.get('_zone')) if '_zone' in r else map_door_to_zone(out['Door'], out['Direction'])
+                        except Exception:
+                            out['Zone'] = None
+                        try:
+                            gap = r.get('_swipe_gap_seconds') if '_swipe_gap_seconds' in r else None
+                            out['SwipeGapSeconds'] = float(gap) if gap is not None else None
+                            out['SwipeGap'] = format_seconds_to_hms(out['SwipeGapSeconds'])
+                        except Exception:
+                            out['SwipeGapSeconds'] = None
+                            out['SwipeGap'] = None
+
+                        _append_swipe(out, raw_name)
+            except Exception as e:
+                logging.exception("Error processing raw swipe file for date %s: %s", d, e)
+                continue
+
+    return jsonify({
+        "aggregated_rows": cleaned_matched,
+        "raw_swipe_files": sorted(list(raw_files)),
+        "raw_swipes": raw_swipes_out
+    }), 200
+
+
+@app.route('/override', methods=['POST'])
+def set_override():
+    """
+    POST JSON: { "employee_id": "<EmployeeID or person_uid>", "level": "Low|Medium|High|Clear", "reason": "justification text" }
+    Saves override to outputs/overrides.csv. Run-time uses this file to adjust RiskLevel display.
+    """
+    try:
+        payload = request.get_json(force=True)
+        emp = payload.get('employee_id')
+        level = payload.get('level')
+        reason = payload.get('reason', '')
+        if not emp or not level:
+            return jsonify({'error':'employee_id and level required'}), 400
+        ok = _save_override(str(emp).strip(), str(level).strip(), str(reason).strip())
+        if not ok:
+            return jsonify({'error':'failed to save override'}), 500
+        return jsonify({'status':'ok'}), 200
+    except Exception as e:
+        logging.exception("Override save error")
+        return jsonify({'error': str(e)}), 500
+
+# ... rest of file (export, download_swipes, train, chatbot_query, serve_employee_image) remain unchanged ...
+# (note: serve_employee_image below uses get_person_image_bytes which now works because _get_acvscore_conn is restored)
+
+@app.route('/record/export', methods=['GET'])
+def export_record_excel():
+    """
+    /record/export?employee_id=...&date=YYYY-MM-DD  OR /record/export?person_uid=...&date=YYYY-MM-DD
+    Produces an Excel file (xlsx) filtered for the requested employee and date (if provided).
+    Two sheets:
+      - "Details — Evidence": EmployeeName, EmployeeID, Door, Direction, Zone, Date, LocaleMessageTime, SwipeGapSeconds, PartitionName2, _source_file
+      - "Swipe timeline": Employee Name, Employee ID, Card, Date, Time, SwipeGapSeconds, Door, Direction, Zone, Note
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    date_str = request.args.get('date')  # optional 'YYYY-MM-DD' (single date)
+    if not q:
+        return jsonify({"error":"employee_id or person_uid is required"}), 400
+
+    # Determine list of raw swipe files to scan. If date provided, restrict to that date only.
+    files_to_scan = []
+    p = Path(DEFAULT_OUTDIR)
+    if date_str:
+        try:
+            dd = pd.to_datetime(date_str).date()
+            target = dd.strftime("%Y%m%d")
+            candidates = list(p.glob(f"swipes_*_{target}.csv"))
+            files_to_scan = candidates
+        except Exception:
+            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
+    else:
+        # scan all swipes files (most recent first)
+        files_to_scan = sorted(p.glob("swipes_*.csv"), reverse=True)
+
+    if not files_to_scan:
+        return jsonify({"error":"no raw swipe files found for requested date / outputs"}), 404
+
+    all_rows = []
+    for fp in files_to_scan:
+        try:
+            # removed deprecated infer_datetime_format argument
+            raw_df = pd.read_csv(fp, dtype=str, parse_dates=['LocaleMessageTime'])
+        except Exception:
+            try:
+                raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+
+        # normalize column names
+        raw_df = _replace_placeholder_strings(raw_df)
+
+        cols_lower = {c.lower(): c for c in raw_df.columns}
+        # pick possible columns
+        tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+        emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+        name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+        card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+        door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+        dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+        note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+        person_uid_col = cols_lower.get('person_uid')
+
+        # build mask matching requested q: try person_uid, emp_col, card, name
+        mask = pd.Series(False, index=raw_df.index)
+        if person_uid_col and person_uid_col in raw_df.columns:
+            mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
+        if emp_col and emp_col in raw_df.columns:
+            mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
+        # try matching numeric equivalence
+        if not mask.any() and emp_col and emp_col in raw_df.columns:
+            try:
+                q_numeric = float(q)
+                emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                mask = mask | (emp_numeric == q_numeric)
+            except Exception:
+                pass
+        # also try name match if nothing matched
+        if not mask.any() and name_col and name_col in raw_df.columns:
+            mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
+
+        if not mask.any():
+            # nothing to include from this file
+            continue
+
+        filtered = raw_df[mask].copy()
+        if filtered.empty:
+            continue
+
+        # ensure timestamp col exists and parsed
+        if tcol and tcol in filtered.columns:
+            try:
+                filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+            except Exception:
+                pass
+
+        # compute swipe gaps (seconds)
+        if tcol and tcol in filtered.columns:
+            filtered = filtered.sort_values(by=tcol)
+            filtered['_prev_ts'] = filtered[tcol].shift(1)
+            try:
+                filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+            except Exception:
+                filtered['_swipe_gap_seconds'] = 0.0
+        else:
+            filtered['_swipe_gap_seconds'] = 0.0
+
+        # compute zone per row (use door+direction if available)
+        try:
+            if door_col and door_col in filtered.columns:
+                if dir_col and dir_col in filtered.columns:
+                    filtered['_zone'] = filtered.apply(lambda rr: map_door_to_zone(rr.get(door_col), rr.get(dir_col)), axis=1)
+                else:
+                    filtered['_zone'] = filtered[door_col].apply(lambda dv: map_door_to_zone(dv, None))
+            else:
+                filtered['_zone'] = filtered.get('PartitionName2', None)
+        except Exception:
+            filtered['_zone'] = None
+
+        # normalize columns into common shape and append rows
+        for _, r in filtered.iterrows():
+            row = {}
+            row['EmployeeName'] = _to_python_scalar(r.get(name_col)) if (name_col and name_col in filtered.columns) else None
+            # EmployeeID attempts: Int1/Text12/EmployeeID
+            emp_val = None
+            if emp_col and emp_col in filtered.columns:
+                emp_val = _to_python_scalar(r.get(emp_col))
+            else:
+                # fallbacks
+                for cand in ('int1','text12','employeeid','employee_identity','employeeidentity'):
+                    if cand in cols_lower and cols_lower[cand] in filtered.columns:
+                        emp_val = _to_python_scalar(r.get(cols_lower[cand]))
+                        if emp_val:
+                            break
+            row['EmployeeID'] = emp_val
+            row['Card'] = _to_python_scalar(r.get(card_col)) if (card_col and card_col in filtered.columns) else None
+
+            # Date and Time
+            if tcol and tcol in filtered.columns:
+                ts = r.get(tcol)
+                try:
+                    ts_py = pd.to_datetime(ts)
+                    row['Date'] = ts_py.date().isoformat()
+                    row['Time'] = ts_py.time().isoformat()
+                    row['LocaleMessageTime'] = ts_py.isoformat()
+                except Exception:
+                    txt = str(r.get(tcol))
+                    row['Date'] = txt[:10]
+                    row['Time'] = txt[11:19] if len(txt) >= 19 else None
+                    row['LocaleMessageTime'] = txt
+            else:
+                row['Date'] = None
+                row['Time'] = None
+                row['LocaleMessageTime'] = None
+
+            row['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
+            row['SwipeGap'] = format_seconds_to_hms(row['SwipeGapSeconds'])
+
+            row['Door'] = _to_python_scalar(r.get(door_col)) if (door_col and door_col in filtered.columns) else None
+            row['Direction'] = _to_python_scalar(r.get(dir_col)) if (dir_col and dir_col in filtered.columns) else None
+            row['Note'] = _to_python_scalar(r.get(note_col)) if (note_col and note_col in filtered.columns) else None
+
+            # Zone (computed above)
+            try:
+                zone_val = r.get('_zone') if '_zone' in r else None
+                if zone_val is None:
+                    # fallback from door/direction
+                    zone_val = map_door_to_zone(row['Door'], row['Direction'])
+                row['Zone'] = _to_python_scalar(zone_val)
+            except Exception:
+                row['Zone'] = None
+
+            row['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
+            row['_source_file'] = fp.name
+            all_rows.append(row)
+
+    if not all_rows:
+        return jsonify({"error":"no swipe rows matched the requested employee/date"}), 404
+
+    df_out = pd.DataFrame(all_rows)
+
+    # Build two sheets as requested (with exact requested column order)
+    details_cols = ['EmployeeName','EmployeeID','Door','Direction','Zone','Date','LocaleMessageTime','SwipeGapSeconds','PartitionName2','_source_file']
+    timeline_cols = ['EmployeeName','EmployeeID','Card','Date','Time','SwipeGapSeconds','Door','Direction','Zone','Note','_source_file']
+
+    details_df = df_out[[c for c in details_cols if c in df_out.columns]].copy()
+    timeline_df = df_out[[c for c in timeline_cols if c in df_out.columns]].copy()
+
+    # Create excel in-memory
+    output = io.BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            details_df.to_excel(writer, sheet_name='Details — Evidence', index=False)
+            timeline_df.to_excel(writer, sheet_name='Swipe timeline', index=False)
+            writer.save()
+            output.seek(0)
+    except Exception as e:
+        logging.exception("Failed to create Excel: %s", e)
+        return jsonify({"error":"failed to create excel"}), 500
+
+    # If openpyxl available, apply formatting (bold header, center align, borders)
+    if OPENPYXL_AVAILABLE:
+        try:
+            wb = load_workbook(output)
+            thin = Side(border_style="thin", color="000000")
+            thick = Side(border_style="medium", color="000000")
+            for ws in wb.worksheets:
+                # header styling
+                header = ws[1]
+                for cell in header:
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = Border(top=thick, left=thick, right=thick, bottom=thick)
+                # data rows: center & thin border
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                # autosize columns (best-effort)
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        try:
+                            v = str(cell.value) if cell.value is not None else ""
+                        except Exception:
+                            v = ""
+                        if len(v) > max_len:
+                            max_len = len(v)
+                    # limit column width
+                    width = min(max(10, max_len + 2), 50)
+                    ws.column_dimensions[col_letter].width = width
+            # write back to bytes
+            out2 = io.BytesIO()
+            wb.save(out2)
+            out2.seek(0)
+            return send_file(out2, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            logging.exception("Excel styling failed, returning raw file")
+            output.seek(0)
+            return send_file(output, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        # fallback: return raw excel binary without styling
+        output.seek(0)
+        return send_file(output, as_attachment=True,
+                         download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route('/swipes/<filename>', methods=['GET'])
+def download_swipes(filename):
+    """
+    Serve raw swipe CSVs from outputs/ (filename should be the file name only).
+    """
+    fp = DEFAULT_OUTDIR / filename
+    if not fp.exists():
+        return jsonify({"error":"file not found"}), 404
+    # send file
+    return send_from_directory(str(DEFAULT_OUTDIR), filename, as_attachment=True)
+
+
+@app.route('/train', methods=['GET'])
+def build_training_endpoint():
+    end_date_str = request.args.get('end_date')
+    months = int(request.args.get('months') or 3)
+    min_unique = int(request.args.get('min_unique') or 1000)
+    try:
+        if end_date_str:
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        else:
+            end_date = datetime.now().date()
+    except Exception as e:
+        return jsonify({"error": f"invalid end_date: {e}"}), 400
+
+    try:
+        csv_path = build_monthly_training(end_date=end_date, months=months, min_unique_employees=min_unique, outdir=str(DEFAULT_OUTDIR))
+        if csv_path is None:
+            return jsonify({"error":"no training CSV produced (no data)"}), 500
+        return jsonify({"training_csv": str(csv_path)})
+    except Exception as e:
+        logging.exception("build_monthly_training failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# ------------------------------
+# Improved chatbot endpoint & helpers (replacement)
+# ------------------------------
+
+# try to import helpers from trend_runner (they may or may not be present)
+try:
+    from trend_runner import _read_past_trend_csvs, _normalize_id_val, SCENARIO_EXPLANATIONS
+except Exception:
+    _read_past_trend_csvs = None
+    _normalize_id_val = None
+    SCENARIO_EXPLANATIONS = {}
+
+# helper to load the most recent single trend CSV (fast for "today" queries)
+def _load_latest_trend_df(outdir: Path):
+    csvs = sorted(outdir.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return None, None
+    latest = csvs[0]
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        try:
+            df = pd.read_csv(latest, dtype=str)
+        except Exception:
+            return None, None
+    # normalize placeholder strings
+    df = _replace_placeholder_strings(df)
+    return df, latest.name
+
+# helper: find person rows across recent days (useful for "last N days")
+def _find_person_rows(identifier: str, days: int = 90, outdir: Path = DEFAULT_OUTDIR):
+    # normalize token (strip ".0" floats etc)
+    if _normalize_id_val:
+        norm = _normalize_id_val(identifier)
+    else:
+        norm = str(identifier).strip()
+        if '.' in norm:
+            try:
+                f = float(norm)
+                if f.is_integer():
+                    norm = str(int(f))
+            except Exception:
+                pass
+    # read past trend CSVs using trend_runner helper when available
+    today = datetime.now().date()
+    try:
+        if _read_past_trend_csvs:
+            past = _read_past_trend_csvs(str(outdir), days, today)
+        else:
+            # fallback: read files manually
+            files = sorted(Path(outdir).glob("trend_pune_*.csv"), reverse=True)
+            dfs = []
+            cutoff = today - timedelta(days=days)
+            for fp in files:
+                try:
+                    tmp = pd.read_csv(fp, parse_dates=['Date'])
+                    tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                    tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                    dfs.append(tmp)
+                except Exception:
+                    try:
+                        tmp = pd.read_csv(fp, dtype=str)
+                        if 'Date' in tmp.columns:
+                            tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                            tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                            dfs.append(tmp)
+                    except Exception:
+                        continue
+            past = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    except Exception:
+        past = pd.DataFrame()
+
+    if past is None or past.empty:
+        return pd.DataFrame()
+
+    # normalize placeholders
+    past = _replace_placeholder_strings(past)
+
+    # search by EmployeeID, person_uid, EmployeeIdentity, CardNumber, Int1/Text12 if present
+    match_mask = pd.Series(False, index=past.index)
+    for col in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+        if col in past.columns:
+            try:
+                match_mask = match_mask | (past[col].astype(str).fillna('').str.strip() == str(norm).strip())
+            except Exception:
+                continue
+
+    # also try numeric equality
+    if not match_mask.any():
+        try:
+            qnum = float(norm)
+            for col in ('EmployeeID','Int1'):
+                if col in past.columns:
+                    try:
+                        numcol = pd.to_numeric(past[col], errors='coerce')
+                        match_mask = match_mask | (numcol == qnum)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # fuzzy name match if nothing matched above
+    if not match_mask.any() and 'EmployeeName' in past.columns:
+        names = past['EmployeeName'].dropna().astype(str).unique().tolist()
+        close = difflib.get_close_matches(str(identifier), names, n=5, cutoff=0.7)
+        if close:
+            match_mask = match_mask | past['EmployeeName'].astype(str).isin(close)
+
+    return past[match_mask].copy()
+
+# simple sentence builder for scenario codes -> human text
+def _explain_scenario_code(code):
+    if not code:
+        return None
+    code = str(code).strip()
+    # prefer full mapping if available
+    if code in SCENARIO_EXPLANATIONS:
+        try:
+            fn = SCENARIO_EXPLANATIONS.get(code)
+            try:
+                txt = fn({})
+                return txt
+            except Exception:
+                return code.replace("_", " ").replace(">= ", "≥ ")
+        except Exception:
+            return code.replace("_", " ").replace(">= ", "≥ ")
+    # fallback readable version
+    return code.replace("_", " ").replace(">=", "≥")
+
+# fallback mapping for numeric RiskScore -> (score, label)
+def _map_score_to_label_fallback(score: float):
+    try:
+        s = float(score)
+    except Exception:
+        return (0.0, "Low")
+    if s >= 0.75:
+        return (s, "High")
+    if s >= 0.4:
+        return (s, "Medium")
+    return (s, "Low")
+
+@app.route('/chatbot/query', methods=['POST'])
+def chatbot_query():
+    """
+    Improved chatbot query handler.
+    Payload: { "q": "<free text query>", "top_k": 5, "lang": "en" }
+    Recognised intents:
+      - who is high risk today / who is low risk today
+      - show me <EmployeeID|name> last <N> days
+      - explain <scenario_code>
+      - trend details for today / top reasons today
+    Returns: { "answer": "<nl text>", "evidence": [ {source, snippet}, ... ] }
+    """
+    payload = request.get_json(force=True)
+    q = (payload.get('q') or '').strip()
+    if not q:
+        return jsonify({"error":"query text 'q' required"}), 400
+
+    lang = payload.get('lang')  # optional, frontend can provide (we will echo answer in same language string)
+    q_l = q.lower().strip()
+
+    # intent: who is high/low risk today
+    if re.search(r"\bwho is (high|low) risk\b", q_l) or re.search(r"\b(high|low) risk (people|persons|people) (today)?\b", q_l):
+        want = 'high' if 'high' in q_l else 'low' if 'low' in q_l else None
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer": "No trend data available.", "evidence": []})
+        # ensure RiskLevel column exists
+        if 'RiskLevel' not in df.columns:
+            # try to map RiskScore to label if RiskScore present
+            if 'RiskScore' in df.columns:
+                def _map_rs(s):
+                    try:
+                        if pd.isna(s):
+                            return 'Low'
+                    except Exception:
+                        pass
+                    try:
+                        # if external helper available, prefer it
+                        if 'map_score_to_label' in globals() and callable(globals().get('map_score_to_label')):
+                            try:
+                                return globals().get('map_score_to_label')(float(s))[1]
+                            except Exception:
+                                pass
+                        # fallback
+                        return _map_score_to_label_fallback(float(s))[1]
+                    except Exception:
+                        return 'Low'
+                df['RiskLevel'] = df['RiskScore'].apply(lambda s: _map_rs(s))
+            else:
+                df['RiskLevel'] = df.get('RiskLevel', 'Low')
+
+        if want == 'high':
+            sel = df[df['RiskLevel'].astype(str).str.lower() == 'high']
+        elif want == 'low':
+            sel = df[df['RiskLevel'].astype(str).str.lower() == 'low']
+        else:
+            sel = df
+
+        names = sel['EmployeeName'].dropna().astype(str).unique().tolist()
+        if not names:
+            ans = f"No {want} risk persons found in the latest data." if want else "No persons found."
+            return jsonify({"answer": ans, "evidence": []})
+        else:
+            # limit list length
+            ans = f"{want.capitalize()} risk persons today: " + ", ".join(names[:40])
+            sample = _clean_sample_df(sel.head(10), max_rows=10)
+            return jsonify({"answer": ans, "evidence": sample})
+
+    # intent: explain <scenario>
+    m = re.match(r".*\bexplain\s+([A-Za-z0-9_\-]+)\b.*", q_l)
+    if m:
+        code = m.group(1).strip()
+        explanation = _explain_scenario_code(code)
+        ans = f"Explanation for '{code}': {explanation}"
+        return jsonify({"answer": ans, "evidence": []})
+
+    # intent: trend details for today — top reasons
+    if 'trend details' in q_l or 'top reasons' in q_l or 'trend details for today' in q_l:
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer":"No trend data available.","evidence":[]})
+        # aggregate Reasons column
+        if 'Reasons' in df.columns:
+            reasons = {}
+            for v in df['Reasons'].dropna().astype(str):
+                for part in re.split(r'[;,\|]', v):
+                    key = part.strip()
+                    if key and not _is_placeholder_str(key):
+                        reasons[key] = reasons.get(key, 0) + 1
+            # sort
+            top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:10]
+            if not top:
+                return jsonify({"answer":"No reason counts available today.","evidence":[]})
+            ans = "Top reasons today: " + ", ".join([f"{k} ({c})" for k,c in top])
+            # include small evidence of rows where those reasons occurred
+            sample = []
+            try:
+                top_reasons = [k for k,_ in top]
+                mask = df['Reasons'].astype(str).apply(lambda s: any(tr in s for tr in top_reasons))
+                sample_df = df[mask].head(10)
+                sample = _clean_sample_df(sample_df, max_rows=10)
+            except Exception:
+                sample = []
+            return jsonify({"answer": ans, "evidence": sample})
+
+    # intent: show me <id|name> last N days
+    m = re.match(r".*\bshow (?:me )?([A-Za-z0-9\-\:\s]+?) (?:for )?(?:last )?(\d+)\s*days\b", q_l)
+    if not m:
+        # also accept "show me 320172 last 90 days" or "show 320172 last 90 days" (looser)
+        m = re.match(r".*\b(show|display)\s+(?:me\s+)?([A-Za-z0-9\-\:\s]+?)\s+last\s+(\d+)\s*days\b", q_l)
+    if m:
+        if len(m.groups()) == 2:
+            identifier, days = m.group(1).strip(), int(m.group(2))
+        else:
+            # if earlier regex produced different groups
+            identifier = m.group(1).strip()
+            days = int(m.group(2))
+        # find person rows in past `days`
+        rows = _find_person_rows(identifier, days=days, outdir=DEFAULT_OUTDIR)
+        if rows is None or rows.empty:
+            return jsonify({"answer": f"No records found for '{identifier}' in last {days} days.", "evidence": []})
+        # prepare textual summary
+        flagged = rows[rows.get('IsFlagged', False) == True] if 'IsFlagged' in rows.columns else pd.DataFrame()
+        flagged_count = int(len(flagged))
+        total_days = int(len(rows))
+        latest_row = rows.sort_values('Date', ascending=False).iloc[0].to_dict()
+        name = latest_row.get('EmployeeName') or latest_row.get('person_uid') or latest_row.get('EmployeeID')
+        ans = f"Found {total_days} day(s) for {name} in the last {days} days. Flagged days: {flagged_count}."
+        sample = _clean_sample_df(rows.sort_values('Date', ascending=False).head(10), max_rows=10)
+        return jsonify({"answer": ans, "evidence": sample})
+
+    # fallback: try simple heuristics like "who is present today" or "present today"
+    if 'present today' in q_l or 'who is present today' in q_l:
+        df, fname = _load_latest_trend_df(DEFAULT_OUTDIR)
+        if df is None:
+            return jsonify({"answer":"No trend data available.","evidence":[]})
+        if 'PresentToday' in df.columns:
+            present = df[df['PresentToday'] == True]
+            names = present['EmployeeName'].dropna().unique().tolist()
+            ans = f"Present today: {', '.join(names[:40]) if names else 'None'}"
+            sample = _clean_sample_df(present.head(10), max_rows=10)
+            return jsonify({"answer": ans, "evidence": sample})
+        else:
+            return jsonify({"answer":"PresentToday field not available in latest trends.","evidence":[]})
+
+    # final graceful fallback with helpful hint
+    hint = "I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last 90 days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+    return jsonify({"answer": f"I can help with trend & risk questions. I recognized: {q}. Try: {hint}", "evidence":[]})
+
+# Serve employee image route (defined after app)
+@app.route('/employee/<empid>/image', methods=['GET'])
+def serve_employee_image(empid):
+    """
+    Serve the portrait for a personnel record where ParentId = empid (ACVSCore.Images).
+    Uses the query you provided:
+      SELECT AI.Image AS ImageBuffer FROM ACVSCore.Access.Images AI WHERE AI.ParentId = @id
+    If found, returns binary with best-effort content-type detection.
+    """
+    if empid is None:
+        return jsonify({"error": "employee id required"}), 400
+
+    try:
+        img_bytes = get_person_image_bytes(empid)
+        if not img_bytes:
+            return jsonify({"error": "no image found"}), 404
+
+        # try to detect jpeg/png
+        header = img_bytes[:8]
+        content_type = 'application/octet-stream'
+        if len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+            content_type = 'image/jpeg'
+        elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+            content_type = 'image/png'
+        # send as file-like
+        bio = io.BytesIO(img_bytes)
+        bio.seek(0)
+        return send_file(bio, mimetype=content_type)
+    except Exception:
+        logging.exception("Error serving image for employee %s", empid)
+        return jsonify({"error": "failed to serve image"}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8002, debug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Behaviour Analysis — Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- React + ReactDOM + Babel (quick prototyping) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Flatpickr (high-quality calendar) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+  <!-- (styles omitted here for brevity — use your existing styles) -->
+
+  <link rel="stylesheet" href="style.css">
+
+
+</head>
+
+<body>
+
+</head>
+
+
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    (function () {
+      const { useState, useEffect, useRef } = React;
+
+      // CHANGE THIS IF YOUR API HOST DIFFERS
+      const API_BASE = "http://localhost:8002";
+
+      // Colour mapping requested by user
+      const RISK_COLORS = {
+        "Low": "#10b981",
+        "Low Medium": "#86efac",
+        "Medium": "#facc15",
+        "Medium High": "#fb923c",
+        "High": "#ef4444"
+      };
+
+      const RISK_LABELS = ["Low", "Low Medium", "Medium", "Medium High", "High"];
+
+      const SCENARIO_EXPLANATIONS = {
+        "long_gap_>=4.5h": "Long gap between swipes (>= 4.5 hours) — could indicate extended out-of-office break.",
+        "short_duration_<4h": "Short total duration in office (< 4 hours).",
+        "coffee_badging": "Frequent short badge cycles (>=4) with short duration — possible 'coffee badging'.",
+        "low_swipe_count_<=2": "Low swipe count (<=2) for the day.",
+        "single_door": "All swipes used the same door — single-door behavior.",
+        "only_in": "Only IN swipe(s) recorded for the day.",
+        "only_out": "Only OUT swipe(s) recorded for the day.",
+        "overtime_>=10h": "Long duration (>=10 hours) — overtime.",
+        "very_long_duration_>=16h": "Very long duration (>=16 hours) — suspiciously long presence.",
+        "unusually_high_swipes": "Unusually high number of swipes versus historical median.",
+        "repeated_short_breaks": "Multiple short breaks within the day.",
+        "multiple_location_same_day": "Swipes recorded at multiple locations same day.",
+        "weekend_activity": "Activity recorded on weekend.",
+        "repeated_rejection_count": "Several card rejections.",
+        "badge_sharing_suspected": "Badge sharing suspected (same card used by multiple persons on same day).",
+        "early_arrival_before_06": "First swipe before 06:00.",
+        "late_exit_after_22": "Last swipe after 22:00.",
+        "shift_inconsistency": "Duration inconsistent with historical shift patterns.",
+        "trending_decline": "Historical trending decline flagged.",
+        "consecutive_absent_days": "Marked absent for consecutive days historically.",
+        "high_variance_duration": "High variance in durations historically.",
+        "short_duration_on_high_presence_days": "Short duration even though employee usually attends many days.",
+        "swipe_overlap": "Simultaneous swipe(s) near the same time with other uid(s) (possible tailgating or collusion).",
+        "shortstay_longout_repeat": "Pattern: short stay, long out-of-office, short return (repeat)."
+      };
+
+      function pad(n) { return n.toString().padStart(2, '0'); }
+      function formatDateISO(d) {
+        if (!d) return "";
+        const dt = (d instanceof Date) ? d : new Date(d);
+        return dt.getFullYear() + "-" + pad(dt.getMonth() + 1) + "-" + pad(dt.getDate());
+      }
+      function datesBetween(start, end) {
+        var out = [];
+        var cur = new Date(start);
+        while (cur <= end) {
+          out.push(new Date(cur));
+          cur.setDate(cur.getDate() + 1);
+        }
+        return out;
+      }
+      function safeDateDisplay(val) {
+        if (!val && val !== 0) return "";
+        try {
+          var d = (val instanceof Date) ? val : new Date(val);
+          if (isNaN(d.getTime())) return String(val);
+          return d.toLocaleString();
+        } catch (e) {
+          return String(val);
+        }
+      }
+      function sanitizeName(row) {
+        return row.EmployeeName || row.EmployeeName_x || row.EmployeeName_y || row.person_uid || "";
+      }
+      function downloadCSV(rows, filename) {
+        if (!rows || !rows.length) { alert("No rows to export"); return; }
+        var cols = Object.keys(rows[0]);
+        var lines = [cols.join(",")];
+        rows.forEach(function (r) {
+          var row = cols.map(function (c) {
+            var v = (r[c] === undefined || r[c] === null) ? "" : String(r[c]).replace(/\n/g, ' ');
+            return JSON.stringify(v);
+          }).join(",");
+          lines.push(row);
+        });
+        var blob = new Blob([lines.join("\n")], { type: 'text/csv' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a'); a.href = url; a.download = filename || 'export.csv'; a.click(); URL.revokeObjectURL(url);
+      }
+
+      // convert seconds -> "HH:mm:ss"
+      function formatSecondsToHmsJS(seconds) {
+        if (seconds === null || seconds === undefined || seconds === '') return "-";
+        const n = Number(seconds);
+        if (isNaN(n) || !isFinite(n)) return "-";
+        const s = Math.max(0, Math.floor(n));
+        const hh = Math.floor(s / 3600);
+        const mm = Math.floor((s % 3600) / 60);
+        const ss = s % 60;
+        return pad(hh) + ":" + pad(mm) + ":" + pad(ss);
+      }
+
+      // ----- Day-boundary helpers -----
+      // Treat times before DAY_BOUNDARY_HOUR as belonging to previous logical day.
+      // Change this value to 2 or 4 depending on your site policy.
+      const DAY_BOUNDARY_HOUR = 2; // default: 02:00 (Pune shift)
+
+      // Accepts a JS Date (local) and returns a 'logical' YYYY-MM-DD string.
+      function logicalDateForTs(dt, boundaryHour = DAY_BOUNDARY_HOUR) {
+        if (!dt || !(dt instanceof Date) || isNaN(dt.getTime())) return null;
+        // Use local hour/day components (avoid toISOString timezone issues)
+        const hour = dt.getHours();
+        const year = dt.getFullYear();
+        const month = dt.getMonth(); // zero-based
+        const day = dt.getDate();
+        // if hour < boundary, count this as previous day
+        const out = new Date(year, month, day, 0, 0, 0, 0);
+        if (hour < boundaryHour) {
+          out.setDate(out.getDate() - 1);
+        }
+        // format YYYY-MM-DD using local components
+        const y = out.getFullYear();
+        const m = String(out.getMonth() + 1).padStart(2, '0');
+        const d = String(out.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+      }
+
+      // Safely create JS Date from evidence row using Date/Time or LocaleMessageTime.
+      function makeLocalDateFromRow(r) {
+        // prefer explicit LocaleMessageTime if provided (ISO or parseable)
+        try {
+          if (r.LocaleMessageTime) {
+            const t = new Date(r.LocaleMessageTime);
+            if (!isNaN(t.getTime())) return t;
+          }
+        } catch (e) {}
+        try {
+          if (r.Date && r.Time) {
+            // build "YYYY-MM-DDTHH:MM:SS" local (this will be parsed as local in modern browsers if no timezone)
+            const s = `${r.Date}T${r.Time}`;
+            const t = new Date(s);
+            if (!isNaN(t.getTime())) return t;
+          }
+        } catch (e) {}
+        // fallback: if r.Date exists, return midnight of that date
+        try {
+          if (r.Date) {
+            const parts = String(r.Date).slice(0,10).split('-');
+            if (parts.length === 3) {
+              return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 0, 0, 0, 0);
+            }
+          }
+        } catch (e) {}
+        return null;
+      }
+
+
+
+
+      function App() {
+        var yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+
+        const [dateFrom, setDateFrom] = useState(formatDateISO(yesterday));
+        const [dateTo, setDateTo] = useState(formatDateISO(new Date()));
+        const [loading, setLoading] = useState(false);
+        const [summary, setSummary] = useState({ rows: 0, flagged_rows: 0, files: [], end_date: null });
+        const [rows, setRows] = useState([]);
+        const [reasonsCount, setReasonsCount] = useState({});
+        const [riskCounts, setRiskCounts] = useState({ "Low": 0, "Low Medium": 0, "Medium": 0, "Medium High": 0, "High": 0 });
+        const [filterText, setFilterText] = useState("");
+        const [page, setPage] = useState(1);
+        const [selectedReason, setSelectedReason] = useState("");
+        const [reasonFilterText, setReasonFilterText] = useState("");
+        const [modalRow, setModalRow] = useState(null);
+        const [modalDetails, setModalDetails] = useState(null);
+        const [modalLoading, setModalLoading] = useState(false);
+        const [selectedRiskFilter, setSelectedRiskFilter] = useState("");
+        const pageSize = 25;
+        const chartRef = useRef(null);
+        const chartInst = useRef(null);
+
+        // flatpickr refs
+        const fromRef = useRef(null);
+        const toRef = useRef(null);
+        const fromFp = useRef(null);
+        const toFp = useRef(null);
+
+        // Chat state
+        const [chatOpen, setChatOpen] = useState(false);
+        const [chatMessages, setChatMessages] = useState([]); // {who: 'user'|'bot', text, evidence:[]}
+        const [chatInput, setChatInput] = useState("");
+        const [chatLoading, setChatLoading] = useState(false);
+
+        useEffect(function () {
+          if (window.flatpickr && fromRef.current && toRef.current) {
+            try { if (fromFp.current) fromFp.current.destroy(); } catch (e) { }
+            try { if (toFp.current) toFp.current.destroy(); } catch (e) { }
+            fromFp.current = window.flatpickr(fromRef.current, {
+              dateFormat: "Y-m-d",
+              defaultDate: dateFrom,
+              allowInput: true,
+              onChange: function (selectedDates, str) {
+                if (selectedDates && selectedDates.length) {
+                  const iso = formatDateISO(selectedDates[0]);
+                  setDateFrom(iso);
+                  try { if (toFp.current) toFp.current.set('minDate', iso); } catch (e) { }
+                  if (dateTo && new Date(iso) > new Date(dateTo)) {
+                    setDateTo(iso);
+                    try { if (toFp.current) toFp.current.setDate(iso, true); } catch (e) { }
+                  }
+                }
+              }
+            });
+            toFp.current = window.flatpickr(toRef.current, {
+              dateFormat: "Y-m-d",
+              defaultDate: dateTo,
+              allowInput: true,
+              onChange: function (selectedDates, str) {
+                if (selectedDates && selectedDates.length) {
+                  const iso = formatDateISO(selectedDates[0]);
+                  setDateTo(iso);
+                  try { if (fromFp.current) fromFp.current.set('maxDate', iso); } catch (e) { }
+                  if (dateFrom && new Date(iso) < new Date(dateFrom)) {
+                    setDateFrom(iso);
+                    try { if (fromFp.current) fromFp.current.setDate(iso, true); } catch (e) { }
+                  }
+                }
+              }
+            });
+            try { if (fromFp.current) fromFp.current.set('maxDate', dateTo); if (toFp.current) toFp.current.set('minDate', dateFrom); } catch (e) { }
+          }
+          loadLatest();
+          return function () { try { if (fromFp.current) fromFp.current.destroy(); } catch (e) { } try { if (toFp.current) toFp.current.destroy(); } catch (e) { } };
+          // eslint-disable-next-line
+        }, []);
+
+        useEffect(function () {
+          try { if (fromFp.current && dateFrom) fromFp.current.setDate(dateFrom, false); } catch (e) { }
+          try { if (toFp.current && dateTo) toFp.current.setDate(dateTo, false); } catch (e) { }
+          try { if (fromFp.current) fromFp.current.set('maxDate', dateTo); } catch (e) { }
+          try { if (toFp.current) toFp.current.set('minDate', dateFrom); } catch (e) { }
+        }, [dateFrom, dateTo]);
+
+        async function runForRange() {
+          setLoading(true);
+          setRows([]);
+          setSummary({ rows: 0, flagged_rows: 0, files: [], end_date: null });
+          setReasonsCount({});
+          setRiskCounts({ "Low": 0, "Low Medium": 0, "Medium": 0, "Medium High": 0, "High": 0 });
+          try {
+            const start = encodeURIComponent(dateFrom);
+            const end = encodeURIComponent(dateTo);
+            let url = API_BASE + "/run?start=" + start + "&end=" + end + "&full=true";
+            let r = await fetch(url, { method: 'GET' });
+            if (!r.ok) { const txt = await r.text(); throw new Error("API returned " + r.status + ": " + txt); }
+            let js = await r.json();
+
+            const totalRows = (typeof js.aggregated_unique_persons === 'number') ? js.aggregated_unique_persons
+                             : (typeof js.rows === 'number') ? js.rows : 0;
+            const totalFlagged = (typeof js.flagged_rows === 'number') ? js.flagged_rows : 0;
+            const files = js.files || [];
+
+
+
+            const sample = Array.isArray(js.flagged_persons) && js.flagged_persons.length ? js.flagged_persons
+                : (Array.isArray(js.sample) ? js.sample : []);
+                 setRows(sample);
+
+
+            setSummary({ rows: totalRows, flagged_rows: totalFlagged, files: files, end_date: formatDateISO(new Date(dateTo)) });
+
+            if (js.reasons_count && Object.keys(js.reasons_count).length > 0) {
+              setReasonsCount(js.reasons_count);
+            } else {
+              computeReasonsAndRisks(sample);
+            }
+            if (js.risk_counts && Object.keys(js.risk_counts).length > 0) {
+              const all = { "Low":0,"Low Medium":0,"Medium":0,"Medium High":0,"High":0 };
+              Object.keys(js.risk_counts).forEach(k => { all[k] = js.risk_counts[k]; });
+              setRiskCounts(all);
+            } else {
+              computeReasonsAndRisks(sample);
+            }
+
+            setPage(1);
+          } catch (err) {
+            alert("Error: " + err.message);
+            console.error(err);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        function pushChatMessage(msg) {
+          setChatMessages(prev => [...prev, msg]);
+          setTimeout(() => {
+            const el = document.querySelector('.chat-body');
+            if (el) el.scrollTop = el.scrollHeight;
+          }, 50);
+        }
+
+        // single computeReasonsAndRisks (kept once)
+        function computeReasonsAndRisks(dataRows) {
+          var counts = {};
+          var rcounts = { "Low": 0, "Low Medium": 0, "Medium": 0, "Medium High": 0, "High": 0 };
+          (dataRows || []).forEach(function (r) {
+            if (r.Reasons) {
+              var parts = String(r.Reasons).split(";").map(function (s) { return s.trim(); }).filter(Boolean);
+              parts.forEach(function (p) { counts[p] = (counts[p] || 0) + 1; });
+            }
+            var rl = getRiskLabelForRow(r);
+            if (rl && rcounts[rl] !== undefined) {
+              rcounts[rl] += 1;
+            } else if (rl && rcounts[rl] === undefined) {
+              rcounts[rl] = (rcounts[rl] || 0) + 1;
+            } else {
+              rcounts["Low"] += 1;
+            }
+          });
+          setReasonsCount(counts);
+          setRiskCounts(rcounts);
+        }
+
+
+        async function loadLatest() {
+  setLoading(true);
+  try {
+    // compute yesterday in YYYY-MM-DD
+    var d = new Date();
+    d.setDate(d.getDate() - 1);
+    var yesterday = formatDateISO(d);
+
+    // set the date inputs to yesterday (so UI reflects the selection)
+    setDateFrom(yesterday);
+    setDateTo(yesterday);
+
+    // call the run endpoint for yesterday only (start == end == yesterday)
+    const start = encodeURIComponent(yesterday);
+    const end = encodeURIComponent(yesterday);
+    let url = API_BASE + "/run?start=" + start + "&end=" + end + "&full=true";
+    let r = await fetch(url, { method: 'GET' });
+    if (!r.ok) { const txt = await r.text(); throw new Error("API returned " + r.status + ": " + txt); }
+    let js = await r.json();
+
+    const totalRows = (typeof js.aggregated_unique_persons === 'number') ? js.aggregated_unique_persons
+                     : (typeof js.rows === 'number') ? js.rows : 0;
+    const totalFlagged = (typeof js.flagged_rows === 'number') ? js.flagged_rows : 0;
+    const files = js.files || [];
+
+    const sample = Array.isArray(js.sample) ? js.sample : [];
+
+    setRows(sample);
+    setSummary({ rows: totalRows, flagged_rows: totalFlagged, files: files, end_date: yesterday });
+
+    if (js.reasons_count && Object.keys(js.reasons_count).length > 0) {
+      setReasonsCount(js.reasons_count);
+    } else {
+      computeReasonsAndRisks(sample);
+    }
+    if (js.risk_counts && Object.keys(js.risk_counts).length > 0) {
+      const all = { "Low":0,"Low Medium":0,"Medium":0,"Medium High":0,"High":0 };
+      Object.keys(js.risk_counts).forEach(k => { all[k] = js.risk_counts[k]; });
+      setRiskCounts(all);
+    } else {
+      computeReasonsAndRisks(sample);
+    }
+
+    setPage(1);
+  } catch (err) {
+    alert("Error: " + err.message);
+    console.error(err);
+  } finally {
+    setLoading(false);
+  }
+}
+
+        function getRiskLabelForRow(r) {
+          if (!r) return null;
+          var rl = r.RiskLevel || r.Risk || null;
+          if (rl) return String(rl);
+          if (r.RiskScore !== undefined && r.RiskScore !== null) {
+            const mapNum = { 1: "Low", 2: "Low Medium", 3: "Medium", 4: "Medium High", 5: "High" };
+            return mapNum[String(r.RiskScore)] || null;
+          }
+          return null;
+        }
+
+        // chart build function
+        function buildChart(rcounts) {
+          var labels = RISK_LABELS;
+          var values = labels.map(l => rcounts && rcounts[l] ? rcounts[l] : 0);
+          var colors = labels.map(l => {
+            if (selectedRiskFilter) {
+              return (l === selectedRiskFilter) ? RISK_COLORS[l] : '#e6edf3';
+            } else {
+              return RISK_COLORS[l] || '#cccccc';
+            }
+          });
+
+          var ctx = chartRef.current && chartRef.current.getContext ? chartRef.current.getContext('2d') : null;
+          if (!ctx) return;
+          try { if (chartInst.current) chartInst.current.destroy(); } catch (e) { }
+
+          chartInst.current = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: labels,
+              datasets: [{
+                label: 'Flagged by Risk Level',
+                data: values,
+                borderColor: '#2563eb',
+                backgroundColor: 'rgba(37,99,235,0.2)',
+                fill: true,
+                tension: 0.3,
+                pointBackgroundColor: colors,
+                pointRadius: 5,
+                pointHoverRadius: 7
+              }]
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              plugins: {
+                legend: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: function (context) {
+                      return context.parsed.y + ' cases';
+                    }
+                  }
+                }
+              },
+              onClick: function (evt, elements) {
+                if (elements && elements.length > 0) {
+                  var idx = elements[0].index;
+                  var label = this.data.labels[idx];
+                  handleRiskBarClick(label);
+                }
+              },
+              scales: {
+                y: { beginAtZero: true, ticks: { precision: 0 } }
+              }
+            }
+          });
+
+        }
+
+        useEffect(function () {
+          buildChart(riskCounts);
+        }, [riskCounts, selectedRiskFilter]);
+
+        // filtering & pagination helpers (includes risk filter + sorting)
+        var filtered = (rows || []).filter(function (r) {
+          var hay = (sanitizeName(r) + " " + (r.EmployeeID || "") + " " + (r.CardNumber || "") + " " + (r.Reasons || "")).toLowerCase();
+          var textOk = !filterText || hay.indexOf(filterText.toLowerCase()) !== -1;
+          var reasonOk = !selectedReason || (r.Reasons && ((";" + String(r.Reasons) + ";").indexOf(selectedReason) !== -1));
+          var riskOk = true;
+          if (selectedRiskFilter) {
+            var rl = getRiskLabelForRow(r);
+            if (!rl) { riskOk = false; }
+            else riskOk = (String(rl) === String(selectedRiskFilter));
+          }
+          return textOk && reasonOk && riskOk;
+        })
+        .sort(function(a, b) {
+          var va = Number(a.ViolationDaysLast90);
+          var vb = Number(b.ViolationDaysLast90);
+          if (isNaN(va)) va = 0;
+          if (isNaN(vb)) vb = 0;
+          if (vb !== va) return vb - va;
+          return (sanitizeName(a) || "").localeCompare(sanitizeName(b) || "");
+        });
+
+        var totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+        var pageRows = filtered.slice((page - 1) * pageSize, page * pageSize);
+
+        function exportFiltered() { downloadCSV(filtered, "trend_filtered_export.csv"); }
+
+        function onReasonClick(reason) {
+          if (!reason) { setSelectedReason(""); return; }
+          if (selectedReason === reason) setSelectedReason(""); else setSelectedReason(reason);
+          setPage(1);
+        }
+
+        async function openEvidence(row) {
+          setModalRow(row);
+          setModalDetails(null);
+          setModalLoading(true);
+          try {
+            const q = encodeURIComponent(row.EmployeeID || row.person_uid || "");
+            const resp = await fetch(API_BASE + "/record?employee_id=" + q);
+            if (!resp.ok) { const txt = await resp.text(); throw new Error("record failed: " + resp.status + " - " + txt); }
+            const js = await resp.json();
+            const details = { aggregated_rows: js.aggregated_rows || [], raw_swipe_files: js.raw_swipe_files || [], raw_swipes: js.raw_swipes || [] };
+            setModalDetails(details);
+          } catch (e) {
+            alert("Failed loading details: " + e.message);
+            console.error(e);
+          } finally { setModalLoading(false); }
+        }
+
+        function closeModal() { setModalRow(null); setModalDetails(null); }
+
+        var rowsCount = (summary && typeof summary.rows === 'number') ? summary.rows : (rows ? rows.length : 0);
+        var flaggedCount = (summary && typeof summary.flagged_rows === 'number') ? summary.flagged_rows : (rows ? rows.filter(function (r) { return !!r.Reasons; }).length : 0);
+        var flaggedPct = rowsCount ? Math.round((flaggedCount * 100) / (rowsCount || 1)) : 0;
+
+        function renderOverlapCell(r) {
+          var ov = r.OverlapWith || r.swipe_overlap || r.overlap_with || null;
+          if (ov && typeof ov === 'string') {
+            var parts = ov.split(";").map(function (s) { return s.trim(); }).filter(Boolean);
+            if (parts.length === 0) return <span className="muted">—</span>;
+            return <span className="pill" title={ov}>{parts.length} overlap</span>;
+          }
+          return <span className="muted">—</span>;
+        }
+
+        function renderReasonChips(reasonText) {
+          if (!reasonText) return <span className="muted">—</span>;
+          const parts = String(reasonText).split(";").map(s => s.trim()).filter(Boolean);
+          return parts.map((p, idx) => (<span key={idx} className="pill" title={SCENARIO_EXPLANATIONS[p] || p}>{p}</span>));
+        }
+
+        function renderReasonExplanations(reasonText) {
+          if (!reasonText) return <div className="muted">No flags</div>;
+          const parts = String(reasonText).split(";").map(s => s.trim()).filter(Boolean);
+          return (
+            <div>
+              {parts.map((p, idx) => (
+                <div key={idx} className="why-item" style={{ marginBottom: 8 }}>
+                  <b>{p}</b>
+                  <div className="small">{SCENARIO_EXPLANATIONS[p] || "No explanation available."}</div>
+                </div>
+              ))}
+            </div>
+          );
+        }
+
+        async function sendChat(qText, opts={top_k:5}) {
+          if (!qText || !qText.toString().trim()) return;
+          const text = qText.toString().trim();
+          pushChatMessage({who:'user', text});
+          setChatInput("");
+          setChatLoading(true);
+          try {
+            const payload = Object.assign({q: text}, opts);
+            const resp = await fetch(API_BASE + "/chatbot/query", {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+              const t = await resp.text().catch(()=>'');
+              throw new Error("Server: " + resp.status + " " + t);
+            }
+            const js = await resp.json();
+            const answer = js.answer || js.answer_text || js.result || "No answer returned.";
+            const evidence = Array.isArray(js.evidence) ? js.evidence : (js.evidence ? [js.evidence] : []);
+            pushChatMessage({who:'bot', text: answer, evidence});
+          } catch (err) {
+            pushChatMessage({who:'bot', text: "Error: " + err.message, evidence: []});
+            console.error("chat error", err);
+          } finally {
+            setChatLoading(false);
+            setTimeout(() => {
+              const el = document.querySelector('.chat-body');
+              if (el) el.scrollTop = el.scrollHeight;
+            }, 80);
+          }
+        }
+
+        const QUICK_PROMPTS = [
+          "Who is high risk today",
+          "Who is low risk today",
+          "Show me 320172 last 90 days",
+          "Trend details for today — top reasons",
+          "Explain repeated_short_breaks"
+        ];
+        function useQuickPrompt(q) {
+          setChatOpen(true);
+          sendChat(q);
+        }
+
+
+
+        
+        function renderSwipeTimeline(details, modalRow) {
+          if (!details || !details.raw_swipes || details.raw_swipes.length === 0) {
+            return <div className="muted">No raw swipe evidence available (person not flagged or raw file missing).</div>;
+          }
+
+          // Build JS objects with local timestamps & computed logical date
+          const all = details.raw_swipes.map(r => {
+            const obj = Object.assign({}, r);
+            try {
+              // create a local Date object from available fields
+              obj.__ts = makeLocalDateFromRow(obj);
+            } catch (e) {
+              obj.__ts = null;
+            }
+
+            // compute gap seconds (prefer numeric SwipeGapSeconds, else parse SwipeGap like "HH:MM:SS")
+            let gap = null;
+            if (obj.SwipeGapSeconds !== undefined && obj.SwipeGapSeconds !== null) {
+              gap = Number(obj.SwipeGapSeconds);
+              if (isNaN(gap)) gap = null;
+            } else if (obj.SwipeGap) {
+              try {
+                const parts = String(obj.SwipeGap).split(':').map(p => Number(p));
+                if (parts.length === 3 && parts.every(p => !isNaN(p))) gap = parts[0]*3600 + parts[1]*60 + parts[2];
+              } catch (e) { gap = null; }
+            }
+            obj.__gap = gap;
+
+            // compute normalized zone string
+            obj.__zone_l = String((obj.Zone || '')).toLowerCase();
+
+            // compute logical date string (YYYY-MM-DD) using boundary hour rule
+            const ts = obj.__ts;
+            obj.__logical_date = ts ? logicalDateForTs(ts, DAY_BOUNDARY_HOUR) : (obj.Date ? String(obj.Date).slice(0,10) : null);
+
+            return obj;
+          }).sort((a, b) => {
+            // sort by actual timestamp when available, fallback to logical date + time string
+            if (a.__ts && b.__ts) return a.__ts - b.__ts;
+            if (a.__ts) return -1;
+            if (b.__ts) return 1;
+            const ka = (a.Date || '') + ' ' + (a.Time || '');
+            const kb = (b.Date || '') + ' ' + (b.Time || '');
+            return ka.localeCompare(kb);
+          });
+
+          // compute day-start flags using logical date
+          const flags = new Array(all.length).fill(null).map(() => ({ dayStart: false, outReturn: false }));
+          for (let i = 0; i < all.length; i++) {
+            const cur = all[i];
+            const prev = all[i - 1];
+            const curDate = cur.__logical_date || (cur.Date ? String(cur.Date).slice(0,10) : null);
+            const prevDate = prev ? (prev.__logical_date || (prev.Date ? String(prev.Date).slice(0,10) : null)) : null;
+            if (!prev || prevDate !== curDate) flags[i].dayStart = true;
+          }
+
+          // mark out->return pairs (same logic as before, but use __zone_l and __gap)
+          const OUT_RETURN_GAP_SECONDS = 60 * 60;
+          for (let i = 0; i < all.length - 1; i++) {
+            const a = all[i], b = all[i + 1];
+            const aZone = a.__zone_l || ''; const bZone = b.__zone_l || ''; const bGap = b.__gap || 0;
+            if (aZone.includes('out of office') || aZone.includes('out_of_office') || aZone.includes('out of')) {
+              if (!bZone.includes('out of office') && (bGap >= OUT_RETURN_GAP_SECONDS || (bGap === null && aZone.includes('out')))) {
+                flags[i].outReturn = true; flags[i + 1].outReturn = true;
+              }
+            }
+          }
+
+          return (
+            <div className="table-scroll">
+              <table className="evidence-table" role="table" aria-label="Swipe timeline">
+                <thead>
+                  <tr>
+                    <th>Employee Name</th>
+                    <th>Employee ID</th>
+                    <th>Card</th>
+                    <th>Date</th>
+                    <th>Time</th>
+                    <th>SwipeGap</th>
+                    <th>Door</th>
+                    <th>Direction</th>
+                    <th>Zone</th>
+                    <th>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {all.map((rObj, idx) => {
+                    const r = rObj || {};
+                    const g = r.__gap;
+                    const gapFormatted = (r.SwipeGap && String(r.SwipeGap).trim()) ? String(r.SwipeGap) : (g !== null && g !== undefined) ? formatSecondsToHmsJS(g) : "-";
+
+                    // Decide which date/time to display: show logical date for day grouping, but show original time
+                    const displayDate = r.__logical_date || (r.Date ? String(r.Date).slice(0,10) : '-');
+                    const displayTime = r.Time || (r.__ts ? r.__ts.toTimeString().slice(0,8) : '-');
+
+                    const cls = [];
+                    if (flags[idx].dayStart) cls.push('row-day-start');
+                    if (flags[idx].outReturn) cls.push('row-out-return');
+                    if (g && g >= OUT_RETURN_GAP_SECONDS) cls.push('highlight-long-duration');
+                    return (
+                      <tr key={idx} className={cls.join(' ')}>
+                        <td className="small">{r.EmployeeName || '-'}</td>
+                        <td className="small">{r.EmployeeID || '-'}</td>
+                        <td className="small">{r.CardNumber || r.Card || '-'}</td>
+                        <td className="small">{displayDate}</td>
+                        <td className="small">{displayTime}</td>
+                        <td className="small">{gapFormatted}</td>
+                        <td className="small" style={{ minWidth: 160 }}>{r.Door || '-'}</td>
+                        <td className="small">{r.Direction || '-'}</td>
+                        <td className="small">{r.Zone || '-'}</td>
+                        <td className="small">{r.Note || '-'}{r._source ? <span className="muted"> ({r._source})</span> : null}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
+
+        function handleRiskBarClick(label) {
+          if (!label) return;
+          if (selectedRiskFilter === label) {
+            setSelectedRiskFilter("");
+          } else {
+            setSelectedRiskFilter(label);
+          }
+          setPage(1);
+        }
+
+        function clearRiskFilter() {
+          setSelectedRiskFilter("");
+        }
+
+        // ---- RETURN: place chat FAB / chat modal INSIDE the returned JSX ----
+        return (
+          <div className="container" aria-live="polite">
+            {loading && (
+              <div className="spinner-overlay" role="status" aria-label="Loading">
+                <div className="spinner-box">
+                  <div className="spinner" />
+                  <div style={{ fontWeight: 700 }}>Loading…</div>
+                </div>
+              </div>
+            )}
+
+            <div className="topbar" role="banner">
+              <div className="wu-brand" aria-hidden={false}>
+                <div className="wu-logo">WU</div>
+                <div className="title-block">
+                  <h1>Western Union — Trend Analysis</h1>
+                  <p>Pune</p>
+                </div>
+              </div>
+
+              <div className="header-actions" role="region" aria-label="controls">
+                <div className="control">
+                  <label className="small" htmlFor="fromDate">From</label>
+                  <input id="fromDate" ref={fromRef} className="date-input" type="text" placeholder="YYYY-MM-DD" />
+                </div>
+
+                <div className="control">
+                  <label className="small" htmlFor="toDate">To</label>
+                  <input id="toDate" ref={toRef} className="date-input" type="text" placeholder="YYYY-MM-DD" />
+                </div>
+
+                <button className="btn-primary" onClick={runForRange} disabled={loading}>Run</button>
+                <button className="btn-ghost" onClick={loadLatest} disabled={loading}>Load latest</button>
+              </div>
+            </div>
+
+            {/* cards, main content, table etc. (keep your implementation as-is) */}
+            <div className="card-shell">
+              <div className="cards" aria-hidden={loading}>
+                <div className="card" title="Rows analysed">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{(rowsCount !== undefined && rowsCount !== null) ? rowsCount.toLocaleString() : 0}</h3>
+                      <p>Rows analysed</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="card card-flagged" title="Flagged rows">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{(flaggedCount !== undefined && flaggedCount !== null) ? flaggedCount.toLocaleString() : 0}</h3>
+                      <p>Flagged rows</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="card card-rate" title="Flagged rate">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{flaggedPct}%</h3>
+                      <p>Flagged rate</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="main">
+                <div className="left">
+                  <div className="chart-wrap" aria-label="Risk level chart">
+                    <canvas ref={chartRef}></canvas>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                    <input placeholder="Search name, employee id, card or reason..." value={filterText} onChange={function (e) { setFilterText(e.target.value); setPage(1); }} style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #e6edf3' }} />
+                    <div className="muted">Showing {filtered.length} / {rows.length} rows</div>
+                    <button className="small-button" onClick={exportFiltered}>Export filtered</button>
+                    {selectedRiskFilter ? <button className="small-button" onClick={clearRiskFilter}>Clear risk filter</button> : null}
+                  </div>
+
+                  <div style={{ marginTop: 10 }} className="table-scroll" role="region" aria-label="results table">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Employee</th>
+                          <th className="small">ID</th>
+                          <th className="small">Card</th>
+                          <th className="small">Date</th>
+                          <th className="small">Duration</th>
+                          <th className="small">ViolationDaysLast90</th>
+                          <th className="small">Reasons</th>
+                          <th className="small">Evidence</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pageRows.map(function (r, idx) {
+                          var empName = sanitizeName(r);
+                          var displayDate = safeDateDisplay(r.Date || r.FirstSwipe || r.LastSwipe);
+                          var durText = r.Duration || (r.DurationMinutes ? Math.round(r.DurationMinutes) + " min" : "");
+                          var flagged = r.Reasons && String(r.Reasons).trim();
+                          return (
+                            <tr key={idx} className={flagged ? "flagged-row" : ""}>
+                              <td className="row-click" onClick={function () { openEvidence(r); }}>{empName || <span className="muted">—</span>}</td>
+                              <td className="small">{r.EmployeeID || ""}</td>
+                              <td className="small">{r.CardNumber || ""}</td>
+                              <td className="small">{displayDate}</td>
+                              <td className="small">{durText}</td>
+                              <td className="small">
+                                {(r.ViolationDaysLast90 !== undefined && r.ViolationDaysLast90 !== null && r.ViolationDaysLast90 !== "")
+                                  ? (Number(r.ViolationDaysLast90).toString())
+                                  : ((r.ViolationDaysLast_90 !== undefined && r.ViolationDaysLast_90 !== null) ? String(r.ViolationDaysLast_90) : "")
+                                }
+                              </td>
+                              <td className="small">{renderReasonChips(r.Reasons)}</td>
+                              <td className="small">
+                                <button className="evidence-btn" onClick={function () { openEvidence(r); }}>Evidence</button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
+                    <button onClick={function () { setPage(function (p) { return Math.max(1, p - 1); }); }} disabled={page <= 1}>Prev</button>
+                    <div className="muted">Page {page} / {totalPages}</div>
+                    <button onClick={function () { setPage(function (p) { return Math.min(totalPages, p + 1); }); }} disabled={page >= totalPages}>Next</button>
+                  </div>
+                </div>
+
+                <aside className="right" aria-label="side panel">
+                  <div className="sidebar-section">
+                    <strong>Risk filters</strong>
+                    <div className="small muted" style={{ marginTop: 6 }}>Click a risk to filter. Chart click also toggles filter.</div>
+
+                    <div className="risk-filter-list" style={{ marginTop: 8 }}>
+                      {RISK_LABELS.map((lab) => {
+                        const cnt = (riskCounts && riskCounts[lab]) ? riskCounts[lab] : 0;
+                        const active = selectedRiskFilter === lab;
+                        return (
+                          <div key={lab} role="button" tabIndex={0} aria-pressed={active} className={"risk-chip " + (active ? "active" : "")} onClick={function () { handleRiskBarClick(lab); }} onKeyDown={function (e) { if (e.key === 'Enter' || e.key === ' ') { handleRiskBarClick(lab); } }}>
+                            <div style={{ width: 10, height: 10, borderRadius: 999, background: RISK_COLORS[lab], boxShadow: '0 2px 6px rgba(0,0,0,0.08)' }}></div>
+                            <div style={{ fontSize: 13 }}>{lab} <span className="muted" style={{ marginLeft: 6 }}>({cnt})</span></div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div style={{ marginTop: 8 }}>
+                      <button className="small-button" onClick={clearRiskFilter}>Clear risk filter</button>
+                    </div>
+                  </div>
+
+                  <div className="sidebar-section" style={{ marginTop: 12 }}>
+                    <strong>Top reasons summary</strong>
+                    <div className="small muted" style={{ marginTop: 6 }}>Click a reason to filter the table by that reason. Click again to clear.</div>
+
+                    <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                      <input placeholder="Filter reason list..." value={reasonFilterText} onChange={function (e) { setReasonFilterText(e.target.value); }} style={{ flex: 1, padding: '6px 8px', borderRadius: 6, border: '1px solid #e2e8f0' }} />
+                      <button className="small-button" onClick={function () { setSelectedReason(''); setReasonFilterText(''); }}>Clear</button>
+                    </div>
+
+                    <div style={{ marginTop: 8, maxHeight: 320, overflow: 'auto' }}>
+                      {Object.keys(reasonsCount).length === 0 && <div className="muted">No flags found</div>}
+                      {Object.entries(reasonsCount).sort(function (a, b) { return b[1] - a[1]; }).filter(function (kv) {
+                        var name = kv[0];
+                        if (!reasonFilterText) return true;
+                        return name.toLowerCase().indexOf(reasonFilterText.toLowerCase()) !== -1;
+                      }).slice(0, 50).map(function (kv) {
+                        var name = kv[0], count = kv[1];
+                        var active = selectedReason === name;
+                        return (
+                          <div key={name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+                            <button className={"chip " + (active ? "active" : "")} style={{ textAlign: 'left', flex: 1 }} onClick={function () { onReasonClick(name); }}>
+                              {name}
+                            </button>
+                            <div style={{ minWidth: 48, textAlign: 'right' }} className="small"><b>{count}</b></div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </div>
+
+            {modalRow &&
+              <div className="modal" onClick={closeModal}>
+                <div className="modal-inner" onClick={function (e) { e.stopPropagation(); }}>
+                  {/* modal contents (unchanged) */}
+                  <div className="modal-header">
+                    <div className="header-content">
+                      <div className="header-icon">
+                        <i className="bi bi-clipboard2-data-fill"></i>
+                      </div>
+                      <div className="header-text">
+                        <h3>Details — Evidence</h3>
+                        <div className="header-subtitle small">Evidence & explanation for selected row</div>
+                      </div>
+                    </div>
+                    <button className="close-btn" onClick={closeModal}>
+                      <i className="bi bi-x-lg"></i>
+                      Close
+                    </button>
+                  </div>
+                  <div className="modal-body">
+                    {modalLoading && (
+                      <div className="loading-state">
+                        <div className="loading-spinner"></div>
+                        <span>Loading evidence…</span>
+                      </div>
+                    )}
+                    <div className="modal-top" role="region" aria-label="evidence summary">
+                      {/* ... modal body contents as in original ... */}
+                      <div className="image-section">
+                        <div className="image-container">
+                          <div className="multi-color-border">
+                            <div className="color-ring color-1"></div>
+                            <div className="color-ring color-2"></div>
+                            <div className="color-ring color-3"></div>
+                            <div className="color-ring color-4"></div>
+                            <div className="image-content">
+                              {(modalDetails && modalDetails.aggregated_rows && modalDetails.aggregated_rows.length > 0) ? (
+                                (() => {
+                                  const md = modalDetails.aggregated_rows[0];
+                                  if (md && md.imageUrl) {
+                                    return (
+                                      <img
+                                        className="modal-image"
+                                        src={API_BASE + md.imageUrl}
+                                        alt="Employee"
+                                        onError={(e) => {
+                                          e.target.style.display = 'none';
+                                          e.target.nextSibling.style.display = 'flex';
+                                        }}
+                                      />
+                                    );
+                                  } else {
+                                    return <div className="modal-image-placeholder">No image</div>;
+                                  }
+                                })()
+                              ) : (
+                                <div className="modal-image-placeholder">
+                                  <i className="bi bi-person-square"></i>
+                                  <span>No image</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* rest of modal columns (kept same) */}
+                      <div className="modal-details">
+                        <div className="details-header">
+                          <div className="emp-info">
+                            <div className="emp-name">
+                              {sanitizeName(modalRow) || "—"}
+                              <span
+                                className="risk-badge"
+                                style={{
+                                  marginLeft: "12px",
+                                  background:
+                                    RISK_COLORS[modalRow.RiskLevel] ||
+                                    RISK_COLORS[getRiskLabelForRow(modalRow)] ||
+                                    RISK_COLORS["Low"],
+                                }}
+                              >
+                                {modalRow.RiskLevel ||
+                                  (modalRow.RiskScore ? "Score " + modalRow.RiskScore : "Low")}
+                              </span>
+                            </div>
+                            <div className="emp-badge">
+                              <i className="bi bi-person-badge"></i>
+                              ID: {modalRow.EmployeeID || "—"}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="details-grid">
+                          <div className="detail-item">
+                            <div className="detail-icon">
+                              <i className="bi bi-credit-card"></i>
+                            </div>
+                            <div className="detail-content">
+                              <label>Card Number</label>
+                              <span>{modalRow.CardNumber || "—"}</span>
+                            </div>
+                          </div>
+                          <div className="detail-item">
+                            <div className="detail-icon">
+                              <i className="bi bi-envelope"></i>
+                            </div>
+                            <div className="detail-content">
+                              <label>Email</label>
+                              <span>
+                                {(modalDetails && modalDetails.aggregated_rows && modalDetails.aggregated_rows[0] && modalDetails.aggregated_rows[0].EmployeeEmail)
+                                  ? modalDetails.aggregated_rows[0].EmployeeEmail
+                                  : <span className="muted">—</span>}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="detail-item">
+                            <div className="detail-icon">
+                              <i className="bi bi-calendar-date"></i>
+                            </div>
+                            <div className="detail-content">
+                              <label>Date</label>
+                              <span>{safeDateDisplay(modalRow.Date || modalRow.FirstSwipe)}</span>
+                            </div>
+                          </div>
+                          <div className="detail-item">
+                            <div className="detail-icon">
+                              <i className="bi bi-clock"></i>
+                            </div>
+                            <div className="detail-content">
+                              <label>Duration</label>
+                              <span className="duration-badge">
+                                {modalRow.Duration || (modalRow.DurationMinutes ? Math.round(modalRow.DurationMinutes) + " min" : "—")}
+                              </span>
+                            </div>
+                            <div style={{ marginTop: 8, textAlign: 'right' }}>
+                              <div className="muted">Violation days (90d)</div>
+                              <div style={{ fontWeight: 700 }}>
+                                {(modalRow.ViolationDaysLast90 !== undefined && modalRow.ViolationDaysLast90 !== null)
+                                  ? modalRow.ViolationDaysLast90
+                                  : 0}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="modal-reasons">
+                        <div className="explanation-section" style={{ marginTop: 12 }}>
+                          <div style={{ fontWeight: 700 }}>Explanation</div>
+                          <div style={{
+                            marginTop: 8,
+                            maxHeight: 160,
+                            overflow: 'auto',
+                            background: '#fff',
+                            border: '1px solid #eef2f7',
+                            padding: 8,
+                            borderRadius: 6
+                          }}>
+                            {modalRow.Explanation
+                              ? <div style={{ whiteSpace: 'pre-wrap' }}>{modalRow.Explanation}</div>
+                              : <div className="muted">No explanation provided.</div>}
+                          </div>
+                        </div>
+                        <div className="reasons-section">
+                          <div className="section-title">
+                            <i className="bi bi-list-check"></i>
+                            Reasons Flagged
+                          </div>
+                          <div className="reasons-list">
+                            {renderReasonChips(modalRow.Reasons)}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="evidence-section">
+                      <div className="section-header">
+                        <i className="bi bi-folder2-open"></i>
+                        <h4>Available Evidence Files</h4>
+                      </div>
+                      <div className="files-container">
+                        {modalDetails && modalDetails.raw_swipe_files && modalDetails.raw_swipe_files.length > 0 ? (
+                          <div className="files-list">
+                            {modalDetails.raw_swipe_files.map((f, i) => (
+                              <div key={i} className="file-item">
+                                <i className="bi bi-file-earmark-text"></i>
+                                <span className="file-name">{f}</span>
+                                <button
+                                  className="download-btn"
+                                  onClick={function () { window.location = API_BASE + "/swipes/" + encodeURIComponent(f); }}
+                                >
+                                  <i className="bi bi-download"></i>
+                                  Download
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="no-files">
+                            <i className="bi bi-folder-x"></i>
+                            <span>No raw swipe files found for this person/date.</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="timeline-section">
+                      <div className="section-header">
+                        <i className="bi bi-clock-history"></i>
+                        <h4>Swipe Timeline</h4>
+                        <span className="subtitle">Filtered for this person/date</span>
+                      </div>
+                      <div className="timeline-content">
+                        {modalDetails ? renderSwipeTimeline(modalDetails, modalRow) : (
+                          <div className="loading-timeline">
+                            <i className="bi bi-hourglass-split"></i>
+                            <span>Evidence not loaded yet.</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="raw-json-section">
+                      <label className="toggle-label">
+                        <input
+                          type="checkbox"
+                          id="showraw"
+                          onChange={function (e) {
+                            const el = document.getElementById('rawpayload');
+                            if (el) el.style.display = e.target.checked ? 'block' : 'none';
+                          }}
+                        />
+                        <span className="toggle-slider"></span>
+                        <span className="toggle-text">
+                          <i className="bi bi-code-slash"></i>
+                          Show raw aggregated JSON
+                        </span>
+                      </label>
+                      <div id="rawpayload" className="raw-json">
+                        <pre>{JSON.stringify(modalRow, null, 2)}</pre>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            }
+
+            {/* ===== CHAT FAB & CHAT MODAL: now INSIDE the component RETURN (no more stray JSX outside) ===== */}
+            <button className="chat-fab" title="Ask Trend Details (Ask Me )" onClick={() => setChatOpen(true)} aria-label="Open chat">
+               
+              <span className="meta-icon"><img src="chat-bot.png" alt=""/></span>
+            </button>
+
+            {chatOpen && (
+              <div className="chat-modal" role="dialog" aria-modal="true" aria-label="Trend Chatbot">
+                <div className="chat-header">
+                  <div style={{display:'flex', alignItems:'center', gap:8}}>
+                    <div style={{width:36,height:36, borderRadius:8, background:'#', display:'flex', alignItems:'center', justifyContent:'center', color:'#2563eb', fontWeight:800}}><img src="chat-bot.png" alt=""  style={{width:36,height:36, }}/></div>
+                    <div>
+                      <div className="title">Ask me — Trend Details</div>
+                      <div style={{fontSize:12, opacity:0.85}}>Ask trend & risk questions</div>
+                    </div>
+                  </div>
+                  <div style={{marginLeft:'auto'}}>
+                    <button className="small-button bot-close" onClick={() => { setChatOpen(false); }}>Close</button>
+                  </div>
+                </div>
+
+                <div className="chat-body">
+                  {chatMessages.length === 0 && (
+                    <div style={{color:'#64748b', fontSize:13}}>
+                      Hi — ask about trends (e.g. "Who is high risk today"). Use the quick prompts below.
+                    </div>
+                  )}
+                  {chatMessages.map((m, i) => (
+                    <div key={i} style={{display:'block'}}>
+                      <div className={"chat-bubble " + (m.who === 'user' ? 'user' : 'bot')}>
+                        {m.text}
+                        {m.who === 'bot' && m.evidence && m.evidence.length > 0 && (
+                          <div className="chat-evidence">
+                            <strong>Evidence</strong>
+                            <div style={{marginTop:6}}>{m.evidence.slice(0,5).map((e,j)=>(<div key={j}>{typeof e === 'string' ? e : JSON.stringify(e)}</div>))}</div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+
+                  {chatLoading && <div className="chat-loading" style={{marginTop:6}}>Thinking…</div>}
+                  <div style={{marginTop:8}} className="quick-prompts" aria-hidden={chatLoading}>
+                    {QUICK_PROMPTS.map((q,idx)=>(
+                      <button key={idx} onClick={()=>useQuickPrompt(q)} disabled={chatLoading}>{q}</button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="chat-input-row">
+                  <input
+                    className="chat-input"
+                    placeholder="Type a question, e.g. 'Who is high risk today'…"
+                    value={chatInput}
+                    onChange={(e)=>setChatInput(e.target.value)}
+                    onKeyDown={(e)=>{ if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(chatInput); } }}
+                  />
+                  <button className="chat-send-btn" onClick={()=>sendChat(chatInput)} disabled={chatLoading}>Send</button>
+                </div>
+              </div>
+            )}
+
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(React.createElement(App));
+    })();
+  </script>
+</body>
+</html>
+
+
+
