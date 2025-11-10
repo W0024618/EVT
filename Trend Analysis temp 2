@@ -1,3 +1,144 @@
+    if use_pune_2am_boundary and (sw_for_features is not None) and (not sw_for_features.empty):
+        try:
+            # ensure LocaleMessageTime parsed
+            if 'LocaleMessageTime' in sw_for_features.columns:
+                sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features['LocaleMessageTime'], errors='coerce')
+            else:
+                # try other timestamp columns defensively
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_for_features.columns:
+                        sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features[cand], errors='coerce')
+                        break
+
+            # PRESERVE original times for evidence + later matching
+            sw_for_features['OriginalLocaleMessageTime'] = sw_for_features['LocaleMessageTime']
+
+            # shift timestamps backward by 2 hours so the 'date' computed from them moves the day boundary to 02:00
+            sw_for_features['LocaleMessageTime'] = sw_for_features['LocaleMessageTime'] - pd.Timedelta(hours=2)
+
+            # recompute durations using shifted swipes so FirstSwipe/LastSwipe/Duration match 02:00-day boundary
+            try:
+                durations_for_features = compute_daily_durations(sw_for_features)
+            except Exception:
+                logging.exception("Failed to recompute durations for Pune 2AM boundary; falling back to original durations.")
+                durations_for_features = durations.copy() if durations is not None else pd.DataFrame()
+
+            # For debugging/evidence linking: optionally write shifted-version of raw swipes
+            try:
+                sw_shifted_out = Path(outdir) / f"swipes_{city.lower().replace(' ','_')}_{target_date.strftime('%Y%m%d')}_shifted.csv"
+                # keep essential cols, including the OriginalLocaleMessageTime for traceability
+                cols_keep = [c for c in sw_for_features.columns if c in ('person_uid','EmployeeID','CardNumber','LocaleMessageTime','OriginalLocaleMessageTime','Door','Direction','PartitionName2')]
+                sw_for_features[cols_keep].to_csv(sw_shifted_out, index=False)
+            except Exception:
+                logging.debug("Could not write shifted swipes evidence file (non-fatal).")
+        except Exception:
+            logging.exception("Failed preparing shifted swipes for Pune 2AM logic; using original swipes/durations.")
+            sw_for_features = swipes.copy() if swipes is not None else pd.DataFrame()
+            durations_for_features = durations.copy() if durations is not None else pd.DataFrame()
+
+
+
+
+
+
+
+
+    # ===== POST-PROCESS MERGE: heuristic to attach tiny early-morning fragments into previous day =====
+    # This reduces spurious "separate day" rows for swipes that occur shortly after midnight (00:00-02:00)
+    try:
+        # convert FirstSwipe/LastSwipe to datetimes (they come back as timestamps)
+        grouped['FirstSwipe_dt'] = pd.to_datetime(grouped['FirstSwipe'], errors='coerce')
+        grouped['LastSwipe_dt']  = pd.to_datetime(grouped['LastSwipe'],  errors='coerce')
+
+        rows_to_drop = set()
+        # threshold: if a day's first swipe is in 00:00..02:00 (after original midnight), and gap to prior day's LastSwipe <= MERGE_GAP_SECONDS,
+        # then attach current day into previous day for the same person.
+        MERGE_GAP_SECONDS = int(4 * 3600)  # <= 4 hours; tweakable
+        # iterate per person
+        for pid, sub in grouped.sort_values(['person_uid','Date']).groupby('person_uid'):
+            prev_idx = None
+            for idx, r in sub.reset_index().iterrows():
+                real_idx = int(r['index']) if 'index' in r else r.name
+                cur_first = pd.to_datetime(grouped.at[real_idx, 'FirstSwipe_dt'])
+                cur_date = grouped.at[real_idx, 'Date']
+                if prev_idx is not None:
+                    prev_last = pd.to_datetime(grouped.at[prev_idx, 'LastSwipe_dt'])
+                    # if current first exists and is within MERGE_GAP_SECONDS of prev last, and the current FirstSwipe is early morning (hour < 2)
+                    if (not pd.isna(cur_first)) and (not pd.isna(prev_last)):
+                        gap = (cur_first - prev_last).total_seconds()
+                        if 0 <= gap <= MERGE_GAP_SECONDS and cur_first.time().hour < 2:
+                            try:
+                                # merge current row into prev row: sum CountSwipes, max gap, extend LastSwipe etc.
+                                grouped.at[prev_idx, 'CountSwipes'] = int(grouped.at[prev_idx, 'CountSwipes']) + int(grouped.at[real_idx, 'CountSwipes'])
+                                grouped.at[prev_idx, 'MaxSwipeGapSeconds'] = max(int(grouped.at[prev_idx, 'MaxSwipeGapSeconds'] or 0), int(grouped.at[real_idx, 'MaxSwipeGapSeconds'] or 0), int(gap))
+                                # extend LastSwipe to current's LastSwipe_dt if later
+                                if not pd.isna(grouped.at[real_idx, 'LastSwipe_dt']):
+                                    if pd.isna(grouped.at[prev_idx, 'LastSwipe_dt']) or grouped.at[real_idx, 'LastSwipe_dt'] > grouped.at[prev_idx, 'LastSwipe_dt']:
+                                        grouped.at[prev_idx, 'LastSwipe_dt'] = grouped.at[real_idx, 'LastSwipe_dt']
+                                        grouped.at[prev_idx, 'LastSwipe'] = grouped.at[real_idx, 'LastSwipe']
+                                # recompute CardNumber/UniqueDoors/UniqueLocations conservative approach: prefer prev if present, else use current
+                                if not grouped.at[prev_idx, 'CardNumber']:
+                                    grouped.at[prev_idx, 'CardNumber'] = grouped.at[real_idx, 'CardNumber']
+                                grouped.at[prev_idx, 'UniqueDoors'] = int(max(int(grouped.at[prev_idx].get('UniqueDoors') or 0), int(grouped.at[real_idx].get('UniqueDoors') or 0)))
+                                grouped.at[prev_idx, 'UniqueLocations'] = int(max(int(grouped.at[prev_idx].get('UniqueLocations') or 0), int(grouped.at[real_idx].get('UniqueLocations') or 0)))
+                                # mark this index to drop
+                                rows_to_drop.add(real_idx)
+                                # do not advance prev_idx (we keep same prev to possibly absorb multiple small fragments)
+                                continue
+                            except Exception:
+                                pass
+                prev_idx = real_idx
+        if rows_to_drop:
+            grouped = grouped.drop(index=list(rows_to_drop)).reset_index(drop=True)
+    except Exception:
+        logging.exception("Failed merge-early-morning fragments (non-fatal).")
+
+
+
+
+
+
+
+
+
+        # build dates_for_row from Date / FirstSwipe / LastSwipe (include original raw-date where available)
+        dates_for_row = set()
+        if 'Date' in agg_row and pd.notna(agg_row['Date']):
+            try:
+                d = pd.to_datetime(agg_row['Date']).date()
+                dates_for_row.add(d.isoformat())
+            except Exception:
+                pass
+        for col in ('FirstSwipe','LastSwipe'):
+            if col in agg_row and pd.notna(agg_row[col]):
+                try:
+                    d = pd.to_datetime(agg_row[col]).date()
+                    dates_for_row.add(d.isoformat())
+                except Exception:
+                    pass
+
+        # If the aggregated row contains 'OriginalLocaleMessageTime' (produced for Pune 2am shift), include that date too
+        if 'OriginalLocaleMessageTime' in agg_row and pd.notna(agg_row['OriginalLocaleMessageTime']):
+            try:
+                orig_d = pd.to_datetime(agg_row['OriginalLocaleMessageTime']).date()
+                dates_for_row.add(orig_d.isoformat())
+            except Exception:
+                pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check below 3 File carefully i want to fix logic here like..
 Ealry Arrival .
 Short stay long gap Scenarion
