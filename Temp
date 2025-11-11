@@ -1,3 +1,154 @@
+# --- improved human-readable scenario explanations (use hours for duration/gaps) ---
+def _hrs_from_minutes(mins):
+    try:
+        m = float(mins or 0.0)
+        return round(m / 60.0, 1)
+    except Exception:
+        return None
+
+def _hrs_from_seconds(sec):
+    try:
+        s = float(sec or 0.0)
+        return round(s / 3600.0, 1)
+    except Exception:
+        return None
+
+SCENARIO_EXPLANATIONS = {
+    "long_gap_>=4.5h": lambda r: (
+        (lambda h: f"Long gap between swipes (~{h} h)." if h is not None else "Long gap between swipes.")
+        (_hrs_from_seconds(r.get('MaxSwipeGapSeconds')))
+    ),
+    "short_duration_<4h": lambda r: (
+        # if duration is zero but we only saw only_in/only_out, be explicit
+        "Only 'IN' events recorded. No complete IN/OUT pair for this day." if int(r.get('OnlyIn', 0)) == 1 else
+        "Only 'OUT' events recorded. No complete IN/OUT pair for this day." if int(r.get('OnlyOut', 0)) == 1 else
+        (lambda h: f"Short total presence (~{h} h)." if h is not None else "Short total presence.")(_hrs_from_minutes(r.get('DurationMinutes')))
+    ),
+    "coffee_badging": lambda r: "Multiple quick swipes in short time.",
+    "low_swipe_count_<=2": lambda r: "Very few swipes on day.",
+    "single_door": lambda r: "Only a single door used during the day.",
+    "only_in": lambda r: "Only 'IN' events recorded.",
+    "only_out": lambda r: "Only 'OUT' events recorded.",
+    "overtime_>=10h": lambda r: "Overtime detected (>=10 hours).",
+    "very_long_duration_>=16h": lambda r: "Very long presence (>=16 hours).",
+    "zero_swipes": lambda r: "No swipes recorded on this day.",
+    "unusually_high_swipes": lambda r: "Unusually high number of swipes compared to peers/history.",
+    "repeated_short_breaks": lambda r: "Many short gaps between swipes.",
+    "multiple_location_same_day": lambda r: "Multiple locations/partitions used in same day.",
+    "weekend_activity": lambda r: "Activity recorded on weekend day.",
+    "repeated_rejection_count": lambda r: "Multiple rejection events recorded.",
+    "badge_sharing_suspected": lambda r: "Same card used by multiple users on same day — possible badge sharing.",
+    "early_arrival_before_06": lambda r: "First swipe earlier than 06:00.",
+    "late_exit_after_22": lambda r: "Last swipe after 22:00.",
+    "shift_inconsistency": lambda r: "Duration deviates from historical shift patterns.",
+    "trending_decline": lambda r: "Employee shows trending decline in presence.",
+    "consecutive_absent_days": lambda r: "Consecutive absent days observed historically.",
+    "high_variance_duration": lambda r: "High variance in daily durations historically.",
+    "short_duration_on_high_presence_days": lambda r: "Short duration despite normally high presence days.",
+    "swipe_overlap": lambda r: "Overlap in swipe times with other persons on same door.",
+    "behaviour_shift": lambda r: "Significant change in arrival time compared to historical baseline.",
+    "shortstay_longout_repeat": lambda r: "Repeated pattern: short in → long out → short return."
+}
+
+
+
+
+
+
+
+
+
+def _recompute_gaps_from_raw_swipes(sw_df, features_df, date_col_for_raw='AdjustedMessageTime'):
+    """
+    Recompute per-feature row MaxSwipeGapSeconds / CountSwipes / FirstSwipe / LastSwipe / Duration*
+    by grouping the raw swipe rows by (person_uid, display_date).
+    sw_df: raw sw_for_features (must contain 'person_uid' and either 'AdjustedMessageTime' or 'LocaleMessageTime')
+    features_df: features DataFrame with 'person_uid' and 'DisplayDate' columns (dates)
+    This mutates features_df in place (updates values when more accurate raw info exists).
+    """
+    try:
+        if sw_df is None or sw_df.empty or features_df is None or features_df.empty:
+            return
+        tmp = sw_df.copy()
+        # choose the timestamp used for logical day grouping
+        if 'AdjustedMessageTime' in tmp.columns and tmp['AdjustedMessageTime'].notna().any():
+            tmp['_ts_local_for_display'] = pd.to_datetime(tmp['AdjustedMessageTime'], errors='coerce')
+        else:
+            # fall back to LocaleMessageTime
+            tmp['_ts_local_for_display'] = pd.to_datetime(tmp['LocaleMessageTime'], errors='coerce')
+
+        # assign display_date per raw row (same boundary that created DisplayDate)
+        tmp['_display_date'] = tmp['_ts_local_for_display'].dt.date
+
+        # group
+        grp = tmp.dropna(subset=['person_uid', '_display_date']).groupby(['person_uid', '_display_date'])
+        counts = grp.size()
+        firsts = grp['_ts_local_for_display'].min()
+        lasts = grp['_ts_local_for_display'].max()
+
+        # compute max gap per group
+        max_gaps = {}
+        for (pid, d), g in grp:
+            times = sorted(g['_ts_local_for_display'].dropna().tolist())
+            mg = 0
+            for i in range(1, len(times)):
+                s = int((times[i] - times[i-1]).total_seconds())
+                if s > mg:
+                    mg = s
+            max_gaps[(str(pid), d)] = int(mg)
+
+        # iterate features rows and update where raw gives better info for same display date
+        for idx, row in features_df.reset_index().iterrows():
+            real_idx = int(row['index']) if 'index' in row else row['index'] if 'index' in row else row.name
+            pid = row.get('person_uid')
+            disp = row.get('DisplayDate') or row.get('Date')
+            if pid is None or disp is None:
+                continue
+            key = (str(pid), disp) if isinstance(disp, (date,)) else (str(pid), disp)
+            # our keys in max_gaps use python date; make sure types match
+            k2 = (str(pid), disp)
+            if k2 in max_gaps:
+                try:
+                    features_df.at[real_idx, 'MaxSwipeGapSeconds'] = int(max_gaps[k2])
+                except Exception:
+                    pass
+            # counts/first/last/duration
+            try:
+                c = int(counts.get((pid, disp), counts.get((str(pid), disp), 0)))
+                if c and (int(row.get('CountSwipes', 0)) == 0):
+                    features_df.at[real_idx, 'CountSwipes'] = int(c)
+                f = firsts.get((pid, disp)) if (pid, disp) in firsts.index else firsts.get((str(pid), disp))
+                l = lasts.get((pid, disp)) if (pid, disp) in lasts.index else lasts.get((str(pid), disp))
+                if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
+                    features_df.at[real_idx, 'FirstSwipe'] = pd.to_datetime(f)
+                if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
+                    features_df.at[real_idx, 'LastSwipe'] = pd.to_datetime(l)
+                # recompute duration if possible
+                fs = features_df.at[real_idx, 'FirstSwipe']
+                ls = features_df.at[real_idx, 'LastSwipe']
+                if pd.notna(fs) and pd.notna(ls):
+                    dursec = max(0, (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds())
+                    features_df.at[real_idx, 'DurationSeconds'] = float(dursec)
+                    features_df.at[real_idx, 'DurationMinutes'] = float(dursec / 60.0)
+            except Exception:
+                continue
+    except Exception:
+        logging.exception("Failed to recompute gaps from raw swipes (non-fatal).")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now frontend display correct data as per day boundry.. now i just want to update Explanation and Avilable Evidance file details carefully...
 
 
