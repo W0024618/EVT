@@ -1,3 +1,211 @@
+def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+    cols_to_fix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    for c in cols_to_fix:
+        base = c[:-2]
+        if base in df.columns:
+            try:
+                df.drop(columns=[c], inplace=True)
+            except Exception:
+                pass
+        else:
+            try:
+                df.rename(columns={c: base}, inplace=True)
+            except Exception:
+                pass
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            df['Date'] = df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+        except Exception:
+            pass
+    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
+        if dtcol in df.columns:
+            try:
+                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
+                df[dtcol] = df[dtcol].apply(lambda t: t.to_pydatetime().isoformat() if pd.notna(t) else None)
+            except Exception:
+                try:
+                    df[dtcol] = df[dtcol].astype(str).replace('NaT', None)
+                except Exception:
+                    pass
+    df = df.where(pd.notnull(df), None)
+    rows = df.head(max_rows).to_dict(orient='records')
+    cleaned = []
+
+    # helper regex to find GUIDs inside text
+    GUID_IN_TEXT_RE = re.compile(r'[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}')
+
+    for r in rows:
+        out = {}
+        # copy existing columns with scalar conversion
+        for k, v in r.items():
+            out[k] = _to_python_scalar(v)
+
+        # Prefer feature/duration-derived name fields if present in the raw record
+        # Candidate tokens in order:
+        name_tokens = ['EmployeeName_feat', 'EmployeeName_dur', 'EmployeeName', 'ObjectName1', 'objectname1', 'employee_name', 'name']
+        resolved_name = _resolve_field_from_record(r, name_tokens)
+        if resolved_name:
+            out['EmployeeName'] = resolved_name
+        else:
+            # if name is placeholder or looks like guid, try to use EmployeeID as fallback name only if no better name
+            maybe_name = out.get('EmployeeName')
+            emp_id = out.get('EmployeeID') or out.get('EmployeeIdentity') or out.get('person_uid')
+            if (maybe_name in (None, '', 'nan')) or (_looks_like_guid(maybe_name) if isinstance(maybe_name, str) else False):
+                if emp_id and not _looks_like_guid(emp_id):
+                    out['EmployeeName'] = str(emp_id)
+
+        # --- NEW: Ensure EmployeeID surfaced from best candidates (feat/dur/int/text12) ---
+        try:
+            emp_candidates = ['EmployeeID_feat', 'EmployeeID_dur', 'EmployeeID', 'Int1', 'Text12']
+            emp_val = _resolve_field_from_record(r, emp_candidates)
+            if emp_val:
+                # normalize floats like '320172.0' -> '320172'
+                try:
+                    s = str(emp_val).strip()
+                    if '.' in s:
+                        f = float(s)
+                        if math.isfinite(f) and f.is_integer():
+                            s = str(int(f))
+                    emp_val = s
+                except Exception:
+                    pass
+                # avoid GUID-looking values for EmployeeID
+                if not _looks_like_guid(str(emp_val)):
+                    out['EmployeeID'] = emp_val
+        except Exception:
+            pass
+
+        # Ensure EmployeeID normalized as string where possible (keep existing logic)
+        if 'EmployeeID' in out and isinstance(out['EmployeeID'], str) and _looks_like_guid(out['EmployeeID']):
+            out['EmployeeID'] = None
+
+        # Duration: prefer explicit Duration strings, then _dur/_feat, then compute from seconds/minutes
+        dur_val = _resolve_field_from_record(r, ['Duration', 'Duration_dur', 'Duration_feat'])
+        if dur_val:
+            out['Duration'] = str(dur_val)
+        else:
+            # try DurationSeconds
+            ds = r.get('DurationSeconds') if 'DurationSeconds' in r else None
+            dm = r.get('DurationMinutes') if 'DurationMinutes' in r else None
+            try:
+                if ds not in (None, '', 'nan') and not (isinstance(ds, float) and math.isnan(ds)):
+                    out['Duration'] = format_seconds_to_hms(float(ds))
+                elif dm not in (None, '', 'nan') and not (isinstance(dm, float) and math.isnan(dm)):
+                    out['Duration'] = format_seconds_to_hms(float(dm) * 60.0)
+            except Exception:
+                out['Duration'] = out.get('Duration') or None
+
+        # Also include DurationSeconds/Minutes explicitly when present for front-end use
+        if 'DurationSeconds' in r and r.get('DurationSeconds') not in (None, '', 'nan'):
+            try:
+                out['DurationSeconds'] = float(r.get('DurationSeconds'))
+            except Exception:
+                out['DurationSeconds'] = _to_python_scalar(r.get('DurationSeconds'))
+        if 'DurationMinutes' in r and r.get('DurationMinutes') not in (None, '', 'nan'):
+            try:
+                out['DurationMinutes'] = float(r.get('DurationMinutes'))
+            except Exception:
+                out['DurationMinutes'] = _to_python_scalar(r.get('DurationMinutes'))
+
+        # --- NEW: Replace GUIDs inside ViolationExplanation/Explanation using EmployeeID or EmployeeName ---
+        try:
+            expl = out.get('ViolationExplanation') or out.get('Explanation') or None
+            if expl and isinstance(expl, str) and GUID_IN_TEXT_RE.search(expl):
+                repl = out.get('EmployeeID') or out.get('EmployeeName') or None
+                if repl:
+                    out['ViolationExplanation'] = GUID_IN_TEXT_RE.sub(str(repl), expl)
+                    out['Explanation'] = out.get('ViolationExplanation')
+        except Exception:
+            pass
+
+        cleaned.append(out)
+    return cleaned
+
+
+
+
+
+
+
+
+def _explain_scenarios_detected(row, detected_list):
+    pieces = []
+    # prefer non-GUID EmployeeID, then EmployeeName, then person_uid stripped
+    name = None
+    try:
+        # check explicit EmployeeID (non-GUID)
+        empid = row.get('EmployeeID') or row.get('EmployeeID_feat') or row.get('EmployeeID_dur') or row.get('Int1') or row.get('Text12')
+        if empid and not _looks_like_guid(empid) and not _is_placeholder_str(empid):
+            name = str(empid).strip()
+        else:
+            # prefer a human name if present and not a GUID
+            nm = row.get('EmployeeName')
+            if nm and _looks_like_name(nm) and not _is_placeholder_str(nm):
+                name = str(nm).strip()
+            else:
+                # try stripping person_uid prefixes like 'emp:' or 'uid:' if present
+                pu = row.get('person_uid')
+                if isinstance(pu, str) and (pu.startswith('emp:') or pu.startswith('uid:') or pu.startswith('name:')):
+                    try:
+                        stripped = _strip_uid_prefix(pu)
+                        if stripped and not _looks_like_guid(stripped):
+                            name = str(stripped)
+                    except Exception:
+                        pass
+                if not name:
+                    # fallback: use EmployeeID if it's non-empty and non-placeholder even if it looks like GUID
+                    if empid and not _is_placeholder_str(empid):
+                        name = str(empid)
+                    else:
+                        name = row.get('EmployeeName') or row.get('person_uid') or row.get('EmployeeID') or "Employee"
+    except Exception:
+        name = row.get('EmployeeName') or row.get('person_uid') or row.get('EmployeeID') or "Employee"
+
+    prefix = f"{name} - "
+    for sc in detected_list:
+        sc = sc.strip()
+        fn = SCENARIO_EXPLANATIONS.get(sc)
+        try:
+            if fn:
+                pieces.append(fn(row))
+            else:
+                pieces.append(sc.replace("_", " ").replace(">=", "≥"))
+        except Exception:
+            pieces.append(sc)
+    if not pieces:
+        return None
+    explanation = " ".join([p if p.endswith('.') else p + '.' for p in pieces])
+
+    # Replace any GUID that accidentally remained inside explanation with the chosen human identifier
+    try:
+        GUID_IN_TEXT_RE = re.compile(r'[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}')
+        if name and isinstance(explanation, str) and GUID_IN_TEXT_RE.search(explanation):
+            explanation = GUID_IN_TEXT_RE.sub(str(name), explanation)
+    except Exception:
+        pass
+
+    # return with prefix (keeps old behaviour of starting with "Name - ")
+    return prefix + " " + explanation
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Also check API  responcee 
 {
   "_raw_unique_person_uids": 3070,
