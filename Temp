@@ -1,3 +1,696 @@
+# add these imports near top (if they already exist make sure they're present)
+from trend_runner import compute_violation_days_map  # used to compute violation days over history
+from trend_runner import _strip_uid_prefix as _strip_uid_prefix_tr  # reuse if available
+
+# ---- small id normalization helper (local, robust) ----
+def _normalize_id_local(v):
+    try:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '' or s.lower() in ('nan','none','null','-'):
+            return None
+        # strip trailing .0 for float-like strings
+        if '.' in s:
+            try:
+                f = float(s)
+                if math.isfinite(f) and f.is_integer():
+                    return str(int(f))
+            except Exception:
+                pass
+        return s
+    except Exception:
+        return None
+
+def _lookup_violation_days_for_ident(violation_map: dict, *candidates):
+    """
+    Given a precomputed violation_map (from compute_violation_days_map),
+    try multiple candidate ids (normalized) and return first found int or 0.
+    """
+    if not violation_map:
+        return 0
+    for c in candidates:
+        if c is None:
+            continue
+        n = _normalize_id_local(c)
+        if n in violation_map:
+            return int(violation_map.get(n, 0))
+        # also try strip prefix like 'emp:' / 'uid:' / 'name:' if present
+        try:
+            stripped = _strip_uid_prefix_tr(str(n))
+            if stripped != n and stripped in violation_map:
+                return int(violation_map.get(stripped, 0))
+        except Exception:
+            pass
+    return 0
+
+
+
+
+
+
+
+
+
+
+
+def _find_swipe_files(outdir: Path, date_obj: Optional[date] = None, city_slug: Optional[str] = None):
+    """
+    Return a list of Path objects (most-recent-first) matching likely raw swipe file names.
+    This is deliberately tolerant: supports variations like:
+      swipes_*.csv, swipes_*_YYYYMMDD.csv, swipes_{city}_*_{YYYYMMDD}.csv, swipe_*.csv
+    """
+    p = Path(outdir)
+    if not p.exists():
+        return []
+
+    candidates = []
+    if date_obj:
+        target = date_obj.strftime("%Y%m%d")
+        patterns = [
+            f"swipes_*_{target}.csv",
+            f"swipes_{city_slug}_*_{target}.csv" if city_slug else None,
+            f"swipe_*_{target}.csv",
+            f"*_{target}.csv"  # last-resort: any file ending with date
+        ]
+    else:
+        patterns = [
+            "swipes_*.csv",
+            f"swipes_{city_slug}_*.csv" if city_slug else None,
+            "swipe_*.csv",
+            "swipes_*.csv"
+        ]
+    # flatten and dedupe
+    seen = set()
+    for pat in patterns:
+        if not pat:
+            continue
+        for fp in sorted(p.glob(pat), reverse=True):
+            if fp.name not in seen:
+                seen.add(fp.name)
+                candidates.append(fp)
+    # final fallback: include any CSV in outputs that looks like a swipe file
+    if not candidates:
+        for fp in sorted(p.glob("*.csv"), reverse=True):
+            ln = fp.name.lower()
+            if 'swipe' in ln or 'card' in ln or 'locale' in ln or 'localemessagetime' in ln:
+                if fp.name not in seen:
+                    seen.add(fp.name)
+                    candidates.append(fp)
+    return candidates
+
+
+
+
+
+
+
+
+
+
+@app.route('/record', methods=['GET'])
+def get_record():
+    """
+    /record?employee_id=... or /record?person_uid=...
+    Returns matching aggregated trend rows and filtered raw swipe rows (only for flagged persons).
+    Updated:
+      - reads all trend CSVs for the configured city
+      - attaches personnel info and image metadata (if available)
+      - attaches ViolationDaysLast90 computed from historical trend CSVs
+      - robustly finds raw swipe CSVs and builds swipe timeline rows
+    """
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    include_unflagged = str(request.args.get('include_unflagged', '')).lower() in ('1', 'true', 'yes')
+    city_param = request.args.get('city') or request.args.get('site') or 'pune'
+    city_slug = _slug_city(city_param)
+
+    p = Path(DEFAULT_OUTDIR)
+    # read all trend CSVs for city first (concat)
+    csvs = sorted(p.glob(f"trend_{city_slug}_*.csv"), reverse=True)
+    if not csvs:
+        csvs = sorted(p.glob("trend_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    df_list = []
+    for fp in csvs:
+        try:
+            tmp = pd.read_csv(fp, parse_dates=['Date', 'FirstSwipe', 'LastSwipe'])
+        except Exception:
+            try:
+                tmp = pd.read_csv(fp, dtype=str)
+                if 'Date' in tmp.columns:
+                    tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+            except Exception:
+                continue
+        df_list.append(tmp)
+    if not df_list:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+    df = pd.concat(df_list, ignore_index=True)
+
+    # normalize placeholder literal strings
+    df = _replace_placeholder_strings(df)
+
+    if q is None:
+        cleaned = _clean_sample_df(df, max_rows=10)
+        return jsonify({'aggregated_rows': cleaned, 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    q_str = str(q).strip()
+
+    # normalize series helper
+    def normalize_series(s):
+        if s is None:
+            return pd.Series([''] * len(df))
+        s = s.fillna('').astype(str).str.strip()
+        def _norm_val(v):
+            if not v:
+                return ''
+            try:
+                if '.' in v:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv.is_integer():
+                        return str(int(fv))
+            except Exception:
+                pass
+            return v
+        return s.map(_norm_val)
+
+    found_mask = pd.Series(False, index=df.index)
+
+    if 'EmployeeID' in df.columns:
+        emp_series = normalize_series(df['EmployeeID'])
+        found_mask = found_mask | (emp_series == q_str)
+
+    if 'person_uid' in df.columns:
+        uid_series = normalize_series(df['person_uid'])
+        found_mask = found_mask | (uid_series == q_str)
+
+    if 'Int1' in df.columns and not found_mask.any():
+        int1_series = normalize_series(df['Int1'])
+        found_mask = found_mask | (int1_series == q_str)
+
+    if not found_mask.any():
+        # numeric equivalence attempt
+        try:
+            q_numeric = float(q_str)
+            if 'EmployeeID' in df.columns:
+                emp_numeric = pd.to_numeric(df['EmployeeID'], errors='coerce')
+                found_mask = found_mask | (emp_numeric == q_numeric)
+            if 'Int1' in df.columns and not found_mask.any():
+                int_numeric = pd.to_numeric(df['Int1'], errors='coerce')
+                found_mask = found_mask | (int_numeric == q_numeric)
+        except Exception:
+            pass
+
+    matched = df[found_mask].copy()
+    if matched.empty:
+        return jsonify({'aggregated_rows': [], 'raw_swipe_files': [], 'raw_swipes': []}), 200
+
+    cleaned_matched = _clean_sample_df(matched, max_rows=len(matched))
+
+    # --- ENRICH aggregated rows with personnel/image/violation info ---
+    try:
+        # precompute violation days map for last 90 days
+        try:
+            violation_map = compute_violation_days_map(str(DEFAULT_OUTDIR), 90, datetime.now().date())
+        except Exception:
+            violation_map = {}
+        matched_indexed = matched.reset_index(drop=True)
+
+        for idx_c, cleaned in enumerate(cleaned_matched):
+            candidate_row = None
+            # attempt to find best matching aggregated row
+            try:
+                if cleaned.get('person_uid') and 'person_uid' in matched_indexed.columns:
+                    mr = matched_indexed[matched_indexed.get('person_uid', '').astype(str) == str(cleaned['person_uid'])]
+                    if not mr.empty:
+                        candidate_row = mr.iloc[0].to_dict()
+                if candidate_row is None and cleaned.get('EmployeeID') and 'EmployeeID' in matched_indexed.columns:
+                    mr = matched_indexed[matched_indexed.get('EmployeeID', '').astype(str) == str(cleaned['EmployeeID'])]
+                    if not mr.empty:
+                        candidate_row = mr.iloc[0].to_dict()
+                if candidate_row is None and cleaned.get('EmployeeName') and 'EmployeeName' in matched_indexed.columns:
+                    mr = matched_indexed[matched_indexed.get('EmployeeName', '').astype(str).str.strip().fillna('') == str(cleaned['EmployeeName']).strip()]
+                    if not mr.empty:
+                        candidate_row = mr.iloc[0].to_dict()
+                if candidate_row is None and len(matched_indexed) > 0:
+                    candidate_row = matched_indexed.iloc[0].to_dict()
+            except Exception:
+                candidate_row = None
+
+            # Attach Explanation (prefer aggregated Explanation if present)
+            violation_expl = None
+            try:
+                if candidate_row:
+                    # Explanation column might be present in candidate_row (aggregated CSV)
+                    violation_expl = candidate_row.get('Explanation') or candidate_row.get('explanation') or None
+                # fallback: construct from Reasons if available
+                if not violation_expl:
+                    reasons = cleaned.get('Reasons') or (candidate_row.get('Reasons') if candidate_row else None)
+                    if reasons:
+                        # join top parts
+                        parts = [p.strip() for p in re.split(r'[;,\|]', str(reasons)) if p.strip()]
+                        # map scenario codes (if any) into human text using SCENARIO_EXPLANATIONS
+                        mapped = []
+                        for p in parts:
+                            if p in SCENARIO_EXPLANATIONS:
+                                try:
+                                    mapped.append(SCENARIO_EXPLANATIONS[p](candidate_row or {}))
+                                except Exception:
+                                    mapped.append(p)
+                            else:
+                                mapped.append(p)
+                        violation_expl = " ".join(mapped) if mapped else None
+            except Exception:
+                violation_expl = None
+
+            # Violation days (last 90) - try multiple id tokens
+            try:
+                candidates = []
+                for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                    if cleaned.get(k) not in (None, '', 'nan'):
+                        candidates.append(cleaned.get(k))
+                # also include candidate_row fallback
+                if candidate_row:
+                    for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+                        if candidate_row.get(k) not in (None,'','nan'):
+                            candidates.append(candidate_row.get(k))
+                vdays = _lookup_violation_days_for_ident(violation_map, *candidates)
+            except Exception:
+                vdays = 0
+
+            # personnel lookup (best-effort) - use previously defined helpers
+            personnel_info = {}
+            try:
+                lookup_candidates = []
+                if candidate_row:
+                    for k in ('EmployeeObjID','EmployeeObjId','EmployeeIdentity','ObjectID','GUID','EmployeeID','Int1','Text12','EmployeeName'):
+                        if candidate_row.get(k) not in (None,'','nan'):
+                            lookup_candidates.append(candidate_row.get(k))
+                for k in ('EmployeeID','person_uid','EmployeeName'):
+                    if cleaned.get(k) not in (None,'','nan'):
+                        lookup_candidates.append(cleaned.get(k))
+                # find personnel info once
+                for cand in lookup_candidates:
+                    if cand is None:
+                        continue
+                    try:
+                        info = get_personnel_info(cand)
+                        if info and (info.get('ObjectID') is not None or info.get('EmailAddress') is not None or info.get('ManagerEmail') is not None):
+                            personnel_info = info
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                personnel_info = {}
+
+            # attach to cleaned dict
+            try:
+                cleaned['ViolationDaysLast90'] = int(vdays or 0)
+                cleaned['ViolationExplanation'] = violation_expl
+                if personnel_info:
+                    cleaned['EmployeeObjID'] = personnel_info.get('ObjectID')
+                    cleaned['EmployeeEmail'] = personnel_info.get('EmailAddress')
+                    cleaned['ManagerEmail'] = personnel_info.get('ManagerEmail')
+                    if personnel_info.get('ObjectID') is not None:
+                        cleaned['imageUrl'] = f"/employee/{personnel_info.get('ObjectID')}/image"
+                        try:
+                            b = get_person_image_bytes(personnel_info.get('ObjectID'))
+                            cleaned['HasImage'] = True if b else False
+                        except Exception:
+                            cleaned['HasImage'] = False
+                    else:
+                        cleaned['imageUrl'] = None
+                        cleaned['HasImage'] = False
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Failed enriching aggregated rows with personnel/email/image/violation info")
+
+    # --- Build raw_swipes by scanning swipe files for matched persons/dates ---
+    raw_files = set()
+    raw_swipes_out = []
+    seen_swipe_keys = set()
+
+    def _append_swipe(out_row, source_name):
+        key = (
+            out_row.get('Date') or '',
+            out_row.get('Time') or '',
+            (out_row.get('Door') or '').strip(),
+            (out_row.get('Direction') or '').strip(),
+            (out_row.get('CardNumber') or out_row.get('Card') or '').strip()
+        )
+        if key in seen_swipe_keys:
+            return
+        seen_swipe_keys.add(key)
+        out_row['_source'] = source_name
+        raw_swipes_out.append(out_row)
+
+    # collect dates referenced by matched aggregated rows
+    dates_to_scan = set()
+    for _, agg_row in matched.iterrows():
+        # prefer Date column, else FirstSwipe/LastSwipe
+        try:
+            if 'Date' in agg_row and pd.notna(agg_row['Date']):
+                try:
+                    d = pd.to_datetime(agg_row['Date']).date()
+                    dates_to_scan.add(d)
+                except Exception:
+                    pass
+            for col in ('FirstSwipe','LastSwipe'):
+                if col in agg_row and pd.notna(agg_row[col]):
+                    try:
+                        d = pd.to_datetime(agg_row[col]).date()
+                        dates_to_scan.add(d)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    # if none found, leave dates_to_scan empty to scan all files
+    if not dates_to_scan:
+        dates_to_scan = {None}
+
+    for d in dates_to_scan:
+        # get candidate swipe files using helper
+        candidates = _find_swipe_files(DEFAULT_OUTDIR, date_obj=d, city_slug=city_slug)
+        for fp in candidates:
+            raw_files.add(fp.name)
+            try:
+                try:
+                    raw_df = pd.read_csv(fp, parse_dates=['LocaleMessageTime'])
+                except Exception:
+                    raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+
+            raw_df = _replace_placeholder_strings(raw_df)
+            cols_lower = {c.lower(): c for c in raw_df.columns}
+            tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+            emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+            name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+            card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+            door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+            dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+            note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+            person_uid_col = cols_lower.get('person_uid')
+
+            # build mask by employee/person/card/name
+            mask = pd.Series(False, index=raw_df.index)
+            # match by person_uid if available
+            if person_uid_col and person_uid_col in raw_df.columns:
+                mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
+            # emp id
+            if emp_col and emp_col in raw_df.columns:
+                mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
+            # numeric equivalence
+            if not mask.any() and emp_col and emp_col in raw_df.columns:
+                try:
+                    q_numeric = float(q)
+                    emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                    mask = mask | (emp_numeric == q_numeric)
+                except Exception:
+                    pass
+            # name match if nothing else
+            if not mask.any() and name_col and name_col in raw_df.columns:
+                mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
+
+            if not mask.any():
+                continue
+
+            filtered = raw_df[mask].copy()
+            if filtered.empty:
+                continue
+
+            # ensure timestamp col parsed
+            if tcol and tcol in filtered.columns:
+                try:
+                    filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+                except Exception:
+                    pass
+
+            # compute swipe gaps
+            if tcol and tcol in filtered.columns:
+                filtered = filtered.sort_values(by=tcol)
+                filtered['_prev_ts'] = filtered[tcol].shift(1)
+                try:
+                    filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+                except Exception:
+                    filtered['_swipe_gap_seconds'] = 0.0
+                # zero gaps which start a new day
+                try:
+                    cur_dates = filtered[tcol].dt.date
+                    prev_dates = cur_dates.shift(1)
+                    day_start_mask = (prev_dates != cur_dates) | (filtered['_prev_ts'].isna())
+                    filtered.loc[day_start_mask, '_swipe_gap_seconds'] = 0.0
+                except Exception:
+                    pass
+            else:
+                filtered['_swipe_gap_seconds'] = 0.0
+
+            # compute zone
+            try:
+                if door_col and door_col in filtered.columns:
+                    if dir_col and dir_col in filtered.columns:
+                        filtered['_zone'] = filtered.apply(lambda rr: map_door_to_zone(rr.get(cols_lower.get(door_col.lower())), rr.get(cols_lower.get(dir_col.lower()))), axis=1)
+                    else:
+                        filtered['_zone'] = filtered[door_col].apply(lambda dv: map_door_to_zone(dv, None))
+                else:
+                    filtered['_zone'] = filtered.get('PartitionName2', None)
+            except Exception:
+                filtered['_zone'] = None
+
+            # normalize and append
+            for _, r in filtered.iterrows():
+                out = {}
+                out['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in filtered.columns else _to_python_scalar(matched.iloc[0].get('EmployeeName') if not matched.empty else q)
+                # EmployeeID
+                emp_val = None
+                if emp_col and emp_col in filtered.columns:
+                    emp_val = _to_python_scalar(r.get(emp_col))
+                else:
+                    for cand in ('Int1','Text12','EmployeeID','EmployeeIdentity','empid','id'):
+                        if cand.lower() in cols_lower:
+                            emp_val = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                            if emp_val not in (None,'','nan'):
+                                break
+                    if emp_val in (None,'','nan'):
+                        emp_val = _to_python_scalar(matched.iloc[0].get('EmployeeID') if not matched.empty else None)
+                if emp_val is not None:
+                    try:
+                        s = str(emp_val).strip()
+                        if '.' in s:
+                            f = float(s)
+                            if math.isfinite(f) and f.is_integer():
+                                s = str(int(f))
+                        if _looks_like_guid(s) or _is_placeholder_str(s):
+                            emp_val = None
+                        else:
+                            emp_val = s
+                    except Exception:
+                        if _looks_like_guid(emp_val):
+                            emp_val = None
+                out['EmployeeID'] = emp_val
+
+                # Card
+                card_val = None
+                if card_col and card_col in filtered.columns:
+                    card_val = _to_python_scalar(r.get(card_col))
+                else:
+                    for cand in ('CardNumber','CHUID','Card','card_no','cardnum','value','xmlmessage'):
+                        if cand.lower() in cols_lower:
+                            card_val = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                            if card_val not in (None,'','nan'):
+                                break
+                    if card_val in (None,'','nan'):
+                        card_val = _to_python_scalar(matched.iloc[0].get('CardNumber') if not matched.empty else None)
+                if card_val is not None:
+                    try:
+                        cs = str(card_val).strip()
+                        if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                            card_val = None
+                        else:
+                            card_val = cs
+                    except Exception:
+                        card_val = None
+                out['CardNumber'] = card_val
+                out['Card'] = card_val
+
+                # timestamp -> Date/Time
+                if tcol and tcol in filtered.columns:
+                    ts = r.get(tcol)
+                    try:
+                        ts_py = pd.to_datetime(ts)
+                        out['Date'] = ts_py.date().isoformat()
+                        out['Time'] = ts_py.time().isoformat()
+                        out['LocaleMessageTime'] = ts_py.isoformat()
+                    except Exception:
+                        txt = str(r.get(tcol))
+                        out['Date'] = txt[:10]
+                        out['Time'] = txt[11:19] if len(txt) >= 19 else txt
+                        out['LocaleMessageTime'] = txt
+                else:
+                    out['Date'] = None
+                    out['Time'] = None
+                    out['LocaleMessageTime'] = None
+
+                out['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
+                out['SwipeGap'] = format_seconds_to_hms(out['SwipeGapSeconds'])
+                out['Door'] = _to_python_scalar(r.get(door_col)) if (door_col and door_col in filtered.columns) else None
+                out['Direction'] = _to_python_scalar(r.get(dir_col)) if (dir_col and dir_col in filtered.columns) else _to_python_scalar(r.get('Direction')) if 'Direction' in r else None
+                out['Note'] = _to_python_scalar(r.get(note_col)) if (note_col and note_col in filtered.columns) else None
+                try:
+                    out['Zone'] = _to_python_scalar(r.get('_zone')) if '_zone' in r else map_door_to_zone(out['Door'], out['Direction'])
+                except Exception:
+                    out['Zone'] = None
+                out['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
+                out['_source_file'] = fp.name
+
+                _append_swipe(out, fp.name)
+
+    # prepare response
+    return jsonify({
+        "aggregated_rows": cleaned_matched,
+        "raw_swipe_files": sorted(list(raw_files)),
+        "raw_swipes": raw_swipes_out
+    }), 200
+
+
+
+
+
+
+
+
+
+
+
+    if date_str:
+        ...
+        files_to_scan = candidates
+    else:
+        # scan all swipes files (most recent first)
+        files_to_scan = sorted(p.glob("swipes_*.csv"), reverse=True)
+
+
+
+
+
+    # discover files (use helper)
+    if date_str:
+        try:
+            dd = pd.to_datetime(date_str).date()
+            files_to_scan = _find_swipe_files(DEFAULT_OUTDIR, date_obj=dd, city_slug=city_param)
+        except Exception:
+            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
+    else:
+        files_to_scan = _find_swipe_files(DEFAULT_OUTDIR, date_obj=None, city_slug=city_param)
+
+
+
+
+
+
+
+
+
+
+        "reasons_count": {},   # more detailed breakdown left to other endpoints
+        "risk_counts": {},     # likewise
+
+
+
+
+
+
+        # build reasons_count (top breakdown) and risk_counts
+        "reasons_count": (lambda dfr=combined_df: (
+            (lambda rc: rc if rc else {})(
+                (lambda: {
+                    k: v for k, v in sorted(
+                        (lambda d: d.items())(
+                            (lambda m: m)(dict(
+                                (lambda s: (lambda out: [(p.strip(), out.setdefault(p.strip(), out.get(p.strip(), 0) + 1)) for p in re.split(r'[;,\|]', s) if p.strip()]) )(s) or None for s in dfr['Reasons'].dropna().astype(str)
+                            )) if 'Reasons' in dfr.columns and not dfr['Reasons'].dropna().empty else {}
+                        ), key=lambda x: x[1], reverse=True
+                    )
+                })
+            )
+        ))(),
+        "risk_counts": (lambda dfr=combined_df: (
+            (lambda rc: rc if rc else {})(
+                (lambda: {
+                    k: v for k, v in sorted(
+                        ((lambda md: md.items())(
+                            (lambda: (lambda rc_inner: rc_inner)(
+                                (lambda: (lambda rcmap: rcmap)(
+                                    (lambda: (lambda: (
+                                        (lambda rcmap: rcmap)(
+                                            (lambda: (lambda rcout: rcout)(
+                                                (lambda: rcout := {}, [
+                                                    (rcout.__setitem__(str(v), rcout.get(str(v), 0) + 1))
+                                                    for v in dfr['RiskLevel'].fillna('').astype(str) if v
+                                                ]) and rcout
+                                            )()) )())()
+                                        )())())()
+                                    ))()
+                                ))()
+                            ))()
+                        ))), key=lambda x: x[1], reverse=True
+                    )
+                })
+            )
+        ))()
+
+
+
+
+
+
+
+
+@app.route('/employee/<empid>/image', methods=['GET'])
+def serve_employee_image(empid):
+    if empid is None:
+        return jsonify({"error": "employee id required"}), 400
+    try:
+        # try ACVSCore first (existing code)
+        img_bytes = get_person_image_bytes(empid)
+        if img_bytes:
+            header = img_bytes[:8]
+            content_type = 'application/octet-stream'
+            if len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+                content_type = 'image/jpeg'
+            elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+                content_type = 'image/png'
+            bio = io.BytesIO(img_bytes)
+            bio.seek(0)
+            return send_file(bio, mimetype=content_type)
+        # fallback: look for local file outputs/images/<empid>.(jpg|png|jpeg)
+        img_dir = Path(DEFAULT_OUTDIR) / "images"
+        if img_dir.exists():
+            for ext in ('jpg','jpeg','png','bmp'):
+                cand = img_dir / f"{empid}.{ext}"
+                if cand.exists():
+                    return send_file(str(cand), mimetype=f"image/{'jpeg' if ext in ('jpg','jpeg') else ext}")
+        return jsonify({"error": "no image found"}), 404
+    except Exception:
+        logging.exception("Error serving image for employee %s", empid)
+        return jsonify({"error": "failed to serve image"}), 500
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # backend/app.py
 from flask import Flask, jsonify, request, send_from_directory, send_file
 from datetime import datetime, timedelta, date
