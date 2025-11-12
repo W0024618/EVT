@@ -1,3 +1,476 @@
+# backend/duration_report.py
+from __future__ import annotations
+
+import logging
+import os
+import re
+import warnings
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+import numpy as np
+
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# ODBC driver name (override with environment variable if needed)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# Try to import shared door/zone helpers from config; fall back to a small local implementation if missing.
+try:
+    from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+except Exception:
+    # fallback — keep behaviour if config file unavailable
+    BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area"])
+    OUT_OF_OFFICE_ZONE = "Out of office"
+
+    def map_door_to_zone(door: object, direction: object = None) -> str:
+        """
+        Fallback: Map a raw Door string (and optionally Direction) to a logical zone.
+        (This is only used if config.door_zone can't be imported.)
+        """
+        try:
+            if door is None:
+                return None
+            s = str(door).strip()
+            if not s:
+                return None
+            s_l = s.lower()
+            # fallback: direction-based inference
+            if direction and isinstance(direction, str):
+                d = direction.strip().lower()
+                if "out" in d:
+                    return OUT_OF_OFFICE_ZONE
+                if "in" in d:
+                    # assume reception/working
+                    return "Reception Area"
+            # heuristic fallback
+            if "out" in s_l or "exit" in s_l or ("turnstile" in s_l and "out" in s_l):
+                return OUT_OF_OFFICE_ZONE
+            # else treat as working area
+            return "Working Area"
+        except Exception:
+            return None
+
+# REGION configuration - databases list used to build UNION queries
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUPNQ0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["APAC.Default", "SG.Singapore", "PH.Manila","IN.HYD"]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUFRA0986V",
+        "databases": [
+            "ACVSUJournal_00011029","ACVSUJournal_00011028","ACVSUJournal_00011027",
+            "ACVSUJournal_00011026","ACVSUJournal_00011025","ACVSUJournal_00011024",
+            "ACVSUJournal_00011023"
+        ],
+        "partitions": ["LT.Vilnius","IT.Rome","UK.London","IE.DUblin", "DU.Abu Dhab", "ES.Madrid"]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUSJO0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition","PA.Panama City","PE.Lima", "MX.Mexico City"]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUDEN0891V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        # NOTE: these should match the PartitionName2 values used in DB query WHERE clause.
+        # keep as DB-side partition names (example provided earlier used things like 'US.CO.OBS', 'USA/Canada Default', etc).
+        "partitions": ["US.CO.OBS", "USA/Canada Default", "US.FL.Miami", "US.NYC"],
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]  # kept for reference but not used for filtering now
+    }
+}
+
+
+# --- Note: Added AdjustedMessageTime into the generic template, date condition templated as {date_condition}
+# Also added a hard filter: only PersonnelType = 'Employee' (push filtering to DB).
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t3.[Name] IN ('Contractor','Terminated Contractor') THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[Int1] AS Int1,
+    t2.[Text12] AS Text12,
+    t_xml.XmlMessage AS XmlMessage,
+    sc.value AS XmlShredValue,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    DATEADD(HOUR, -2, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS AdjustedMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND t3.[Name] = 'Employee'
+  {date_condition}
+  {region_filter}
+"""
+
+# Helpers (must exist before build_region_query)
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+def _connect_master(rc: Dict[str, Any]):
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+    try:
+        conn_str = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB for server %s", rc.get("server"))
+        return None
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        # updated: use explicit PartitionName2 list for NAMER (matches the SQL example you provided)
+        partitions = rc.get("partitions", [])
+        if partitions:
+            parts_sql = ", ".join(f"'{p}'" for p in partitions)
+            region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+        else:
+            # fallback to the old logical_like behaviour (kept for safety)
+            likes = rc.get("logical_like", [])
+            if likes:
+                like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+                region_filter = f"AND ({like_sql})"
+            else:
+                region_filter = ""
+    else:
+        region_filter = ""
+
+    # Build date_condition:
+    # - For APAC we must fetch LocaleMessageTime rows for target_date AND target_date + 1 day
+    #   because AdjustedMessageTime = LocaleMessageTime - 2 hours; some swipes near midnight on next day
+    #   belong to the shifted date group.
+    if region_key == "apac":
+        next_date_str = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        date_condition = (
+            "AND (CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{d1}' "
+            "OR CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{d2}')"
+            .format(d1=date_str, d2=next_date_str)
+        )
+    else:
+        date_condition = "AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'".format(date=date_str)
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date_condition=date_condition, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date_condition=date_condition, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+    
+# DB connection & fetch
+def get_connection(region_key: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    # use first database in list if present
+    db = rc.get("databases", [rc.get("database")])[0]
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};"
+        f"SERVER={rc['server']};DATABASE={db};UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+    "EmployeeName", "Door", "EmployeeID", "Int1", "Text12", "XmlMessage", "XmlShredValue", "CardNumber",
+    "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "AdjustedMessageTime", "MessageType",
+    "Direction", "CompanyName", "PrimaryLocation"
+]
+
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = None
+    try:
+        conn = get_connection(region_key)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
+            df = pd.read_sql(sql, conn)
+    except Exception:
+        logging.exception("Failed to run query for region %s", region_key)
+        df = pd.DataFrame(columns=cols)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+    # ensure expected columns exist
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # Dates parsing
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    try:
+        if "AdjustedMessageTime" in df.columns:
+            df["AdjustedMessageTime"] = pd.to_datetime(df["AdjustedMessageTime"], errors="coerce")
+        else:
+            df["AdjustedMessageTime"] = pd.NaT
+    except Exception:
+        df["AdjustedMessageTime"] = pd.to_datetime(df.get("AdjustedMessageTime").astype(str), errors="coerce") if "AdjustedMessageTime" in df.columns else pd.NaT
+
+    # defensive: make text fields strings (avoid object type surprises)
+    for tcol in ("Door", "PartitionName2", "PersonnelTypeName", "EmployeeName", "CompanyName", "PrimaryLocation"):
+        if tcol in df.columns:
+            df[tcol] = df[tcol].fillna("").astype(str)
+
+    # Filter: only Employees (defensive; the SQL template already requests t3.Name = 'Employee')
+    try:
+        if "PersonnelTypeName" in df.columns:
+            df = df[df["PersonnelTypeName"].str.strip().str.lower() == "employee"].copy()
+    except Exception:
+        # If PersonnelTypeName missing or unexpected, keep df as-is but log
+        logging.debug("Could not apply PersonnelTypeName filter for region %s", region_key)
+
+    # maintain person_uid same as compute logic
+    def make_person_uid(row):
+        eid = row.get("EmployeeIdentity")
+        if pd.notna(eid) and str(eid).strip() != "":
+            return str(eid).strip()
+        pieces = [
+            (str(row.get("EmployeeID")) if row.get("EmployeeID") is not None else "").strip(),
+            (str(row.get("CardNumber")) if row.get("CardNumber") is not None else "").strip(),
+            (str(row.get("EmployeeName")) if row.get("EmployeeName") is not None else "").strip()
+        ]
+        joined = "|".join([p for p in pieces if p])
+        return joined or None
+
+    if not df.empty:
+        df['person_uid'] = df.apply(make_person_uid, axis=1)
+
+    # ----- REGION SPECIFIC NORMALIZATIONS -----
+    # APAC: map PartitionName2/Door patterns to friendly names:
+    if region_key == "apac" and not df.empty:
+        def normalize_apac_partition(row):
+            door = (row.get("Door") or "") or ""
+            part = (row.get("PartitionName2") or "") or ""
+            d = door.upper()
+            p = part or ""
+            # Door-based mappings
+            if "APAC_PI" in d or d.startswith("APAC_PI"):
+                return "Taguig City"
+            if "APAC_PH" in d or d.startswith("APAC_PH"):
+                return "Quezon City"
+            # Pune detection (APAC.Default or PUN in door/partition)
+            if "PUN" in d or "PUNE" in d or ("APAC.DEFAULT" in p.upper() or p.upper().strip() == "APAC.DEFAULT"):
+                return "Pune"
+            if "APAC_MY" in d or "MY.KUALA" in p.upper() or "KUALA" in d:
+                return "MY.Kuala Lumpur"
+            if "IN.HYD" in p.upper() or "HYD" in d:
+                return "IN.HYD"
+            if "SG.SINGAPORE" in p or "SINGAPORE" in d:
+                return "SG.Singapore"
+            # fallback to existing PartitionName2
+            return part
+        df["PartitionName2"] = df.apply(normalize_apac_partition, axis=1)
+
+    # NAMER: normalize PartitionName2 and add LogicalLocation per the SQL example you provided
+    if region_key == "namer" and not df.empty:
+        def namer_partition_and_logical(row):
+            door = (row.get("Door") or "") or ""
+            part = (row.get("PartitionName2") or "") or ""
+            d = door.upper()
+            p = part.upper()
+            normalized = part
+            logical = "Other"
+
+            if ("US.CO.HQ" in d) or ("HQ" in d and "HQ" in d[:20]) or ("DENVER" in d) or (p == "US.CO.OBS"):
+                normalized = "US.CO.OBS"
+                logical = "Denver-HQ"
+            elif "AUSTIN" in d or "AUSTIN TX" in d or p == "USA/CANADA DEFAULT":
+                normalized = "USA/Canada Default"
+                logical = "Austin Texas"
+            elif "MIAMI" in d or p == "US.FL.MIAMI":
+                normalized = "US.FL.Miami"
+                logical = "Miami"
+            elif "NYC" in d or "NEW YORK" in d or p == "US.NYC":
+                normalized = "US.NYC"
+                logical = "New York"
+            else:
+                # fallback mappings for common PartitionName2 values
+                if p == "US.CO.OBS":
+                    normalized = "US.CO.OBS"; logical = "Denver-HQ"
+                elif p == "USA/CANADA DEFAULT":
+                    normalized = "USA/Canada Default"; logical = "Austin Texas"
+                elif p == "US.FL.MIAMI":
+                    normalized = "US.FL.Miami"; logical = "Miami"
+                elif p == "US.NYC":
+                    normalized = "US.NYC"; logical = "New York"
+                else:
+                    normalized = part
+                    logical = "Other"
+            return pd.Series({"PartitionName2": normalized, "LogicalLocation": logical})
+
+        mapped = df.apply(namer_partition_and_logical, axis=1)
+        df["PartitionName2"] = mapped["PartitionName2"].astype(str)
+        df["LogicalLocation"] = mapped["LogicalLocation"].astype(str)
+
+    # ensure PartitionName2 column exists as string
+    if "PartitionName2" not in df.columns:
+        df["PartitionName2"] = ""
+
+    # ensure LogicalLocation exists (maybe empty for non-NAMER rows)
+    if "LogicalLocation" not in df.columns:
+        df["LogicalLocation"] = ""
+
+    return df[cols + (['person_uid'] if 'person_uid' in df.columns else [])]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 <!doctype html>
 <html>
 
