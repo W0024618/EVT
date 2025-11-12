@@ -1,3 +1,224 @@
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    """
+    Run trend for one or more dates.
+    Accepts:
+      - GET: query params
+      - POST JSON: body params
+    Params:
+      - date=YYYY-MM-DD  (single day)
+      - start=YYYY-MM-DD & end=YYYY-MM-DD (range inclusive)
+      - regions=apac,emea  (comma/pipe/semicolon separated)
+      - city / site / site_name  (optional)
+    Returns a compact JSON summary with sample rows.
+    """
+    # --- parse params robustly (prevent NameError) ---
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        # POST
+        if request.is_json:
+            try:
+                params = request.get_json(force=True) or {}
+            except Exception:
+                params = {}
+        else:
+            # form-encoded fallback
+            try:
+                params = request.form.to_dict() or {}
+            except Exception:
+                params = {}
+
+    # parse dates
+    date_str = (params.get('date') or params.get('Date') or '').strip() or None
+    start_str = (params.get('start') or params.get('Start') or '').strip() or None
+    end_str = (params.get('end') or params.get('End') or '').strip() or None
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            # default to yesterday and today
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            dates = [yesterday, today]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    # parse regions param (comma/pipe/semicolon separated)
+    regions_param = params.get('regions') or params.get('region') or ''
+    if regions_param:
+        regions = [r.strip().lower() for r in re.split(r'[;,|]', str(regions_param)) if r.strip()]
+    else:
+        # default to keys from REGION_CONFIG if available
+        try:
+            regions = [k.lower() for k in list(REGION_CONFIG.keys())]
+        except Exception:
+            regions = ['apac']
+
+    # validate against REGION_CONFIG (silently skip unknown)
+    valid_regions = []
+    for r in regions:
+        if r in (REGION_CONFIG or {}):
+            valid_regions.append(r)
+        else:
+            logging.debug("Requested region '%s' not in REGION_CONFIG - skipping", r)
+    if not valid_regions:
+        valid_regions = [k.lower() for k in REGION_CONFIG.keys()] if REGION_CONFIG else ['apac']
+
+    params['_regions_to_run'] = valid_regions
+
+    # city / site param
+    city_param = params.get('city') or params.get('site') or params.get('site_name') or 'pune'
+    city_slug = _slug_city(city_param)
+    params['_city'] = city_slug
+
+    combined_rows = []
+    files = []
+
+    # Run per-date pipeline
+    for d in dates:
+        try:
+            # prefer new signature with regions + city
+            try:
+                df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug)
+            except TypeError:
+                # fallback: older signature may not accept regions/city
+                try:
+                    df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+                except TypeError:
+                    # final fallback to duration_report.run_for_date then combine durations
+                    logging.info("run_trend_for_date signature mismatch; falling back to duration_report.run_for_date")
+                    from duration_report import run_for_date as _dr_run_for_date
+                    region_results = _dr_run_for_date(d, valid_regions, str(DEFAULT_OUTDIR), city_param)
+                    combined_list = []
+                    for rkey, res in (region_results or {}).items():
+                        try:
+                            df_dur = res.get('durations')
+                            if df_dur is not None and not df_dur.empty:
+                                combined_list.append(df_dur)
+                        except Exception:
+                            continue
+                    df = pd.concat(combined_list, ignore_index=True) if combined_list else pd.DataFrame()
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        # collect possible output CSV name(s) for UI visibility
+        csv_path = DEFAULT_OUTDIR / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+        # accept DataFrame-like results
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            continue
+
+        # normalize placeholder literal strings
+        try:
+            df = _replace_placeholder_strings(df)
+        except Exception:
+            pass
+
+        # ensure minimal expected columns for downstream
+        if 'IsFlagged' not in df.columns:
+            df['IsFlagged'] = False
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        combined_rows.append(df)
+
+    combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+    # normalize placeholders again defensively
+    combined_df = _replace_placeholder_strings(combined_df)
+
+    # compute some basic metrics
+    try:
+        if not combined_df.empty:
+            if 'person_uid' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['person_uid'].dropna().astype(str).nunique())
+            elif 'EmployeeID' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['EmployeeID'].dropna().astype(str).nunique())
+            else:
+                raw_unique_person_uids = int(len(combined_df))
+        else:
+            raw_unique_person_uids = 0
+    except Exception:
+        raw_unique_person_uids = int(len(combined_df)) if combined_df is not None else 0
+
+    try:
+        if not combined_df.empty and 'IsFlagged' in combined_df.columns:
+            flagged_df = combined_df[combined_df['IsFlagged'] == True].copy()
+        else:
+            flagged_df = pd.DataFrame()
+    except Exception:
+        flagged_df = pd.DataFrame()
+
+    try:
+        analysis_count = int(raw_unique_person_uids)
+    except Exception:
+        analysis_count = int(len(combined_df)) if combined_df is not None else 0
+
+    try:
+        flagged_count = int(len(flagged_df))
+        flagged_rate_pct = float((flagged_count / analysis_count * 100.0) if analysis_count and analysis_count > 0 else 0.0)
+    except Exception:
+        flagged_count = int(len(flagged_df))
+        flagged_rate_pct = 0.0
+
+    # sample for UI
+    try:
+        sample_source = flagged_df if not flagged_df.empty else combined_df
+        samples = _clean_sample_df(sample_source.head(10), max_rows=10) if sample_source is not None and not sample_source.empty else []
+    except Exception:
+        samples = []
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "aggregated_rows_total_raw": int(len(combined_df)),
+        "aggregated_unique_persons": int(analysis_count),
+        "rows": int(analysis_count),
+        "flagged_rows": int(flagged_count),
+        "flagged_rate_percent": float(flagged_rate_pct),
+        "files": files,
+        "sample": (samples[:10] if isinstance(samples, list) else samples),
+        "reasons_count": {},   # more detailed breakdown left to other endpoints
+        "risk_counts": {},     # likewise
+        "flagged_persons": (samples if samples else []),
+        "_raw_unique_person_uids": int(raw_unique_person_uids),
+        "regions_run": params.get('_regions_to_run', []),
+        "city_used": city_slug
+    }
+
+    return jsonify(resp)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now fix below issue carefully
 
 full_dispatch_request
