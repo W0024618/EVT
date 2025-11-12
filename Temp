@@ -1,3 +1,269 @@
+def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[pd.DataFrame] = None, outdir: Optional[str] = None, target_date: Optional[date] = None) -> pd.DataFrame:
+    """
+    Take combined durations DataFrame and optional swipes DataFrame and compute:
+      - scenario boolean columns
+      - Reasons (semicolon-separated scenario keys)
+      - ViolationExplanation (human text)
+      - AnomalyScore (weighted sum)
+      - IsFlagged (AnomalyScore >= ANOMALY_THRESHOLD)
+      - ViolationDaysLast90 (from history)
+    """
+    if combined_df is None or combined_df.empty:
+        return pd.DataFrame()
+
+    df = combined_df.copy()
+    # Ensure person_uid exists
+    if 'person_uid' not in df.columns:
+        df['person_uid'] = df.apply(lambda r: _canonical_person_uid(r), axis=1)
+
+    # Ensure key columns exist
+    for c in ['FirstSwipe','LastSwipe','CountSwipes','DurationMinutes','MaxSwipeGapSeconds','EmployeeID','CardNumber','person_uid','Date']:
+        if c not in df.columns:
+            df[c] = None
+
+    # apply scenario functions to each row
+    scenario_flags = {}
+    for sc_code, sc_fn in SCENARIOS:
+        try:
+            # apply robustly
+            flags = []
+            for _, r in df.iterrows():
+                try:
+                    flags.append(bool(sc_fn(r)))
+                except Exception:
+                    flags.append(False)
+            df[sc_code] = flags
+            scenario_flags[sc_code] = df[sc_code]
+        except Exception:
+            df[sc_code] = False
+            scenario_flags[sc_code] = df[sc_code]
+
+    # build Reasons (list) and AnomalyScore
+    def compute_row_reasons_score(row):
+        detected = []
+        score = 0.0
+        for sc_code, _ in SCENARIOS:
+            try:
+                if bool(row.get(sc_code)):
+                    detected.append(sc_code)
+                    score += float(WEIGHTS.get(sc_code, 0.0))
+            except Exception:
+                continue
+        return detected, float(score)
+
+    reasons_list = []
+    scores = []
+    for _, r in df.iterrows():
+        detected, sc = compute_row_reasons_score(r)
+        reasons_list.append(detected)
+        scores.append(sc)
+    df['ReasonsList'] = reasons_list
+    df['AnomalyScore'] = scores
+    df['AnomalyScore'] = pd.to_numeric(df['AnomalyScore'], errors='coerce').fillna(0.0)
+
+    # human explanation
+    def make_explanation(row):
+        try:
+            detected = row.get('ReasonsList') or []
+            if not detected:
+                return None
+            return _explain_scenarios_detected(row, detected)
+        except Exception:
+            return None
+
+    df['ViolationExplanation'] = df.apply(make_explanation, axis=1)
+
+    # Reasons text (semi-colon)
+    def reasons_to_text(lst):
+        try:
+            if not lst:
+                return None
+            return ";".join(lst)
+        except Exception:
+            return None
+
+    df['Reasons'] = df['ReasonsList'].apply(reasons_to_text)
+
+    # IsFlagged
+    df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: float(s) >= ANOMALY_THRESHOLD)
+
+    # ViolationDaysLast90: try to compute from history (best-effort)
+    try:
+        td = target_date if target_date is not None else (date.today())
+        vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, td)
+    except Exception:
+        vmap = {}
+
+    def lookup_violation_days(row):
+        try:
+            candidates = []
+            for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+                v = row.get(k)
+                if v not in (None, '', float('nan')):
+                    candidates.append(_normalize_id_val(v))
+            for c in candidates:
+                if c is None:
+                    continue
+                if c in vmap:
+                    return int(vmap.get(c, 0))
+                stripped = _strip_uid_prefix(c)
+                if stripped != c and stripped in vmap:
+                    return int(vmap.get(stripped, 0))
+            return 0
+        except Exception:
+            return 0
+
+    df['ViolationDaysLast90'] = df.apply(lookup_violation_days, axis=1)
+
+    # tidy / expose common fields: ensure Date is iso / datetime
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    # provide a textual Reasons field if missing
+    if 'Reasons' not in df.columns:
+        df['Reasons'] = df['ReasonsList'].apply(reasons_to_text)
+
+    # keep ordering sensible
+    return df
+
+def run_trend_for_date(target_date: date,
+                       regions: Optional[List[str]] = None,
+                       outdir: str = None,
+                       city: str = "pune",
+                       as_dict: bool = False) -> pd.DataFrame:
+    """
+    Enhanced run_trend_for_date: collects swipes + durations, computes features and scores.
+    """
+    city_slug = _slug_city(city)
+    if regions is None:
+        try:
+            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+        except Exception:
+            regions = []
+    regions = [r.lower() for r in regions if r]
+    outdir_path = Path(outdir) if outdir else OUTDIR
+
+    # fetch durations & swipes per region
+    if run_for_date is None:
+        raise RuntimeError("duration_report.run_for_date is not available in this environment.")
+    try:
+        results = run_for_date(target_date, regions, str(outdir_path), city)
+    except TypeError:
+        try:
+            results = run_for_date(target_date, regions, str(outdir_path))
+        except Exception:
+            results = run_for_date(target_date)
+
+    # combine durations and swipes across regions
+    dur_list = []
+    swipe_list = []
+    for rkey, rr in (results or {}).items():
+        try:
+            dfdur = rr.get('durations')
+            if dfdur is not None and not dfdur.empty:
+                dfdur = dfdur.copy()
+                dfdur['region'] = rkey
+                dur_list.append(dfdur)
+        except Exception:
+            continue
+        try:
+            dfsw = rr.get('swipes')
+            if dfsw is not None and not dfsw.empty:
+                dfcopy = dfsw.copy()
+                dfcopy['region'] = rkey
+                swipe_list.append(dfcopy)
+        except Exception:
+            continue
+
+    combined = pd.concat(dur_list, ignore_index=True) if dur_list else pd.DataFrame()
+    sw_combined = pd.concat(swipe_list, ignore_index=True) if swipe_list else pd.DataFrame()
+
+    # compute scoring: use available score_trends_from_durations / compute_features pipeline
+    trend_df = combined
+    try:
+        # try using compute_features if swipes available to enrich features
+        if not combined.empty:
+            # merge features using compute_features if available
+            try:
+                features_df = compute_features(sw_combined, combined) if (callable(globals().get('compute_features')) and not sw_combined.empty) else None
+                if features_df is not None and not features_df.empty:
+                    # merge combined durations with features on person_uid & Date
+                    merged = pd.merge(features_df, combined, how='left', on=['person_uid', 'Date'], suffixes=('_feat', '_dur'))
+                    # prefer feature-derived columns where present
+                    trend_df = merged
+                else:
+                    trend_df = combined
+            except Exception:
+                trend_df = combined
+
+            # score rows
+            trend_df = score_trends_from_durations(trend_df, swipes_df=sw_combined, outdir=str(outdir_path) if outdir_path else None, target_date=target_date)
+        else:
+            trend_df = combined
+    except Exception:
+        trend_df = combined
+
+    # compatibility: if caller asked for dict summary
+    if as_dict:
+        if isinstance(trend_df, pd.DataFrame):
+            total_rows = int(len(trend_df))
+            flagged_rows = int(trend_df['IsFlagged'].sum()) if 'IsFlagged' in trend_df.columns else 0
+            reasons_count = {}
+            risk_counts = {}
+            try:
+                if 'Reasons' in trend_df.columns:
+                    for v in trend_df['Reasons'].dropna().astype(str):
+                        for part in re.split(r'[;,\|]', v):
+                            key = part.strip()
+                            if key:
+                                reasons_count[key] = reasons_count.get(key, 0) + 1
+                if 'RiskLevel' in trend_df.columns:
+                    for v in trend_df['RiskLevel'].fillna('').astype(str):
+                        if v:
+                            risk_counts[v] = risk_counts.get(v, 0) + 1
+            except Exception:
+                pass
+            sample_records = trend_df.head(20).to_dict(orient='records') if not trend_df.empty else []
+            return {
+                'rows': total_rows,
+                'flagged_rows': flagged_rows,
+                'aggregated_unique_persons': total_rows,
+                'sample': sample_records,
+                'reasons_count': reasons_count,
+                'risk_counts': risk_counts,
+                'files': []
+            }
+        else:
+            return {
+                'rows': 0,
+                'flagged_rows': 0,
+                'aggregated_unique_persons': 0,
+                'sample': [],
+                'reasons_count': {},
+                'risk_counts': {},
+                'files': []
+            }
+
+    return trend_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
     out_cols = [
         "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
