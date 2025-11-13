@@ -1,3 +1,459 @@
+def get_personnel_info(candidate_identifier: object) -> Dict[str, Any]:
+    """
+    Try to resolve personnel record using a flexible lookup.
+    Returns dict with keys: ObjectID (may be None), GUID, Name, EmailAddress, EmployeeEmail, ManagerEmail
+    If resolution fails returns empty dict.
+
+    NOTE: If ACVSCore DB is not reachable this function falls back to scanning local CSV outputs (outputs/*.csv)
+    to find email/name information for the identifier.
+    """
+    out: Dict[str, Any] = {}
+    if candidate_identifier is None:
+        return out
+    conn = _get_acvscore_conn()
+    if conn is None:
+        # Fallback: try to search local outputs CSVs for matching identifier (EmployeeID, person_uid, Text12, Name)
+        try:
+            cand = str(candidate_identifier).strip()
+            # look in outputs (recent trend CSVs) for any email-like columns
+            p = DEFAULT_OUTDIR
+            if p.exists():
+                for fp in sorted(p.glob("*.csv"), reverse=True):
+                    try:
+                        # read a small sample
+                        df = pd.read_csv(fp, nrows=200, dtype=str)
+                        if df is None or df.empty:
+                            continue
+                        cols_lower = {c.lower(): c for c in df.columns}
+                        # possible id columns
+                        id_cols = []
+                        for c in ('employeeid','int1','text12','person_uid','guid','objectid','employee_identity'):
+                            if c in cols_lower:
+                                id_cols.append(cols_lower[c])
+                        match_mask = pd.Series(False, index=df.index)
+                        for ic in id_cols:
+                            try:
+                                match_mask = match_mask | (df[ic].astype(str).str.strip() == cand)
+                            except Exception:
+                                continue
+                        # also try name columns
+                        name_cols = [cols_lower[c] for c in ('employeename','objectname1','name') if c in cols_lower]
+                        if not match_mask.any() and name_cols:
+                            for nc in name_cols:
+                                try:
+                                    match_mask = match_mask | (df[nc].astype(str).str.strip().str.lower() == cand.lower())
+                                except Exception:
+                                    continue
+                        if match_mask.any():
+                            row = df[match_mask].iloc[0].to_dict()
+                            # extract likely fields
+                            out['ObjectID'] = row.get(cols_lower.get('objectid')) if 'objectid' in cols_lower else None
+                            out['GUID'] = row.get(cols_lower.get('guid')) if 'guid' in cols_lower else None
+                            # email candidates
+                            email = None
+                            for ec in ('emailaddress','email','employeeemail','workemail','email_address','e-mail','e mail','contact'):
+                                if ec in cols_lower:
+                                    val = row.get(cols_lower[ec])
+                                    if val and str(val).strip():
+                                        email = str(val).strip()
+                                        break
+                            out['EmailAddress'] = email
+                            out['EmployeeEmail'] = email
+                            # name
+                            name = None
+                            for nc in name_cols:
+                                val = row.get(nc)
+                                if val and str(val).strip():
+                                    name = str(val).strip()
+                                    break
+                            out['Name'] = name
+                            return out
+                    except Exception:
+                        continue
+        except Exception:
+            logging.exception("Local CSV personnel fallback failed for %s", candidate_identifier)
+        return out
+
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT TOP 1 ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            FROM ACVSCore.Access.Personnel
+            WHERE
+              (CAST(ObjectID AS NVARCHAR(200)) = ?)
+              OR (GUID = ?)
+              OR (CAST(Int1 AS NVARCHAR(200)) = ?)
+              OR (Text12 = ?)
+              OR (Name = ?)
+            ORDER BY ObjectID DESC
+        """
+        cand = str(candidate_identifier).strip()
+        params = (cand, cand, cand, cand, cand)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            # map row -> dict (defensive: cursor.description may vary by driver)
+            try:
+                cols = [c[0] for c in cur.description] if hasattr(cur, 'description') and cur.description else None
+                if cols and len(cols) == len(row):
+                    rowdict = dict(zip(cols, row))
+                else:
+                    # fallback to positional mapping
+                    rowdict = {
+                        'ObjectID': row[0] if len(row) > 0 else None,
+                        'GUID': row[1] if len(row) > 1 else None,
+                        'Name': row[2] if len(row) > 2 else None,
+                        'EmailAddress': row[3] if len(row) > 3 else None,
+                        'ManagerEmail': row[4] if len(row) > 4 else None
+                    }
+            except Exception:
+                rowdict = {}
+                try:
+                    rowdict['ObjectID'] = row[0]
+                    rowdict['GUID'] = row[1]
+                    rowdict['Name'] = row[2]
+                    rowdict['EmailAddress'] = row[3]
+                    rowdict['ManagerEmail'] = row[4]
+                except Exception:
+                    pass
+
+            # defensive: normalize and produce EmployeeEmail alias (try many possible fields)
+            objid = rowdict.get('ObjectID')
+            guid = rowdict.get('GUID')
+            name = rowdict.get('Name') or rowdict.get('EmployeeName') or None
+
+            # Email resolution: prefer explicit columns; support alternative names
+            email = None
+            for k in ('EmailAddress', 'EmployeeEmail', 'Email', 'WorkEmail', 'EMail'):
+                v = rowdict.get(k)
+                if v and str(v).strip():
+                    email = str(v).strip()
+                    break
+            # final normalization (strip whitespace)
+            if email:
+                email = email.strip()
+            out['ObjectID'] = objid
+            out['GUID'] = guid
+            out['Name'] = name
+            out['EmailAddress'] = email
+            # add alias so callers that expect EmployeeEmail will find it
+            out['EmployeeEmail'] = email
+            out['ManagerEmail'] = rowdict.get('ManagerEmail') or rowdict.get('ManagerEMail') or None
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    """
+    Query ACVSCore.Access.Images for top image where ParentId ~ parent_id and return raw bytes.
+    Handles common ParentId variants (numeric, 'emp:<id>' prefix, GUID-containing).
+    Returns None if not found or on error.
+
+    Fallbacks:
+      - If DB not available or returns nothing, try common local image paths under outputs/images/ or outputs/employee_images/
+      - Also check files named <parent_id>.(jpg|jpeg|png|bmp) under outputs/
+    """
+    conn = _get_acvscore_conn()
+    # Normalize candidate strings for filenames
+    def _name_variants(pid):
+        s = str(pid) if pid is not None else ''
+        s_clean = s.strip()
+        variants = [s_clean, f"emp_{s_clean}", f"emp:{s_clean}", f"{s_clean}.jpg", f"{s_clean}.png", f"{s_clean}.jpeg", f"{s_clean}.bmp"]
+        return variants
+
+    if conn is None:
+        # try local filesystem fallbacks
+        try:
+            p_images = DEFAULT_OUTDIR / "images"
+            p_emp_images = DEFAULT_OUTDIR / "employee_images"
+            candidates = []
+            if p_images.exists():
+                candidates.extend(sorted(p_images.glob("*"), reverse=True))
+            if p_emp_images.exists():
+                candidates.extend(sorted(p_emp_images.glob("*"), reverse=True))
+            # common filename patterns
+            name_variants = _name_variants(parent_id)
+            for candfile in candidates:
+                try:
+                    n = candfile.name.lower()
+                    if any(v.lower() in n for v in name_variants) or any(n.endswith(ext) for ext in ('.jpg','.jpeg','.png','.bmp')):
+                        with open(candfile, 'rb') as fh:
+                            return fh.read()
+                except Exception:
+                    continue
+            # also check root outputs for direct filenames
+            for ext in ('.jpg','.jpeg','.png','.bmp'):
+                fp = DEFAULT_OUTDIR / f"{parent_id}{ext}"
+                if fp.exists():
+                    try:
+                        with open(fp, 'rb') as fh:
+                            return fh.read()
+                    except Exception:
+                        continue
+        except Exception:
+            logging.exception("Local image fallback failed for parent_id=%s", parent_id)
+        return None
+
+    try:
+        cur = conn.cursor()
+
+        # Try 1: exact match (most common)
+        sql = """
+            SELECT TOP 1 AI.Image
+            FROM ACVSCore.Access.Images AI
+            WHERE AI.ParentId = ?
+              AND DATALENGTH(AI.Image) > 0
+            ORDER BY AI.ObjectID DESC
+        """
+        try:
+            cur.execute(sql, (str(parent_id),))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                try:
+                    val = row[0]
+                    # pyodbc may return memoryview or bytearray
+                    if isinstance(val, memoryview):
+                        return bytes(val)
+                    if isinstance(val, bytearray):
+                        return bytes(val)
+                    if isinstance(val, (bytes, bytearray)):
+                        return bytes(val)
+                    # fallback attempt
+                    return bytes(val)
+                except Exception:
+                    return row[0]
+        except Exception:
+            # swallow per-attempt errors and try fallbacks
+            logging.debug("get_person_image_bytes: primary query failed for ParentId=%s", parent_id)
+
+        # Try 2: prefixed parent id (common pattern: 'emp:<id>')
+        try:
+            pref = f"emp:{str(parent_id)}"
+            sql2 = """
+                SELECT TOP 1 AI.Image
+                FROM ACVSCore.Access.Images AI
+                WHERE (AI.ParentId = ?)
+                  AND DATALENGTH(AI.Image) > 0
+                ORDER BY AI.ObjectID DESC
+            """
+            cur.execute(sql2, (pref,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                try:
+                    val = row[0]
+                    if isinstance(val, memoryview):
+                        return bytes(val)
+                    if isinstance(val, bytearray):
+                        return bytes(val)
+                    if isinstance(val, (bytes, bytearray)):
+                        return bytes(val)
+                    return bytes(val)
+                except Exception:
+                    return row[0]
+        except Exception:
+            logging.debug("get_person_image_bytes: prefixed query failed for ParentId=%s", parent_id)
+
+        # Try 3: LIKE fallback (slow)
+        try:
+            s = str(parent_id)
+            if len(s) <= 64:
+                sql3 = """
+                    SELECT TOP 1 AI.Image
+                    FROM ACVSCore.Access.Images AI
+                    WHERE AI.ParentId LIKE '%' + ? + '%'
+                      AND DATALENGTH(AI.Image) > 0
+                    ORDER BY AI.ObjectID DESC
+                """
+                cur.execute(sql3, (s,))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    try:
+                        val = row[0]
+                        if isinstance(val, memoryview):
+                            return bytes(val)
+                        if isinstance(val, bytearray):
+                            return bytes(val)
+                        if isinstance(val, (bytes, bytearray)):
+                            return bytes(val)
+                        return bytes(val)
+                    except Exception:
+                        return row[0]
+        except Exception:
+            logging.debug("get_person_image_bytes: LIKE fallback failed for ParentId=%s", parent_id)
+
+    except Exception:
+        logging.exception("Failed to fetch image for ParentId=%s", parent_id)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"):
+    """
+    Adds columns to df:
+      - EmployeeEmail (string or None)
+      - imageUrl (string or None) -> path the frontend should fetch (relative or absolute)
+    Uses app.get_personnel_info when available; otherwise builds reasonable imageUrl from EmployeeID.
+    Returns new DataFrame (copy).
+    """
+    if df is None or df.empty:
+        return df
+
+    # Try to build absolute endpoint if running inside Flask request context
+    try:
+        from flask import request as _flask_request
+        base = (_flask_request.url_root or _flask_request.host_url).rstrip('/')
+        if base:
+            image_endpoint_template = f"{base}/employee/{{}}/image"
+    except Exception:
+        # no request context — keep given template (caller may set absolute string)
+        pass
+
+    get_personnel_info, get_person_image_bytes = _get_personnel_funcs_lazy()
+
+    emails = []
+    image_urls = []
+
+    for _, row in df.iterrows():
+        email = None
+        image_url = None
+
+        # prefer canonical non-GUID employee id for lookup
+        cand_empid = None
+        for tok in ('EmployeeID', 'EmployeeID_feat', 'EmployeeID_dur', 'Int1', 'Text12', 'employeeid'):
+            if tok in row and row.get(tok) not in (None, '', float('nan')):
+                cand_empid = _normalize_for_lookup(row.get(tok))
+                if cand_empid:
+                    break
+
+        cand_uid = None
+        for tok in ('EmployeeIdentity', 'person_uid', 'GUID'):
+            if tok in row and row.get(tok) not in (None, '', float('nan')):
+                cand_uid = row.get(tok)
+                break
+
+        # Try app.get_personnel_info if available (best source for Email + canonical ObjectID/GUID)
+        if get_personnel_info:
+            try:
+                lookup_token = cand_empid or cand_uid
+                pi = None
+                if lookup_token is not None:
+                    pi = get_personnel_info(lookup_token)
+                else:
+                    # last-resort: try employee name/object name if present
+                    ln = row.get('EmployeeName') or row.get('ObjectName1')
+                    if ln:
+                        pi = get_personnel_info(ln)
+                if pi and isinstance(pi, dict):
+                    # EmployeeEmail alias from app.get_personnel_info
+                    email = pi.get('EmployeeEmail') or pi.get('EmailAddress') or pi.get('Email') or None
+                    # determine parent id for image route: prefer ObjectID, then GUID, then EmployeeID
+                    parent = pi.get('ObjectID') or pi.get('GUID') or cand_empid or cand_uid
+                    if parent is not None:
+                        image_url = image_endpoint_template.format(str(parent))
+            except Exception:
+                # don't propagate enrichment errors
+                email = email or None
+                image_url = image_url or None
+
+        # fallback when get_personnel_info not available or returned nothing
+        if email is None:
+            # try to find email-like fields in row if present
+            for possible in ('EmployeeEmail', 'Email', 'EmailAddress', 'WorkEmail', 'ManagerEmail', 'EMail'):
+                if possible in row and row.get(possible) not in (None, '', float('nan')):
+                    email = row.get(possible)
+                    break
+
+        if image_url is None:
+            # fallback: if we have an EmployeeID use that for image route
+            if cand_empid:
+                image_url = image_endpoint_template.format(cand_empid)
+            elif cand_uid:
+                image_url = image_endpoint_template.format(cand_uid)
+            else:
+                image_url = None
+
+        # normalize simple email string
+        if email and isinstance(email, str):
+            email = email.strip()
+
+        emails.append(email)
+        image_urls.append(image_url)
+
+    out = df.copy()
+    out['EmployeeEmail'] = emails
+    out['imageUrl'] = image_urls
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Once again refer How to get Employee Image and Email check below file carefuly 
 use below file only for Refrance and fix the issue carefully...
 
