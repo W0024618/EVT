@@ -1,1 +1,182 @@
+1) Patch trend_runner.py (required)
+
+Replace the fragile try/except block that attempts to create _DisplayDate_for_merge / _DisplayDate_for_merge_str with the safe version below. This is the block in your file located inside the big # Recompute per-row metrics from raw swipes and merge into features section (search for where you do features['_DisplayDate_for_merge'] = ... and the following except block). Replace that entire attempt+fallback with the code below.
+
+Patch (exact code) — insert in trend_runner.py where the merge is attempted (replace the old block):
+
+
+
+
+
+            # --- robust creation of merge keys for DisplayDate ---
+            # We used to assume 'DisplayDate' exists; sometimes it doesn't which caused KeyError/AttributeError.
+            # Create two helper columns that are safe for joining: a normalized Timestamp and a safe string.
+            try:
+                if 'DisplayDate' in features.columns:
+                    try:
+                        features['_DisplayDate_for_merge'] = pd.to_datetime(features['DisplayDate'], errors='coerce').dt.normalize()
+                    except Exception:
+                        features['_DisplayDate_for_merge'] = pd.NaT
+                    try:
+                        features['_DisplayDate_for_merge_str'] = pd.to_datetime(features['DisplayDate'], errors='coerce').astype(str).fillna('')
+                    except Exception:
+                        # fallback to stringification of the original series
+                        try:
+                            features['_DisplayDate_for_merge_str'] = features['DisplayDate'].astype(str).fillna('')
+                        except Exception:
+                            features['_DisplayDate_for_merge_str'] = ''
+                else:
+                    features['_DisplayDate_for_merge'] = pd.NaT
+                    features['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build feature merge keys for DisplayDate; proceeding without them")
+                features['_DisplayDate_for_merge'] = pd.NaT
+                features['_DisplayDate_for_merge_str'] = ''
+
+            try:
+                if 'DisplayDate' in raw_metrics_df.columns:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').dt.normalize()
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').astype(str).fillna('')
+                else:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build raw_metrics merge keys; falling back to string keys")
+                raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+
+            # Prefer the datetime normalized join if available, else fall back to string join
+            merged_metrics = None
+            try:
+                merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                          left_on=['person_uid', '_DisplayDate_for_merge'],
+                                          right_on=['person_uid', '_DisplayDate_for_merge'],
+                                          suffixes=('','_rawagg'))
+            except Exception:
+                try:
+                    merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                              left_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              right_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              suffixes=('','_rawagg'))
+                except Exception:
+                    logging.exception("Both merge attempts failed; continuing without raw-agg merge")
+                    merged_metrics = features.copy()
+
+            # coalesce raw columns back into features (if present)
+            try:
+                for base_col, raw_col in [
+                    ('FirstSwipe','FirstSwipe_raw'),
+                    ('LastSwipe','LastSwipe_raw'),
+                    ('CountSwipes','CountSwipes_raw'),
+                    ('DurationSeconds','DurationSeconds_raw'),
+                    ('DurationMinutes','DurationMinutes_raw'),
+                    ('MaxSwipeGapSeconds','MaxSwipeGapSeconds_raw'),
+                    ('ShortGapCount','ShortGapCount_raw'),
+                    ('UniqueDoors','UniqueDoors_raw'),
+                    ('UniqueLocations','UniqueLocations_raw'),
+                    ('CardNumber','CardNumber_raw'),
+                    ('EmployeeID','EmployeeID_raw'),
+                    ('EmployeeName','EmployeeName_raw')
+                ]:
+                    if raw_col in merged_metrics.columns:
+                        try:
+                            merged_metrics[base_col] = merged_metrics[raw_col].combine_first(merged_metrics.get(base_col))
+                        except Exception:
+                            # best-effort: if combine_first fails, keep original
+                            pass
+                feature_cols = list(features.columns)
+                if all(c in merged_metrics.columns for c in feature_cols):
+                    features = merged_metrics[feature_cols].copy()
+                else:
+                    features = merged_metrics.copy()
+                for helper_col in ['_DisplayDate_for_merge', '_DisplayDate_for_merge_str']:
+                    if helper_col in features.columns:
+                        try:
+                            features.drop(columns=[helper_col], inplace=True)
+                        except Exception:
+                            pass
+            except Exception:
+                logging.exception("Post-merge coalescing failed; leaving features as-is.")
+
+
+
+
+
+
+
+
+
+
+2) Small logging + diagnostics in app.py (recommended, tiny changes)
+
+Add a couple of logging.info() / logging.debug() lines so you can see what get_personnel_info() and get_person_image_bytes() actually tried and returned. This will not change behavior, only make failures visible so you can confirm whether DB lookups failed or IDs didn’t match.
+
+Patch — replace the start and end of get_personnel_info() in app.py with this (or add these logging lines near start and just before return):
+
+
+
+def get_personnel_info(candidate_identifier: object) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    logging.info("get_personnel_info: lookup called with candidate_identifier=%s", candidate_identifier)
+    if candidate_identifier is None:
+        logging.info("get_personnel_info: no candidate provided")
+        return out
+    conn = _get_acvscore_conn()
+    if conn is None:
+        logging.info("get_personnel_info: ACVSCore connection unavailable (skipping DB lookup)")
+        return out
+    try:
+        cur = conn.cursor()
+        ...
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            ...
+            logging.info("get_personnel_info: found personnel row for candidate=%s -> ObjectID=%s Email=%s", candidate_identifier, out.get('ObjectID'), out.get('EmailAddress'))
+        else:
+            logging.info("get_personnel_info: no personnel row found for candidate=%s", candidate_identifier)
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        ...
+    return out
+
+
+
+
+
+
+
+Patch — add logging lines in get_person_image_bytes() near the top and when falling back to file system:
+
+
+
+
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    logging.info("get_person_image_bytes: lookup for ParentId=%s", parent_id)
+    # DB attempt...
+    try:
+        conn = _get_acvscore_conn()
+        if conn is not None:
+            ...
+                if row and row[0] is not None:
+                    logging.info("get_person_image_bytes: image found in DB for ParentId=%s (len=%d)", parent_id, len(row[0]) if row[0] else 0)
+                    ...
+    except Exception:
+        logging.debug("ACVSCore DB unavailable for image lookup; will try filesystem fallbacks for ParentId=%s", parent_id)
+    # Filesystem fallback
+    try:
+        ...
+        for c in cand_ids:
+            for folder in (Path(DEFAULT_OUTDIR) / "images", Path(DEFAULT_OUTDIR), Path(".")):
+                if not folder.exists():
+                    continue
+                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
+                    fp = folder / (f"{c}{ext}")
+                    logging.debug("get_person_image_bytes: checking path %s", fp)
+                    if fp.exists() and fp.is_file():
+                        logging.info("get_person_image_bytes: loaded image file %s", fp)
+                        ...
+
+
 
