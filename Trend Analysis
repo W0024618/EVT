@@ -1,3 +1,279 @@
+            # --- robust creation of merge keys for DisplayDate ---
+            # We used to assume 'DisplayDate' exists; sometimes it doesn't which caused KeyError/AttributeError.
+            # Create two helper columns that are safe for joining: a normalized Timestamp and a safe string.
+            try:
+                if 'DisplayDate' in features.columns:
+                    try:
+                        features['_DisplayDate_for_merge'] = pd.to_datetime(features['DisplayDate'], errors='coerce').dt.normalize()
+                    except Exception:
+                        features['_DisplayDate_for_merge'] = pd.NaT
+                    try:
+                        features['_DisplayDate_for_merge_str'] = pd.to_datetime(features['DisplayDate'], errors='coerce').astype(str).fillna('')
+                    except Exception:
+                        # fallback to stringification of the original series
+                        try:
+                            features['_DisplayDate_for_merge_str'] = features['DisplayDate'].astype(str).fillna('')
+                        except Exception:
+                            features['_DisplayDate_for_merge_str'] = ''
+                else:
+                    features['_DisplayDate_for_merge'] = pd.NaT
+                    features['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build feature merge keys for DisplayDate; proceeding without them")
+                features['_DisplayDate_for_merge'] = pd.NaT
+                features['_DisplayDate_for_merge_str'] = ''
+
+            try:
+                if 'DisplayDate' in raw_metrics_df.columns:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').dt.normalize()
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').astype(str).fillna('')
+                else:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build raw_metrics merge keys; falling back to string keys")
+                raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+
+            # Prefer the datetime normalized join if available, else fall back to string join
+            merged_metrics = None
+            try:
+                merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                          left_on=['person_uid', '_DisplayDate_for_merge'],
+                                          right_on=['person_uid', '_DisplayDate_for_merge'],
+                                          suffixes=('','_rawagg'))
+            except Exception:
+                try:
+                    merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                              left_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              right_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              suffixes=('','_rawagg'))
+                except Exception:
+                    logging.exception("Both merge attempts failed; continuing without raw-agg merge")
+                    merged_metrics = features.copy()
+
+            # coalesce raw columns back into features (if present)
+            try:
+                for base_col, raw_col in [
+                    ('FirstSwipe','FirstSwipe_raw'),
+                    ('LastSwipe','LastSwipe_raw'),
+                    ('CountSwipes','CountSwipes_raw'),
+                    ('DurationSeconds','DurationSeconds_raw'),
+                    ('DurationMinutes','DurationMinutes_raw'),
+                    ('MaxSwipeGapSeconds','MaxSwipeGapSeconds_raw'),
+                    ('ShortGapCount','ShortGapCount_raw'),
+                    ('UniqueDoors','UniqueDoors_raw'),
+                    ('UniqueLocations','UniqueLocations_raw'),
+                    ('CardNumber','CardNumber_raw'),
+                    ('EmployeeID','EmployeeID_raw'),
+                    ('EmployeeName','EmployeeName_raw')
+                ]:
+                    if raw_col in merged_metrics.columns:
+                        try:
+                            merged_metrics[base_col] = merged_metrics[raw_col].combine_first(merged_metrics.get(base_col))
+                        except Exception:
+                            # best-effort: if combine_first fails, keep original
+                            pass
+                feature_cols = list(features.columns)
+                if all(c in merged_metrics.columns for c in feature_cols):
+                    features = merged_metrics[feature_cols].copy()
+                else:
+                    features = merged_metrics.copy()
+                for helper_col in ['_DisplayDate_for_merge', '_DisplayDate_for_merge_str']:
+                    if helper_col in features.columns:
+                        try:
+                            features.drop(columns=[helper_col], inplace=True)
+                        except Exception:
+                            pass
+            except Exception:
+                logging.exception("Post-merge coalescing failed; leaving features as-is.")
+
+
+
+
+
+
+
+
+
+
+
+def get_personnel_info(candidate_identifier: object) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    logging.info("get_personnel_info: lookup called with candidate_identifier=%s", candidate_identifier)
+    if candidate_identifier is None:
+        logging.info("get_personnel_info: no candidate provided")
+        return out
+    conn = _get_acvscore_conn()
+    if conn is None:
+        logging.info("get_personnel_info: ACVSCore connection unavailable (skipping DB lookup)")
+        return out
+    try:
+        cur = conn.cursor()
+        # We'll attempt to match on multiple columns: ObjectID, GUID, Int1, Text12, Name
+        # Use parameters (all strings) — SQL will handle mismatched types.
+        sql = """
+            SELECT TOP 1 ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            FROM ACVSCore.Access.Personnel
+            WHERE
+              (CAST(ObjectID AS NVARCHAR(200)) = ?)
+              OR (GUID = ?)
+              OR (CAST(Int1 AS NVARCHAR(200)) = ?)
+              OR (Text12 = ?)
+              OR (Name = ?)
+            ORDER BY ObjectID DESC
+        """
+        cand = str(candidate_identifier).strip()
+        params = (cand, cand, cand, cand, cand)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            # columns: ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            try:
+                out['ObjectID'] = row[0]
+                out['GUID'] = row[1]
+                out['Name'] = row[2]
+                out['EmailAddress'] = row[3]
+                out['ManagerEmail'] = row[4]
+            except Exception:
+                # defensive assignment by index
+                out = {
+                    'ObjectID': row[0] if len(row) > 0 else None,
+                    'GUID': row[1] if len(row) > 1 else None,
+                    'Name': row[2] if len(row) > 2 else None,
+                    'EmailAddress': row[3] if len(row) > 3 else None,
+                    'ManagerEmail': row[4] if len(row) > 4 else None
+                }
+            logging.info("get_personnel_info: found personnel row for candidate=%s -> ObjectID=%s Email=%s", candidate_identifier, out.get('ObjectID'), out.get('EmailAddress'))
+        else:
+            logging.info("get_personnel_info: no personnel row found for candidate=%s", candidate_identifier)
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    logging.info("get_person_image_bytes: lookup for ParentId=%s", parent_id)
+    # 1) try DB (as before) — keep behaviour if available
+    try:
+        conn = _get_acvscore_conn()
+        if conn is not None:
+            try:
+                cur = conn.cursor()
+                sql = """
+                    SELECT TOP 1 AI.Image
+                    FROM ACVSCore.Access.Images AI
+                    WHERE AI.ParentId = ?
+                      AND DATALENGTH(AI.Image) > 0
+                    ORDER BY AI.ObjectID DESC
+                """
+                cur.execute(sql, (str(parent_id),))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    logging.info("get_person_image_bytes: image found in DB for ParentId=%s (len=%d)", parent_id, len(row[0]) if row[0] else 0)
+                    try:
+                        b = bytes(row[0])
+                        return b
+                    except Exception:
+                        return row[0]
+            except Exception:
+                logging.exception("Failed to fetch image for ParentId=%s via DB", parent_id)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        logging.debug("ACVSCore DB unavailable for image lookup; will try filesystem fallbacks for ParentId=%s", parent_id)
+
+    # 2) Try filesystem fallbacks under DEFAULT_OUTDIR (use typical file extensions)
+    try:
+        # ensure DEFAULT_OUTDIR exists and convert parent_id to safe filename
+        cand_ids = []
+        if parent_id is None:
+            return None
+        pid_raw = str(parent_id).strip()
+        # add raw and numeric-only variants
+        cand_ids.append(pid_raw)
+        try:
+            # if numeric-like, add int form
+            if '.' in pid_raw:
+                f = float(pid_raw)
+                if f.is_integer():
+                    cand_ids.append(str(int(f)))
+        except Exception:
+            pass
+        # also try stripped non-alphanumeric variants
+        cand_ids = list(dict.fromkeys(cand_ids))
+
+        for c in cand_ids:
+            for folder in (Path(DEFAULT_OUTDIR) / "images", Path(DEFAULT_OUTDIR), Path(".")):
+                if not folder.exists():
+                    continue
+                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
+                    fp = folder / (f"{c}{ext}")
+                    logging.debug("get_person_image_bytes: checking path %s", fp)
+                    if fp.exists() and fp.is_file():
+                        logging.info("get_person_image_bytes: loaded image file %s", fp)
+                        try:
+                            return fp.read_bytes()
+                        except Exception:
+                            continue
+                # also try files where parent_id might be part of filename
+                for fp in folder.glob(f"*{c}*"):
+                    logging.debug("get_person_image_bytes: checking glob match %s", fp)
+                    if fp.is_file():
+                        try:
+                            b = fp.read_bytes()
+                            if b:
+                                logging.info("get_person_image_bytes: loaded image via glob %s", fp)
+                                return b
+                        except Exception:
+                            continue
+    except Exception:
+        logging.exception("Filesystem image lookup failed for ParentId=%s", parent_id)
+
+    # nothing found
+    return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I dont Understand how to integrate below logic so onec check both file carefully and share me exat updated patch so i can easily 
 Swap each other...
 
