@@ -1,3 +1,1480 @@
+# backend/trend_runner.py
+"""
+Cleaned and consolidated trend_runner.py
+- Preserves public API:
+    run_trend_for_date(target_date, regions=None, outdir=None, city="pune", as_dict=False)
+    build_monthly_training(start_date=None, end_date=None, outdir=None, city='Pune', as_dict=False)
+- Defensive imports and robust merging/normalization
+- Ensures no stray try: without except/finally
+- Lightweight personnel enrichment hooks (lazy import from app)
+- Saves trend CSV to outdir (trend_pune_YYYYMMDD.csv)
+"""
+
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+import calendar
+import json
+import logging
+import hashlib
+import math
+import re
+import os
+from collections import defaultdict
+from typing import Optional, List
+
+import pandas as pd
+import numpy as np
+
+# Basic logging
+logging.basicConfig(level=logging.INFO)
+
+# ------------------ personnel enrichment (lazy) ------------------
+def _get_personnel_funcs_lazy():
+    """
+    Try to import personnel helpers from app.py at call time (avoids circular imports).
+    Returns tuple (get_personnel_info_fn_or_None, get_person_image_bytes_fn_or_None).
+    """
+    try:
+        import importlib
+        appmod = importlib.import_module('app')  # adjust if your app module name differs
+        gpi = getattr(appmod, 'get_personnel_info', None)
+        gpib = getattr(appmod, 'get_person_image_bytes', None)
+        return gpi, gpib
+    except Exception:
+        return None, None
+
+def _normalize_for_lookup(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if len(s) > 36 and '-' in s:
+        return s
+    return s
+
+def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"):
+    if df is None or df.empty:
+        return df
+    get_personnel_info, get_person_image_bytes = _get_personnel_funcs_lazy()
+    emails = []
+    image_urls = []
+    for _, row in df.iterrows():
+        email = None
+        image_url = None
+        cand_empid = None
+        for tok in ('EmployeeID', 'EmployeeID_feat', 'EmployeeID_dur', 'Int1', 'Text12'):
+            if tok in row and row.get(tok) not in (None, '', float('nan')):
+                cand_empid = _normalize_for_lookup(row.get(tok))
+                break
+        cand_uid = row.get('EmployeeIdentity') or row.get('person_uid') or None
+        if get_personnel_info:
+            try:
+                lookup = cand_empid or cand_uid
+                pi = get_personnel_info(lookup) if lookup else None
+                if pi and isinstance(pi, dict):
+                    email = pi.get('EmployeeEmail') or pi.get('EmailAddress') or None
+                    parent = pi.get('ObjectID') or pi.get('GUID') or cand_empid or cand_uid
+                    if parent:
+                        image_url = image_endpoint_template.format(str(parent))
+            except Exception:
+                pass
+        if email is None:
+            for fld in ('EmployeeEmail', 'Email', 'EmailAddress', 'ManagerEmail'):
+                if fld in row and row.get(fld) not in (None, '', float('nan')):
+                    email = row.get(fld)
+                    break
+        if image_url is None:
+            if cand_empid:
+                image_url = image_endpoint_template.format(cand_empid)
+            elif cand_uid:
+                image_url = image_endpoint_template.format(cand_uid)
+            else:
+                image_url = None
+        emails.append(email)
+        image_urls.append(image_url)
+    out = df.copy()
+    out['EmployeeEmail'] = emails
+    out['imageUrl'] = image_urls
+    return out
+
+# ------------------ duration_report imports (robust) ------------------
+try:
+    from duration_report import run_for_date, compute_daily_durations, REGION_CONFIG
+except Exception:
+    try:
+        from duration_report import run_for_date, compute_daily_durations
+        REGION_CONFIG = {}
+    except Exception:
+        try:
+            from duration_report import run_for_date
+            compute_daily_durations = None
+            REGION_CONFIG = {}
+        except Exception:
+            run_for_date = None
+            compute_daily_durations = None
+            REGION_CONFIG = {}
+
+# ------------------ optional config door_zone mapping ------------------
+try:
+    from config.door_zone import map_door_to_zone as config_map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+except Exception:
+    config_map_door_to_zone = None
+    BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area"])
+    OUT_OF_OFFICE_ZONE = "Out of office"
+
+# History profile (optional)
+CANDIDATE_HISTORY = [
+    Path(__file__).parent / "config" / "current_analysis.csv",
+    Path(__file__).parent.parent / "config" / "current_analysis.csv",
+    Path.cwd() / "current_analysis.csv",
+    Path(__file__).parent / "current_analysis.csv"
+]
+HIST_PATH = None
+for p in CANDIDATE_HISTORY:
+    if p.exists():
+        HIST_PATH = p
+        break
+
+if HIST_PATH:
+    try:
+        HIST_DF = pd.read_csv(HIST_PATH)
+        logging.info("Loaded historical profile from %s (rows=%d)", HIST_PATH, len(HIST_DF))
+    except Exception:
+        logging.warning("Failed to load historical profile from %s", HIST_PATH)
+        HIST_DF = pd.DataFrame()
+else:
+    HIST_DF = pd.DataFrame()
+
+# Outdir
+OUTDIR = Path("./outputs")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR = Path("./models")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Small helpers
+_PLACEHOLDER_STRS = set(['', 'nan', 'na', 'n/a', '-', '—', '–', 'none', 'null'])
+_GUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$')
+
+def _is_placeholder_str(s: object) -> bool:
+    try:
+        if s is None:
+            return True
+        st = str(s).strip().lower()
+        return st in _PLACEHOLDER_STRS
+    except Exception:
+        return False
+
+def _normalize_id_val(v):
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan" or _is_placeholder_str(s):
+        return None
+    try:
+        if '.' in s:
+            f = float(s)
+            if math.isfinite(f) and f.is_integer():
+                return str(int(f))
+    except Exception:
+        pass
+    return s
+
+def _looks_like_guid(s: object) -> bool:
+    try:
+        if s is None:
+            return False
+        st = str(s).strip()
+        if not st:
+            return False
+        return bool(_GUID_RE.match(st))
+    except Exception:
+        return False
+
+def _looks_like_name(s: object) -> bool:
+    try:
+        if s is None:
+            return False
+        st = str(s).strip()
+        if not st:
+            return False
+        if _looks_like_guid(st):
+            return False
+        return bool(re.search(r'[A-Za-z]', st))
+    except Exception:
+        return False
+
+def _pick_first_non_guid_value(series):
+    for v in series:
+        if v is None:
+            continue
+        try:
+            s = str(v).strip()
+            if not s:
+                continue
+            if _is_placeholder_str(s):
+                continue
+            if _looks_like_guid(s):
+                continue
+            return s
+        except Exception:
+            continue
+    return None
+
+def _canonical_person_uid(row):
+    empid = row.get('EmployeeID', None)
+    empident = row.get('EmployeeIdentity', None)
+    name = row.get('EmployeeName', None)
+    empid_n = _normalize_id_val(empid)
+    if empid_n and not _looks_like_guid(empid_n):
+        return f"emp:{empid_n}"
+    empident_n = _normalize_id_val(empident)
+    if empident_n:
+        return f"uid:{empident_n}"
+    if name and str(name).strip():
+        h = hashlib.sha1(str(name).strip().lower().encode('utf8')).hexdigest()[:10]
+        return f"name:{h}"
+    return None
+
+# Short card xml extractor
+_CARD_XML_RE = re.compile(r'<Card>([^<]+)</Card>', re.IGNORECASE | re.DOTALL)
+def _extract_card_from_xml(txt):
+    try:
+        if not txt or not isinstance(txt, str):
+            return None
+        m = _CARD_XML_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r'CHUID.*?Card.*?[:=]\s*([0-9A-Za-z\-\_]+)', txt, re.IGNORECASE | re.DOTALL)
+        if m2:
+            return m2.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+# door -> zone mapping fallback
+try:
+    _BREAK_ZONES = BREAK_ZONES
+    _OUT_OF_OFFICE_ZONE = OUT_OF_OFFICE_ZONE
+except Exception:
+    _BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area"])
+    _OUT_OF_OFFICE_ZONE = "Out of office"
+
+def map_door_to_zone(door: object, direction: object = None) -> str:
+    try:
+        if config_map_door_to_zone is not None:
+            return config_map_door_to_zone(door, direction)
+    except Exception:
+        pass
+    try:
+        if door is None:
+            return None
+        s = str(door).strip()
+        if not s:
+            return None
+        s_l = s.lower()
+        if direction and isinstance(direction, str):
+            d = direction.strip().lower()
+            if "out" in d:
+                return _OUT_OF_OFFICE_ZONE
+            if "in" in d:
+                return "Reception Area"
+        if "out" in s_l or "exit" in s_l or ("turnstile" in s_l and "out" in s_l):
+            return _OUT_OF_OFFICE_ZONE
+        return "Working Area"
+    except Exception:
+        return None
+
+# ----- Config and scenarios -----
+VIOLATION_WINDOW_DAYS = 90
+RISK_THRESHOLDS = [
+    (0.5, "Low"),
+    (1.5, "Low Medium"),
+    (2.5, "Medium"),
+    (4.0, "Medium High"),
+    (float("inf"), "High"),
+]
+
+def map_score_to_label(score: float):
+    try:
+        if score is None:
+            score = 0.0
+        s = float(score)
+    except Exception:
+        s = 0.0
+    bucket = 1
+    label = "Low"
+    for i, (threshold, lbl) in enumerate(RISK_THRESHOLDS, start=1):
+        if s <= threshold:
+            bucket = i
+            label = lbl
+            break
+    return bucket, label
+
+# SCENARIOS (kept compact)
+def scenario_long_gap(row):
+    try:
+        gap = int(row.get('MaxSwipeGapSeconds') or 0)
+        return gap >= int(4.5 * 3600)
+    except Exception:
+        return False
+
+def scenario_short_duration(row):
+    return (row.get('DurationMinutes') or 0) < 240
+
+def scenario_coffee_badging(row):
+    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
+
+def scenario_low_swipe_count(row):
+    return 0 < (row.get('CountSwipes') or 0) <= 2
+
+def scenario_single_door(row):
+    return (row.get('UniqueDoors') or 0) <= 1
+
+def scenario_only_in(row):
+    return int(row.get('OnlyIn', 0)) == 1
+
+def scenario_only_out(row):
+    return int(row.get('OnlyOut', 0)) == 1
+
+def scenario_zero_swipes(row):
+    try:
+        return int(row.get('CountSwipes', 0)) == 0
+    except Exception:
+        return False
+
+def scenario_unusually_high_swipes(row):
+    try:
+        cur = int(row.get('CountSwipes') or 0)
+        dur = float(row.get('DurationMinutes') or 0.0)
+        return (cur > 50) and (dur < 60)
+    except Exception:
+        return False
+
+# keep a list
+SCENARIOS = [
+    ("long_gap_>=4.5h", scenario_long_gap),
+    ("short_duration_<4h", scenario_short_duration),
+    ("coffee_badging", scenario_coffee_badging),
+    ("low_swipe_count_<=2", scenario_low_swipe_count),
+    ("single_door", scenario_single_door),
+    ("only_in", scenario_only_in),
+    ("only_out", scenario_only_out),
+    ("zero_swipes", scenario_zero_swipes),
+    ("unusually_high_swipes", scenario_unusually_high_swipes),
+]
+
+WEIGHTS = {
+    "long_gap_>=4.5h": 0.3,
+    "short_duration_<4h": 1.0,
+    "coffee_badging": 1.0,
+    "low_swipe_count_<=2": 0.5,
+    "single_door": 0.25,
+    "only_in": 0.8,
+    "only_out": 0.8,
+    "zero_swipes": 0.4,
+    "unusually_high_swipes": 1.5
+}
+ANOMALY_THRESHOLD = 1.5
+
+# ---------------- compute_features ----------------
+def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFrame:
+    if swipes is None or swipes.empty:
+        return pd.DataFrame()
+    sw = swipes.copy()
+    # find time column
+    cols_lower = {c.lower(): c for c in sw.columns}
+    time_candidates = ['localemessagetime', 'messagetime', 'timestamp', 'time', 'localemessagetimestamp']
+    found_time_col = next((cols_lower[c] for c in time_candidates if c in cols_lower), None)
+    if found_time_col:
+        sw['LocaleMessageTime'] = pd.to_datetime(sw[found_time_col], errors='coerce')
+    elif 'Date' in sw.columns:
+        try:
+            sw['LocaleMessageTime'] = pd.to_datetime(sw['Date'], errors='coerce')
+        except Exception:
+            sw['LocaleMessageTime'] = pd.NaT
+    else:
+        sw['LocaleMessageTime'] = pd.NaT
+
+    # Date grouping
+    if 'AdjustedMessageTime' in sw.columns and sw['AdjustedMessageTime'].notna().any():
+        try:
+            sw['AdjustedMessageTime'] = pd.to_datetime(sw['AdjustedMessageTime'], errors='coerce')
+            mask_adj = sw['AdjustedMessageTime'].notna()
+            sw.loc[mask_adj, 'Date'] = sw.loc[mask_adj, 'AdjustedMessageTime'].dt.date
+            sw.loc[~mask_adj, 'Date'] = pd.to_datetime(sw.loc[~mask_adj, 'LocaleMessageTime'], errors='coerce').dt.date
+        except Exception:
+            sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
+    else:
+        sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
+
+    # column candidates
+    name_candidates = ['employeename', 'objectname1', 'objectname', 'employee_name', 'name', 'object_name']
+    employeeid_candidates = ['int1', 'text12', 'employeeid', 'employee_id', 'empid', 'id']
+    card_candidates = ['cardnumber', 'chuid', 'card', 'card_no', 'cardnum', 'value']
+    door_candidates = ['door', 'doorname', 'door_name']
+    direction_candidates = ['direction', 'directionname', 'direction_name']
+
+    name_col = next((cols_lower[c] for c in name_candidates if c in cols_lower), None)
+    empid_col = next((cols_lower[c] for c in employeeid_candidates if c in cols_lower), None)
+    card_col = next((cols_lower[c] for c in card_candidates if c in cols_lower), None)
+    door_col = next((cols_lower[c] for c in door_candidates if c in cols_lower), None)
+    dir_col = next((cols_lower[c] for c in direction_candidates if c in cols_lower), None)
+
+    try:
+        if dir_col and dir_col in sw.columns:
+            sw['Direction'] = sw[dir_col]
+        if door_col and door_col in sw.columns:
+            sw['Door'] = sw[door_col]
+        if empid_col and empid_col in sw.columns:
+            sw['EmployeeID'] = sw[empid_col]
+        if name_col and name_col in sw.columns:
+            sw['EmployeeName'] = sw[name_col]
+        if card_col and card_col in sw.columns:
+            sw['CardNumber'] = sw[card_col]
+    except Exception:
+        logging.exception("Normalization of swipe columns failed.")
+
+    # personnel type tolerant filtering (if available)
+    if 'PersonnelTypeName' in sw.columns:
+        try:
+            sw['PersonnelTypeName'] = sw['PersonnelTypeName'].astype(str).str.strip()
+            mask = sw['PersonnelTypeName'].str.lower().str.contains(r'employee|terminated', na=False)
+            sw = sw[mask].copy()
+        except Exception:
+            pass
+    elif 'PersonnelType' in sw.columns:
+        try:
+            sw['PersonnelType'] = sw['PersonnelType'].astype(str).str.strip()
+            mask = sw['PersonnelType'].str.lower().str.contains(r'employee|terminated', na=False)
+            sw = sw[mask].copy()
+        except Exception:
+            pass
+
+    if sw.empty:
+        return pd.DataFrame()
+
+    if 'person_uid' not in sw.columns:
+        def make_person_uid_local(r):
+            empid_val = None
+            if empid_col and empid_col in r and pd.notna(r.get(empid_col)):
+                empid_val = r.get(empid_col)
+            elif 'EmployeeID' in r and pd.notna(r.get('EmployeeID')):
+                empid_val = r.get('EmployeeID')
+            empident_val = r.get('EmployeeIdentity') if 'EmployeeIdentity' in r else None
+            name_val = None
+            if name_col and name_col in r:
+                name_val = r.get(name_col)
+            elif 'EmployeeName' in r:
+                name_val = r.get('EmployeeName')
+            elif 'ObjectName1' in r:
+                name_val = r.get('ObjectName1')
+            return _canonical_person_uid({
+                'EmployeeID': empid_val,
+                'EmployeeIdentity': empident_val,
+                'EmployeeName': name_val
+            })
+        try:
+            sw['person_uid'] = sw.apply(make_person_uid_local, axis=1)
+        except Exception:
+            sw['person_uid'] = None
+
+    sel_cols = set(['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
+                    'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
+                    'EmployeeIdentity'])
+    sel_cols = [c for c in sel_cols if c in sw.columns]
+
+    def agg_swipe_group(g):
+        times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
+        gaps = []
+        short_gap_count = 0
+        for i in range(1, len(times)):
+            s = (times[i] - times[i-1]).total_seconds()
+            gaps.append(s)
+            if s <= 5*60:
+                short_gap_count += 1
+        max_gap = int(max(gaps)) if gaps else 0
+        in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
+        out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
+        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+        # card extraction
+        card_numbers = []
+        if 'CardNumber' in g.columns:
+            card_numbers = list(pd.unique(g['CardNumber'].dropna()))
+        if not card_numbers:
+            for c in g.columns:
+                if 'xml' in c.lower():
+                    for raw in g[c].dropna().astype(str):
+                        extracted = _extract_card_from_xml(raw)
+                        if extracted:
+                            card_numbers.append(extracted)
+        card_numbers = list(dict.fromkeys(card_numbers))
+        card_number = None
+        for c in card_numbers:
+            n = _normalize_id_val(c)
+            if n and not _looks_like_guid(n):
+                card_number = n
+                break
+        # pick employee id/name
+        employee_id = None
+        employee_name = None
+        employee_identity = None
+        personnel_type = None
+        if 'EmployeeID' in g.columns:
+            vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
+            employee_id = _pick_first_non_guid_value(vals)
+        if 'EmployeeIdentity' in g.columns:
+            vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
+            if not vals.empty:
+                employee_identity = vals.iloc[0]
+        candidate_name_vals = None
+        if 'EmployeeName' in g.columns:
+            candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
+        elif 'ObjectName1' in g.columns:
+            candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+        if candidate_name_vals is not None and not candidate_name_vals.empty:
+            employee_name = _pick_first_non_guid_value(candidate_name_vals)
+        if 'PersonnelTypeName' in g.columns:
+            vals = g['PersonnelTypeName'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        elif 'PersonnelType' in g.columns:
+            vals = g['PersonnelType'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        first_swipe = times[0] if times else None
+        last_swipe = times[-1] if times else None
+
+        # timeline & segments mapping to zones
+        timeline = []
+        for _, row in g.sort_values('LocaleMessageTime').iterrows():
+            t = row.get('LocaleMessageTime')
+            dname = None
+            if 'Door' in row and pd.notna(row.get('Door')):
+                dname = row.get('Door')
+            direction = row.get('Direction') if 'Direction' in row else None
+            zone = map_door_to_zone(dname, direction)
+            timeline.append((t, dname, direction, zone))
+        segments = []
+        if timeline:
+            cur_zone = None
+            seg_start = timeline[0][0]
+            seg_label = None
+            for (t, dname, direction, zone) in timeline:
+                if zone in _BREAK_ZONES:
+                    lbl = 'break'
+                elif zone == _OUT_OF_OFFICE_ZONE:
+                    lbl = 'out_of_office'
+                else:
+                    lbl = 'work'
+                if cur_zone is None:
+                    cur_zone = zone
+                    seg_label = lbl
+                    seg_start = t
+                else:
+                    if lbl != seg_label:
+                        segments.append({
+                            'label': seg_label,
+                            'start': seg_start,
+                            'end': t,
+                            'start_zone': cur_zone
+                        })
+                        seg_start = t
+                        seg_label = lbl
+                        cur_zone = zone
+                    else:
+                        cur_zone = cur_zone or zone
+            if seg_label is not None:
+                segments.append({
+                    'label': seg_label,
+                    'start': seg_start,
+                    'end': timeline[-1][0],
+                    'start_zone': cur_zone
+                })
+
+        # compute break counts roughly
+        break_count = 0
+        long_break_count = 0
+        total_break_minutes = 0.0
+        BREAK_MINUTES_THRESHOLD = 60
+        OUT_OFFICE_COUNT_MINUTES = 180
+        LONG_BREAK_FLAG_MINUTES = 120
+        for i, s in enumerate(segments):
+            lbl = s.get('label')
+            start = s.get('start')
+            end = s.get('end')
+            dur_mins = ((end - start).total_seconds() / 60.0) if (start and end) else 0.0
+            if lbl == 'break':
+                if dur_mins >= BREAK_MINUTES_THRESHOLD:
+                    break_count += 1
+                    total_break_minutes += dur_mins
+                    if dur_mins >= LONG_BREAK_FLAG_MINUTES:
+                        long_break_count += 1
+            elif lbl == 'out_of_office':
+                prev_lbl = segments[i-1]['label'] if i > 0 else None
+                next_lbl = segments[i+1]['label'] if i < len(segments)-1 else None
+                if prev_lbl == 'work' and next_lbl == 'work' and dur_mins >= OUT_OFFICE_COUNT_MINUTES:
+                    break_count += 1
+                    total_break_minutes += dur_mins
+                    if dur_mins >= LONG_BREAK_FLAG_MINUTES:
+                        long_break_count += 1
+
+        pattern_flag = False
+        try:
+            seq = []
+            for s in segments:
+                dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
+                seq.append((s['label'], int(round(dur_mins))))
+            for i in range(len(seq)-2):
+                a = seq[i]
+                b = seq[i+1]
+                c = seq[i+2]
+                if (a[0] == 'work' and a[1] < 60) and \
+                   (b[0] in ('out_of_office','break') and b[1] >= LONG_BREAK_FLAG_MINUTES) and \
+                   (c[0] == 'work' and c[1] < 60):
+                    pattern_flag = True
+                    break
+        except Exception:
+            pattern_flag = False
+
+        return pd.Series({
+            'CountSwipes': int(len(g)),
+            'MaxSwipeGapSeconds': int(max_gap),
+            'ShortGapCount': int(short_gap_count),
+            'InCount': in_count,
+            'OutCount': out_count,
+            'UniqueDoors': int(unique_doors),
+            'UniqueLocations': int(unique_locations),
+            'RejectionCount': int(rejection_count),
+            'CardNumber': card_number,
+            'EmployeeID': employee_id,
+            'EmployeeIdentity': employee_identity,
+            'EmployeeName': employee_name,
+            'PersonnelType': personnel_type,
+            'FirstSwipe': first_swipe,
+            'LastSwipe': last_swipe,
+            'BreakCount': int(break_count),
+            'LongBreakCount': int(long_break_count),
+            'TotalBreakMinutes': float(round(total_break_minutes,1)),
+            'PatternShortLongRepeat': bool(pattern_flag),
+            'PatternSequenceReadable': None
+        })
+
+    # group and aggregate
+    try:
+        grouped = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])[sel_cols]
+        grouped = grouped.apply(agg_swipe_group).reset_index()
+    except Exception:
+        logging.exception("Grouping swipes failed")
+        return pd.DataFrame()
+
+    # simple merge of durations if present
+    dur = pd.DataFrame() if durations is None else durations.copy()
+    if not dur.empty and 'Date' in dur.columns:
+        try:
+            dur['Date'] = pd.to_datetime(dur['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
+
+    # normalize columns and types
+    def ensure_col(df, col, default=None):
+        if col not in df.columns:
+            df[col] = default
+    for cdef in [
+        ('DurationSeconds', 0), ('FirstSwipe', pd.NaT), ('LastSwipe', pd.NaT), ('CountSwipes', 0),
+        ('MaxSwipeGapSeconds', 0), ('ShortGapCount', 0), ('RejectionCount', 0), ('UniqueLocations', 0),
+        ('UniqueDoors', 0), ('CardNumber', None), ('EmployeeID', None), ('EmployeeName', None),
+        ('EmployeeIdentity', None), ('PersonnelType', None), ('BreakCount', 0), ('LongBreakCount', 0),
+        ('TotalBreakMinutes', 0.0), ('PatternShortLongRepeat', False)
+    ]:
+        ensure_col(merged, cdef[0], cdef[1])
+
+    # normalize some fields
+    try:
+        merged['EmployeeID'] = merged['EmployeeID'].apply(lambda v: _normalize_id_val(v) if v is not None else None)
+    except Exception:
+        pass
+    try:
+        merged['CardNumber'] = merged['CardNumber'].apply(lambda v: None if v is None else str(v).strip())
+    except Exception:
+        pass
+    try:
+        merged['DurationSeconds'] = pd.to_numeric(merged.get('DurationSeconds', 0), errors='coerce').fillna(0).astype(float)
+        merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
+    except Exception:
+        merged['DurationMinutes'] = merged.get('DurationMinutes', 0)
+
+    for col in ['FirstSwipe', 'LastSwipe']:
+        try:
+            merged[col] = pd.to_datetime(merged[col], errors='coerce')
+        except Exception:
+            merged[col] = pd.NaT
+
+    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
+    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
+    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
+
+    # mark if present in history
+    try:
+        hist_map = {}
+        if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
+            hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
+        merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: _normalize_id_val(x) in hist_map if pd.notna(x) else False)
+    except Exception:
+        merged['EmpHistoryPresent'] = False
+
+    # sanitize strings
+    for c in ['EmployeeID', 'CardNumber', 'EmployeeIdentity', 'PersonnelType']:
+        if c in merged.columns:
+            merged[c] = merged[c].apply(lambda v: None if v is None else str(v).strip())
+
+    if 'EmployeeName' in merged.columns:
+        merged['EmployeeName'] = merged['EmployeeName'].apply(lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v)) or _looks_like_guid(v) or _is_placeholder_str(v)) else str(v).strip())
+
+    return merged
+
+# ---------------- scoring ----------------
+def _read_past_trend_csvs(outdir: str, window_days: int, target_date: date):
+    p = Path(outdir)
+    if not p.exists():
+        return pd.DataFrame()
+    csvs = sorted(p.glob("trend_pune_*.csv"), reverse=True)
+    if not csvs:
+        return pd.DataFrame()
+    dfs = []
+    cutoff = target_date - timedelta(days=window_days)
+    for fp in csvs:
+        try:
+            df = pd.read_csv(fp, parse_dates=['Date'])
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+                df = df[df['Date'].apply(lambda d: d is not None and (d >= cutoff and d <= target_date))]
+            dfs.append(df)
+        except Exception:
+            try:
+                df = pd.read_csv(fp, dtype=str)
+                if 'Date' in df.columns:
+                    try:
+                        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+                        df = df[df['Date'].apply(lambda d: d is not None and (d >= cutoff and d <= target_date))]
+                    except Exception:
+                        pass
+                dfs.append(df)
+            except Exception:
+                continue
+    if not dfs:
+        return pd.DataFrame()
+    try:
+        return pd.concat(dfs, ignore_index=True)
+    except Exception:
+        return pd.DataFrame()
+
+def _read_scenario_counts_by_person(outdir: str, window_days: int, target_date: date, scenario_col: str):
+    df = _read_past_trend_csvs(outdir, window_days, target_date)
+    if df is None or df.empty or scenario_col not in df.columns:
+        return {}
+    id_cols = [c for c in ('person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12') if c in df.columns]
+    out = defaultdict(int)
+    try:
+        if df[scenario_col].dtype == bool:
+            q = df[df[scenario_col] == True]
+        else:
+            q = df[df[scenario_col].astype(str).str.lower() == 'true']
+        for _, r in q.iterrows():
+            for col in id_cols:
+                raw = r.get(col)
+                if raw in (None, '', float('nan')):
+                    continue
+                norm = _normalize_id_val(raw)
+                if norm:
+                    out[str(norm)] += 1
+                    stripped = _strip_uid_prefix(str(norm))
+                    if stripped != str(norm):
+                        out[str(stripped)] += 1
+    except Exception:
+        pass
+    return dict(out)
+
+def _strip_uid_prefix(s):
+    try:
+        if s is None:
+            return s
+        st = str(s)
+        for p in ('emp:', 'uid:', 'name:'):
+            if st.startswith(p):
+                return st[len(p):]
+        return st
+    except Exception:
+        return s
+
+def compute_violation_days_map(outdir: str, window_days: int, target_date: date):
+    df = _read_past_trend_csvs(outdir, window_days, target_date)
+    if df is None or df.empty:
+        return {}
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+    id_cols = [c for c in ('person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber') if c in df.columns]
+    if 'IsFlagged' not in df.columns:
+        if 'AnomalyScore' in df.columns:
+            df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: float(s) >= ANOMALY_THRESHOLD if not pd.isna(s) else False)
+        else:
+            df['IsFlagged'] = False
+    ident_dates = defaultdict(set)
+    try:
+        flagged = df[df['IsFlagged'] == True]
+        for _, r in flagged.iterrows():
+            d = r.get('Date')
+            if d is None:
+                continue
+            for col in id_cols:
+                raw = r.get(col)
+                if raw is None:
+                    continue
+                norm = _normalize_id_val(raw)
+                if norm:
+                    ident_dates[str(norm)].add(d)
+                    stripped = _strip_uid_prefix(str(norm))
+                    if stripped != str(norm):
+                        ident_dates[str(stripped)].add(d)
+    except Exception:
+        logging.exception("Error building violation days map from history.")
+    return {k: int(len(v)) for k, v in ident_dates.items()}
+
+def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[pd.DataFrame] = None, outdir: Optional[str] = None, target_date: Optional[date] = None) -> pd.DataFrame:
+    if combined_df is None or combined_df.empty:
+        return pd.DataFrame()
+    df = combined_df.copy()
+    if 'person_uid' not in df.columns:
+        df['person_uid'] = df.apply(lambda r: _canonical_person_uid(r), axis=1)
+    for c in ['FirstSwipe','LastSwipe','CountSwipes','DurationMinutes','MaxSwipeGapSeconds','EmployeeID','CardNumber','person_uid','Date']:
+        if c not in df.columns:
+            df[c] = None
+    # reconcile with raw swipes if provided
+    if swipes_df is not None and not swipes_df.empty and 'person_uid' in swipes_df.columns:
+        try:
+            tsw = swipes_df.copy()
+            if 'LocaleMessageTime' in tsw.columns:
+                tsw['LocaleMessageTime'] = pd.to_datetime(tsw['LocaleMessageTime'], errors='coerce')
+            else:
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in tsw.columns:
+                        tsw['LocaleMessageTime'] = pd.to_datetime(tsw[cand], errors='coerce')
+                        break
+            if 'Date' not in tsw.columns:
+                if 'LocaleMessageTime' in tsw.columns:
+                    tsw['Date'] = tsw['LocaleMessageTime'].dt.date
+            grp = tsw.dropna(subset=['person_uid', 'Date']).groupby(['person_uid', 'Date'])
+            counts = grp.size().to_dict()
+            firsts = grp['LocaleMessageTime'].min().to_dict()
+            lasts = grp['LocaleMessageTime'].max().to_dict()
+            def _fix_row_by_raw(idx, row):
+                key = (row.get('person_uid'), row.get('Date'))
+                if key in counts and (int(row.get('CountSwipes') or 0) == 0 or pd.isna(row.get('CountSwipes'))):
+                    try:
+                        c = int(counts.get(key, 0))
+                        df.at[idx, 'CountSwipes'] = c
+                        f = firsts.get(key)
+                        l = lasts.get(key)
+                        if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
+                            df.at[idx, 'FirstSwipe'] = pd.to_datetime(f)
+                        if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
+                            df.at[idx, 'LastSwipe'] = pd.to_datetime(l)
+                        try:
+                            fs = df.at[idx, 'FirstSwipe']
+                            ls = df.at[idx, 'LastSwipe']
+                            if pd.notna(fs) and pd.notna(ls):
+                                dursec = (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds()
+                                dursec = max(0, dursec)
+                                df.at[idx, 'DurationSeconds'] = float(dursec)
+                                df.at[idx, 'DurationMinutes'] = float(dursec / 60.0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            for ix, r in df[df['CountSwipes'].fillna(0).astype(int) == 0].iterrows():
+                try:
+                    _fix_row_by_raw(ix, r)
+                except Exception:
+                    logging.debug("Failed to reconcile row %s with raw swipes", ix)
+        except Exception:
+            logging.exception("Reconciliation with raw swipes failed.")
+    # Build badge map and swipe overlap map for severity checks (simple)
+    badge_map = {}
+    swipe_overlap_map = {}
+    if swipes_df is not None and not swipes_df.empty:
+        try:
+            tmp = swipes_df[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
+            if not tmp.empty:
+                grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
+                badge_map = {(row.Date, row.CardNumber): int(row.distinct_users) for row in grouped_card.itertuples(index=False)}
+        except Exception:
+            badge_map = {}
+    # Evaluate scenarios
+    for name, fn in SCENARIOS:
+        try:
+            df[name] = df.apply(lambda r, f=fn: bool(f(r)), axis=1)
+        except Exception:
+            df[name] = False
+    # compute weighted score
+    def compute_score(r):
+        score = 0.0
+        detected = []
+        for name, _ in SCENARIOS:
+            val = bool(r.get(name))
+            w = WEIGHTS.get(name, 0.0)
+            if val and w > 0:
+                score += float(w)
+                detected.append(name)
+        return score, detected
+    try:
+        scores = df.apply(lambda r: pd.Series(compute_score(r), index=['AnomalyScore', 'DetectedScenarios']), axis=1)
+        df['AnomalyScore'] = scores['AnomalyScore'].astype(float)
+        df['DetectedScenarios'] = scores['DetectedScenarios'].apply(lambda x: "; ".join(x) if (isinstance(x, (list, tuple)) and len(x)>0) else None)
+    except Exception:
+        df['AnomalyScore'] = 0.0
+        df['DetectedScenarios'] = None
+    df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
+    # PresentToday flag and ViolationDaysLast90 using history
+    try:
+        df['PresentToday'] = df['CountSwipes'].fillna(0).astype(int) > 0
+        vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
+        def lookup_violation_days(row):
+            try:
+                candidates = []
+                for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+                    v = row.get(k)
+                    if v not in (None, '', float('nan')):
+                        candidates.append(_normalize_id_val(v))
+                for c in candidates:
+                    if c is None:
+                        continue
+                    if c in vmap:
+                        return int(vmap.get(c, 0))
+                    stripped = _strip_uid_prefix(c)
+                    if stripped != c and stripped in vmap:
+                        return int(vmap.get(stripped, 0))
+                return 0
+            except Exception:
+                return 0
+        df['ViolationDaysLast90'] = df.apply(lookup_violation_days, axis=1)
+    except Exception:
+        df['ViolationDaysLast90'] = 0
+    # Build textual Reasons and ViolationExplanation
+    def _explain_scenarios_detected(row, detected_list):
+        if not detected_list:
+            return None
+        pieces = []
+        for sc in detected_list:
+            pieces.append(sc.replace("_", " ").replace(">=", "≥"))
+        explanation = " ".join([p if p.endswith('.') else p + '.' for p in pieces])
+        return explanation
+    def reasons_for_row(r):
+        if not bool(r.get('IsFlagged')):
+            return None, None
+        ds_raw = r.get('DetectedScenarios')
+        if ds_raw:
+            ds = [s.strip() for s in ds_raw.split(";") if s and s.strip()]
+            explanation = _explain_scenarios_detected(r, ds)
+            reasons_codes = "; ".join(ds) if ds else None
+            return reasons_codes, explanation
+        return None, None
+    try:
+        reason_tuples = df.apply(lambda r: pd.Series(reasons_for_row(r), index=['Reasons', 'ViolationExplanation']), axis=1)
+        df['Reasons'] = reason_tuples['Reasons']
+        df['ViolationExplanation'] = reason_tuples['ViolationExplanation']
+    except Exception:
+        df['Reasons'] = None
+        df['ViolationExplanation'] = None
+    # risk mapping
+    try:
+        df['RiskScore'] = df['AnomalyScore'].apply(lambda s: map_score_to_label(s)[0])
+        df['RiskLevel'] = df['AnomalyScore'].apply(lambda s: map_score_to_label(s)[1])
+    except Exception:
+        df['RiskScore'] = 1
+        df['RiskLevel'] = 'Low'
+    # final booleans normalization
+    for col in [name for name, _ in SCENARIOS] + ['IsFlagged']:
+        if col in df.columns:
+            try:
+                df[col] = df[col].astype(bool)
+            except Exception:
+                pass
+    return df
+
+# ---------------- run_trend_for_date ----------------
+def _slug_city(city: str) -> str:
+    if not city:
+        return "pune"
+    return str(city).strip().lower().replace(" ", "_")
+
+def run_trend_for_date(target_date: date,
+                       regions: Optional[List[str]] = None,
+                       outdir: str = None,
+                       city: str = "pune",
+                       as_dict: bool = False) -> pd.DataFrame:
+    city_slug = _slug_city(city)
+    if regions is None:
+        try:
+            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+        except Exception:
+            regions = []
+    regions = [r.lower() for r in regions if r]
+    outdir_path = Path(outdir) if outdir else OUTDIR
+    if run_for_date is None:
+        raise RuntimeError("duration_report.run_for_date is not available in this environment.")
+    # call run_for_date defensively
+    try:
+        results = run_for_date(target_date, regions, str(outdir_path), city)
+    except TypeError:
+        try:
+            results = run_for_date(target_date, regions, str(outdir_path))
+        except Exception:
+            try:
+                results = run_for_date(target_date)
+            except Exception as e:
+                logging.exception("run_for_date failed entirely.")
+                raise
+    # combine durations and swipes across regions
+    dur_list = []
+    swipe_list = []
+    try:
+        for rkey, rr in (results or {}).items():
+            try:
+                dfdur = rr.get('durations')
+                if dfdur is not None and not dfdur.empty:
+                    dfdur = dfdur.copy()
+                    dfdur['region'] = rkey
+                    dur_list.append(dfdur)
+            except Exception:
+                pass
+            try:
+                dfsw = rr.get('swipes')
+                if dfsw is not None and not dfsw.empty:
+                    dfcopy = dfsw.copy()
+                    dfcopy['region'] = rkey
+                    swipe_list.append(dfcopy)
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Failed to iterate results returned by run_for_date.")
+    combined = pd.concat(dur_list, ignore_index=True) if dur_list else pd.DataFrame()
+    sw_combined = pd.concat(swipe_list, ignore_index=True) if swipe_list else pd.DataFrame()
+
+    # Decide Pune 2AM boundary
+    use_pune_2am_boundary = False
+    try:
+        if city and isinstance(city, str) and 'pun' in city.strip().lower():
+            use_pune_2am_boundary = True
+        else:
+            if os.getenv("PUNE_2AM_BOUNDARY", "0") == "1":
+                use_pune_2am_boundary = True
+    except Exception:
+        use_pune_2am_boundary = False
+
+    # Prepare for features; possibly shift times for Pune 02:00 grouping
+    sw_for_features = sw_combined.copy() if sw_combined is not None else pd.DataFrame()
+    durations_for_features = combined.copy() if combined is not None else pd.DataFrame()
+
+    if use_pune_2am_boundary and (sw_for_features is not None) and (not sw_for_features.empty):
+        try:
+            if 'LocaleMessageTime' in sw_for_features.columns:
+                sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features['LocaleMessageTime'], errors='coerce')
+            else:
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_for_features.columns:
+                        sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features[cand], errors='coerce')
+                        break
+            sw_for_features['OriginalLocaleMessageTime'] = sw_for_features['LocaleMessageTime']
+            sw_for_features['LocaleMessageTime'] = sw_for_features['LocaleMessageTime'] - pd.Timedelta(hours=2)
+            # recompute durations if compute_daily_durations is available
+            if callable(compute_daily_durations):
+                try:
+                    durations_for_features = compute_daily_durations(sw_for_features)
+                except Exception:
+                    logging.exception("compute_daily_durations failed for shifted swipes; falling back to original durations.")
+                    durations_for_features = combined.copy()
+            # save shifted raw optionally
+            try:
+                sw_shifted_out = Path(outdir_path) / f"swipes_{city_slug}_{target_date.strftime('%Y%m%d')}_shifted.csv"
+                cols_keep = [c for c in sw_for_features.columns if c in ('person_uid','EmployeeID','CardNumber','LocaleMessageTime','OriginalLocaleMessageTime','Door','Direction','PartitionName2')]
+                sw_for_features[cols_keep].to_csv(sw_shifted_out, index=False)
+            except Exception:
+                logging.debug("Could not write shifted swipes file.")
+        except Exception:
+            logging.exception("Failed to prepare shifted swipes for Pune 2AM logic.")
+            sw_for_features = sw_combined.copy()
+            durations_for_features = combined.copy()
+
+    # compute features
+    features = compute_features(sw_for_features, durations_for_features)
+    if features is None:
+        features = pd.DataFrame()
+    if features.empty:
+        logging.warning("run_trend_for_date: no features computed")
+        if as_dict:
+            return {'rows': 0, 'flagged_rows': 0, 'sample': [], 'reasons_count': {}, 'risk_counts': {}, 'aggregated_unique_persons': 0}
+        return pd.DataFrame()
+
+    # restore FirstSwipe/LastSwipe to original timeline if shifted
+    if use_pune_2am_boundary:
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in features.columns:
+                try:
+                    features[dtcol] = pd.to_datetime(features[dtcol], errors='coerce') + pd.Timedelta(hours=2)
+                except Exception:
+                    pass
+
+    # Save raw swipes for evidence
+    try:
+        if sw_combined is not None and not sw_combined.empty:
+            sw_out = Path(outdir_path) / f"swipes_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+            sw_combined.to_csv(sw_out, index=False)
+            logging.info("Saved raw swipes to %s", sw_out)
+    except Exception:
+        logging.warning("Failed to save raw swipes")
+
+    # Recompute per-row metrics from raw swipes and merge into features
+    try:
+        if sw_combined is not None and not sw_combined.empty:
+            if 'LocaleMessageTime' not in sw_combined.columns:
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_combined.columns:
+                        sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined[cand], errors='coerce')
+                        break
+            else:
+                sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined['LocaleMessageTime'], errors='coerce')
+            if use_pune_2am_boundary:
+                sw_combined['DisplayDateKey'] = (sw_combined['LocaleMessageTime'] - pd.Timedelta(hours=2)).dt.date
+            else:
+                sw_combined['DisplayDateKey'] = sw_combined['LocaleMessageTime'].dt.date
+
+            def _agg_metrics(g):
+                times_sorted = sorted(list(pd.to_datetime(g['LocaleMessageTime'].dropna())))
+                count_swipes = len(times_sorted)
+                max_gap = 0
+                short_gap_count = 0
+                if len(times_sorted) >= 2:
+                    gaps = []
+                    for i in range(1, len(times_sorted)):
+                        s = (times_sorted[i] - times_sorted[i-1]).total_seconds()
+                        gaps.append(s)
+                        if s <= 5*60:
+                            short_gap_count += 1
+                    max_gap = int(max(gaps)) if gaps else 0
+                first_ts = times_sorted[0] if times_sorted else None
+                last_ts = times_sorted[-1] if times_sorted else None
+                unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+                unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+                def _pick_non_guid(colname):
+                    if colname in g.columns:
+                        for v in pd.unique(g[colname].dropna().astype(str).map(lambda x: x.strip())):
+                            if v and (not _GUID_RE.match(v)) and v.lower() not in _PLACEHOLDER_STRS:
+                                return v
+                    return None
+                card = _pick_non_guid('CardNumber')
+                empid = _pick_non_guid('EmployeeID') or _pick_non_guid('Int1') or _pick_non_guid('Text12')
+                empname = _pick_non_guid('EmployeeName') or _pick_non_guid('ObjectName1')
+                duration_sec = 0.0
+                if first_ts is not None and last_ts is not None:
+                    try:
+                        duration_sec = float((pd.to_datetime(last_ts) - pd.to_datetime(first_ts)).total_seconds())
+                        if duration_sec < 0:
+                            duration_sec = 0.0
+                    except Exception:
+                        duration_sec = 0.0
+                return pd.Series({
+                    'FirstSwipe_raw': first_ts,
+                    'LastSwipe_raw': last_ts,
+                    'CountSwipes_raw': int(count_swipes),
+                    'DurationSeconds_raw': float(duration_sec),
+                    'DurationMinutes_raw': float(duration_sec/60.0),
+                    'MaxSwipeGapSeconds_raw': int(max_gap),
+                    'ShortGapCount_raw': int(short_gap_count),
+                    'UniqueDoors_raw': int(unique_doors),
+                    'UniqueLocations_raw': int(unique_locations),
+                    'CardNumber_raw': card,
+                    'EmployeeID_raw': empid,
+                    'EmployeeName_raw': empname
+                })
+
+            grouped_raw = sw_combined.dropna(subset=['person_uid', 'DisplayDateKey'], how='any').groupby(['person_uid', 'DisplayDateKey'])
+            if not grouped_raw.ngroups:
+                raw_metrics_df = pd.DataFrame(columns=[
+                    'person_uid','DisplayDate','FirstSwipe_raw','LastSwipe_raw','CountSwipes_raw','DurationSeconds_raw',
+                    'DurationMinutes_raw','MaxSwipeGapSeconds_raw','ShortGapCount_raw','UniqueDoors_raw','UniqueLocations_raw',
+                    'CardNumber_raw','EmployeeID_raw','EmployeeName_raw'
+                ])
+            else:
+                raw_metrics_df = grouped_raw.apply(_agg_metrics).reset_index()
+                raw_metrics_df.rename(columns={'DisplayDateKey':'DisplayDate'}, inplace=True)
+
+            # merge robustly
+            try:
+                features['_DisplayDate_for_merge'] = pd.to_datetime(features['DisplayDate'], errors='coerce').dt.normalize()
+                raw_metrics_df['_DisplayDate_for_merge'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').dt.normalize()
+                merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                          left_on=['person_uid', '_DisplayDate_for_merge'],
+                                          right_on=['person_uid', '_DisplayDate_for_merge'],
+                                          suffixes=('','_rawagg'))
+            except Exception:
+                # fallback to string keys
+                try:
+                    features['_DisplayDate_for_merge_str'] = pd.to_datetime(features.get('DisplayDate', None), errors='coerce').astype(str).fillna('')
+                except Exception:
+                    features['_DisplayDate_for_merge_str'] = features.get('DisplayDate', '').astype(str).fillna('')
+                try:
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = pd.to_datetime(raw_metrics_df.get('DisplayDate', None), errors='coerce').astype(str).fillna('')
+                except Exception:
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = raw_metrics_df.get('DisplayDate', '').astype(str).fillna('')
+                try:
+                    merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                              left_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              right_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              suffixes=('','_rawagg'))
+                except Exception:
+                    merged_metrics = features.copy()
+            # coalesce raw columns back into features
+            try:
+                for base_col, raw_col in [
+                    ('FirstSwipe','FirstSwipe_raw'),
+                    ('LastSwipe','LastSwipe_raw'),
+                    ('CountSwipes','CountSwipes_raw'),
+                    ('DurationSeconds','DurationSeconds_raw'),
+                    ('DurationMinutes','DurationMinutes_raw'),
+                    ('MaxSwipeGapSeconds','MaxSwipeGapSeconds_raw'),
+                    ('ShortGapCount','ShortGapCount_raw'),
+                    ('UniqueDoors','UniqueDoors_raw'),
+                    ('UniqueLocations','UniqueLocations_raw'),
+                    ('CardNumber','CardNumber_raw'),
+                    ('EmployeeID','EmployeeID_raw'),
+                    ('EmployeeName','EmployeeName_raw')
+                ]:
+                    if raw_col in merged_metrics.columns:
+                        try:
+                            merged_metrics[base_col] = merged_metrics[raw_col].combine_first(merged_metrics.get(base_col))
+                        except Exception:
+                            pass
+                feature_cols = list(features.columns)
+                if all(c in merged_metrics.columns for c in feature_cols):
+                    features = merged_metrics[feature_cols].copy()
+                else:
+                    features = merged_metrics.copy()
+                for helper_col in ['_DisplayDate_for_merge', '_DisplayDate_for_merge_str']:
+                    if helper_col in features.columns:
+                        try:
+                            features.drop(columns=[helper_col], inplace=True)
+                        except Exception:
+                            pass
+            except Exception:
+                logging.exception("Post-merge coalescing failed; leaving features as-is.")
+    except Exception:
+        logging.exception("Failed recomputing raw metrics (non-fatal)")
+
+    # If we used shifted timeline restore displayed times (safety)
+    if use_pune_2am_boundary:
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in features.columns:
+                try:
+                    features[dtcol] = pd.to_datetime(features[dtcol], errors='coerce') + pd.Timedelta(hours=2)
+                except Exception:
+                    pass
+
+    # Merge features with durations (prefer features)
+    try:
+        merged = pd.merge(features, combined, how='left', on=['person_uid', 'Date'], suffixes=('_feat', '_dur'))
+    except Exception:
+        merged = features
+
+    trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date)
+
+    # write csv
+    try:
+        write_df = trend_df.copy()
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in write_df.columns:
+                write_df[dtcol] = pd.to_datetime(write_df[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+        if 'Date' in write_df.columns:
+            try:
+                write_df['Date'] = pd.to_datetime(write_df['Date'], errors='coerce').dt.date
+                write_df['Date'] = write_df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+            except Exception:
+                pass
+        write_df = write_df.where(pd.notnull(write_df), None)
+        out_csv = Path(outdir_path) / f"trend_pune_{target_date.strftime('%Y%m%d')}.csv"
+        write_df.to_csv(out_csv, index=False)
+        logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(write_df))
+    except Exception:
+        logging.exception("Failed to write trend CSV")
+
+    # Format DisplayDate
+    try:
+        if 'DisplayDate' in trend_df.columns:
+            trend_df['DisplayDate'] = pd.to_datetime(trend_df['DisplayDate'], errors='coerce').dt.date
+            trend_df['DisplayDate'] = trend_df['DisplayDate'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+    except Exception:
+        pass
+
+    if as_dict:
+        try:
+            rec_df = trend_df.copy()
+            for dtcol in ('FirstSwipe', 'LastSwipe'):
+                if dtcol in rec_df.columns:
+                    rec_df[dtcol] = pd.to_datetime(rec_df[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+            if 'Date' in rec_df.columns:
+                try:
+                    rec_df['Date'] = pd.to_datetime(rec_df['Date'], errors='coerce').dt.date
+                    rec_df['Date'] = rec_df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+                except Exception:
+                    pass
+            rec_df = rec_df.where(pd.notnull(rec_df), None)
+            total_rows = int(len(rec_df))
+            flagged_rows = int(rec_df['IsFlagged'].sum()) if 'IsFlagged' in rec_df.columns else 0
+            reasons_count = {}
+            risk_counts = {}
+            try:
+                if 'Reasons' in rec_df.columns:
+                    for v in rec_df['Reasons'].dropna().astype(str):
+                        for part in re.split(r'[;,\|]', v):
+                            key = part.strip()
+                            if key:
+                                reasons_count[key] = reasons_count.get(key, 0) + 1
+                if 'RiskLevel' in rec_df.columns:
+                    for v in rec_df['RiskLevel'].fillna('').astype(str):
+                        if v:
+                            risk_counts[v] = risk_counts.get(v, 0) + 1
+            except Exception:
+                pass
+            sample_records = rec_df.head(20).to_dict(orient='records') if not rec_df.empty else []
+            return {
+                'rows': total_rows,
+                'flagged_rows': flagged_rows,
+                'aggregated_unique_persons': total_rows,
+                'sample': sample_records,
+                'reasons_count': reasons_count,
+                'risk_counts': risk_counts,
+                'files': []
+            }
+        except Exception:
+            logging.exception("Failed to build dict output for run_trend_for_date")
+            return {'rows': len(trend_df), 'flagged_rows': int(trend_df['IsFlagged'].sum() if 'IsFlagged' in trend_df.columns else 0),
+                    'sample': [], 'reasons_count': {}, 'risk_counts': {}, 'aggregated_unique_persons': len(trend_df)}
+
+    return trend_df
+
+# ---------------- helper wrappers ----------------
+from datetime import datetime as _datetime
+from datetime import timedelta as _timedelta
+def _ensure_date_obj(d):
+    if d is None:
+        return None
+    if isinstance(d, date):
+        return d
+    if isinstance(d, _datetime):
+        return d.date()
+    if isinstance(d, str):
+        try:
+            return _datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            try:
+                return _datetime.fromisoformat(d).date()
+            except Exception:
+                raise ValueError(f"Unsupported date string: {d}")
+    raise ValueError(f"Unsupported date type: {type(d)}")
+
+def build_monthly_training(start_date=None, end_date=None, outdir: str = None, city: str = 'Pune', as_dict: bool = False):
+    od = Path(outdir) if outdir else OUTDIR
+    od.mkdir(parents=True, exist_ok=True)
+    if start_date is None and end_date is None:
+        today = date.today()
+        first = date(today.year, today.month, 1)
+        last = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+    else:
+        if start_date is None:
+            raise ValueError("start_date must be provided when end_date is provided")
+        first = _ensure_date_obj(start_date)
+        if end_date is None:
+            last = date(first.year, first.month, calendar.monthrange(first.year, first.month)[1])
+        else:
+            last = _ensure_date_obj(end_date)
+    if last < first:
+        raise ValueError("end_date must be >= start_date")
+    cur = first
+    ran = []
+    errors = {}
+    total_flagged = 0
+    total_rows = 0
+    while cur <= last:
+        try:
+            logging.info("build_monthly_training: running for %s (city=%s)", cur.isoformat(), city)
+            res = run_trend_for_date(cur, outdir=str(od), city=city, as_dict=as_dict)
+            ran.append({'date': cur.isoformat(), 'result': res})
+            if isinstance(res, dict):
+                total_flagged += int(res.get('flagged_rows', 0) or 0)
+                total_rows += int(res.get('rows', 0) or 0)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logging.exception("build_monthly_training: failed for %s", cur)
+            errors[cur.isoformat()] = str(e)
+        cur = cur + _timedelta(days=1)
+    summary = {
+        'start_date': first.isoformat(),
+        'end_date': last.isoformat(),
+        'dates_attempted': (last - first).days + 1,
+        'dates_succeeded': len([r for r in ran if r.get('result') is not None]),
+        'dates_failed': len(errors),
+        'errors': errors,
+        'total_rows': total_rows,
+        'total_flagged': total_flagged
+    }
+    if as_dict:
+        return summary
+    return ran
+
+def read_90day_cache(outdir: str = None):
+    od = Path(outdir) if outdir else OUTDIR
+    fp = od / "90day_cache.json"
+    if not fp.exists():
+        return {}
+    try:
+        with fp.open("r", encoding="utf8") as fh:
+            return json.load(fh)
+    except Exception:
+        logging.exception("read_90day_cache: failed to read %s", str(fp))
+        return {}
+
+if __name__ == "__main__":
+    today = datetime.now().date()
+    df = run_trend_for_date(today, as_dict=False)
+    print("Completed; rows:", len(df) if df is not None else 0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
 >>
 Traceback (most recent call last):
