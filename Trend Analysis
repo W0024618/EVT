@@ -1,3 +1,196 @@
+    # scan swipe files for the matched person
+    for d in dates_to_scan:
+        # discover candidate swipe files for this date (and city if provided)
+        candidates = _find_swipe_files(DEFAULT_OUTDIR, date_obj=d, city_slug=city_slug)
+
+        # If nothing found for exact date/city, try a permissive fallback for that date (region-swipes, any swipes for date)
+        if not candidates:
+            logging.info(
+                "No swipe files matched date=%s city=%s — falling back to permissive search",
+                d, city_slug
+            )
+            candidates = _find_swipe_files(DEFAULT_OUTDIR, date_obj=d, city_slug=None)  # ignore city
+
+        for fp in candidates:
+            raw_files.add(fp.name)
+
+            try:
+                try:
+                    raw_df = pd.read_csv(fp, parse_dates=['LocaleMessageTime'])
+                except Exception:
+                    raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                # unreadable / corrupted file -> skip
+                continue
+
+            raw_df = _replace_placeholder_strings(raw_df)
+            cols_lower = {c.lower(): c for c in raw_df.columns}
+            tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+            emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+            name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+            card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+            door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+            dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+            note_col = cols_lower.get('rejection_type') or cols_lower.get('note') or cols_lower.get('source') or None
+            person_uid_col = cols_lower.get('person_uid')
+
+            mask = pd.Series(False, index=raw_df.index)
+            if person_uid_col and person_uid_col in raw_df.columns:
+                mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == str(q).strip())
+            if emp_col and emp_col in raw_df.columns:
+                mask = mask | (raw_df[emp_col].astype(str).str.strip() == str(q).strip())
+            if not mask.any() and emp_col and emp_col in raw_df.columns:
+                try:
+                    q_numeric = float(q)
+                    emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                    mask = mask | (emp_numeric == q_numeric)
+                except Exception:
+                    pass
+            if not mask.any() and name_col and name_col in raw_df.columns:
+                # safe name compare
+                try:
+                    mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == str(q).strip().lower())
+                except Exception:
+                    pass
+
+            if not mask.any():
+                continue
+
+            filtered = raw_df[mask].copy()
+            if filtered.empty:
+                continue
+
+            if tcol and tcol in filtered.columns:
+                try:
+                    filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+                except Exception:
+                    pass
+
+            if tcol and tcol in filtered.columns:
+                filtered = filtered.sort_values(by=tcol)
+                filtered['_prev_ts'] = filtered[tcol].shift(1)
+                try:
+                    filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+                except Exception:
+                    filtered['_swipe_gap_seconds'] = 0.0
+                try:
+                    cur_dates = filtered[tcol].dt.date
+                    prev_dates = cur_dates.shift(1)
+                    day_start_mask = (prev_dates != cur_dates) | (filtered['_prev_ts'].isna())
+                    filtered.loc[day_start_mask, '_swipe_gap_seconds'] = 0.0
+                except Exception:
+                    pass
+            else:
+                filtered['_swipe_gap_seconds'] = 0.0
+
+            try:
+                if door_col and door_col in filtered.columns:
+                    if dir_col and dir_col in filtered.columns:
+                        # careful: apply needs column names from raw_df
+                        filtered['_zone'] = filtered.apply(lambda rr: map_door_to_zone(rr.get(door_col), rr.get(dir_col)), axis=1)
+                    else:
+                        filtered['_zone'] = filtered[door_col].apply(lambda dv: map_door_to_zone(dv, None))
+                else:
+                    filtered['_zone'] = filtered.get('PartitionName2', None)
+            except Exception:
+                filtered['_zone'] = None
+
+            for _, r in filtered.iterrows():
+                out = {}
+                out['EmployeeName'] = _to_python_scalar(r.get(name_col)) if name_col and name_col in filtered.columns else _to_python_scalar(matched.iloc[0].get('EmployeeName') if not matched.empty else q)
+                emp_val = None
+                if emp_col and emp_col in filtered.columns:
+                    emp_val = _to_python_scalar(r.get(emp_col))
+                else:
+                    for cand in ('Int1','Text12','EmployeeID','EmployeeIdentity','empid','id'):
+                        if cand.lower() in cols_lower:
+                            emp_val = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                            if emp_val not in (None,'','nan'):
+                                break
+                    if emp_val in (None,'','nan'):
+                        emp_val = _to_python_scalar(matched.iloc[0].get('EmployeeID') if not matched.empty else None)
+                if emp_val is not None:
+                    try:
+                        s = str(emp_val).strip()
+                        if '.' in s:
+                            f = float(s)
+                            if math.isfinite(f) and f.is_integer():
+                                s = str(int(f))
+                        if _looks_like_guid(s) or _is_placeholder_str(s):
+                            emp_val = None
+                        else:
+                            emp_val = s
+                    except Exception:
+                        if _looks_like_guid(emp_val):
+                            emp_val = None
+                out['EmployeeID'] = emp_val
+
+                card_val = None
+                if card_col and card_col in filtered.columns:
+                    card_val = _to_python_scalar(r.get(card_col))
+                else:
+                    for cand in ('CardNumber','CHUID','Card','card_no','cardnum','value','xmlmessage'):
+                        if cand.lower() in cols_lower:
+                            card_val = _to_python_scalar(r.get(cols_lower[cand.lower()]))
+                            if card_val not in (None,'','nan'):
+                                break
+                    if card_val in (None,'','nan'):
+                        card_val = _to_python_scalar(matched.iloc[0].get('CardNumber') if not matched.empty else None)
+                if card_val is not None:
+                    try:
+                        cs = str(card_val).strip()
+                        if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                            card_val = None
+                        else:
+                            card_val = cs
+                    except Exception:
+                        card_val = None
+                out['CardNumber'] = card_val
+                out['Card'] = card_val
+
+                if tcol and tcol in filtered.columns:
+                    ts = r.get(tcol)
+                    try:
+                        ts_py = pd.to_datetime(ts)
+                        out['Date'] = ts_py.date().isoformat()
+                        out['Time'] = ts_py.time().isoformat()
+                        out['LocaleMessageTime'] = ts_py.isoformat()
+                    except Exception:
+                        txt = str(r.get(tcol))
+                        out['Date'] = txt[:10]
+                        out['Time'] = txt[11:19] if len(txt) >= 19 else txt
+                        out['LocaleMessageTime'] = txt
+                else:
+                    out['Date'] = None
+                    out['Time'] = None
+                    out['LocaleMessageTime'] = None
+
+                out['SwipeGapSeconds'] = float(r.get('_swipe_gap_seconds')) if '_swipe_gap_seconds' in r else 0.0
+                out['SwipeGap'] = format_seconds_to_hms(out['SwipeGapSeconds'])
+                out['Door'] = _to_python_scalar(r.get(door_col)) if (door_col and door_col in filtered.columns) else None
+                out['Direction'] = _to_python_scalar(r.get(dir_col)) if (dir_col and dir_col in filtered.columns) else _to_python_scalar(r.get('Direction')) if 'Direction' in r else None
+                out['Note'] = _to_python_scalar(r.get(note_col)) if (note_col and note_col in filtered.columns) else None
+                try:
+                    out['Zone'] = _to_python_scalar(r.get('_zone')) if '_zone' in r else map_door_to_zone(out['Door'], out['Direction'])
+                except Exception:
+                    out['Zone'] = None
+                out['PartitionName2'] = _to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None
+                out['_source_file'] = fp.name
+                _append_swipe(out, fp.name)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i Have update below file as per above suggestion then we got below error so fix the error carefully....
 
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
