@@ -1,3 +1,195 @@
+# ----------------------------
+# NEW: Recompute per-row metrics (gaps/duration/counts) from raw swipes AFTER DisplayDate fixed
+# This removes spurious long gaps created when swipes were split across the 02:00 boundary.
+# (This block now runs after features is computed so we can merge raw metrics back into features.)
+# ----------------------------
+try:
+    if sw_combined is not None and not sw_combined.empty:
+        # ensure LocaleMessageTime exists and is parsed
+        if 'LocaleMessageTime' not in sw_combined.columns:
+            for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                if cand in sw_combined.columns:
+                    sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined[cand], errors='coerce')
+                    break
+        else:
+            sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined['LocaleMessageTime'], errors='coerce')
+
+        # compute display-date key on raw swipes consistent with features DisplayDate
+        if use_pune_2am_boundary:
+            # For mapping to DisplayDate we must mimic the shifted grouping: adjusted = LocaleMessageTime - 2 hours
+            sw_combined['DisplayDateKey'] = (sw_combined['LocaleMessageTime'] - pd.Timedelta(hours=2)).dt.date
+        else:
+            sw_combined['DisplayDateKey'] = sw_combined['LocaleMessageTime'].dt.date
+
+        # helper to compute metrics per (person_uid, DisplayDateKey)
+        def _agg_metrics(g):
+            times = list(pd.to_datetime(g['LocaleMessageTime'].dropna()))
+            times_sorted = sorted(times)
+            count_swipes = len(times_sorted)
+            max_gap = 0
+            short_gap_count = 0
+            if len(times_sorted) >= 2:
+                gaps = []
+                for i in range(1, len(times_sorted)):
+                    s = (times_sorted[i] - times_sorted[i-1]).total_seconds()
+                    gaps.append(s)
+                    if s <= 5*60:
+                        short_gap_count += 1
+                max_gap = int(max(gaps)) if gaps else 0
+            first_ts = times_sorted[0] if times_sorted else None
+            last_ts = times_sorted[-1] if times_sorted else None
+            # doors/locations
+            unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+            unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+            # pick first non-guid CardNumber/EmployeeID/EmployeeName
+            def _pick_non_guid(colname):
+                if colname in g.columns:
+                    for v in pd.unique(g[colname].dropna().astype(str).map(lambda x: x.strip())):
+                        if v and (not _GUID_RE.match(v)) and v.lower() not in _PLACEHOLDER_STRS:
+                            return v
+                return None
+            card = _pick_non_guid('CardNumber') or _pick_non_guid('card') or _pick_non_guid('XmlShredValue') or None
+            empid = _pick_non_guid('EmployeeID') or _pick_non_guid('Int1') or _pick_non_guid('Text12') or None
+            empname = _pick_non_guid('EmployeeName') or _pick_non_guid('ObjectName1') or None
+            duration_sec = 0.0
+            if first_ts is not None and last_ts is not None:
+                try:
+                    duration_sec = float((pd.to_datetime(last_ts) - pd.to_datetime(first_ts)).total_seconds())
+                    if duration_sec < 0:
+                        duration_sec = 0.0
+                except Exception:
+                    duration_sec = 0.0
+            return pd.Series({
+                'FirstSwipe_raw': first_ts,
+                'LastSwipe_raw': last_ts,
+                'CountSwipes_raw': int(count_swipes),
+                'DurationSeconds_raw': float(duration_sec),
+                'DurationMinutes_raw': float(duration_sec/60.0),
+                'MaxSwipeGapSeconds_raw': int(max_gap),
+                'ShortGapCount_raw': int(short_gap_count),
+                'UniqueDoors_raw': int(unique_doors),
+                'UniqueLocations_raw': int(unique_locations),
+                'CardNumber_raw': card,
+                'EmployeeID_raw': empid,
+                'EmployeeName_raw': empname
+            })
+
+        # group and compute metrics
+        grouped_raw = sw_combined.dropna(subset=['person_uid', 'DisplayDateKey'], how='any').groupby(['person_uid', 'DisplayDateKey'])
+        if not grouped_raw.ngroups:
+            raw_metrics_df = pd.DataFrame(columns=[
+                'person_uid','DisplayDateKey','FirstSwipe_raw','LastSwipe_raw','CountSwipes_raw','DurationSeconds_raw',
+                'DurationMinutes_raw','MaxSwipeGapSeconds_raw','ShortGapCount_raw','UniqueDoors_raw','UniqueLocations_raw',
+                'CardNumber_raw','EmployeeID_raw','EmployeeName_raw'
+            ])
+        else:
+            raw_metrics_df = grouped_raw.apply(_agg_metrics).reset_index()
+            # rename DisplayDateKey column to match features
+            raw_metrics_df.rename(columns={'DisplayDateKey':'DisplayDate'}, inplace=True)
+
+        # merge metrics back into features keyed by person_uid + DisplayDate
+        try:
+            # --- Ensure both sides have the same dtype (datetime64[ns]) for merge key ---
+            # Normalize features DisplayDate -> datetime64[ns] at midnight
+            features['_DisplayDate_for_merge'] = pd.to_datetime(features['DisplayDate'], errors='coerce').dt.normalize()
+
+            # Normalize raw_metrics DisplayDate -> datetime64[ns] at midnight
+            raw_metrics_df['_DisplayDate_for_merge'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').dt.normalize()
+
+            # Attempt the merge
+            merged_metrics = pd.merge(
+                features, raw_metrics_df, how='left',
+                left_on=['person_uid', '_DisplayDate_for_merge'],
+                right_on=['person_uid', '_DisplayDate_for_merge'],
+                suffixes=('','_rawagg')
+            )
+
+        except Exception as merge_exc:
+            logging.exception("Initial merge failed (attempting robust fallback): %s", merge_exc)
+            # Robust fallback: coerce both keys to string representation and try again
+            try:
+                features['_DisplayDate_for_merge_str'] = features['_DisplayDate_for_merge'].astype(str).fillna('')
+            except Exception:
+                features['_DisplayDate_for_merge_str'] = pd.to_datetime(features.get('DisplayDate', None), errors='coerce').astype(str).fillna('')
+
+            try:
+                raw_metrics_df['_DisplayDate_for_merge_str'] = pd.to_datetime(raw_metrics_df.get('DisplayDate', None), errors='coerce').astype(str).fillna('')
+            except Exception:
+                raw_metrics_df['_DisplayDate_for_merge_str'] = raw_metrics_df.get('DisplayDate', '').astype(str).fillna('')
+
+            try:
+                merged_metrics = pd.merge(
+                    features, raw_metrics_df, how='left',
+                    left_on=['person_uid', '_DisplayDate_for_merge_str'],
+                    right_on=['person_uid', '_DisplayDate_for_merge_str'],
+                    suffixes=('','_rawagg')
+                )
+            except Exception:
+                logging.exception("Fallback string-key merge failed; using features unchanged.")
+                merged_metrics = features.copy()
+
+        # Where raw metrics exist, prefer those values (keep existing feature columns otherwise)
+        try:
+            for base_col, raw_col in [
+                ('FirstSwipe','FirstSwipe_raw'),
+                ('LastSwipe','LastSwipe_raw'),
+                ('CountSwipes','CountSwipes_raw'),
+                ('DurationSeconds','DurationSeconds_raw'),
+                ('DurationMinutes','DurationMinutes_raw'),
+                ('MaxSwipeGapSeconds','MaxSwipeGapSeconds_raw'),
+                ('ShortGapCount','ShortGapCount_raw'),
+                ('UniqueDoors','UniqueDoors_raw'),
+                ('UniqueLocations','UniqueLocations_raw'),
+                ('CardNumber','CardNumber_raw'),
+                ('EmployeeID','EmployeeID_raw'),
+                ('EmployeeName','EmployeeName_raw')
+            ]:
+                if raw_col in merged_metrics.columns:
+                    try:
+                        merged_metrics[base_col] = merged_metrics[raw_col].combine_first(merged_metrics.get(base_col))
+                    except Exception:
+                        merged_metrics[base_col] = merged_metrics.get(base_col)
+
+            # preserve original feature columns and override those updated above
+            feature_cols = list(features.columns)
+            # If merged_metrics doesn't contain all feature_cols, fallback to merged_metrics.columns
+            if all(c in merged_metrics.columns for c in feature_cols):
+                features = merged_metrics[feature_cols].copy()
+            else:
+                features = merged_metrics.copy()
+            # drop helper merge keys if present
+            for helper_col in ['_DisplayDate_for_merge', '_DisplayDate_for_merge_str']:
+                if helper_col in features.columns:
+                    try:
+                        features.drop(columns=[helper_col], inplace=True)
+                    except Exception:
+                        pass
+        except Exception:
+            logging.exception("Post-merge coalescing failed; leaving features as-is.")
+
+except Exception:
+    # Catch-all for the entire recompute block — non-fatal: leave features unchanged.
+    logging.exception("Failed recomputing per-row metrics from raw swipes (non-fatal).")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I have Update as per Aboeve Still we have same error need to fix this issue carefully...
 
 
