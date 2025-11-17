@@ -1,3 +1,175 @@
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "AdjustedMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    # parse datetimes if present
+    try:
+        if df["LocaleMessageTime"].dtype == object:
+            df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    if "AdjustedMessageTime" in df.columns and df["AdjustedMessageTime"].dtype == object:
+        df["AdjustedMessageTime"] = pd.to_datetime(df["AdjustedMessageTime"], errors="coerce")
+
+    # defensive dedupe: round to seconds to avoid millisecond differences and drop near-duplicates
+    try:
+        # create a rounded timestamp column to seconds
+        df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+        dedupe_subset = ["person_uid", "_lts_rounded", "CardNumber", "Door"]
+        df = df.drop_duplicates(subset=dedupe_subset, keep="first").copy()
+    except Exception:
+        # fallback to previous dedupe if something fails
+        dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+        try:
+            df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+        except Exception:
+            pass
+
+    # robust Pune detector (used only to decide logical date boundary)
+    def _is_pune_row(r):
+        try:
+            part = str(r.get("PartitionName2") or "").strip().lower()
+            ploc = str(r.get("PrimaryLocation") or "").strip().lower()
+            door = str(r.get("Door") or "").strip().lower()
+            if "pun" in part or "pune" in part:
+                return True
+            if "pun" in ploc or "pune" in ploc:
+                return True
+            if "pun" in door or "pune" in door:
+                return True
+            return False
+        except Exception:
+            return False
+
+    # Date assignment:
+    # - Default: use LocaleMessageTime.date()
+    # - For Pune rows, if AdjustedMessageTime available use AdjustedMessageTime.date() so 2AM boundary works.
+    try:
+        df["Date"] = df["LocaleMessageTime"].dt.date
+        if "AdjustedMessageTime" in df.columns:
+            mask_pune = df.apply(_is_pune_row, axis=1) & df["AdjustedMessageTime"].notna()
+            if mask_pune.any():
+                df.loc[mask_pune, "Date"] = df.loc[mask_pune, "AdjustedMessageTime"].dt.date
+    except Exception:
+        try:
+            df["Date"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce").dt.date
+        except Exception:
+            df["Date"] = None
+
+    # ensure person_uid (keep existing canonicalization where present)
+    df["person_uid"] = df.apply(
+        lambda row: row.get("person_uid")
+        if pd.notna(row.get("person_uid")) and str(row.get("person_uid")).strip() != ""
+        else "|".join([str(row.get(c)).strip() for c in ["EmployeeID", "CardNumber", "EmployeeName"] if pd.notna(row.get(c)) and str(row.get(c)).strip() != ""]),
+        axis=1
+    )
+    df = df[df["person_uid"].notna()].copy()
+
+    # Group and aggregate — important: pick first *non-empty* EmployeeName (avoid blank-first problem)
+    try:
+        df = df.sort_values("LocaleMessageTime")
+        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
+            FirstSwipe=("LocaleMessageTime", "first"),
+            LastSwipe=("LocaleMessageTime", "last"),
+            FirstDoor=("Door", "first"),
+            LastDoor=("Door", "last"),
+            CountSwipes=("LocaleMessageTime", "count"),
+            EmployeeIdentity=("EmployeeIdentity", "first"),
+            EmployeeID=("EmployeeID", lambda s: _pick_first_non_guid_value(s)),
+            EmployeeName=("EmployeeName", lambda s: _pick_first_non_guid_value(s)),
+            CardNumber=("CardNumber", lambda s: _pick_first_non_guid_value(s)),
+            PersonnelTypeName=("PersonnelTypeName", "first"),
+            PartitionName2=("PartitionName2", "first"),
+            CompanyName=("CompanyName", "first"),
+            PrimaryLocation=("PrimaryLocation", "first"),
+            FirstDirection=("Direction", "first"),
+            LastDirection=("Direction", "last")
+        ).reset_index()
+    except Exception:
+        def agg_for_group(g):
+            g_sorted = g.sort_values("LocaleMessageTime")
+            first = g_sorted.iloc[0]
+            last = g_sorted.iloc[-1]
+            # pick first sensible EmployeeName / EmployeeID / CardNumber
+            empid = _pick_first_non_guid_value(g_sorted["EmployeeID"]) if "EmployeeID" in g_sorted else first.get("EmployeeID")
+            ename = _pick_first_non_guid_value(g_sorted["EmployeeName"]) if "EmployeeName" in g_sorted else first.get("EmployeeName")
+            cnum = _pick_first_non_guid_value(g_sorted["CardNumber"]) if "CardNumber" in g_sorted else first.get("CardNumber")
+            return pd.Series({
+                "person_uid": first["person_uid"],
+                "EmployeeIdentity": first.get("EmployeeIdentity"),
+                "EmployeeID": empid,
+                "EmployeeName": ename,
+                "CardNumber": cnum,
+                "Date": first["Date"],
+                "FirstSwipe": first["LocaleMessageTime"],
+                "LastSwipe": last["LocaleMessageTime"],
+                "FirstDoor": first.get("Door"),
+                "LastDoor": last.get("Door"),
+                "CountSwipes": int(len(g_sorted)),
+                "PersonnelTypeName": first.get("PersonnelTypeName"),
+                "PartitionName2": first.get("PartitionName2"),
+                "CompanyName": first.get("CompanyName"),
+                "PrimaryLocation": first.get("PrimaryLocation"),
+                "FirstDirection": first.get("Direction"),
+                "LastDirection": last.get("Direction")
+            })
+        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    # compute duration using LocaleMessageTime first/last (this keeps wall-clock times correct)
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(
+        lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s >= 0 else None
+    )
+
+    # ensure all output cols exist
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    # drop any helper column if leaked
+    if "_lts_rounded" in grouped.columns:
+        try:
+            grouped = grouped.drop(columns=["_lts_rounded"])
+        except Exception:
+            pass
+
+    return grouped[out_cols]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i have review below issue only for Pune 
 When Select Pune (APAC.Default)
 i have udentify one issue Which is regaring time issue and Name Missing 
