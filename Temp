@@ -1,3 +1,168 @@
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "DurationMinutes", "DurationDisplay", "DurationHMS",
+        "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = swipes_df.copy()
+    expected = ["EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+                "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    # parse datetimes if present
+    try:
+        if df["LocaleMessageTime"].dtype == object:
+            df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    # drop near-duplicate swipes (round to seconds)
+    try:
+        df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+        dedupe_subset = ["person_uid", "_lts_rounded", "CardNumber", "Door"]
+        df = df.drop_duplicates(subset=dedupe_subset, keep="first").copy()
+    except Exception:
+        dedupe_cols = ["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"]
+        try:
+            df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+        except Exception:
+            pass
+
+    # Date assignment (STRICT: only use LocaleMessageTime.date())
+    try:
+        df["Date"] = df["LocaleMessageTime"].dt.date
+    except Exception:
+        try:
+            df["Date"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce").dt.date
+        except Exception:
+            df["Date"] = None
+
+    # ensure person_uid (keep existing canonicalization where present)
+    df["person_uid"] = df.apply(
+        lambda row: row.get("person_uid")
+        if pd.notna(row.get("person_uid")) and str(row.get("person_uid")).strip() != ""
+        else "|".join([str(row.get(c)).strip() for c in ["EmployeeID", "CardNumber", "EmployeeName"] if pd.notna(row.get(c)) and str(row.get(c)).strip() != ""]),
+        axis=1
+    )
+    df = df[df["person_uid"].notna()].copy()
+
+    # Group and aggregate — pick first non-empty EmployeeName and EmployeeID
+    try:
+        df = df.sort_values("LocaleMessageTime")
+        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
+            FirstSwipe=("LocaleMessageTime", "first"),
+            LastSwipe=("LocaleMessageTime", "last"),
+            FirstDoor=("Door", "first"),
+            LastDoor=("Door", "last"),
+            CountSwipes=("LocaleMessageTime", "count"),
+            EmployeeIdentity=("EmployeeIdentity", "first"),
+            EmployeeID=("EmployeeID", lambda s: _pick_first_non_guid_value(s)),
+            EmployeeName=("EmployeeName", lambda s: _pick_first_non_guid_value(s)),
+            CardNumber=("CardNumber", lambda s: _pick_first_non_guid_value(s)),
+            PersonnelTypeName=("PersonnelTypeName", "first"),
+            PartitionName2=("PartitionName2", "first"),
+            CompanyName=("CompanyName", "first"),
+            PrimaryLocation=("PrimaryLocation", "first"),
+            FirstDirection=("Direction", "first"),
+            LastDirection=("Direction", "last")
+        ).reset_index()
+    except Exception:
+        def agg_for_group(g):
+            g_sorted = g.sort_values("LocaleMessageTime")
+            first = g_sorted.iloc[0]
+            last = g_sorted.iloc[-1]
+            empid = _pick_first_non_guid_value(g_sorted["EmployeeID"]) if "EmployeeID" in g_sorted else first.get("EmployeeID")
+            ename = _pick_first_non_guid_value(g_sorted["EmployeeName"]) if "EmployeeName" in g_sorted else first.get("EmployeeName")
+            cnum = _pick_first_non_guid_value(g_sorted["CardNumber"]) if "CardNumber" in g_sorted else first.get("CardNumber")
+            return pd.Series({
+                "person_uid": first["person_uid"],
+                "EmployeeIdentity": first.get("EmployeeIdentity"),
+                "EmployeeID": empid,
+                "EmployeeName": ename,
+                "CardNumber": cnum,
+                "Date": first["Date"],
+                "FirstSwipe": first["LocaleMessageTime"],
+                "LastSwipe": last["LocaleMessageTime"],
+                "FirstDoor": first.get("Door"),
+                "LastDoor": last.get("Door"),
+                "CountSwipes": int(len(g_sorted)),
+                "PersonnelTypeName": first.get("PersonnelTypeName"),
+                "PartitionName2": first.get("PartitionName2"),
+                "CompanyName": first.get("CompanyName"),
+                "PrimaryLocation": first.get("PrimaryLocation"),
+                "FirstDirection": first.get("Direction"),
+                "LastDirection": last.get("Direction")
+            })
+        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    # compute duration using LocaleMessageTime first/last (wall-clock)
+    grouped["DurationSeconds"] = (grouped["LastSwipe"] - grouped["FirstSwipe"]).dt.total_seconds().clip(lower=0)
+    grouped["Duration"] = grouped["DurationSeconds"].apply(
+        lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) and s >= 0 else None
+    )
+
+    # helper: format minutes to "Hh Mm"
+    def _format_minutes_to_hhmm(seconds_val):
+        try:
+            if seconds_val is None or (isinstance(seconds_val, float) and np.isnan(seconds_val)):
+                return None
+            total_minutes = int(round(float(seconds_val) / 60.0))
+            h = total_minutes // 60
+            m = total_minutes % 60
+            return f"{h}h {m}m"
+        except Exception:
+            return None
+
+    # Duration in integer minutes (useful where UI currently shows '689 min')
+    grouped["DurationMinutes"] = grouped["DurationSeconds"].apply(lambda s: int(round(s/60)) if pd.notna(s) else None)
+
+    # Human readable hours display, e.g. "11h 29m"
+    grouped["DurationDisplay"] = grouped["DurationSeconds"].apply(_format_minutes_to_hhmm)
+
+    # Also provide a standard H:MM:SS string
+    grouped["DurationHMS"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # ensure all output cols exist
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    # drop helper column if present
+    if "_lts_rounded" in grouped.columns:
+        try:
+            grouped = grouped.drop(columns=["_lts_rounded"])
+        except Exception:
+            pass
+    if "_prev_ts" in grouped.columns:
+        try:
+            grouped = grouped.drop(columns=["_prev_ts"])
+        except Exception:
+            pass
+
+    return grouped[out_cols]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 SyntaxError: expected 'except' or 'finally' block
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
 >>
