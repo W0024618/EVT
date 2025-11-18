@@ -1,3 +1,507 @@
+@app.route('/record/export', methods=['GET'])
+def export_record_excel():
+    q = request.args.get('employee_id') or request.args.get('person_uid')
+    date_str = request.args.get('date')
+    city_param = request.args.get('city') or request.args.get('site') or 'pune'
+    city_slug = _slug_city(city_param)
+
+    if not q:
+        return jsonify({"error":"employee_id or person_uid is required"}), 400
+
+    q_str = str(q).strip()
+
+    # Helper: load trend CSV(s) and build set of flagged (id, date) tuples
+    def _load_flagged_map(target_date=None):
+        flagged_pairs = set()
+        try:
+            p = Path(DEFAULT_OUTDIR)
+            candidates = []
+            if target_date:
+                # try city/date specific trend file first
+                ymd = target_date.strftime('%Y%m%d')
+                f = p / f"trend_{city_slug}_{ymd}.csv"
+                if f.exists():
+                    candidates = [f]
+            if not candidates:
+                # fallback to any trend_*.csv in outputs
+                candidates = sorted(p.glob("trend_*.csv"), reverse=True)
+            for fp in candidates:
+                try:
+                    tdf = pd.read_csv(fp)
+                except Exception:
+                    try:
+                        tdf = pd.read_csv(fp, dtype=str)
+                    except Exception:
+                        continue
+                if tdf is None or tdf.empty:
+                    continue
+                tdf = _replace_placeholder_strings(tdf)
+                # ensure Date is normalized to iso date string
+                if 'Date' in tdf.columns:
+                    try:
+                        tdf['Date'] = pd.to_datetime(tdf['Date'], errors='coerce').dt.date
+                        tdf['DateISO'] = tdf['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+                    except Exception:
+                        tdf['DateISO'] = tdf['Date'].astype(str)
+                else:
+                    tdf['DateISO'] = None
+                # find flagged rows (IsFlagged True or AnomalyScore >= threshold)
+                if 'IsFlagged' in tdf.columns:
+                    sel = tdf[tdf['IsFlagged'] == True]
+                else:
+                    # fallback: consider AnomalyScore >= ANOMALY_THRESHOLD as flagged
+                    if 'AnomalyScore' in tdf.columns:
+                        try:
+                            sel = tdf[pd.to_numeric(tdf['AnomalyScore'], errors='coerce').fillna(0) >= ANOMALY_THRESHOLD]
+                        except Exception:
+                            sel = pd.DataFrame()
+                    else:
+                        sel = pd.DataFrame()
+
+                if sel is None or sel.empty:
+                    continue
+
+                for _, rr in sel.iterrows():
+                    date_iso = None
+                    try:
+                        date_iso = rr.get('DateISO') or (pd.to_datetime(rr.get('Date'), errors='coerce').date().isoformat() if rr.get('Date') is not None else None)
+                    except Exception:
+                        date_iso = None
+                    # collect EmployeeID and person_uid if present
+                    for idcol in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'Int1', 'Text12', 'CardNumber'):
+                        try:
+                            if idcol in rr and rr.get(idcol) not in (None, '', float('nan')):
+                                val = str(rr.get(idcol)).strip()
+                                if val:
+                                    flagged_pairs.add((idcol, val, date_iso))
+                                    # also add date-agnostic tuple for easy contains checks
+                                    flagged_pairs.add((idcol, val, None))
+                        except Exception:
+                            continue
+            return flagged_pairs
+        except Exception:
+            return set()
+
+    # parse date param for targeted checking (optional)
+    target_date_obj = None
+    if date_str:
+        try:
+            target_date_obj = pd.to_datetime(date_str).date()
+        except Exception:
+            return jsonify({"error":"invalid date format, expected YYYY-MM-DD"}), 400
+
+    flagged_map = _load_flagged_map(target_date_obj)
+
+    # Quick check: ensure the requested employee/q is flagged for the requested date (or flagged at all)
+    def _is_q_flagged(qtoken, date_iso=None):
+        if not qtoken:
+            return False
+        # check across multiple id columns recorded in trend files
+        for idcol in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'Int1', 'Text12', 'CardNumber'):
+            if (idcol, qtoken, date_iso) in flagged_map or (idcol, qtoken, None) in flagged_map:
+                return True
+        return False
+
+    # if date provided require flagged on that date; otherwise accept flagged any-date
+    q_flagged = _is_q_flagged(q_str, target_date_obj.isoformat() if target_date_obj else None)
+    if not q_flagged:
+        # if not flagged with exact id, try numeric-normalized attempts (strip trailing .0 etc)
+        try:
+            if '.' in q_str:
+                fq = None
+                try:
+                    f = float(q_str)
+                    if math.isfinite(f) and f.is_integer():
+                        fq = str(int(f))
+                except Exception:
+                    fq = None
+                if fq and _is_q_flagged(fq, target_date_obj.isoformat() if target_date_obj else None):
+                    q_flagged = True
+        except Exception:
+            pass
+
+    if not q_flagged:
+        return jsonify({"error": "employee not flagged (no evidence rows for requested employee/date)"}), 404
+
+    # find swipe files to scan
+    p = Path(DEFAULT_OUTDIR)
+    files_to_scan = []
+    if target_date_obj:
+        files_to_scan = _find_swipe_files(DEFAULT_OUTDIR, date_obj=target_date_obj, city_slug=city_slug, include_shifted=False if city_slug == 'pune' else True)
+    else:
+        files_to_scan = _find_swipe_files(DEFAULT_OUTDIR, date_obj=None, city_slug=city_slug)
+    if not files_to_scan:
+        avail = _find_swipe_files(DEFAULT_OUTDIR, date_obj=None, city_slug=None, include_shifted=False)
+        avail_names = [f.name for f in avail] if avail else []
+        logging.info("export_record_excel: no files matched for date=%s city=%s; available swipe files=%s", date_str, city_slug, avail_names)
+        return jsonify({"error": "no raw swipe files found for requested date / outputs", "available_swipe_files": avail_names}), 404
+
+    all_rows = []
+    for fp in files_to_scan:
+        try:
+            raw_df = pd.read_csv(fp, dtype=str, parse_dates=['LocaleMessageTime'])
+        except Exception:
+            try:
+                raw_df = pd.read_csv(fp, dtype=str)
+            except Exception:
+                continue
+
+        raw_df = _replace_placeholder_strings(raw_df)
+        cols_lower = {c.lower(): c for c in raw_df.columns}
+        tcol = cols_lower.get('localemessagetime') or cols_lower.get('messagetime') or cols_lower.get('timestamp') or cols_lower.get('time') or None
+        emp_col = cols_lower.get('int1') or cols_lower.get('employeeid') or cols_lower.get('employeeidentity') or cols_lower.get('employee_id') or None
+        name_col = cols_lower.get('employeename') or cols_lower.get('objectname1') or cols_lower.get('employee_name') or None
+        card_col = cols_lower.get('cardnumber') or cols_lower.get('card') or cols_lower.get('chuid') or cols_lower.get('value') or None
+        door_col = cols_lower.get('door') or cols_lower.get('doorname') or cols_lower.get('door_name') or None
+        dir_col = cols_lower.get('direction') or cols_lower.get('directionname') or cols_lower.get('direction_name') or None
+        admit_cols = [c for c in ('admitcode','admit','admit_code','admit_type','admitstatus') if c in cols_lower]
+        admit_col = cols_lower.get(admit_cols[0]) if admit_cols else None
+        personnel_col = cols_lower.get('personneltype') or cols_lower.get('personneltypename') or None
+        location_col = cols_lower.get('partitionname2') or cols_lower.get('location') or cols_lower.get('partitionname') or None
+        person_uid_col = cols_lower.get('person_uid')
+
+        mask = pd.Series(False, index=raw_df.index)
+        if person_uid_col and person_uid_col in raw_df.columns:
+            mask = mask | (raw_df[person_uid_col].astype(str).str.strip() == q_str)
+        if emp_col and emp_col in raw_df.columns:
+            mask = mask | (raw_df[emp_col].astype(str).str.strip() == q_str)
+        if not mask.any() and emp_col and emp_col in raw_df.columns:
+            try:
+                q_numeric = float(q_str)
+                emp_numeric = pd.to_numeric(raw_df[emp_col], errors='coerce')
+                mask = mask | (emp_numeric == q_numeric)
+            except Exception:
+                pass
+        if not mask.any() and name_col and name_col in raw_df.columns:
+            try:
+                mask = mask | (raw_df[name_col].astype(str).str.strip().str.lower() == q_str.lower())
+            except Exception:
+                pass
+
+        if not mask.any():
+            continue
+
+        filtered = raw_df[mask].copy()
+        if filtered.empty:
+            continue
+
+        if tcol and tcol in filtered.columns:
+            try:
+                filtered[tcol] = pd.to_datetime(filtered[tcol], errors='coerce')
+            except Exception:
+                pass
+
+        if tcol and tcol in filtered.columns:
+            filtered = filtered.sort_values(by=tcol)
+            filtered['_prev_ts'] = filtered[tcol].shift(1)
+            try:
+                filtered['_swipe_gap_seconds'] = (filtered[tcol] - filtered['_prev_ts']).dt.total_seconds().fillna(0).astype(float)
+            except Exception:
+                filtered['_swipe_gap_seconds'] = 0.0
+        else:
+            filtered['_swipe_gap_seconds'] = 0.0
+
+        try:
+            if door_col and door_col in filtered.columns:
+                if dir_col and dir_col in filtered.columns:
+                    filtered['_zone'] = filtered.apply(lambda rr: map_door_to_zone(rr.get(door_col), rr.get(dir_col)), axis=1)
+                else:
+                    filtered['_zone'] = filtered[door_col].apply(lambda dv: map_door_to_zone(dv, None))
+            else:
+                filtered['_zone'] = filtered.get('PartitionName2', None)
+        except Exception:
+            filtered['_zone'] = None
+
+        for _, r in filtered.iterrows():
+            # compute timestamp variants
+            ts_val = None
+            if tcol and tcol in filtered.columns:
+                ts_val = r.get(tcol)
+            else:
+                if 'Date' in filtered.columns:
+                    ts_val = r.get('Date')
+            try:
+                dt = pd.to_datetime(ts_val)
+                locale_iso = dt.isoformat() if pd.notna(dt) else None
+            except Exception:
+                locale_iso = str(ts_val) if ts_val is not None else None
+            try:
+                date_only = dt.strftime("%d-%b-%y") if pd.notna(dt) else None
+            except Exception:
+                date_only = None
+            try:
+                swipe_time = dt.strftime("%I:%M:%S %p").lstrip("0") if pd.notna(dt) else None
+            except Exception:
+                swipe_time = None
+
+            # EmployeeID resolution
+            emp_val = None
+            try:
+                if emp_col and emp_col in filtered.columns:
+                    emp_val = _to_python_scalar(r.get(emp_col))
+                else:
+                    for cand in ('Int1','Text12','EmployeeID','EmployeeIdentity','empid','id'):
+                        cl = cols_lower.get(cand.lower())
+                        if cl and cl in filtered.columns:
+                            emp_val = _to_python_scalar(r.get(cl))
+                            if emp_val:
+                                break
+            except Exception:
+                emp_val = None
+            if emp_val is not None:
+                try:
+                    s = str(emp_val).strip()
+                    if '.' in s:
+                        try:
+                            f = float(s)
+                            if math.isfinite(f) and f.is_integer():
+                                s = str(int(f))
+                        except Exception:
+                            pass
+                    emp_val = s
+                except Exception:
+                    pass
+
+            # ObjectName1 / EmployeeName
+            obj_name = None
+            try:
+                if name_col and name_col in filtered.columns:
+                    obj_name = _to_python_scalar(r.get(name_col))
+                elif 'ObjectName1' in filtered.columns:
+                    obj_name = _to_python_scalar(r.get('ObjectName1'))
+                elif 'EmployeeName' in filtered.columns:
+                    obj_name = _to_python_scalar(r.get('EmployeeName'))
+            except Exception:
+                obj_name = None
+
+            personnel_val = _to_python_scalar(r.get(personnel_col)) if (personnel_col and personnel_col in filtered.columns) else None
+            location_val = _to_python_scalar(r.get(location_col)) if (location_col and location_col in filtered.columns) else (_to_python_scalar(r.get('PartitionName2')) if 'PartitionName2' in filtered.columns else None)
+
+            # Card Number
+            card_val = None
+            try:
+                if card_col and card_col in filtered.columns:
+                    card_val = _to_python_scalar(r.get(card_col))
+                else:
+                    for cand in ('CardNumber','CHUID','Card','card_no','cardnum','value','xmlmessage'):
+                        cl = cols_lower.get(cand.lower())
+                        if cl and cl in filtered.columns:
+                            card_val = _to_python_scalar(r.get(cl))
+                            if card_val not in (None, '', 'nan'):
+                                break
+                if card_val is not None:
+                    card_val = str(card_val).strip()
+            except Exception:
+                card_val = None
+
+            admit_val = _to_python_scalar(r.get(admit_col)) if (admit_col and admit_col in filtered.columns) else None
+            if not admit_val:
+                for cand in ('Admit','AdmitCode','Admit_Type','Rejection_Type','Note','NoteType','Source'):
+                    cl = cols_lower.get(cand.lower())
+                    if cl and cl in filtered.columns:
+                        admit_val = _to_python_scalar(r.get(cl))
+                        if admit_val:
+                            break
+
+            direction_val = _to_python_scalar(r.get(dir_col)) if (dir_col and dir_col in filtered.columns) else _to_python_scalar(r.get('Direction')) if 'Direction' in filtered.columns else None
+            door_val = _to_python_scalar(r.get(door_col)) if (door_col and door_col in filtered.columns) else _to_python_scalar(r.get('Door')) if 'Door' in filtered.columns else None
+
+            row_out = {
+                "LocaleMessageTime": locale_iso,
+                "DateOnly": date_only,
+                "Swipe_Time": swipe_time,
+                "EmployeeID": emp_val,
+                "ObjectName1": obj_name,
+                "PersonnelType": personnel_val,
+                "Location": location_val,
+                "CardNumber": card_val,
+                "AdmitCode": admit_val,
+                "Direction": direction_val,
+                "Door": door_val,
+                "_source_file": fp.name
+            }
+
+            all_rows.append(row_out)
+
+    if not all_rows:
+        return jsonify({"error":"no swipe rows matched the requested employee/date"}), 404
+
+    df_out = pd.DataFrame(all_rows)
+
+    # Further restrict to only rows that match a flagged trend row on the same Date & EmployeeID/person_uid
+    # Build flagged lookup using trend CSV(s) again but now keyed by EmployeeID/Date
+    flagged_dates = set()
+    try:
+        p = Path(DEFAULT_OUTDIR)
+        # load relevant trend csv(s)
+        trend_candidates = []
+        if target_date_obj:
+            fp_try = p / f"trend_{city_slug}_{target_date_obj.strftime('%Y%m%d')}.csv"
+            if fp_try.exists():
+                trend_candidates = [fp_try]
+        if not trend_candidates:
+            trend_candidates = sorted(p.glob("trend_*.csv"), reverse=True)
+        for tf in trend_candidates:
+            try:
+                tdf = pd.read_csv(tf)
+            except Exception:
+                try:
+                    tdf = pd.read_csv(tf, dtype=str)
+                except Exception:
+                    continue
+            if tdf is None or tdf.empty:
+                continue
+            tdf = _replace_placeholder_strings(tdf)
+            if 'IsFlagged' in tdf.columns:
+                tsel = tdf[tdf['IsFlagged'] == True]
+            else:
+                if 'AnomalyScore' in tdf.columns:
+                    try:
+                        tsel = tdf[pd.to_numeric(tdf['AnomalyScore'], errors='coerce').fillna(0) >= ANOMALY_THRESHOLD]
+                    except Exception:
+                        tsel = pd.DataFrame()
+                else:
+                    tsel = pd.DataFrame()
+            if tsel is None or tsel.empty:
+                continue
+            for _, tt in tsel.iterrows():
+                try:
+                    dval = None
+                    if 'Date' in tt and pd.notna(tt.get('Date')):
+                        try:
+                            dval = pd.to_datetime(tt.get('Date')).date().isoformat()
+                        except Exception:
+                            dval = str(tt.get('Date'))
+                    # collect candidate ids
+                    for idcol in ('EmployeeID','person_uid','EmployeeIdentity','Int1','Text12','CardNumber'):
+                        if idcol in tt and tt.get(idcol) not in (None, '', float('nan')):
+                            try:
+                                ival = str(tt.get(idcol)).strip()
+                                if ival:
+                                    flagged_dates.add((idcol, ival, dval))
+                                    flagged_dates.add((idcol, ival, None))
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+    except Exception:
+        flagged_dates = set()
+
+    # Keep rows where employee/date is present in flagged_dates
+    def _row_is_flagged(r):
+        emp = r.get('EmployeeID') or ''
+        date_only = r.get('DateOnly')
+        # try iso date from DateOnly (it is in DD-MMM-YY), so translate to iso for matching if possible
+        date_iso = None
+        try:
+            if date_only:
+                # parse using day-month-year short form
+                date_iso = pd.to_datetime(date_only, format="%d-%b-%y", errors='coerce')
+                if pd.notna(date_iso):
+                    date_iso = date_iso.date().isoformat()
+                else:
+                    date_iso = None
+        except Exception:
+            date_iso = None
+        # match by EmployeeID & date or EmployeeID with any date
+        if emp and ((('EmployeeID', emp, date_iso) in flagged_dates) or (('EmployeeID', emp, None) in flagged_dates)):
+            return True
+        # also try matching by person_uid if employee string includes emp:/uid: patterns
+        for idcol in ('person_uid', 'EmployeeIdentity', 'Int1', 'Text12', 'CardNumber'):
+            if ((idcol, q_str, date_iso) in flagged_dates) or ((idcol, q_str, None) in flagged_dates):
+                return True
+        # fallback: if q matched and we earlier accepted q_flagged, accept rows for q
+        try:
+            if str(q_str) and (str(q_str) == str(emp) or str(q_str) == str(r.get('CardNumber'))):
+                return True
+        except Exception:
+            pass
+        return False
+
+    df_filtered = df_out[df_out.apply(_row_is_flagged, axis=1)].copy()
+    if df_filtered.empty:
+        return jsonify({"error":"no flagged swipe rows found for the requested employee/date"}), 404
+
+    # final column ordering and ensure only the columns requested
+    final_cols = ["LocaleMessageTime","DateOnly","Swipe_Time","EmployeeID","ObjectName1","PersonnelType","Location","CardNumber","AdmitCode","Direction","Door"]
+    # ensure all final_cols exist in df_filtered (create missing as None)
+    for c in final_cols:
+        if c not in df_filtered.columns:
+            df_filtered[c] = None
+    df_final = df_filtered[final_cols].copy()
+
+    # write excel with single sheet "Evidence" (strict columns only)
+    output = io.BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_final.to_excel(writer, sheet_name='Evidence', index=False)
+            writer.save()
+            output.seek(0)
+    except Exception as e:
+        logging.exception("Failed to create Excel: %s", e)
+        return jsonify({"error":"failed to create excel"}), 500
+
+    if OPENPYXL_AVAILABLE:
+        try:
+            wb = load_workbook(output)
+            thin = Side(border_style="thin", color="000000")
+            thick = Side(border_style="medium", color="000000")
+            for ws in wb.worksheets:
+                header = ws[1]
+                for cell in header:
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = Border(top=thick, left=thick, right=thick, bottom=thick)
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        try:
+                            v = str(cell.value) if cell.value is not None else ""
+                        except Exception:
+                            v = ""
+                        if len(v) > max_len:
+                            max_len = len(v)
+                    width = min(max(10, max_len + 2), 50)
+                    ws.column_dimensions[col_letter].width = width
+            out2 = io.BytesIO()
+            wb.save(out2)
+            out2.seek(0)
+            return send_file(out2, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            logging.exception("Excel styling failed, returning raw file")
+            output.seek(0)
+            return send_file(output, as_attachment=True,
+                             download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        output.seek(0)
+        return send_file(output, as_attachment=True,
+                         download_name=f"evidence_{str(q).replace(' ','_')}_{date_str or 'all'}.xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I thimk we need to update 
 @app.route('/record/export', methods=['GET'])
 
