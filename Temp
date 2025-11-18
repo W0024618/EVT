@@ -1,3 +1,221 @@
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    # Defensive: normalize incoming regions list
+    try:
+        requested_regions = [r.lower() for r in (regions or []) if r]
+    except Exception:
+        requested_regions = []
+
+    # If user provided a city/site, try to map that city to one or more region keys
+    def _normalize_token(s: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', str(s or '').strip().lower())
+
+    if city:
+        city_raw = str(city).strip()
+        city_norm = _normalize_token(city_raw)
+
+        # find regions whose partitions or logical_like look like this city
+        matched_regions = []
+        for rkey, rc in (REGION_CONFIG or {}).items():
+            parts = rc.get("partitions", []) or []
+            likes = rc.get("logical_like", []) or []
+            tokens = set()
+            for p in parts:
+                if not p:
+                    continue
+                tokens.add(_normalize_token(p))
+                # also split on punctuation/dot and add parts (e.g. "LT.Vilnius" -> "vilnius")
+                for part_piece in re.split(r'[.\-/\s]', str(p)):
+                    if part_piece:
+                        tokens.add(_normalize_token(part_piece))
+            for lk in likes:
+                tokens.add(_normalize_token(lk))
+            # also include server/database names as a fallback
+            if city_norm and city_norm in tokens:
+                matched_regions.append(rkey)
+
+        # If we could map city to specific region(s), only run those
+        if matched_regions:
+            requested_regions = [m for m in matched_regions]
+
+    # fallback to all regions in config if none requested
+    try:
+        if not requested_regions:
+            requested_regions = [k.lower() for k in list(REGION_CONFIG.keys())]
+    except Exception:
+        requested_regions = ['apac']
+
+    results: Dict[str, Any] = {}
+    for r in requested_regions:
+        if not r:
+            continue
+        rkey = r.lower()
+        if rkey not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", rkey, target_date)
+        try:
+            swipes = fetch_swipes_for_region(rkey, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", rkey)
+            swipes = pd.DataFrame()
+
+        # If a city was requested, apply a strict (but defensive) city filter
+        if city and not swipes.empty:
+            city_raw = str(city).strip()
+            city_norm = _normalize_token(city_raw)
+
+            alt_tokens = set()
+            alt_tokens.add(city_raw)
+            alt_tokens.add(city_raw.replace('-', ' '))
+            alt_tokens.add(city_raw.replace('_', ' '))
+            alt_tokens.add(city_raw.replace('.', ' '))
+            alt_tokens.add(city_raw.replace(' ', '-'))
+            alt_tokens.update({t.title() for t in list(alt_tokens)})
+            if city_norm:
+                alt_tokens.add(city_norm)
+
+            def _norm_for_cmp(s):
+                try:
+                    if s is None:
+                        return ''
+                    return re.sub(r'[^a-z0-9]', '', str(s).strip().lower())
+                except Exception:
+                    return ''
+
+            # precompute normalized columns (safe defaults)
+            try:
+                part_norm = swipes["PartitionName2"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "PartitionName2" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+                door_norm = swipes["Door"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "Door" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+                pl_norm = swipes["PrimaryLocation"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "PrimaryLocation" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+            except Exception:
+                part_norm = pd.Series([''] * len(swipes), index=swipes.index)
+                door_norm = pd.Series([''] * len(swipes), index=swipes.index)
+                pl_norm = pd.Series([''] * len(swipes), index=swipes.index)
+
+            # Build mask: start False
+            mask = pd.Series(False, index=swipes.index)
+
+            # 1) Strict: prefer PartitionName2 exact matches (canonical names from normalize)
+            for t in alt_tokens:
+                t_norm = _norm_for_cmp(t)
+                if not t_norm:
+                    continue
+                try:
+                    mask = mask | (part_norm == t_norm)
+                except Exception:
+                    continue
+
+            # 2) For rows where PartitionName2 is empty / unknown, allow Door token contains match (permissive)
+            try:
+                no_part_mask = part_norm.fillna('').astype(str) == ''
+                if no_part_mask.any():
+                    door_mask = pd.Series(False, index=swipes.index)
+                    for t in alt_tokens:
+                        t_norm = _norm_for_cmp(t)
+                        if not t_norm:
+                            continue
+                        door_mask = door_mask | door_norm.str.contains(t_norm, na=False)
+                    # only accept door matches when partition is empty
+                    mask = mask | (door_mask & no_part_mask)
+            except Exception:
+                logging.debug("Door-based fallback match failed for city filter in region %s", rkey)
+
+            # 3) Allow PrimaryLocation match ONLY for rows with empty PartitionName2 and not already matched
+            try:
+                remaining_mask = ~mask
+                pl_mask = pd.Series(False, index=swipes.index)
+                for t in alt_tokens:
+                    t_norm = _norm_for_cmp(t)
+                    if not t_norm:
+                        continue
+                    pl_mask = pl_mask | pl_norm.str.contains(t_norm, na=False)
+                mask = mask | (pl_mask & (part_norm.fillna('') == '') & remaining_mask)
+            except Exception:
+                logging.debug("PrimaryLocation fallback match failed for city filter in region %s", rkey)
+
+            # 4) Finally, also check Door and EmployeeName contains across all rows (additional permissive matches)
+            try:
+                for col in ("Door", "EmployeeName"):
+                    if col in swipes.columns:
+                        col_norm = swipes[col].fillna("").astype(str).str.lower().apply(_norm_for_cmp)
+                        col_mask = pd.Series(False, index=swipes.index)
+                        for t in alt_tokens:
+                            t_norm = _norm_for_cmp(t)
+                            if not t_norm:
+                                continue
+                            col_mask = col_mask | col_norm.str.contains(t_norm, na=False)
+                        mask = mask | col_mask
+            except Exception:
+                logging.debug("Door/EmployeeName contains-match fallback failed for city filter in region %s", rkey)
+
+            # Apply the mask strictly
+            before = len(swipes)
+            swipes = swipes[mask].copy()
+            logging.info("City filter '%s' applied for region %s: rows before=%d after=%d", city_raw, rkey, before, len(swipes))
+
+        # compute durations for this region
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", rkey)
+            durations = pd.DataFrame()
+
+        # frontend-friendly display columns for swipes
+        try:
+            if "LocaleMessageTime" in swipes.columns:
+                swipes["LocaleMessageTime"] = pd.to_datetime(swipes["LocaleMessageTime"], errors="coerce")
+                swipes["DateOnly"] = swipes["LocaleMessageTime"].dt.date
+                swipes["Time"] = swipes["LocaleMessageTime"].dt.strftime("%H:%M:%S")
+            else:
+                if "Date" in swipes.columns and "Time" in swipes.columns:
+                    swipes["DateOnly"] = swipes["Date"]
+        except Exception:
+            logging.debug("Frontend display enrichment failed for region %s", rkey)
+
+        if "AdjustedMessageTime" not in swipes.columns:
+            swipes["AdjustedMessageTime"] = pd.NaT
+
+        # write outputs
+        try:
+            csv_path = outdir_path / f"{rkey}_duration_{target_date.strftime('%Y%m%d')}.csv"
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", rkey)
+        try:
+            swipes_csv_path = outdir_path / f"{rkey}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", rkey)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", rkey, csv_path if 'csv_path' in locals() else '<unknown>', len(durations) if durations is not None else 0)
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", rkey, swipes_csv_path if 'swipes_csv_path' in locals() else '<unknown>', len(swipes) if swipes is not None else 0)
+
+        results[rkey] = {"swipes": swipes, "durations": durations}
+
+    return results
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Fix below error and share Updated snippet alos fix indentation error 
 
 
