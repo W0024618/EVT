@@ -1,3 +1,346 @@
+# ---------- Replace get_person_image_bytes, _build_image_response, _handle_employee_image ----------
+
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    """
+    Try to load an employee image:
+      1) DB (ACVSCore.Images) - if available
+      2) Filesystem - several candidate folders and filename variants
+      3) Base64 text files (.b64, .txt) containing image data
+    Returns bytes or None.
+    """
+    logging.info("get_person_image_bytes: lookup for ParentId=%s", parent_id)
+    if parent_id is None:
+        logging.debug("get_person_image_bytes: no parent_id provided")
+        return None
+
+    # 1) Attempt DB lookup (if pyodbc available and connection works)
+    try:
+        conn = _get_acvscore_conn()
+        if conn is not None:
+            try:
+                cur = conn.cursor()
+                sql = """
+                    SELECT TOP 1 AI.Image
+                    FROM ACVSCore.Access.Images AI
+                    WHERE AI.ParentId = ?
+                      AND DATALENGTH(AI.Image) > 0
+                    ORDER BY AI.ObjectID DESC
+                """
+                cur.execute(sql, (str(parent_id),))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    try:
+                        b = bytes(row[0])
+                        logging.info("get_person_image_bytes: found image in DB for ParentId=%s (len=%d)", parent_id, len(b))
+                        return b
+                    except Exception:
+                        logging.exception("get_person_image_bytes: failed converting DB image to bytes for ParentId=%s", parent_id)
+                        return row[0]
+            except Exception:
+                logging.exception("get_person_image_bytes: DB fetch failed for ParentId=%s", parent_id)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            logging.debug("get_person_image_bytes: ACVSCore connection not available; skipping DB step")
+    except Exception:
+        logging.exception("get_person_image_bytes: unexpected DB path error")
+
+    # 2) Filesystem search (many candidate dirs & name variants)
+    try:
+        pid_raw = str(parent_id).strip()
+        cand_ids = [pid_raw]
+
+        # add integer form if numeric-like (avoid trailing .0)
+        try:
+            f = float(pid_raw)
+            if f.is_integer():
+                int_form = str(int(f))
+                if int_form not in cand_ids:
+                    cand_ids.append(int_form)
+        except Exception:
+            pass
+
+        # add emp_ prefix and zero-padded variants (common)
+        try:
+            if pid_raw and pid_raw.isdigit():
+                cand_ids.append(f"emp_{pid_raw}")
+                # a small range of zero-pad versions (if filenames used fixed width)
+                if len(pid_raw) < 8:
+                    cand_ids.append(pid_raw.zfill(8))
+        except Exception:
+            pass
+
+        # unique preserve order
+        cand_ids = list(dict.fromkeys(cand_ids))
+
+        candidate_dirs = [
+            (Path(DEFAULT_OUTDIR) / "images"),
+            Path(DEFAULT_OUTDIR),
+            Path(__file__).resolve().parent / "images",
+            Path(__file__).resolve().parent,
+            Path.cwd()
+        ]
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+        # Also accept base64 text files
+        b64_exts = (".b64", ".txt")
+
+        logging.debug("get_person_image_bytes: searching filesystem for IDs=%s under dirs=%s", cand_ids, [str(d) for d in candidate_dirs])
+
+        for c in cand_ids:
+            for folder in candidate_dirs:
+                try:
+                    if not folder.exists():
+                        continue
+                except Exception:
+                    continue
+
+                # exact filename matches with typical extensions
+                for ext in exts:
+                    fp = folder / f"{c}{ext}"
+                    try:
+                        if fp.exists() and fp.is_file():
+                            logging.info("get_person_image_bytes: found file %s", fp)
+                            try:
+                                return fp.read_bytes()
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading %s", fp)
+                                continue
+                    except Exception:
+                        continue
+
+                # check for base64 container files (.b64 / .txt)
+                for ext in b64_exts:
+                    fp = folder / f"{c}{ext}"
+                    try:
+                        if fp.exists() and fp.is_file():
+                            logging.info("get_person_image_bytes: found base64 file %s", fp)
+                            try:
+                                txt = fp.read_text(encoding='utf-8', errors='ignore').strip()
+                                if txt:
+                                    # If file looks like raw base64 (no commas), decode
+                                    if ',' in txt and txt.startswith('data:'):
+                                        # data URI style: data:image/png;base64,... -> strip prefix
+                                        try:
+                                            b64 = txt.split(',', 1)[1]
+                                            return base64.b64decode(b64)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        return base64.b64decode(txt)
+                                    except Exception:
+                                        logging.exception("get_person_image_bytes: base64 decode failed for %s", fp)
+                                        continue
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading base64 file %s", fp)
+                                continue
+                    except Exception:
+                        continue
+
+                # glob fallback where parent_id is part of filename
+                try:
+                    for fp in folder.glob(f"*{c}*"):
+                        if fp.is_file():
+                            try:
+                                b = fp.read_bytes()
+                                if b:
+                                    logging.info("get_person_image_bytes: loaded image via glob %s", fp)
+                                    return b
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading glob file %s", fp)
+                                continue
+                except Exception:
+                    logging.exception("get_person_image_bytes: glob check failed in %s for token %s", folder, c)
+                    continue
+
+    except Exception:
+        logging.exception("get_person_image_bytes: filesystem search failed for ParentId=%s", parent_id)
+
+    logging.debug("get_person_image_bytes: no image found for ParentId=%s", parent_id)
+    return None
+
+
+def _build_image_response(img_bytes: Optional[bytes], empid: str):
+    """
+    Build Flask response for given image bytes. If img_bytes is None -> returns an inline SVG placeholder.
+    Also sets debug headers:
+      - X-Image-Source: 'db', 'fs', 'b64', 'placeholder'
+    """
+    try:
+        if not img_bytes:
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160">'
+                '<rect fill="#eef2f7" width="100%" height="100%"/>'
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#64748b" font-size="18">'
+                'No image</text></svg>'
+            )
+            bio = io.BytesIO(svg.encode('utf-8'))
+            bio.seek(0)
+            resp = send_file(bio, mimetype='image/svg+xml')
+            resp.status_code = 200
+            resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            resp.headers['X-Image-Source'] = 'placeholder'
+            return resp
+
+        # ensure we have bytes
+        try:
+            if isinstance(img_bytes, (bytes, bytearray)):
+                raw = bytes(img_bytes)
+            elif isinstance(img_bytes, memoryview):
+                raw = img_bytes.tobytes()
+            else:
+                # attempt conversion
+                raw = bytes(img_bytes)
+        except Exception:
+            logging.exception("_build_image_response: failed converting image to bytes for %s", empid)
+            raw = None
+
+        if not raw:
+            logging.debug("_build_image_response: image bytes empty after conversion for %s", empid)
+            return _build_image_response(None, empid)
+
+        # inspect header
+        header = raw[:12]
+        content_type = 'application/octet-stream'
+        try:
+            if len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+                content_type = 'image/jpeg'
+            elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+                content_type = 'image/png'
+            elif header.startswith(b'BM'):
+                content_type = 'image/bmp'
+            elif header[:6] in (b'GIF87a', b'GIF89a'):
+                content_type = 'image/gif'
+            elif header.startswith(b'RIFF') and raw[8:12] == b'WEBP':
+                content_type = 'image/webp'
+        except Exception:
+            content_type = 'application/octet-stream'
+
+        bio = io.BytesIO(raw)
+        bio.seek(0)
+        resp = send_file(bio, mimetype=content_type)
+        resp.headers['Cache-Control'] = 'private, max-age=300'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['X-Image-Source'] = 'db-or-fs'
+        return resp
+
+    except Exception:
+        logging.exception("Error building image response for %s", empid)
+        # fallback placeholder
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#fff" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#333">Error</text></svg>'
+        bio = io.BytesIO(svg.encode('utf-8'))
+        bio.seek(0)
+        resp = send_file(bio, mimetype='image/svg+xml')
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Cache-Control'] = 'no-cache, no-store'
+        resp.headers['X-Image-Source'] = 'error'
+        return resp
+
+
+def _handle_employee_image(empid):
+    """
+    Central handler used by both /employee/<empid>/image and /api/employees/<empid>/image
+    """
+    if empid is None:
+        return jsonify({"error": "employee id required"}), 400
+    try:
+        logging.info("Image request for empid=%s", empid)
+        # direct lookup by empid (DB or filesystem)
+        img_bytes = get_person_image_bytes(empid)
+        if img_bytes:
+            # include header to help debugging whether DB or FS returned it (get_person_image_bytes logs that)
+            return _build_image_response(img_bytes, empid)
+        else:
+            # no bytes found -> placeholder SVG (explicit)
+            logging.debug("No image bytes for empid=%s -> returning placeholder", empid)
+            return _build_image_response(None, empid)
+    except Exception:
+        logging.exception("Error serving image for employee %s", empid)
+        # return placeholder inline image instead of JSON
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#fff" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#333">Error</text></svg>'
+        bio = io.BytesIO(svg.encode('utf-8'))
+        bio.seek(0)
+        resp = send_file(bio, mimetype='image/svg+xml')
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Cache-Control'] = 'no-cache, no-store'
+        resp.headers['X-Image-Source'] = 'error'
+        return resp
+
+# routes kept as:
+# @app.route('/employee/<empid>/image', methods=['GET','HEAD']) -> serve_employee_image() -> _handle_employee_image
+# @app.route('/api/employees/<empid>/image', methods=['GET','HEAD']) -> serve_employee_image_api()
+
+
+
+
+
+
+
+
+
+
+
+
+// Replace the modal image element with this snippet (inside your modalJSX)
+<img
+  className="modal-image"
+  src={resolveApiImageUrl(imgPath) || imgPath}
+  alt={sanitizeName(modalRow) || "Employee image"}
+  onLoad={(e) => {
+    try { console.info("employee image loaded:", e.target.src); } catch (err) {}
+  }}
+  onError={(e) => {
+    try {
+      console.warn("image load failed for:", e.target.src);
+      e.target.onerror = null;
+      // try alternate API alias if available
+      const fbId = (modalDetails && modalDetails.aggregated_rows && modalDetails.aggregated_rows[0] && (modalDetails.aggregated_rows[0].ObjectID || modalDetails.aggregated_rows[0].GUID))
+                    || fallbackId || (modalRow && (modalRow.EmployeeID || modalRow.person_uid));
+      if (fbId) {
+        const alt1 = resolveApiImageUrl(`/api/employees/${fbId}/image`);
+        if (alt1 && e.target.src !== alt1) {
+          console.info("trying alternate image route:", alt1);
+          e.target.src = alt1 + (alt1.indexOf('?') === -1 ? '?cb=' + Date.now() : '&cb=' + Date.now());
+          return;
+        }
+        const alt2 = resolveApiImageUrl(`/employee/${fbId}/image`);
+        if (alt2 && e.target.src !== alt2) {
+          console.info("trying fallback image route:", alt2);
+          e.target.src = alt2 + '?cb=' + Date.now();
+          return;
+        }
+      }
+      // final fallback: inline SVG placeholder (data URI)
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#eef2f7" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#64748b" font-size="18">No image</text></svg>';
+      e.target.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    } catch (err) {
+      try { e.target.style.display = 'none'; } catch (err2) {}
+    }
+  }}
+/>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 check again backend as well Frontend and fix this issue carefully 
 http://localhost:8002/employee/312232/image
 No image
