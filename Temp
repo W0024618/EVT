@@ -1,3 +1,1421 @@
+# backend/app.py
+from flask import Flask, jsonify, request, send_from_directory, jsonify, send_file
+from datetime import datetime, timedelta, date
+from pathlib import Path
+import logging
+import pandas as pd
+import numpy as np
+import joblib
+import math
+import re
+import io
+import base64
+import os
+import difflib
+from io import BytesIO
+from flask import send_file  # add if not present
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from duration_report import REGION_CONFIG
+from datetime import date, timedelta, datetime
+from flask import jsonify, request
+import logging
+logging.basicConfig(level=logging.INFO)
+#from trend_runner import run_trend_for_date, build_monthly_training, OUTDIR
+from trend_runner import run_trend_for_date, build_monthly_training, _enrich_with_personnel_info
+from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+
+
+# create Flask app early (must exist before any @app.route usage)
+from flask import Flask
+try:
+    from flask_cors import CORS
+    _HAS_CORS = True
+except Exception:
+    CORS = None
+    _HAS_CORS = False
+
+app = Flask(__name__, static_folder=None)
+if _HAS_CORS:
+    CORS(app)
+else:
+    logging.warning("flask_cors not available; continuing without CORS.")
+
+
+def _safe_read_csv(fp):
+    try:
+        return pd.read_csv(fp, parse_dates=['LocaleMessageTime'], low_memory=False)
+    except Exception:
+        try:
+            return pd.read_csv(fp, low_memory=False)
+        except Exception:
+            return pd.DataFrame()
+
+
+# ---------- Ensure outputs directory exists early (so OVERRIDES_FILE can be defined safely) ----------
+
+BASE_DIR = Path(__file__).parent.resolve()
+DEFAULT_OUTDIR = BASE_DIR / "outputs"
+DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+OUTDIR = DEFAULT_OUTDIR
+
+OVERRIDES_FILE = DEFAULT_OUTDIR / "overrides.csv"
+
+
+def _load_overrides():
+    if not OVERRIDES_FILE.exists():
+        return {}
+    try:
+        df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+        out = {}
+        for _, r in df.iterrows():
+            emp = str(r.get('EmployeeID') or r.get('person_uid') or '').strip()
+            if not emp:
+                continue
+            out[emp] = {
+                'level': str(r.get('OverrideLevel') or '').strip(),
+                'reason': str(r.get('Reason') or '').strip(),
+                'ts': str(r.get('Timestamp') or '').strip()
+            }
+        return out
+    except Exception:
+        logging.exception("Failed reading overrides file")
+        return {}
+
+def _save_override(employee_key, level, reason):
+    now = datetime.now().isoformat()
+    row = {'EmployeeID': employee_key, 'OverrideLevel': level, 'Reason': reason or '', 'Timestamp': now}
+    try:
+        if OVERRIDES_FILE.exists():
+            df = pd.read_csv(OVERRIDES_FILE, dtype=str)
+            # pandas.DataFrame.append is deprecated -> use concat
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df.to_csv(OVERRIDES_FILE, index=False)
+        return True
+    except Exception:
+        logging.exception("Failed to save override")
+        return False
+
+def _slug_city(s):
+    """
+    Convert a city/site string into a safe slug: lowercase, alphanumeric+hyphen
+    """
+    if not s:
+        return ''
+    # Remove special chars, spaces to hyphens, lower
+    slug = re.sub(r'[^\w\s-]', '', str(s)).strip().lower()
+    slug = re.sub(r'[\s_]+', '-', slug)
+    return slug
+
+
+# --- Use REGION_CONFIG servers to talk to ACVSCore (no separate ACVSCORE_DB_CONFIG) ---
+_acvscore_backoff = {"ts": None, "failed": False}
+_ACVSCORE_BACKOFF_SECONDS = 20
+
+def _get_acvscore_conn():
+    try:
+        import pyodbc
+    except Exception:
+        logging.exception("pyodbc not installed; ACVSCore lookups unavailable.")
+        return None
+
+    from datetime import datetime
+    now = datetime.now().timestamp()
+    last = _acvscore_backoff.get("ts")
+    if last and _acvscore_backoff.get("failed") and (now - last) < _ACVSCORE_BACKOFF_SECONDS:
+        logging.debug("Skipping ACVSCore connection attempt (backoff active).")
+        return None
+
+    tried = []
+    for region_key, rc in (REGION_CONFIG or {}).items():
+        server = rc.get("server")
+        user = rc.get("user")
+        pwd = rc.get("password")
+        if not server:
+            continue
+
+        if user and pwd:
+            tried.append(f"{region_key}@{server}(sql)")
+            conn_str = (
+                f"DRIVER={{{ODBC_DRIVER}}};"
+                f"SERVER={server};DATABASE=ACVSCore;UID={user};PWD={pwd};"
+                "TrustServerCertificate=Yes;"
+            )
+            try:
+                conn = pyodbc.connect(conn_str, autocommit=True, timeout=5)
+                logging.info("Connected to ACVSCore on server %s using REGION_CONFIG[%s] (sql auth).", server, region_key)
+                _acvscore_backoff["ts"] = None
+                _acvscore_backoff["failed"] = False
+                return conn
+            except Exception as e:
+                logging.debug("SQL auth to %s failed: %s", server, e)
+
+        tried.append(f"{region_key}@{server}(trusted)")
+        conn_str_trusted = (
+            f"DRIVER={{{ODBC_DRIVER}}};"
+            f"SERVER={server};DATABASE=ACVSCore;Trusted_Connection=yes;"
+            "TrustServerCertificate=Yes;"
+        )
+        try:
+            conn = pyodbc.connect(conn_str_trusted, autocommit=True, timeout=5)
+            logging.info("Connected to ACVSCore on server %s using REGION_CONFIG[%s] (trusted connection).", server, region_key)
+            _acvscore_backoff["ts"] = None
+            _acvscore_backoff["failed"] = False
+            return conn
+        except Exception as e:
+            logging.debug("Trusted connection to %s failed: %s", server, e)
+            continue
+
+    try:
+        if 'ACVSCORE_DB_CONFIG' in globals() and isinstance(globals().get('ACVSCORE_DB_CONFIG'), dict):
+            cfg = globals().get('ACVSCORE_DB_CONFIG')
+            server = cfg.get('server')
+            user = cfg.get('user')
+            pwd = cfg.get('password')
+            database = cfg.get('database', 'ACVSCore')
+            tried.append(f"ACVSCORE_DB_CONFIG@{server}")
+            try:
+                conn_str = (
+                    f"DRIVER={{{ODBC_DRIVER}}};"
+                    f"SERVER={server};DATABASE={database};UID={user};PWD={pwd};"
+                    "TrustServerCertificate=Yes;"
+                )
+                conn = pyodbc.connect(conn_str, autocommit=True, timeout=5)
+                logging.info("Connected to ACVSCore using ACVSCORE_DB_CONFIG (%s).", server)
+                _acvscore_backoff["ts"] = None
+                _acvscore_backoff["failed"] = False
+                return conn
+            except Exception as e:
+                logging.debug("ACVSCORE_DB_CONFIG connection failed: %s", e)
+    except Exception:
+        logging.debug("ACVSCORE_DB_CONFIG fallback not available or failed.")
+
+    _acvscore_backoff["ts"] = now
+    _acvscore_backoff["failed"] = True
+    logging.error("Failed to connect to ACVSCore using REGION_CONFIG servers. Tried: %s", tried)
+    return None
+
+
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+MODELS_DIR = Path(__file__).parent / "models"
+_loaded_models = {}
+
+def load_model(name):
+    if name in _loaded_models:
+        return _loaded_models[name]
+    p = MODELS_DIR / f"{name}.joblib"
+    if not p.exists():
+        return None
+    data = joblib.load(p)
+    _loaded_models[name] = data
+    return data
+
+
+
+def get_personnel_info(candidate_identifier: object) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    logging.info("get_personnel_info: lookup called with candidate_identifier=%s", candidate_identifier)
+    if candidate_identifier is None:
+        logging.debug("get_personnel_info: no candidate provided")
+        return out
+    conn = _get_acvscore_conn()
+    if conn is None:
+        logging.info("get_personnel_info: ACVSCore connection unavailable (skipping DB lookup)")
+        return out
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT TOP 1 ObjectID, GUID, Name, EmailAddress, ManagerEmail
+            FROM ACVSCore.Access.Personnel
+            WHERE
+              (CAST(ObjectID AS NVARCHAR(200)) = ?)
+              OR (GUID = ?)
+              OR (CAST(Int1 AS NVARCHAR(200)) = ?)
+              OR (Text12 = ?)
+              OR (Name = ?)
+            ORDER BY ObjectID DESC
+        """
+        cand = str(candidate_identifier).strip()
+        cand_guid = cand if _looks_like_guid(cand) else None
+        params = (cand, cand_guid, cand, cand, cand)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row:
+            try:
+                out['ObjectID'] = row[0]
+                out['GUID'] = row[1]
+                out['Name'] = row[2]
+                email_val = row[3] if len(row) > 3 else None
+                out['EmailAddress'] = email_val or None
+                out['EmployeeEmail'] = email_val or None
+                out['Email'] = email_val or None
+                out['ManagerEmail'] = row[4] if len(row) > 4 else None
+            except Exception:
+                out = {
+                    'ObjectID': row[0] if len(row) > 0 else None,
+                    'GUID': row[1] if len(row) > 1 else None,
+                    'Name': row[2] if len(row) > 2 else None,
+                    'EmailAddress': row[3] if len(row) > 3 else None,
+                    'EmployeeEmail': row[3] if len(row) > 3 else None,
+                    'Email': row[3] if len(row) > 3 else None,
+                    'ManagerEmail': row[4] if len(row) > 4 else None
+                }
+            logging.info("get_personnel_info: found personnel row for candidate=%s -> ObjectID=%s Email=%s",
+                         candidate_identifier, out.get('ObjectID'), out.get('EmailAddress'))
+        else:
+            logging.debug("get_personnel_info: no personnel row found for candidate=%s", candidate_identifier)
+    except Exception:
+        logging.exception("Failed personnel lookup for candidate: %s", candidate_identifier)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return out
+
+
+# ---------- Replace get_person_image_bytes, _build_image_response, _handle_employee_image ----------
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    """
+    Try to load an employee image:
+      1) DB (ACVSCore.Images) - if available
+      2) Filesystem - several candidate folders and filename variants
+      3) Base64 text files (.b64, .txt) containing image data
+    Returns bytes or None.
+    """
+    logging.info("get_person_image_bytes: lookup for ParentId=%s", parent_id)
+    if parent_id is None:
+        logging.debug("get_person_image_bytes: no parent_id provided")
+        return None
+
+    # 1) Attempt DB lookup (if pyodbc available and connection works)
+    try:
+        conn = _get_acvscore_conn()
+        if conn is not None:
+            try:
+                cur = conn.cursor()
+                sql = """
+                    SELECT TOP 1 AI.Image
+                    FROM ACVSCore.Access.Images AI
+                    WHERE AI.ParentId = ?
+                      AND DATALENGTH(AI.Image) > 0
+                    ORDER BY AI.ObjectID DESC
+                """
+
+                # Try multiple parent_id candidates (raw, prefix-stripped, numeric-only, emp_ prefixed)
+                cand_parent_ids = []
+                raw_pid = str(parent_id).strip()
+                cand_parent_ids.append(raw_pid)
+                try:
+                    stripped = _strip_person_uid_prefix(raw_pid)
+                except Exception:
+                    stripped = raw_pid
+                if stripped and stripped != raw_pid:
+                    cand_parent_ids.append(stripped)
+                # try numeric int form if possible (avoid trailing .0)
+                try:
+                    if stripped and '.' in stripped:
+                        f = float(stripped)
+                        if f.is_integer():
+                            cand_parent_ids.append(str(int(f)))
+                except Exception:
+                    pass
+                # also try emp_ prefixed filename variant used by some pipelines
+                try:
+                    if stripped and stripped.isdigit():
+                        cand_parent_ids.append(f"emp_{stripped}")
+                except Exception:
+                    pass
+
+                # dedupe while preserving order
+                seen = set()
+                cand_parent_ids = [x for x in cand_parent_ids if x and (not (x in seen or seen.add(x)))]
+
+                for pid_try in cand_parent_ids:
+                    try:
+                        cur.execute(sql, (str(pid_try),))
+                        row = cur.fetchone()
+                        if row and row[0] is not None:
+                            try:
+                                b = bytes(row[0])
+                                logging.info("get_person_image_bytes: image found in DB for ParentId=%s (len=%d)", pid_try, len(b))
+                                return b
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed converting DB image to bytes for ParentId=%s", pid_try)
+                                return row[0]
+                    except Exception:
+                        logging.debug("get_person_image_bytes: DB fetch failed for ParentId=%s (trying next)", pid_try)
+                        continue
+
+                # no candidate returned a DB image - fall through to filesystem approach
+            except Exception:
+                logging.exception("get_person_image_bytes: DB fetch failed for ParentId=%s", parent_id)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            logging.debug("get_person_image_bytes: ACVSCore connection not available; skipping DB step")
+    except Exception:
+        logging.exception("get_person_image_bytes: unexpected DB path error")
+
+    # 2) Filesystem search (many candidate dirs & name variants)
+    try:
+        pid_raw = str(parent_id).strip()
+        cand_ids = [pid_raw]
+
+        # add integer form if numeric-like (avoid trailing .0)
+        try:
+            f = float(pid_raw)
+            if f.is_integer():
+                int_form = str(int(f))
+                if int_form not in cand_ids:
+                    cand_ids.append(int_form)
+        except Exception:
+            pass
+
+        # add emp_ prefix and zero-padded variants (common)
+        try:
+            if pid_raw and pid_raw.isdigit():
+                cand_ids.append(f"emp_{pid_raw}")
+                # a small range of zero-pad versions (if filenames used fixed width)
+                if len(pid_raw) < 8:
+                    cand_ids.append(pid_raw.zfill(8))
+        except Exception:
+            pass
+
+        # unique preserve order
+        cand_ids = list(dict.fromkeys(cand_ids))
+
+        candidate_dirs = [
+            (Path(DEFAULT_OUTDIR) / "images"),
+            Path(DEFAULT_OUTDIR),
+            Path(__file__).resolve().parent / "images",
+            Path(__file__).resolve().parent,
+            Path.cwd()
+        ]
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+        # Also accept base64 text files
+        b64_exts = (".b64", ".txt")
+
+        logging.debug("get_person_image_bytes: searching filesystem for IDs=%s under dirs=%s", cand_ids, [str(d) for d in candidate_dirs])
+
+        for c in cand_ids:
+            for folder in candidate_dirs:
+                try:
+                    if not folder.exists():
+                        continue
+                except Exception:
+                    continue
+
+                # exact filename matches with typical extensions
+                for ext in exts:
+                    fp = folder / f"{c}{ext}"
+                    try:
+                        if fp.exists() and fp.is_file():
+                            logging.info("get_person_image_bytes: found file %s", fp)
+                            try:
+                                return fp.read_bytes()
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading %s", fp)
+                                continue
+                    except Exception:
+                        continue
+
+                # check for base64 container files (.b64 / .txt)
+                for ext in b64_exts:
+                    fp = folder / f"{c}{ext}"
+                    try:
+                        if fp.exists() and fp.is_file():
+                            logging.info("get_person_image_bytes: found base64 file %s", fp)
+                            try:
+                                txt = fp.read_text(encoding='utf-8', errors='ignore').strip()
+                                if txt:
+                                    # If file looks like raw base64 (no commas), decode
+                                    if ',' in txt and txt.startswith('data:'):
+                                        # data URI style: data:image/png;base64,... -> strip prefix
+                                        try:
+                                            b64 = txt.split(',', 1)[1]
+                                            return base64.b64decode(b64)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        return base64.b64decode(txt)
+                                    except Exception:
+                                        logging.exception("get_person_image_bytes: base64 decode failed for %s", fp)
+                                        continue
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading base64 file %s", fp)
+                                continue
+                    except Exception:
+                        continue
+
+                # glob fallback where parent_id is part of filename
+                try:
+                    for fp in folder.glob(f"*{c}*"):
+                        if fp.is_file():
+                            try:
+                                b = fp.read_bytes()
+                                if b:
+                                    logging.info("get_person_image_bytes: loaded image via glob %s", fp)
+                                    return b
+                            except Exception:
+                                logging.exception("get_person_image_bytes: failed reading glob file %s", fp)
+                                continue
+                except Exception:
+                    logging.exception("get_person_image_bytes: glob check failed in %s for token %s", folder, c)
+                    continue
+
+    except Exception:
+        logging.exception("get_person_image_bytes: filesystem search failed for ParentId=%s", parent_id)
+
+    logging.debug("get_person_image_bytes: no image found for ParentId=%s", parent_id)
+    return None
+
+
+def _build_image_response(img_bytes: Optional[bytes], empid: str):
+    """
+    Build Flask response for given image bytes. If img_bytes is None -> returns an inline SVG placeholder.
+    Also sets debug headers:
+      - X-Image-Source: 'db', 'fs', 'b64', 'placeholder'
+    """
+    try:
+        if not img_bytes:
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160">'
+                '<rect fill="#eef2f7" width="100%" height="100%"/>'
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#64748b" font-size="18">'
+                'No image</text></svg>'
+            )
+            bio = io.BytesIO(svg.encode('utf-8'))
+            bio.seek(0)
+            resp = send_file(bio, mimetype='image/svg+xml')
+            resp.status_code = 200
+            resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            resp.headers['X-Image-Source'] = 'placeholder'
+            return resp
+
+        # ensure we have bytes
+        try:
+            if isinstance(img_bytes, (bytes, bytearray)):
+                raw = bytes(img_bytes)
+            elif isinstance(img_bytes, memoryview):
+                raw = img_bytes.tobytes()
+            else:
+                # attempt conversion
+                raw = bytes(img_bytes)
+        except Exception:
+            logging.exception("_build_image_response: failed converting image to bytes for %s", empid)
+            raw = None
+
+        if not raw:
+            logging.debug("_build_image_response: image bytes empty after conversion for %s", empid)
+            return _build_image_response(None, empid)
+
+        # inspect header
+        header = raw[:12]
+        content_type = 'application/octet-stream'
+        try:
+            if len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+                content_type = 'image/jpeg'
+            elif header.startswith(b'\x89PNG\r\n\x1a\n'):
+                content_type = 'image/png'
+            elif header.startswith(b'BM'):
+                content_type = 'image/bmp'
+            elif header[:6] in (b'GIF87a', b'GIF89a'):
+                content_type = 'image/gif'
+            elif header.startswith(b'RIFF') and raw[8:12] == b'WEBP':
+                content_type = 'image/webp'
+        except Exception:
+            content_type = 'application/octet-stream'
+
+        bio = io.BytesIO(raw)
+        bio.seek(0)
+        resp = send_file(bio, mimetype=content_type)
+        resp.headers['Cache-Control'] = 'private, max-age=300'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['X-Image-Source'] = 'db-or-fs'
+        return resp
+
+    except Exception:
+        logging.exception("Error building image response for %s", empid)
+        # fallback placeholder
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#fff" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#333">Error</text></svg>'
+        bio = io.BytesIO(svg.encode('utf-8'))
+        bio.seek(0)
+        resp = send_file(bio, mimetype='image/svg+xml')
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Cache-Control'] = 'no-cache, no-store'
+        resp.headers['X-Image-Source'] = 'error'
+        return resp
+
+
+def _handle_employee_image(empid):
+    """
+    Central handler used by both /employee/<empid>/image and /api/employees/<empid>/image
+    """
+    if empid is None:
+        return jsonify({"error": "employee id required"}), 400
+    try:
+        logging.info("Image request for empid=%s", empid)
+        # direct lookup by empid (DB or filesystem)
+        img_bytes = get_person_image_bytes(empid)
+        if img_bytes:
+            # include header to help debugging whether DB or FS returned it (get_person_image_bytes logs that)
+            return _build_image_response(img_bytes, empid)
+        else:
+            # no bytes found -> placeholder SVG (explicit)
+            logging.debug("No image bytes for empid=%s -> returning placeholder", empid)
+            return _build_image_response(None, empid)
+    except Exception:
+        logging.exception("Error serving image for employee %s", empid)
+        # return placeholder inline image instead of JSON
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#fff" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#333">Error</text></svg>'
+        bio = io.BytesIO(svg.encode('utf-8'))
+        bio.seek(0)
+        resp = send_file(bio, mimetype='image/svg+xml')
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Cache-Control'] = 'no-cache, no-store'
+        resp.headers['X-Image-Source'] = 'error'
+        return resp
+
+
+# Small debug route to list candidate image files & check for a specific empid:
+@app.route('/_debug_images', methods=['GET'])
+def _debug_images():
+    empid = request.args.get('empid')
+    candidate_dirs = [
+        (Path(DEFAULT_OUTDIR) / "images"),
+        Path(DEFAULT_OUTDIR),
+        Path(__file__).resolve().parent / "images",
+        Path(__file__).resolve().parent,
+        Path.cwd()
+    ]
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+    out = []
+    for d in candidate_dirs:
+        try:
+            listing = []
+            if d.exists() and d.is_dir():
+                # list up to 300 files (avoid giant dirs)
+                for i, fp in enumerate(sorted(d.iterdir(), key=lambda p: p.name)[:300]):
+                    try:
+                        listing.append(fp.name)
+                    except Exception:
+                        continue
+            out.append({"dir": str(d), "exists": d.exists(), "files_sample": listing[:50]})
+        except Exception as e:
+            out.append({"dir": str(d), "error": str(e)})
+    result = {"candidates": out}
+    if empid:
+        found = []
+        for dinfo in out:
+            if dinfo.get("exists"):
+                dpath = Path(dinfo["dir"])
+                for ext in exts:
+                    p = dpath / f"{empid}{ext}"
+                    if p.exists():
+                        found.append(str(p))
+                for p in dpath.glob(f"*{empid}*"):
+                    if p.exists():
+                        found.append(str(p))
+        result["found_for_empid"] = sorted(list(dict.fromkeys(found)))
+    return jsonify(result)
+
+
+
+# send_file is needed for Excel responses
+from flask import send_file
+try:
+    # optional import; used for styling
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
+def _to_python_scalar(x):
+    """
+    Convert numpy/pandas scalar types to built-in Python types and
+    convert NaN-like values to None so JSON is safe.
+    """
+    try:
+        import pandas as _pd
+        if isinstance(x, _pd.Timestamp):
+            return x.to_pydatetime().isoformat()
+    except Exception:
+        pass
+
+    try:
+        import numpy as _np
+        if isinstance(x, _np.generic):
+            v = x.item()
+            if isinstance(v, float) and _np.isnan(v):
+                return None
+            return v
+    except Exception:
+        pass
+
+    try:
+        if isinstance(x, float) and math.isnan(x):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(x, (datetime,)):
+        return x.isoformat()
+    if isinstance(x, (bool, int, str, type(None), float)):
+        # convert floats NaN handled above
+        return x
+    try:
+        # fallback to string
+        return str(x)
+    except Exception:
+        return None
+
+
+_uuid_like_re = re.compile(r'^[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}$')
+
+def _looks_like_guid(s):
+    try:
+        if not s or not isinstance(s, str):
+            return False
+        s = s.strip()
+        return bool(_uuid_like_re.match(s)) or s.startswith('name:') or s.startswith('emp:') or s.startswith('uid:')
+    except Exception:
+        return False
+
+
+# Helper: format seconds to HH:MM:SS
+def format_seconds_to_hms(seconds):
+    try:
+        if seconds is None:
+            return None
+        # guard against floats and NaN
+        s = int(float(seconds))
+        if s < 0:
+            s = 0
+        hh = s // 3600
+        mm = (s % 3600) // 60
+        ss = s % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    except Exception:
+        return None
+
+
+# Placeholder tokens (keep consistent with trend_runner expectations)
+_PLACEHOLDER_STRS = set(['', 'nan', 'na', 'n/a', '-', '—', '–', 'none', 'null'])
+
+def _is_placeholder_str(s: object) -> bool:
+    try:
+        if s is None:
+            return True
+        st = str(s).strip().lower()
+        return st in _PLACEHOLDER_STRS
+    except Exception:
+        return False
+
+
+_CARD_XML_RE = re.compile(r'<Card>([^<]+)</Card>', re.IGNORECASE | re.DOTALL)
+def _extract_card_from_xml_text(txt):
+    try:
+        if not txt or not isinstance(txt, str):
+            return None
+        m = _CARD_XML_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r'CHUID.*?Card.*?[:=]\s*([0-9A-Za-z\-\_]+)', txt, re.IGNORECASE | re.DOTALL)
+        if m2:
+            return m2.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_field_from_record(record: dict, candidate_tokens: list):
+    """
+    Search a single row `record` (dict) for likely columns listed in candidate_tokens.
+    Return first non-placeholder value found (converted to Python scalar), else None.
+    """
+    if record is None:
+        return None
+
+    # 1) exact key matches (case-sensitive & common casing)
+    for key in candidate_tokens:
+        if key in record:
+            v = record.get(key)
+            if v is None:
+                continue
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            sval = str(v).strip()
+            if sval and not _is_placeholder_str(sval):
+                return _to_python_scalar(v)
+
+    # 2) case-insensitive contains match
+    lower_keys = {k.lower(): k for k in record.keys()}
+    for tok in candidate_tokens:
+        tok_l = tok.lower()
+        for lk, orig_key in lower_keys.items():
+            if tok_l in lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                if isinstance(v, float) and math.isnan(v):
+                    continue
+                sval = str(v).strip()
+                if sval and not _is_placeholder_str(sval):
+                    return _to_python_scalar(v)
+
+    # 3) xml / value parsing fallback for CardNumber
+    card_like = any(tok.lower() in ('cardnumber', 'chuid', 'card') for tok in candidate_tokens)
+    if card_like:
+        for lk, orig_key in lower_keys.items():
+            if 'xml' in lk or 'xmlmessage' in lk or 'xml_msg' in lk or 'msg' in lk or 'value' == lk:
+                v = record.get(orig_key)
+                if v is None:
+                    continue
+                try:
+                    txt = str(v)
+                    extracted = _extract_card_from_xml_text(txt)
+                    if extracted and not _is_placeholder_str(extracted):
+                        return _to_python_scalar(extracted)
+                except Exception:
+                    continue
+
+    # 4) final fallback: first non-placeholder value
+    for k, v in record.items():
+        if v is None:
+            continue
+        if isinstance(v, float) and math.isnan(v):
+            continue
+        sval = str(v).strip()
+        if sval and not _is_placeholder_str(sval):
+            return _to_python_scalar(v)
+
+    return None
+
+
+def _clean_sample_df(df: pd.DataFrame, max_rows: int = 10):
+    """
+    Clean a dataframe for JSON output (convert NaN -> None, pandas types -> native, format datetimes).
+    """
+    if df is None or df.empty:
+        return []
+    df = df.copy()
+
+    # remove duplicate suffix columns
+    cols_to_fix = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    for c in cols_to_fix:
+        base = c[:-2]
+        if base in df.columns:
+            try:
+                df.drop(columns=[c], inplace=True)
+            except Exception:
+                pass
+        else:
+            try:
+                df.rename(columns={c: base}, inplace=True)
+            except Exception:
+                pass
+
+    # Date normalization
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            df['Date'] = df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+        except Exception:
+            pass
+
+    # Datetime columns to ISO strings
+    for dtcol in ('FirstSwipe', 'LastSwipe', 'LocaleMessageTime'):
+        if dtcol in df.columns:
+            try:
+                df[dtcol] = pd.to_datetime(df[dtcol], errors='coerce')
+                df[dtcol] = df[dtcol].apply(lambda t: t.to_pydatetime().isoformat() if pd.notna(t) else None)
+            except Exception:
+                try:
+                    df[dtcol] = df[dtcol].astype(str).replace('NaT', None)
+                except Exception:
+                    pass
+
+    # Replace NaN/inf -> None
+    df = df.where(pd.notnull(df), None)
+
+    # Convert records to safe Python types
+    rows = df.head(max_rows).to_dict(orient='records')
+    cleaned = []
+    for r in rows:
+        out = {}
+        for k, v in r.items():
+            out[k] = _to_python_scalar(v)
+
+        # Typical fields
+        emp_name = out.get('EmployeeName')
+        emp_id = out.get('EmployeeID') or out.get('EmployeeIdentity')
+        person_uid = out.get('person_uid')
+
+        # ----- Schema-aware fallback resolution -----
+        if not emp_id:
+            emp_tokens = ['Int1', 'Text12', 'EmployeeID', 'empid', 'id']
+            resolved_emp = _resolve_field_from_record(r, emp_tokens)
+            if resolved_emp is not None:
+                try:
+                    s = str(resolved_emp).strip()
+                    if '.' in s:
+                        f = float(s)
+                        if math.isfinite(f) and f.is_integer():
+                            s = str(int(f))
+                    if _looks_like_guid(s):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = s
+                        emp_id = s
+                except Exception:
+                    if _looks_like_guid(resolved_emp):
+                        out['EmployeeID'] = None
+                        emp_id = None
+                    else:
+                        out['EmployeeID'] = resolved_emp
+                        emp_id = resolved_emp
+
+        # Prefer Credential.CardNumber / CHUID / Card as CardNumber when missing — reject GUIDs/placeholders
+        if out.get('CardNumber') in (None, '', 'nan'):
+            card_tokens = ['CardNumber', 'CHUID', 'Card', 'card_no', 'cardnum']
+            resolved_card = _resolve_field_from_record(r, card_tokens)
+            if resolved_card is not None:
+                try:
+                    cs = str(resolved_card).strip()
+                    if _looks_like_guid(cs) or _is_placeholder_str(cs):
+                        out['CardNumber'] = None
+                    else:
+                        out['CardNumber'] = cs
+                except Exception:
+                    out['CardNumber'] = None
+
+        # final safety: ensure EmployeeID/CardNumber are not GUID-like tokens
+        if 'EmployeeID' in out and isinstance(out['EmployeeID'], str) and _looks_like_guid(out['EmployeeID']):
+            out['EmployeeID'] = None
+        if 'CardNumber' in out and isinstance(out['CardNumber'], str) and _looks_like_guid(out['CardNumber']):
+            out['CardNumber'] = None
+
+        # If EmployeeName empty or looks like a GUID, prefer EmployeeID (human id) over GUIDs
+        if (emp_name in (None, '', 'nan')) or (isinstance(emp_name, str) and _looks_like_guid(emp_name)):
+            if emp_id not in (None, '', 'nan') and not _looks_like_guid(emp_id):
+                out['EmployeeName'] = str(emp_id)
+            else:
+                out['EmployeeName'] = None
+
+        cleaned.append(out)
+    return cleaned
+
+# ----- Helpers added to match commented (Pune) file functionality but multi-city-aware -----
+
+def _replace_placeholder_strings(obj):
+    """
+    If obj is a DataFrame, replace known placeholder strings with None (NaN).
+    If obj is a scalar/string, return None for placeholder strings else return obj.
+    """
+    if obj is None:
+        return obj
+    try:
+        if isinstance(obj, pd.DataFrame):
+            df = obj.copy()
+            for col in df.columns:
+                try:
+                    df[col] = df[col].apply(lambda x: None if _is_placeholder_str(x) else x)
+                except Exception:
+                    continue
+            return df
+        else:
+            # scalar
+            return None if _is_placeholder_str(obj) else obj
+    except Exception:
+        return obj
+
+def _normalize_id_local(v):
+    """
+    Normalize an identifier for robust matching/counting:
+    - treat NaN/None/empty as None
+    - strip and convert float-like integers to integer strings
+    """
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == '' or s.lower() == 'nan':
+        return None
+    try:
+        if '.' in s:
+            fv = float(s)
+            if math.isfinite(fv) and fv.is_integer():
+                s = str(int(fv))
+    except Exception:
+        pass
+    return s
+
+# (other helpers and routes remain unchanged, omitted here for brevity in this display)
+# ... (rest of the file continues unchanged) ...
+
+
+# -----------------------
+# Routes
+# -----------------------
+
+@app.route('/')
+def root():
+    return "Trend Analysis API — Multi-city"
+
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.get_json(force=True) or {}
+        else:
+            try:
+                params = request.form.to_dict() or {}
+            except Exception:
+                params = {}
+
+    date_str = (params.get('date') or params.get('Date') or '').strip() or None
+    start_str = (params.get('start') or params.get('Start') or '').strip() or None
+    end_str = (params.get('end') or params.get('End') or '').strip() or None
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            dates = [yesterday, today]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    regions_param = params.get('regions') or params.get('region') or ''
+    if regions_param:
+        regions = [r.strip().lower() for r in re.split(r'[;,|]', str(regions_param)) if r.strip()]
+    else:
+        try:
+            regions = [k.lower() for k in list(REGION_CONFIG.keys())]
+        except Exception:
+            regions = ['apac']
+
+    valid_regions = []
+    for r in regions:
+        if r in (REGION_CONFIG or {}):
+            valid_regions.append(r)
+        else:
+            logging.debug("Requested region '%s' not in REGION_CONFIG - skipping", r)
+    if not valid_regions:
+        valid_regions = [k.lower() for k in REGION_CONFIG.keys()] if REGION_CONFIG else ['apac']
+    params['_regions_to_run'] = valid_regions
+
+    city_param = params.get('city') or params.get('site') or params.get('site_name') or None
+    city_slug = _slug_city(city_param) if city_param else None
+    params['_city'] = city_slug
+
+    combined_rows = []
+    files = []
+
+    # ---------------------------
+    # Run trend for each requested date
+    # ---------------------------
+    for d in dates:
+        try:
+            if run_trend_for_date is None:
+                raise RuntimeError("run_trend_for_date helper not available in trend_runner")
+            try:
+                df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug)
+            except TypeError:
+                try:
+                    df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+                except Exception:
+                    # Last-resort: try duration_report fallback if available
+                    try:
+                        from duration_report import run_for_date as _dr_run_for_date
+                        region_results = _dr_run_for_date(d, valid_regions, str(DEFAULT_OUTDIR), city_param)
+                        combined_list = []
+                        for rkey, res in (region_results or {}).items():
+                            try:
+                                df_dur = res.get('durations')
+                                if df_dur is not None and not df_dur.empty:
+                                    combined_list.append(df_dur)
+                            except Exception:
+                                continue
+                        df = pd.concat(combined_list, ignore_index=True) if combined_list else pd.DataFrame()
+                    except Exception:
+                        raise
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        csv_path = DEFAULT_OUTDIR / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            continue
+
+        try:
+            df = _replace_placeholder_strings(df)
+        except Exception:
+            pass
+
+        if 'IsFlagged' not in df.columns:
+            df['IsFlagged'] = False
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        combined_rows.append(df)
+
+    # *** Important: combine after loop to avoid UnboundLocalError and extra repeated concat inside loop ***
+    try:
+        combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+    except Exception:
+        combined_df = pd.DataFrame()
+
+    try:
+        if not combined_df.empty:
+            if 'person_uid' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['person_uid'].dropna().astype(str).nunique())
+            elif 'EmployeeID' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['EmployeeID'].dropna().astype(str).nunique())
+            else:
+                raw_unique_person_uids = int(len(combined_df))
+        else:
+            raw_unique_person_uids = 0
+    except Exception:
+        raw_unique_person_uids = int(len(combined_df)) if combined_df is not None else 0
+
+    try:
+        if not combined_df.empty and 'IsFlagged' in combined_df.columns:
+            flagged_df = combined_df[combined_df['IsFlagged'] == True].copy()
+        else:
+            flagged_df = pd.DataFrame()
+    except Exception:
+        flagged_df = pd.DataFrame()
+
+    try:
+        analysis_count = int(raw_unique_person_uids)
+    except Exception:
+        analysis_count = int(len(combined_df)) if combined_df is not None else 0
+
+    try:
+        flagged_count = int(len(flagged_df))
+        flagged_rate_pct = float((flagged_count / analysis_count * 100.0) if analysis_count and analysis_count > 0 else 0.0)
+    except Exception:
+        flagged_count = int(len(flagged_df))
+        flagged_rate_pct = 0.0
+
+    try:
+        # If we have flagged rows, return ALL flagged rows (strict)
+        if flagged_df is not None and not flagged_df.empty:
+            sample_source = flagged_df
+            # return exactly flagged_count rows (no hidden head(10) truncation)
+            samples = _clean_sample_df(sample_source, max_rows=int(len(flagged_df)))
+        else:
+            # old behaviour: show a small sample of combined_df
+            sample_source = combined_df
+            samples = _clean_sample_df(sample_source.head(10), max_rows=10) if sample_source is not None and not sample_source.empty else []
+    except Exception:
+        samples = []
+
+    # -----------------------------
+    # NEW: Enrich the sample rows with EmployeeEmail and imageUrl using trend_runner helper
+    # -----------------------------
+    try:
+        if isinstance(samples, list) and samples:
+            try:
+                base = (request.url_root or request.host_url).rstrip('/')
+            except Exception:
+                base = ''
+            try:
+                # build a small dataframe and call trend_runner enrichment helper
+                tmp_df = pd.DataFrame(samples)
+                # pass a fully-qualified image endpoint template so frontend img src works directly
+                template = "/employee/{}/image"
+                if base:
+                    # result will be like: http://host:port/employee/<id>/image
+                    template = f"{base}/employee/{{}}/image"
+                enriched = _enrich_with_personnel_info(tmp_df, image_endpoint_template=template)
+                # ensure Python native types and safe values via cleaning function
+                enriched_clean = _clean_sample_df(enriched, max_rows=len(enriched))
+                samples = enriched_clean
+            except Exception:
+                logging.exception("Failed to enrich /run sample with personnel info (non-fatal).")
+    except Exception:
+        logging.exception("Sample enrichment failed (non-fatal).")
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "aggregated_rows_total_raw": int(len(combined_df)),
+        "aggregated_unique_persons": int(analysis_count),
+        "rows": int(analysis_count),
+        "flagged_rows": int(flagged_count),
+        "flagged_rate_percent": float(flagged_rate_pct),
+        "files": files,
+         "sample": (samples if isinstance(samples, list) else samples),
+        "reasons_count": {},
+        "risk_counts": {},
+        "flagged_persons": (samples if samples else []),
+        "_raw_unique_person_uids": int(raw_unique_person_uids),
+        "regions_run": params.get('_regions_to_run', []),
+        "city_used": city_slug
+    }
+
+    return jsonify(resp)
+
+
+@app.route('/latest', methods=['GET'])
+def latest_results():
+    city_param = request.args.get('city') or request.args.get('site') or 'pune'
+    city_slug = _slug_city(city_param)
+
+    p = Path(DEFAULT_OUTDIR)
+    csvs = sorted(p.glob(f"trend_{city_slug}_*.csv"), reverse=True)
+    if not csvs:
+        csvs = sorted(p.glob("trend_*.csv"), reverse=True)
+    if not csvs:
+        return jsonify({"error": "no outputs found"}), 404
+    latest = csvs[0]
+
+    start_date_iso = None
+    end_date_iso = None
+    try:
+        m = re.search(r'(\d{8})', latest.name)
+        if m:
+            ymd = m.group(1)
+            dt = datetime.strptime(ymd, "%Y%m%d").date()
+            start_date_iso = dt.isoformat()
+            end_date_iso = dt.isoformat()
+    except Exception:
+        start_date_iso = None
+        end_date_iso = None
+
+    try:
+        df = pd.read_csv(latest)
+    except Exception:
+        df = pd.read_csv(latest, dtype=str)
+
+    df = _replace_placeholder_strings(df)
+
+    id_candidates = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'Int1']
+    id_col = next((c for c in id_candidates if c in df.columns), None)
+
+    def _norm_val_for_latest(v):
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '' or s.lower() == 'nan':
+            return None
+        try:
+            if '.' in s:
+                fv = float(s)
+                if math.isfinite(fv) and fv.is_integer():
+                    s = str(int(fv))
+        except Exception:
+            pass
+        return s
+
+    if id_col is None:
+        unique_persons = int(len(df))
+    else:
+        ids_series = df[id_col].apply(_norm_val_for_latest) if id_col in df.columns else pd.Series([None]*len(df))
+        if id_col != 'person_uid' and 'person_uid' in df.columns:
+            ids_series = ids_series.fillna(df['person_uid'].astype(str).replace('nan','').replace('None',''))
+        unique_persons = int(len(set([x for x in ids_series.unique() if x])))
+
+    # build initial sample (list of dicts)
+    sample = _clean_sample_df(df, max_rows=5)  # returns list
+
+    # --- Enrich sample rows with EmployeeEmail and imageUrl (best-effort) ---
+    try:
+        if isinstance(sample, list) and sample:
+            # compute base once
+            try:
+                base = (request.url_root or request.host_url).rstrip('/')
+            except Exception:
+                base = ''
+
+            for s in sample:
+                # ensure keys exist (consistent shape)
+                s.setdefault('EmployeeEmail', None)
+                s.setdefault('imageUrl', None)
+                s.setdefault('HasImage', False)
+
+                # pick a lookup token (EmployeeID / person_uid / EmployeeName / EmployeeIdentity)
+                lookup_token = (
+                    s.get('EmployeeID')
+                    or s.get('person_uid')
+                    or s.get('EmployeeName')
+                    or s.get('EmployeeIdentity')
+                )
+
+                pi = {}
+                if lookup_token:
+                    try:
+                        # try a few candidate tokens: raw, and stripped prefix (emp:/uid:)
+                        candidates = []
+                        rawtok = str(lookup_token).strip()
+                        candidates.append(rawtok)
+                        stripped = _strip_person_uid_prefix(rawtok)
+                        if stripped and stripped != rawtok:
+                            candidates.append(stripped)
+                        # numeric fallback: if stripped like "123.0" -> int form
+                        try:
+                            if stripped:
+                                if '.' in stripped:
+                                    f = float(stripped)
+                                    if f.is_integer():
+                                        candidates.append(str(int(f)))
+                                else:
+                                    # ensure plain digit-only token also used
+                                    candidates.append(stripped)
+                        except Exception:
+                            pass
+
+                        # attempt lookups in order, break on first hit
+                        for cand in candidates:
+                            if not cand:
+                                continue
+                            try:
+                                pi = get_personnel_info(cand) or {}
+                            except Exception:
+                                pi = {}
+                            if pi:
+                                break
+                    except Exception:
+                        pi = {}
+
+                # Prefer personnel DB email if available
+                if pi:
+                    email = pi.get('EmailAddress') or pi.get('EmployeeEmail') or pi.get('Email') or None
+                    if email:
+                        s['EmployeeEmail'] = email
+
+                    # prefer ObjectID / GUID for images
+                    objid = pi.get('ObjectID') or pi.get('GUID') or None
+                    if objid:
+                        # provide relative image path (frontend resolves with API_BASE)
+                        s['imageUrl'] = f"/employee/{objid}/image"
+                        try:
+                            b = get_person_image_bytes(objid)
+                            s['HasImage'] = True if b else False
+                        except Exception:
+                            s['HasImage'] = False
+
+                # fallback: look up email from the CSV rows read (df) if still missing
+                if not s.get('EmployeeEmail') and isinstance(df, pd.DataFrame):
+                    try:
+                        match_mask = pd.Series(False, index=df.index)
+                        if s.get('person_uid') and 'person_uid' in df.columns:
+                            match_mask |= df['person_uid'].astype(str).str.strip() == str(s.get('person_uid')).strip()
+                        if s.get('EmployeeID') and 'EmployeeID' in df.columns:
+                            match_mask |= df['EmployeeID'].astype(str).str.strip() == str(s.get('EmployeeID')).strip()
+
+                        if match_mask.any():
+                            idx = df[match_mask].index[0]
+                            for col in ('Email', 'EmailAddress', 'EmployeeEmail', 'WorkEmail', 'EMail'):
+                                if col in df.columns:
+                                    val = df.at[idx, col]
+                                    if val not in (None, '', 'nan'):
+                                        s['EmployeeEmail'] = val
+                                        break
+                    except Exception:
+                        pass
+
+                # Ensure we at least provide a consistent image route (use EmployeeID/person_uid if no ObjectID)
+                if not s.get('imageUrl'):
+                    empid = s.get('EmployeeID') or s.get('person_uid')
+                    if empid:
+                        s['imageUrl'] = f"/employee/{empid}/image"
+
+    except Exception:
+        pass
+
+    resp = {
+        
+        "file": latest.name,
+        "rows_raw": int(len(df)),
+        "rows": unique_persons,
+        "sample": sample,
+        "start_date": start_date_iso,
+        "end_date": end_date_iso,
+        "city": city_slug
+    }
+    return jsonify(resp)
+
+
+# route alias 1: existing path (keep)
+@app.route('/employee/<empid>/image', methods=['GET', 'HEAD'])
+def serve_employee_image(empid):
+    return _handle_employee_image(empid)
+
+# route alias 2: node-style path used by frontend in some places
+@app.route('/api/employees/<empid>/image', methods=['GET', 'HEAD'])
+def serve_employee_image_api(empid):
+    return _handle_employee_image(empid)
+
+
+# run
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8002, debug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I have update 2 patches in below app.py file so once Now we have indentation error once fix this both patch indentation error carefully.....
 
 
