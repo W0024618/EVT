@@ -1,3 +1,249 @@
+# Put these near the existing helpers (replace your old get_person_image_bytes and _build_image_response)
+def get_person_image_bytes(parent_id) -> Optional[bytes]:
+    logging.info("get_person_image_bytes: lookup for ParentId=%s", parent_id)
+    # 1) try DB (as before) — keep behaviour if available
+    try:
+        conn = _get_acvscore_conn()
+        if conn is not None:
+            try:
+                cur = conn.cursor()
+                sql = """
+                    SELECT TOP 1 AI.Image
+                    FROM ACVSCore.Access.Images AI
+                    WHERE AI.ParentId = ?
+                      AND DATALENGTH(AI.Image) > 0
+                    ORDER BY AI.ObjectID DESC
+                """
+                cur.execute(sql, (str(parent_id),))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    logging.info(
+                        "get_person_image_bytes: image found in DB for ParentId=%s (len=%d)",
+                        parent_id,
+                        len(row[0]) if row[0] else 0
+                    )
+                    # row[0] might be bytes / memoryview / buffer-like; try to return bytes
+                    try:
+                        return bytes(row[0])
+                    except Exception:
+                        # if conversion fails, return raw value (Flask can often handle it)
+                        return row[0]
+            except Exception:
+                logging.exception("Failed to fetch image for ParentId=%s via DB", parent_id)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        logging.debug("ACVSCore DB unavailable for image lookup; will try filesystem fallbacks for ParentId=%s", parent_id)
+
+    # 2) Try filesystem fallbacks under DEFAULT_OUTDIR and project folders (use typical file extensions)
+    try:
+        if parent_id is None:
+            logging.debug("get_person_image_bytes: parent_id is None -> returning None")
+            return None
+
+        pid_raw = str(parent_id).strip()
+        # generate candidate id tokens (raw, numeric-int)
+        cand_ids = [pid_raw]
+        try:
+            # numeric -> add int form (avoid trailing .0)
+            f = float(pid_raw)
+            if f.is_integer():
+                cand_int = str(int(f))
+                if cand_int != pid_raw:
+                    cand_ids.append(cand_int)
+        except Exception:
+            pass
+        cand_ids = list(dict.fromkeys(cand_ids))  # unique preserve order
+
+        # directories to check (in order)
+        candidate_dirs = [
+            (Path(DEFAULT_OUTDIR) / "images"),
+            Path(DEFAULT_OUTDIR),
+            Path(__file__).resolve().parent / "images",
+            Path(__file__).resolve().parent,
+            Path.cwd()
+        ]
+
+        logging.debug("get_person_image_bytes: checking filesystem for IDs=%s under dirs=%s", cand_ids,
+                      [str(d) for d in candidate_dirs])
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+        for c in cand_ids:
+            for folder in candidate_dirs:
+                try:
+                    if not folder.exists():
+                        continue
+                except Exception:
+                    continue
+                # exact filename matches first
+                for ext in exts:
+                    fp = folder / (f"{c}{ext}")
+                    logging.debug("get_person_image_bytes: checking path %s", fp)
+                    try:
+                        if fp.exists() and fp.is_file():
+                            logging.info("get_person_image_bytes: loaded image file %s", fp)
+                            return fp.read_bytes()
+                    except Exception:
+                        logging.exception("Failed reading file %s", fp)
+                        continue
+
+                # glob fallback where parent_id may be part of filename
+                try:
+                    for fp in folder.glob(f"*{c}*"):
+                        logging.debug("get_person_image_bytes: checking glob match %s", fp)
+                        if fp.is_file():
+                            try:
+                                b = fp.read_bytes()
+                                if b:
+                                    logging.info("get_person_image_bytes: loaded image via glob %s", fp)
+                                    return b
+                            except Exception:
+                                logging.exception("Failed reading glob file %s", fp)
+                                continue
+                except Exception:
+                    logging.exception("Glob check failed in %s for token %s", folder, c)
+                    continue
+
+    except Exception:
+        logging.exception("Filesystem image lookup failed for ParentId=%s", parent_id)
+
+    # nothing found
+    logging.debug("get_person_image_bytes: no image found for ParentId=%s", parent_id)
+    return None
+
+
+def _build_image_response(img_bytes: Optional[bytes], empid: str):
+    """
+    Build a Flask response for given image bytes. If img_bytes is None -> returns an inline SVG
+    (image/svg+xml) placeholder with 200 OK so the browser <img> displays a placeholder.
+    """
+    try:
+        if not img_bytes:
+            # inline SVG placeholder (keeps <img> happy)
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160">'
+                '<rect fill="#eef2f7" width="100%" height="100%"/>'
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#64748b" font-size="18">'
+                'No image</text></svg>'
+            )
+            bio = io.BytesIO(svg.encode('utf-8'))
+            bio.seek(0)
+            resp = send_file(bio, mimetype='image/svg+xml')
+            resp.status_code = 200
+            resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            resp.headers['X-Image-Source'] = 'placeholder'
+            return resp
+
+        # robust header detection (support bytes, bytearray, memoryview)
+        try:
+            header = bytes(img_bytes[:12]) if img_bytes is not None else None
+        except Exception:
+            try:
+                header = bytes(img_bytes)[:12]
+            except Exception:
+                header = None
+
+        content_type = 'application/octet-stream'
+        try:
+            if header and len(header) >= 2 and header[0] == 0xFF and header[1] == 0xD8:
+                content_type = 'image/jpeg'
+            elif header and header.startswith(b'\x89PNG\r\n\x1a\n'):
+                content_type = 'image/png'
+            elif header and header.startswith(b'BM'):
+                content_type = 'image/bmp'
+            elif header and header[:6] in (b'GIF87a', b'GIF89a'):
+                content_type = 'image/gif'
+            elif header and header.startswith(b'RIFF') and header[8:12] == b'WEBP':
+                content_type = 'image/webp'
+        except Exception:
+            content_type = 'application/octet-stream'
+
+        bio = io.BytesIO(bytes(img_bytes))
+        bio.seek(0)
+        resp = send_file(bio, mimetype=content_type)
+        # allow short caching but safe for dev
+        resp.headers['Cache-Control'] = 'private, max-age=300'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['X-Image-Source'] = 'db-or-fs'
+        return resp
+    except Exception:
+        logging.exception("Error building image response for %s", empid)
+        # fallback placeholder on any error
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect fill="#fff" width="100%" height="100%"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#333">Error</text></svg>'
+        bio = io.BytesIO(svg.encode('utf-8'))
+        bio.seek(0)
+        resp = send_file(bio, mimetype='image/svg+xml')
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Cache-Control'] = 'no-cache, no-store'
+        return resp
+
+
+# Small debug route to list candidate image files & check for a specific empid:
+@app.route('/_debug_images', methods=['GET'])
+def _debug_images():
+    empid = request.args.get('empid')
+    candidate_dirs = [
+        (Path(DEFAULT_OUTDIR) / "images"),
+        Path(DEFAULT_OUTDIR),
+        Path(__file__).resolve().parent / "images",
+        Path(__file__).resolve().parent,
+        Path.cwd()
+    ]
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+    out = []
+    for d in candidate_dirs:
+        try:
+            listing = []
+            if d.exists() and d.is_dir():
+                # list up to 300 files (avoid giant dirs)
+                for i, fp in enumerate(sorted(d.iterdir(), key=lambda p: p.name)[:300]):
+                    try:
+                        listing.append(fp.name)
+                    except Exception:
+                        continue
+            out.append({"dir": str(d), "exists": d.exists(), "files_sample": listing[:50]})
+        except Exception as e:
+            out.append({"dir": str(d), "error": str(e)})
+    result = {"candidates": out}
+    if empid:
+        found = []
+        for dinfo in out:
+            if dinfo.get("exists"):
+                dpath = Path(dinfo["dir"])
+                for ext in exts:
+                    p = dpath / f"{empid}{ext}"
+                    if p.exists():
+                        found.append(str(p))
+                for p in dpath.glob(f"*{empid}*"):
+                    if p.exists():
+                        found.append(str(p))
+        result["found_for_empid"] = sorted(list(dict.fromkeys(found)))
+    return jsonify(result)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check below file line by line and fix the issue 
 
 INFO:root:Connected to ACVSCore on server SRVWUPNQ0986V using REGION_CONFIG[apac] (sql auth).
