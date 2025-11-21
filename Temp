@@ -1,3 +1,379 @@
+@app.route('/run', methods=['GET', 'POST'])
+def run_trend():
+    params = {}
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        if request.is_json:
+            params = request.get_json(force=True) or {}
+        else:
+            try:
+                params = request.form.to_dict() or {}
+            except Exception:
+                params = {}
+
+    date_str = (params.get('date') or params.get('Date') or '').strip() or None
+    start_str = (params.get('start') or params.get('Start') or '').strip() or None
+    end_str = (params.get('end') or params.get('End') or '').strip() or None
+
+    dates = []
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            dates = [dt]
+        elif start_str and end_str:
+            s = datetime.strptime(start_str, "%Y-%m-%d").date()
+            e = datetime.strptime(end_str, "%Y-%m-%d").date()
+            if e < s:
+                return jsonify({"error":"end must be >= start"}), 400
+            cur = s
+            while cur <= e:
+                dates.append(cur)
+                cur = cur + timedelta(days=1)
+        else:
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            dates = [yesterday, today]
+    except Exception as e:
+        return jsonify({"error": f"Invalid date format: {e}"}), 400
+
+    regions_param = params.get('regions') or params.get('region') or ''
+    if regions_param:
+        regions = [r.strip().lower() for r in re.split(r'[;,|]', str(regions_param)) if r.strip()]
+    else:
+        try:
+            regions = [k.lower() for k in list(REGION_CONFIG.keys())]
+        except Exception:
+            regions = ['apac']
+
+    valid_regions = []
+    for r in regions:
+        if r in (REGION_CONFIG or {}):
+            valid_regions.append(r)
+        else:
+            logging.debug("Requested region '%s' not in REGION_CONFIG - skipping", r)
+    if not valid_regions:
+        valid_regions = [k.lower() for k in REGION_CONFIG.keys()] if REGION_CONFIG else ['apac']
+    params['_regions_to_run'] = valid_regions
+
+    city_param = params.get('city') or params.get('site') or params.get('site_name') or None
+    city_slug = _slug_city(city_param) if city_param else None
+    params['_city'] = city_slug
+
+    combined_rows = []
+    files = []
+
+    # ---------------------------
+    # Run trend for each requested date
+    # ---------------------------
+    for d in dates:
+        try:
+            if run_trend_for_date is None:
+                raise RuntimeError("run_trend_for_date helper not available in trend_runner")
+            try:
+                df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug)
+            except TypeError:
+                try:
+                    df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+                except Exception:
+                    # Last-resort: try duration_report fallback if available
+                    try:
+                        from duration_report import run_for_date as _dr_run_for_date
+                        region_results = _dr_run_for_date(d, valid_regions, str(DEFAULT_OUTDIR), city_param)
+                        combined_list = []
+                        for rkey, res in (region_results or {}).items():
+                            try:
+                                df_dur = res.get('durations')
+                                if df_dur is not None and not df_dur.empty:
+                                    combined_list.append(df_dur)
+                            except Exception:
+                                continue
+                        df = pd.concat(combined_list, ignore_index=True) if combined_list else pd.DataFrame()
+                    except Exception:
+                        raise
+        except Exception as e:
+            logging.exception("run_trend_for_date failed for %s", d)
+            return jsonify({"error": f"runner failed for {d}: {e}"}), 500
+
+        csv_path = DEFAULT_OUTDIR / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            continue
+
+        try:
+            df = _replace_placeholder_strings(df)
+        except Exception:
+            pass
+
+        if 'IsFlagged' not in df.columns:
+            df['IsFlagged'] = False
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        combined_rows.append(df)
+
+    # combine after loop
+    try:
+        combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+    except Exception:
+        combined_df = pd.DataFrame()
+
+    # quick raw unique people count (pre-aggregation)
+    try:
+        if not combined_df.empty:
+            if 'person_uid' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['person_uid'].dropna().astype(str).nunique())
+            elif 'EmployeeID' in combined_df.columns:
+                raw_unique_person_uids = int(combined_df['EmployeeID'].dropna().astype(str).nunique())
+            else:
+                raw_unique_person_uids = int(len(combined_df))
+        else:
+            raw_unique_person_uids = 0
+    except Exception:
+        raw_unique_person_uids = int(len(combined_df)) if combined_df is not None else 0
+
+    # Build flagged_df: rows that are flagged (row-level)
+    try:
+        if not combined_df.empty and 'IsFlagged' in combined_df.columns:
+            flagged_df = combined_df[combined_df['IsFlagged'] == True].copy()
+        else:
+            flagged_df = pd.DataFrame()
+    except Exception:
+        flagged_df = pd.DataFrame()
+
+    # ----- NEW: deduplicate by person and aggregate violations per person -----
+    # Build a stable person key: prefer person_uid > EmployeeID > hashed name
+    def _person_key_for_row(r):
+        try:
+            # prefer person_uid
+            val = None
+            for c in ('person_uid', 'EmployeeID', 'EmployeeIdentity', 'Int1', 'Text12', 'CardNumber'):
+                if c in r and r.get(c) not in (None, '', float('nan')):
+                    val = r.get(c)
+                    break
+            if val is not None:
+                s = _normalize_id_local(val) or None
+                if s:
+                    return s if not _looks_like_guid(s) else None
+            # fallback to name-based key
+            nm = r.get('EmployeeName') or r.get('ObjectName1') or r.get('ObjectName')
+            if nm and isinstance(nm, str) and nm.strip():
+                h = hashlib.sha1(nm.strip().lower().encode('utf8')).hexdigest()[:10]
+                return f"name:{h}"
+            return None
+        except Exception:
+            return None
+
+    # If combined_df empty -> keep earlier behaviour but safe
+    try:
+        if combined_df is None or combined_df.empty:
+            aggregated_df = pd.DataFrame()
+            aggregated_persons = []
+            aggregated_unique_persons = 0
+        else:
+            # ensure Date column exists for per-day counting
+            if 'Date' not in combined_df.columns and 'DateOnly' in combined_df.columns:
+                try:
+                    combined_df['Date'] = pd.to_datetime(combined_df['DateOnly'], errors='coerce').dt.date
+                except Exception:
+                    combined_df['Date'] = None
+
+            # create person key
+            combined_df['_person_key'] = combined_df.apply(lambda r: _person_key_for_row(r), axis=1)
+
+            # fill any missing keys with synthetic index-based key to not lose rows in grouping
+            combined_df['_person_key'] = combined_df['_person_key'].fillna(method='ffill').fillna(method='bfill')
+            combined_df['_person_key'] = combined_df['_person_key'].fillna(combined_df.index.map(lambda i: f"row:{i}"))
+
+            # severity mapping helper
+            def _severity_for_label(lbl):
+                try:
+                    mp = {"Low": 1, "Low Medium": 2, "Medium": 3, "Medium High": 4, "High": 5}
+                    if not lbl:
+                        return 1
+                    return mp.get(str(lbl).strip(), 1)
+                except Exception:
+                    return 1
+
+            # aggregate per-person
+            agg_rows = []
+            for key, grp in combined_df.groupby('_person_key'):
+                try:
+                    # violation counts = number of flagged rows for this person
+                    viol_count = int(grp['IsFlagged'].fillna(False).astype(bool).sum()) if 'IsFlagged' in grp.columns else 0
+                    # distinct flagged dates
+                    flagged_dates = []
+                    if 'IsFlagged' in grp.columns and 'Date' in grp.columns:
+                        try:
+                            flagged_dates = sorted([d for d in pd.to_datetime(grp.loc[grp['IsFlagged']==True, 'Date'], errors='coerce').dt.date.dropna().unique().tolist()])
+                        except Exception:
+                            flagged_dates = []
+                    # pick representative row with highest severity (RiskScore -> RiskLevel fallback)
+                    rep_row = None
+                    rep_sev = -1
+                    for _, r in grp.iterrows():
+                        sev = -1
+                        if 'RiskScore' in r and r.get('RiskScore') is not None:
+                            try:
+                                sev = int(r.get('RiskScore') or 0)
+                            except Exception:
+                                sev = _severity_for_label(r.get('RiskLevel'))
+                        else:
+                            sev = _severity_for_label(r.get('RiskLevel'))
+                        if sev > rep_sev:
+                            rep_sev = sev
+                            rep_row = r
+                    if rep_row is None:
+                        rep_row = grp.iloc[0]
+                    # collect reasons across flagged rows for this person
+                    reasons_set = set()
+                    if 'Reasons' in grp.columns:
+                        for v in grp['Reasons'].dropna().astype(str):
+                            for part in re.split(r'[;,\|]', v):
+                                p = part.strip()
+                                if p and not _is_placeholder_str(p):
+                                    reasons_set.add(p)
+                    rep_reasons = "; ".join(sorted(reasons_set)) if reasons_set else None
+
+                    # representative fields
+                    emp_name = rep_row.get('EmployeeName') if 'EmployeeName' in rep_row else None
+                    emp_id = rep_row.get('EmployeeID') if 'EmployeeID' in rep_row else None
+                    card = rep_row.get('CardNumber') if 'CardNumber' in rep_row else None
+                    risk_level = rep_row.get('RiskLevel') if 'RiskLevel' in rep_row else None
+                    anomaly_score = rep_row.get('AnomalyScore') if 'AnomalyScore' in rep_row else None
+
+                    agg_rows.append({
+                        '_person_key': key,
+                        'EmployeeName': emp_name,
+                        'EmployeeID': emp_id,
+                        'CardNumber': card,
+                        'ViolationCount': viol_count,
+                        'FlaggedDates': [d.isoformat() for d in flagged_dates] if flagged_dates else [],
+                        'RiskLevel': risk_level,
+                        'AnomalyScore': _to_python_scalar(anomaly_score),
+                        'Reasons': rep_reasons,
+                        'representative_row': {k: _to_python_scalar(v) for k, v in (rep_row.to_dict().items() if hasattr(rep_row, 'to_dict') else rep_row.items())}
+                    })
+                except Exception:
+                    logging.exception("Aggregation error for person key %s", key)
+                    continue
+
+            aggregated_df = pd.DataFrame(agg_rows)
+            aggregated_unique_persons = int(len(aggregated_df))
+            aggregated_persons = aggregated_df.to_dict(orient='records')
+    except Exception:
+        logging.exception("Failed to aggregate persons (non-fatal)")
+        aggregated_df = pd.DataFrame()
+        aggregated_persons = []
+        aggregated_unique_persons = int(raw_unique_person_uids or 0)
+
+    # compute analysis_count (unique persons)
+    try:
+        analysis_count = int(aggregated_unique_persons)
+    except Exception:
+        analysis_count = int(raw_unique_person_uids) if raw_unique_person_uids is not None else 0
+
+    # flagged persons (unique persons with at least one violation)
+    try:
+        if aggregated_df is not None and not aggregated_df.empty:
+            flagged_persons_df = aggregated_df[aggregated_df['ViolationCount'].fillna(0).astype(int) > 0].copy()
+        else:
+            flagged_persons_df = pd.DataFrame()
+    except Exception:
+        flagged_persons_df = pd.DataFrame()
+
+    # flagged_rows: total number of flagged occurrences (sum of violation counts)
+    try:
+        flagged_count_total = int(flagged_persons_df['ViolationCount'].sum()) if (flagged_persons_df is not None and not flagged_persons_df.empty) else 0
+    except Exception:
+        try:
+            flagged_count_total = int(len(flagged_df))
+        except Exception:
+            flagged_count_total = 0
+
+    # flagged persons count (number of unique persons flagged)
+    try:
+        flagged_persons_count = int(len(flagged_persons_df)) if flagged_persons_df is not None else 0
+    except Exception:
+        flagged_persons_count = 0
+
+    # flagged rate percent (unique persons flagged / analysis_count)
+    try:
+        flagged_rate_pct = float((flagged_persons_count / analysis_count * 100.0) if analysis_count and analysis_count > 0 else 0.0)
+    except Exception:
+        flagged_rate_pct = 0.0
+
+    # build sample: if we have flagged persons return aggregated persons sample else small sample of combined
+    try:
+        if flagged_persons_df is not None and not flagged_persons_df.empty:
+            samples = _clean_sample_df(flagged_persons_df, max_rows=int(min(50, len(flagged_persons_df))))
+        else:
+            sample_source = combined_df
+            samples = _clean_sample_df(sample_source.head(10), max_rows=10) if sample_source is not None and not sample_source.empty else []
+    except Exception:
+        samples = []
+
+    # reasons_count and risk_counts computed from the underlying flagged rows (keeps violation-weighted counts)
+    reasons_count = {}
+    risk_counts = {}
+    try:
+        if not flagged_df.empty:
+            # reasons from row-level flagged_df (counts reflect row-level violations)
+            if 'Reasons' in flagged_df.columns:
+                for v in flagged_df['Reasons'].dropna().astype(str):
+                    for part in re.split(r'[;,\|]', v):
+                        key = part.strip()
+                        if key and not _is_placeholder_str(key):
+                            reasons_count[key] = reasons_count.get(key, 0) + 1
+            # risk counts from row-level flagged_df (row-level)
+            if 'RiskLevel' in flagged_df.columns:
+                for v in flagged_df['RiskLevel'].fillna('').astype(str):
+                    if v and not _is_placeholder_str(v):
+                        risk_counts[v] = risk_counts.get(v, 0) + 1
+    except Exception:
+        logging.exception("Failed to compute reasons/risk counts")
+
+    resp = {
+        "start_date": dates[0].isoformat() if dates else None,
+        "end_date": dates[-1].isoformat() if dates else None,
+        "aggregated_rows_total_raw": int(len(combined_df)),
+        "aggregated_unique_persons": int(analysis_count),
+        "rows": int(analysis_count),
+        # flagged_rows kept as total flagged occurrences (sum of per-person ViolationCount) for compatibility
+        "flagged_rows": int(flagged_count_total),
+        "flagged_persons_count": int(flagged_persons_count),
+        "flagged_rate_percent": float(flagged_rate_pct),
+        "files": files,
+        "sample": (samples if isinstance(samples, list) else samples),
+        "reasons_count": reasons_count,
+        "risk_counts": risk_counts,
+        "flagged_persons": (aggregated_persons if aggregated_persons else []),
+        "_raw_unique_person_uids": int(raw_unique_person_uids),
+        "regions_run": params.get('_regions_to_run', []),
+        "city_used": city_slug
+    }
+
+    return jsonify(resp)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Once Check both Backend file carefully line by line you know issue is Duplicate EMployee 
 Make single for EMployee and increase count as per Violation ..
 Dont make unnecessary changes so check file line by line understand logic and fix the issue 
