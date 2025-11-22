@@ -1,3 +1,322 @@
+def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd.DataFrame:
+    """
+    Consolidate multiple rows per person (and optionally per-date) into a single row.
+    If combine_dates == False: behave as before (group by person_key + Date).
+    If combine_dates == True: group by person_key only and aggregate Dates, Durations and Reasons
+    into single columns (semi-colon separated), while preserving the best representative row's
+    fields (using your existing priority rules).
+    """
+    if df is None or df.empty:
+        return df
+
+    df2 = df.copy()
+
+    # Normalize Date -> date objects
+    if 'Date' in df2.columns:
+        try:
+            df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+    else:
+        for c in ('FirstSwipe', 'LastSwipe'):
+            if c in df2.columns:
+                try:
+                    df2['Date'] = pd.to_datetime(df2[c], errors='coerce').dt.date
+                    break
+                except Exception:
+                    pass
+        if 'Date' not in df2.columns:
+            df2['Date'] = None
+
+    # Build stable consolidation key: prefer person_uid, then EmployeeID, EmployeeIdentity, CardNumber, EmployeeName
+    id_cols = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'EmployeeName']
+    def _pick_key(row):
+        for c in id_cols:
+            try:
+                if c in row and row.get(c) not in (None, '', float('nan')):
+                    v = row.get(c)
+                    s = str(v).strip()
+                    if s:
+                        return s
+            except Exception:
+                continue
+        return None
+
+    df2['_trend_key'] = df2.apply(_pick_key, axis=1)
+
+    # helper to format duration (use existing format_seconds_to_hms if available)
+    def _fmt_duration_from_row(r):
+        try:
+            # prefer explicit 'Duration' string if present
+            if 'Duration' in r and r.get('Duration') not in (None, '', float('nan')):
+                return str(r.get('Duration')).strip()
+            if 'DurationSeconds' in r and r.get('DurationSeconds') not in (None, '', float('nan')):
+                try:
+                    return format_seconds_to_hms(float(r.get('DurationSeconds')))
+                except Exception:
+                    pass
+            if 'DurationMinutes' in r and r.get('DurationMinutes') not in (None, '', float('nan')):
+                try:
+                    mins = float(r.get('DurationMinutes'))
+                    secs = int(round(mins * 60.0))
+                    return format_seconds_to_hms(secs)
+                except Exception:
+                    pass
+            # fallback to any duration-like column
+            for c in ('DurSeconds','Dur','Duration_str'):
+                if c in r and r.get(c) not in (None, '', float('nan')):
+                    return str(r.get(c))
+        except Exception:
+            pass
+        return None
+
+    # grouping keys: if combine_dates -> group by key only; else group by key+Date
+    group_cols = ['_trend_key'] if combine_dates else ['_trend_key', 'Date']
+
+    out_rows = []
+    try:
+        grouped = df2.groupby(group_cols, sort=False, dropna=False)
+    except Exception:
+        grouped = [(None, df2)]
+
+    for gkeys, group in grouped:
+        # For single-key grouping groupby returns key as tuple when group_cols has multiple items;
+        # unify into a single group dataframe variable `g`
+        g = group.copy()
+
+        # If there is only one row in this group -> keep it (but still normalize Date type)
+        if len(g) == 1:
+            out_rows.append(g.iloc[0])
+            continue
+
+        # pick a representative row using your existing priority rules
+        picked = None
+        try:
+            if 'IsFlagged' in g.columns:
+                flagged = g[g['IsFlagged'] == True]
+                if not flagged.empty:
+                    if 'AnomalyScore' in flagged.columns:
+                        try:
+                            idx = pd.to_numeric(flagged['AnomalyScore'], errors='coerce').fillna(-1).astype(float).idxmax()
+                            picked = flagged.loc[idx].copy()
+                        except Exception:
+                            picked = flagged.iloc[0].copy()
+                    else:
+                        picked = flagged.iloc[0].copy()
+        except Exception:
+            pass
+
+        if picked is None:
+            if 'CountSwipes' in g.columns:
+                try:
+                    idx = pd.to_numeric(g['CountSwipes'], errors='coerce').fillna(-1).astype(float).idxmax()
+                    picked = g.loc[idx].copy()
+                except Exception:
+                    picked = None
+
+        if picked is None:
+            if 'DurationSeconds' in g.columns:
+                try:
+                    idx = pd.to_numeric(g['DurationSeconds'], errors='coerce').fillna(-1).astype(float).idxmax()
+                    picked = g.loc[idx].copy()
+                except Exception:
+                    picked = None
+
+        if picked is None:
+            if 'LastSwipe' in g.columns:
+                try:
+                    g['__ls__'] = pd.to_datetime(g['LastSwipe'], errors='coerce')
+                    idx = g['__ls__'].idxmax()
+                    picked = g.loc[idx].copy()
+                    try:
+                        g = g.drop(columns=['__ls__'])
+                    except Exception:
+                        pass
+                except Exception:
+                    picked = None
+
+        if picked is None:
+            picked = g.iloc[0].copy()
+
+        # If not combining across dates: we are done — keep representative row
+        if not combine_dates:
+            out_rows.append(picked)
+            continue
+
+        # --- combine multiple dates into single row (combine_dates == True) ---
+        # Build Dates list and Durations list (maintain original order by Date)
+        try:
+            # sort group by Date (keep stable ordering)
+            g_sorted = g.copy()
+            try:
+                g_sorted = g_sorted.sort_values(by='Date')
+            except Exception:
+                pass
+
+            dates_list = []
+            durations_list = []
+            reasons_set = set()
+            anomaly_scores = []
+            violation_days_total = 0
+            flagged_any = False
+            countswipes_list = []
+            # iterate rows and collect
+            for _, rr in g_sorted.iterrows():
+                # date string
+                try:
+                    dval = rr.get('Date')
+                    if pd.notna(dval):
+                        if isinstance(dval, (str,)):
+                            ds = pd.to_datetime(dval, errors='coerce')
+                        else:
+                            ds = pd.to_datetime(dval, errors='coerce')
+                        if pd.notna(ds):
+                            dates_list.append(ds.date().strftime("%d/%m/%Y"))
+                        else:
+                            dates_list.append(str(dval))
+                    else:
+                        dates_list.append('')
+                except Exception:
+                    dates_list.append(str(rr.get('Date')))
+
+                # duration
+                dstr = _fmt_duration_from_row(rr)
+                if dstr:
+                    durations_list.append(dstr)
+                else:
+                    # keep blank placeholder for alignment if needed
+                    durations_list.append("")
+
+                # reasons: may be semicolon/comma separated; split and add unique
+                try:
+                    rs = rr.get('Reasons') or rr.get('DetectedScenarios') or None
+                    if rs:
+                        for part in re.split(r'[;,\|]', str(rs)):
+                            p = part.strip()
+                            if p and p.lower() not in ('nan','none',''):
+                                reasons_set.add(p)
+                except Exception:
+                    pass
+
+                # anomaly score
+                try:
+                    if 'AnomalyScore' in rr and rr.get('AnomalyScore') not in (None, '', float('nan')):
+                        anomaly_scores.append(float(rr.get('AnomalyScore')))
+                except Exception:
+                    pass
+
+                # violation days
+                try:
+                    v = rr.get('ViolationDaysLast90')
+                    if v not in (None, '', float('nan')):
+                        violation_days_total += int(float(v))
+                except Exception:
+                    pass
+
+                # flagged
+                try:
+                    if 'IsFlagged' in rr and bool(rr.get('IsFlagged')):
+                        flagged_any = True
+                except Exception:
+                    pass
+
+                try:
+                    if 'CountSwipes' in rr and rr.get('CountSwipes') not in (None, '', float('nan')):
+                        countswipes_list.append(int(float(rr.get('CountSwipes'))))
+                except Exception:
+                    pass
+
+            # attach aggregated fields to picked row
+            # join date+duration entries as "DD/MM/YYYY: HH:MM:SS" pairs (semicolon separated)
+            pairs = []
+            for d, du in zip(dates_list, durations_list):
+                if d and du:
+                    pairs.append(f"{d} {du}")
+                elif d and not du:
+                    pairs.append(f"{d}")
+                elif du and not d:
+                    pairs.append(f"{du}")
+            picked['Dates'] = "; ".join([p for p in dates_list if p])
+            picked['Duration'] = "; ".join([p for p in durations_list if p])
+            # Also keep a combined 'DurationByDate' with date+value
+            picked['DurationByDate'] = "; ".join(pairs) if pairs else None
+
+            # Reasons combined (unique)
+            if reasons_set:
+                picked['Reasons'] = "; ".join(sorted(reasons_set))
+            else:
+                # ensure Reasons exists
+                if 'Reasons' not in picked or picked.get('Reasons') in (None, '', float('nan')):
+                    picked['Reasons'] = None
+
+            # Other metrics: AnomalyScore -> max, IsFlagged -> any True, CountSwipes -> max or sum (prefer max)
+            try:
+                picked['AnomalyScore'] = max(anomaly_scores) if anomaly_scores else picked.get('AnomalyScore')
+            except Exception:
+                pass
+            picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
+            try:
+                picked['ViolationDaysLast90'] = int(violation_days_total)
+            except Exception:
+                pass
+            try:
+                picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
+            except Exception:
+                pass
+
+        except Exception:
+            # if aggregation fails, fall back to the representative row
+            logging.exception("Failed to aggregate multi-date group for key=%s", str(gkeys))
+
+        out_rows.append(picked)
+
+    try:
+        out_df = pd.DataFrame(out_rows).reset_index(drop=True)
+    except Exception:
+        return df
+
+    if '_trend_key' in out_df.columns:
+        try:
+            out_df = out_df.drop(columns=['_trend_key'])
+        except Exception:
+            pass
+
+    return out_df
+
+
+
+
+
+
+
+
+# apply consolidation to remove duplicates that come from multiple regions/files
+try:
+    if not combined_df.empty:
+        # If user asked for a date range (more than one day) then combine across dates
+        combine_across_dates = (len(dates) > 1)
+        combined_df = _consolidate_trend_rows(combined_df, combine_dates=combine_across_dates)
+except Exception:
+    logging.exception("Failed to consolidate duplicate trend rows; proceeding with original combined_df")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i have insert below patch in app.py file still we got Duplicate Entry here ..
 I want Unique Entry for each Person ..
 
