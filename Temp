@@ -1,1 +1,321 @@
+# C:\Users\W0024618\Desktop\Trend Analysis\backend\ml_training.py
+"""
+Train one binary classifier per scenario using either:
+ - an existing training CSV (as before), or
+ - build the training CSV automatically from duration CSVs produced by duration_report.run_for_date.
+
+Default behavior now:
+ - If --build_training is passed (or --durations_dir is provided without --input),
+   the script will scan the durations directory for files named like
+     <region>_duration_YYYYMMDD.csv
+   load rows with Date >= --start_date (default 2025-10-01), aggregate them per person-month,
+   write a training CSV (default outputs/training_person_month.csv) and then train models from it.
+
+Usage examples:
+  # Build training CSV from durations starting Oct 1, 2025 and then train:
+  python ml_training.py --build_training --durations_dir ./outputs --start_date 2025-10-01 --models_dir ./models
+
+  # Or train directly from an existing CSV:
+  python ml_training.py --input ./outputs/training_person_month.csv --models_dir ./models
+"""
+import argparse
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report
+    import joblib
+except Exception as e:
+    logger.error("Required ML packages missing: %s", e)
+    logger.error("Install scikit-learn and joblib: pip install scikit-learn joblib")
+    raise
+
+DEFAULT_FEATURE_COLS = [
+    'CountSwipes_median', 'CountSwipes_mean', 'CountSwipes_sum',
+    'DurationMinutes_median', 'DurationMinutes_mean', 'DurationMinutes_sum',
+    'MaxSwipeGapSeconds_max', 'MaxSwipeGapSeconds_median',
+    'ShortGapCount_sum', 'UniqueDoors_median', 'UniqueLocations_median', 'RejectionCount_sum',
+    'days_present'
+]
+
+
+def auto_detect_scenarios(df):
+    scenario_labels = [c for c in df.columns if c.endswith('_label')]
+    scenarios = [c[:-6] for c in scenario_labels]
+    return scenarios
+
+
+def prepare_features(df, features=None):
+    if features is None:
+        features = DEFAULT_FEATURE_COLS
+    X = df.copy()
+    # ensure columns exist, fill missing with 0/median-like safe defaults
+    for f in features:
+        if f not in X.columns:
+            # sensible default: numeric 0
+            X[f] = 0.0
+    # fill NaNs with 0.0
+    X = X[features].fillna(0.0)
+    return X
+
+
+def train_one(df, scenario, features):
+    label_col = f"{scenario}_label"
+    if label_col not in df.columns:
+        logger.warning("Label %s not in dataframe, skipping", label_col)
+        return None
+    # ensure label is numeric 0/1
+    try:
+        y = df[label_col].astype(int)
+    except Exception:
+        y = pd.to_numeric(df[label_col], errors='coerce').fillna(0).astype(int)
+    if y.sum() == 0:
+        logger.warning("No positive examples for %s; skipping model training", scenario)
+        return None
+    X = prepare_features(df, features)
+    # If dataset is small or stratify fails, fall back to non-stratified split
+    stratify_arg = y if y.nunique() > 1 and len(y) >= 10 else None
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify_arg)
+    except Exception:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    logger.info("Classification report for %s:\n%s", scenario, classification_report(y_test, y_pred, zero_division=0))
+    return clf
+
+
+# ---------------------- Build training CSV from duration files ----------------------
+def _parse_date(d):
+    if pd.isna(d):
+        return None
+    if isinstance(d, (pd.Timestamp, datetime)):
+        return d.date() if isinstance(d, (pd.Timestamp, datetime)) else d
+    try:
+        return pd.to_datetime(d, errors='coerce').date()
+    except Exception:
+        return None
+
+
+def build_training_from_durations(durations_dir: Path, start_date: str = "2025-10-01", out_csv: Path = None):
+    """
+    durations_dir: folder containing files like <region>_duration_YYYYMMDD.csv produced by duration_report.run_for_date
+    start_date: ISO date string; only include rows with Date >= start_date
+    out_csv: Path to write training CSV; if None -> durations_dir / 'training_person_month.csv'
+    Returns path to written CSV.
+    """
+    durations_dir = Path(durations_dir)
+    if out_csv is None:
+        out_csv = durations_dir / "training_person_month.csv"
+    try:
+        start_dt = pd.to_datetime(start_date).date()
+    except Exception:
+        start_dt = pd.to_datetime(start_date, errors='coerce').date()
+
+    files = sorted(durations_dir.glob("*_duration_*.csv"))
+    if not files:
+        logger.warning("No duration CSV files found in %s", durations_dir)
+        # create an empty CSV with columns expected (so training script fails more clearly)
+        empty = pd.DataFrame(columns=["person_uid", "Date"])
+        empty.to_csv(out_csv, index=False)
+        return out_csv
+
+    df_list = []
+    for f in files:
+        try:
+            tmp = pd.read_csv(f, parse_dates=["Date", "FirstSwipe", "LastSwipe"])
+        except Exception:
+            try:
+                tmp = pd.read_csv(f, dtype=str)
+                if "Date" in tmp.columns:
+                    tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce").dt.date
+            except Exception:
+                logger.exception("Failed reading duration file %s", f)
+                continue
+        if tmp is None or tmp.empty:
+            continue
+        # ensure person_uid exists
+        if "person_uid" not in tmp.columns:
+            # try to build person_uid similar to duration_report: prefer EmployeeID / Int1 / Text12 then EmployeeIdentity/name
+            def make_person_uid_local(row):
+                for cand in ("EmployeeID", "Int1", "Text12"):
+                    v = row.get(cand)
+                    if pd.notna(v) and str(v).strip() != "":
+                        return str(v).strip()
+                if pd.notna(row.get("EmployeeIdentity")) and str(row.get("EmployeeIdentity")).strip() != "":
+                    return str(row.get("EmployeeIdentity")).strip()
+                if pd.notna(row.get("EmployeeName")) and str(row.get("EmployeeName")).strip() != "":
+                    return str(row.get("EmployeeName")).strip()
+                return None
+            tmp["person_uid"] = tmp.apply(make_person_uid_local, axis=1)
+        # parse Date to date
+        try:
+            tmp["Date"] = tmp["Date"].apply(lambda x: _parse_date(x))
+        except Exception:
+            tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce").dt.date
+        # keep only rows with Date >= start_dt
+        try:
+            tmp = tmp[tmp["Date"].notna() & (tmp["Date"] >= start_dt)].copy()
+        except Exception:
+            logger.exception("Date filtering failed for file %s", f)
+            continue
+        if tmp.empty:
+            continue
+        # ensure numeric fields exist
+        for c in ("CountSwipes", "DurationMinutes", "MaxSwipeGapSeconds", "ShortGapCount", "UniqueDoors", "UniqueLocations", "RejectionCount"):
+            if c not in tmp.columns:
+                tmp[c] = np.nan
+        # attach region/city context if possible from filename
+        tmp["_source_file"] = f.name
+        df_list.append(tmp)
+
+    if not df_list:
+        logger.warning("No rows found in duration CSVs after start_date filter (%s)", start_dt)
+        empty = pd.DataFrame(columns=["person_uid", "Date"])
+        empty.to_csv(out_csv, index=False)
+        return out_csv
+
+    df_all = pd.concat(df_list, ignore_index=True)
+    # Ensure expected dtypes
+    for c in ("CountSwipes", "DurationMinutes", "MaxSwipeGapSeconds", "ShortGapCount", "UniqueDoors", "UniqueLocations", "RejectionCount"):
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+
+    # Add year-month key for grouping by person-month
+    def ym_from_date(d):
+        try:
+            if pd.isna(d):
+                return None
+            if isinstance(d, (pd.Timestamp, datetime)):
+                d = d.date()
+            if isinstance(d, (str,)):
+                d = pd.to_datetime(d, errors='coerce').date()
+            return f"{d.year:04d}-{d.month:02d}"
+        except Exception:
+            return None
+
+    df_all["year_month"] = df_all["Date"].apply(ym_from_date)
+    df_all = df_all[df_all["year_month"].notna()].copy()
+
+    # Group and compute features per person_uid x year_month
+    agg_funcs = {
+        "CountSwipes": ["median", "mean", "sum"],
+        "DurationMinutes": ["median", "mean", "sum"],
+        "MaxSwipeGapSeconds": ["max", "median"],
+        "ShortGapCount": ["sum"],
+        "UniqueDoors": ["median"],
+        "UniqueLocations": ["median"],
+        "RejectionCount": ["sum"]
+    }
+
+    grouped = df_all.groupby(["person_uid", "year_month"], sort=False).agg(agg_funcs)
+    # flatten columns
+    grouped.columns = ["_".join(filter(None, map(str, c))).strip() for c in grouped.columns.values]
+    grouped = grouped.reset_index()
+
+    # days_present: number of unique Date values per person-month
+    days = df_all.groupby(["person_uid", "year_month"])["Date"].nunique().reset_index().rename(columns={"Date": "days_present"})
+    training = grouped.merge(days, on=["person_uid", "year_month"], how="left")
+
+    # fill NaNs sensibly (zeros for sums, medians/means keep NaN -> fill 0)
+    training = training.fillna(0)
+
+    # Optionally compute or keep other label columns if present in source durations (rare).
+    # For convenience, retain EmployeeName if present in source (first non-null)
+    try:
+        name_map = df_all.sort_values("Date").groupby(["person_uid", "year_month"])["EmployeeName"].first().reset_index()
+        training = training.merge(name_map, on=["person_uid", "year_month"], how="left")
+    except Exception:
+        pass
+
+    # Persist CSV
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    training.to_csv(out_csv, index=False)
+    logger.info("Wrote training CSV with %d rows to %s", len(training), out_csv)
+    return out_csv
+
+
+# ---------------------- Main entrypoint ----------------------
+def main(input_csv: Path = None, models_dir: Path = None, features=None,
+         build_training: bool = False, durations_dir: Path = None, start_date: str = "2025-10-01", training_out_csv: Path = None):
+    # If building training from durations was requested, do it first
+    if build_training or (durations_dir and not input_csv):
+        if not durations_dir:
+            durations_dir = Path("./outputs")
+        else:
+            durations_dir = Path(durations_dir)
+        if not durations_dir.exists():
+            raise FileNotFoundError(f"durations_dir not found: {durations_dir}")
+        training_csv_path = Path(training_out_csv) if training_out_csv else (durations_dir / "training_person_month.csv")
+        input_csv = build_training_from_durations(durations_dir, start_date=start_date, out_csv=training_csv_path)
+
+    # if input_csv still None -> error
+    if not input_csv:
+        raise ValueError("No input CSV provided. Use --input or --build_training with --durations_dir.")
+    input_csv = Path(input_csv)
+    if not input_csv.exists():
+        raise FileNotFoundError(f"input CSV not found: {input_csv}")
+
+    # Load CSV
+    df = pd.read_csv(input_csv)
+    # Basic sanity: ensure numeric feature columns exist as expected by train_one
+    features_to_use = features or DEFAULT_FEATURE_COLS
+
+    # Detect scenarios automatically as before
+    scenarios = auto_detect_scenarios(df)
+    if not scenarios:
+        logger.error("No scenarios ( *_label ) columns found in %s. Nothing to train.", input_csv)
+        # Still exit gracefully
+        return
+
+    models_dir_path = Path(models_dir or "models")
+    models_dir_path.mkdir(parents=True, exist_ok=True)
+
+    for s in scenarios:
+        logger.info("Training for scenario: %s", s)
+        clf = train_one(df, s, features_to_use)
+        if clf is not None:
+            outp = models_dir_path / f"{s}.joblib"
+            joblib.dump({"model": clf, "features": (features_to_use or DEFAULT_FEATURE_COLS)}, outp)
+            logger.info("Saved model to %s", outp)
+        else:
+            logger.info("Skipped training for %s", s)
+
+
+if __name__ == "__main__":
+    import os
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", help="training CSV (person-month) created previously", default=None)
+    parser.add_argument("--models_dir", default="models", help="folder to save models")
+    parser.add_argument("--features", default=None, help="comma separated feature columns (optional)")
+    # new args to build training CSV from duration files
+    parser.add_argument("--build_training", action="store_true", help="Build training CSV from duration files in --durations_dir")
+    parser.add_argument("--durations_dir", help="folder with <region>_duration_YYYYMMDD.csv files (default ./outputs)", default="./outputs")
+    parser.add_argument("--start_date", help="only include duration rows Date >= this ISO date (default 2025-10-01)", default="2025-10-01")
+    parser.add_argument("--training_out", help="path to write built training CSV (optional). default: <durations_dir>/training_person_month.csv", default=None)
+    args = parser.parse_args()
+
+    feature_cols = args.features.split(",") if args.features else None
+    # If --input not provided and --build_training not set, we still allow building by specifying durations_dir
+    try:
+        main(input_csv=args.input, models_dir=args.models_dir, features=feature_cols,
+             build_training=args.build_training, durations_dir=args.durations_dir,
+             start_date=args.start_date, training_out_csv=args.training_out)
+    except Exception as e:
+        logger.exception("Fatal error in ml_training: %s", e)
+        raise
+
+
+
+
+
 
