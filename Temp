@@ -1,1 +1,166 @@
+#!/usr/bin/env python3
+"""
+Generate trend CSVs for a sliding window of days by calling trend_runner.run_trend_for_date.
+
+New features:
+ - --all-cities: discover cities from duration CSVs (since --start) and generate trend CSVs for each city into outdir/<city_slug>/.
+ - Keeps retry logic and permissive fallback to positional call if run_trend_for_date doesn't accept kwargs.
+
+Usage:
+  # single city (old behavior)
+  python generate_90_days.py --end 2025-11-09 --window 90 --city Pune --outdir ./outputs
+
+  # generate for all cities discovered in ./outputs since 2025-10-01
+  python generate_90_days.py --end 2025-11-09 --window 90 --all-cities --outdir ./outputs --start 2025-10-01
+"""
+from datetime import date, timedelta, datetime
+from pathlib import Path
+import sys
+import os
+import argparse
+import logging
+import time
+import pandas as pd
+import re
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+# Make the backend project root importable when running the script directly.
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+os.chdir(str(PROJECT_ROOT))
+
+try:
+    from trend_runner import run_trend_for_date, OUTDIR as TREND_OUTDIR
+except Exception:
+    run_trend_for_date = None
+    TREND_OUTDIR = None
+
+def _slug(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '_', str(s or "").strip().lower()).strip('_') or "unknown"
+
+def find_cities_from_duration_files(outdir: Path, start_date: date) -> list:
+    pattern = re.compile(r'.*_duration_(\d{8})\.csv$', flags=re.IGNORECASE)
+    cities = set()
+    if not outdir.exists():
+        return []
+    for p in outdir.glob("*_duration_*.csv"):
+        m = pattern.match(p.name)
+        if not m:
+            continue
+        try:
+            dt = datetime.strptime(m.group(1), "%Y%m%d").date()
+        except Exception:
+            continue
+        if dt < start_date:
+            continue
+        try:
+            # attempt to read PartitionName2 column first
+            df = pd.read_csv(p, usecols=[c for c in ['PartitionName2'] if c in pd.read_csv(p, nrows=0).columns], dtype=str, low_memory=True)
+            if 'PartitionName2' in df.columns:
+                for v in df['PartitionName2'].dropna().unique():
+                    vs = str(v).strip()
+                    if vs:
+                        cities.add(vs)
+        except Exception:
+            try:
+                df = pd.read_csv(p, dtype=str, low_memory=True)
+                if 'PartitionName2' in df.columns:
+                    for v in df['PartitionName2'].dropna().unique():
+                        vs = str(v).strip()
+                        if vs:
+                            cities.add(vs)
+            except Exception:
+                logging.debug("Failed reading %s for city discovery", p)
+                continue
+    return sorted(cities)
+
+def process_dates(start_date: date, end_date: date, outdir: Path, city: str, max_retries: int = 1, pause_seconds: float = 1.0):
+    d = start_date
+    while d <= end_date:
+        attempt = 0
+        success = False
+        while attempt <= max_retries and not success:
+            try:
+                logging.info("Processing %s (city=%s) attempt %s", d.isoformat(), city, attempt + 1)
+                if run_trend_for_date is None:
+                    raise RuntimeError("trend_runner.run_trend_for_date not importable. Ensure trend_runner is on PYTHONPATH.")
+                run_trend_for_date(d, outdir=str(outdir), city=city)
+                success = True
+            except TypeError as te:
+                # try positional fallback
+                logging.warning("run_trend_for_date signature mismatch (%s). Trying positional call.", te)
+                try:
+                    run_trend_for_date(d)
+                    success = True
+                except Exception as e2:
+                    logging.exception("Positional run_trend_for_date call also failed: %s", e2)
+            except Exception as e:
+                logging.exception("Failed for %s (city=%s): %s", d.isoformat(), city, e)
+            attempt += 1
+            if not success and attempt <= max_retries:
+                time.sleep(pause_seconds)
+        if not success:
+            logging.error("Giving up for %s after %s attempts (city=%s)", d.isoformat(), max_retries + 1, city)
+        d = d + timedelta(days=1)
+
+def main(end_date=None, window_days=90, outdir="./outputs", city="Pune", start_date_override=None, all_cities=False):
+    if end_date:
+        end_dt = date.fromisoformat(end_date)
+    else:
+        end_dt = date.today()
+
+    if start_date_override:
+        start_dt = date.fromisoformat(start_date_override)
+    else:
+        start_dt = end_dt - timedelta(days=window_days - 1)
+
+    out_path = Path(outdir)
+    if TREND_OUTDIR and outdir in ("./outputs", None, ""):
+        try:
+            out_path = Path(TREND_OUTDIR)
+        except Exception:
+            pass
+
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    if all_cities:
+        # discover cities using duration files since provided start (default Oct 1)
+        discovery_start = date.fromisoformat("2025-10-01")
+        logging.info("Discovering cities in %s (duration files since %s)", out_path, discovery_start.isoformat())
+        cities = find_cities_from_duration_files(out_path, discovery_start)
+        if not cities:
+            logging.warning("No cities discovered. Exiting.")
+            return
+        logging.info("Discovered %d cities: %s", len(cities), ", ".join(cities[:10]))
+        for c in cities:
+            slug = _slug(c)
+            city_outdir = out_path / slug
+            logging.info("Generating for city %s -> outputs in %s", c, city_outdir)
+            process_dates(start_dt, end_dt, city_outdir, c, max_retries=1, pause_seconds=1.0)
+    else:
+        out_path.mkdir(parents=True, exist_ok=True)
+        process_dates(start_dt, end_dt, out_path, city, max_retries=1, pause_seconds=1.0)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--end", help="end date (YYYY-MM-DD). default = today", default=None)
+    parser.add_argument("--start", help="start date (YYYY-MM-DD). optional, overrides window", default=None)
+    parser.add_argument("--outdir", help="outputs dir", default="./outputs")
+    parser.add_argument("--window", type=int, default=90, help="window days (default 90)")
+    parser.add_argument("--city", default="Pune")
+    parser.add_argument("--all-cities", action="store_true", help="discover cities from duration files and generate for each")
+    args = parser.parse_args()
+
+    main(end_date=args.end, window_days=args.window, outdir=args.outdir, city=args.city, start_date_override=args.start, all_cities=args.all_cities)
+
+
+
+
+
+
+
 
