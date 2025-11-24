@@ -1,3 +1,252 @@
+# new import to reuse canonicalization helpers from duration_report
+try:
+    from duration_report import _strip_person_uid_prefix
+except Exception:
+    # defensive fallback (shouldn't happen if duration_report present)
+    def _strip_person_uid_prefix(token):
+        if token is None:
+            return None
+        try:
+            s = str(token).strip()
+            if not s:
+                return None
+            if ':' in s:
+                prefix, rest = s.split(':', 1)
+                if prefix.lower() in ('emp', 'uid', 'name'):
+                    rest = rest.strip()
+                    if rest:
+                        return rest
+            return s
+        except Exception:
+            return None
+
+
+
+
+
+
+
+
+
+
+def _parse_employees_param(params) -> List[str]:
+    """
+    Parse employees param from request params (supports JSON list or comma/;| separated string).
+    Returns list of normalized tokens (suffixes stripped: e.g. 'emp:123' -> '123').
+    """
+    vals = params.get('employees') or params.get('employee') or params.get('emp') or None
+    if vals is None:
+        return []
+    out = []
+    # if passed as a list (JSON body), accept directly
+    if isinstance(vals, (list, tuple)):
+        cand_list = list(vals)
+    else:
+        # string: split by common separators
+        s = str(vals).strip()
+        if not s:
+            return []
+        cand_list = [p.strip() for p in re.split(r'[;,|\n]+', s) if p.strip()]
+    for c in cand_list:
+        try:
+            norm = _strip_person_uid_prefix(c)
+            if norm:
+                out.append(str(norm))
+        except Exception:
+            try:
+                sc = str(c).strip()
+                if sc:
+                    out.append(sc)
+            except Exception:
+                continue
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _row_matches_tokens(row, tokens: List[str]) -> bool:
+    """
+    Return True if pandas Series `row` matches any token in tokens list.
+    Matching considerations:
+      - compare person_uid, EmployeeID/Int1/Text12, EmployeeIdentity, CardNumber (string equality)
+      - numeric tokens compared as ints/floats to EmployeeID/Int1 when possible
+      - name tokens: case-insensitive substring match against EmployeeName
+    """
+    if row is None or not tokens:
+        return False
+
+    # gather candidate fields (stringified)
+    def _safe_val(key):
+        try:
+            v = row.get(key) if hasattr(row, 'get') else row.get(key, None)
+        except Exception:
+            try:
+                v = row[key] if key in row else None
+            except Exception:
+                v = None
+        if v is None:
+            return ''
+        try:
+            s = str(v).strip()
+            # strip trailing .0 for floats
+            if '.' in s:
+                try:
+                    f = float(s)
+                    if math.isfinite(f) and float(f).is_integer():
+                        s = str(int(f))
+                except Exception:
+                    pass
+            return s
+        except Exception:
+            return ''
+
+    person_uid_val = _safe_val('person_uid')
+    empid_val = _safe_val('EmployeeID') or _safe_val('Int1') or _safe_val('Text12') or ''
+    empident_val = _safe_val('EmployeeIdentity')
+    card_val = _safe_val('CardNumber') or _safe_val('Card') or ''
+    name_val = _safe_val('EmployeeName') or _safe_val('ObjectName1') or ''
+
+    # prepare normalized set
+    row_set = set()
+    for v in (person_uid_val, empid_val, empident_val, card_val):
+        if v:
+            row_set.add(v)
+    # lower name for substring compare
+    name_lower = name_val.lower() if name_val else ''
+
+    for t in tokens:
+        if t is None:
+            continue
+        tt = str(t).strip()
+        if not tt:
+            continue
+        # numeric attempt
+        matched = False
+        # If token looks numeric integer, compare to numeric employee id fields
+        try:
+            if '.' in tt:
+                f = float(tt)
+                if math.isfinite(f) and f.is_integer():
+                    tt_num = str(int(f))
+                else:
+                    tt_num = None
+            else:
+                # if digits-only
+                tt_num = tt if re.fullmatch(r'\d+', tt) else None
+        except Exception:
+            tt_num = None
+
+        if tt_num:
+            if empid_val == tt_num or empident_val == tt_num or person_uid_val == tt_num:
+                return True
+
+        # direct exact match (person_uid, empid, card, identity)
+        if tt in row_set:
+            return True
+        # sometimes person_uid may include prefixes like emp:123 or uid:GUID
+        if person_uid_val and tt in person_uid_val:
+            return True
+
+        # GUID-like tokens may match EmployeeIdentity or person_uid
+        try:
+            if _looks_like_guid(tt):
+                if empident_val and tt.lower() == empident_val.lower():
+                    return True
+                if person_uid_val and tt.lower() in person_uid_val.lower():
+                    return True
+        except Exception:
+            pass
+
+        # name substring (case-insensitive) match
+        try:
+            if name_lower and tt.lower() in name_lower:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+
+
+
+
+
+
+    # *** Important: combine after loop to avoid UnboundLocalError and extra repeated concat inside loop ***
+    try:
+        combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
+    except Exception:
+        combined_df = pd.DataFrame()
+
+    # ---------- NEW: employee filtering support ----------
+    try:
+        employees_tokens = _parse_employees_param(params)
+    except Exception:
+        employees_tokens = []
+
+    if employees_tokens:
+        try:
+            before_count = int(len(combined_df))
+            # if combined_df empty just fast-fail
+            if combined_df is None or combined_df.empty:
+                logging.info("Employee filter requested but no combined_df rows present.")
+                return jsonify({"message": "No scenario met", "rows": 0}), 200
+
+            # apply row filter
+            try:
+                mask = combined_df.apply(lambda r: _row_matches_tokens(r, employees_tokens), axis=1)
+                combined_df = combined_df[mask].copy()
+            except Exception:
+                # per-row apply can fail on exotic frames, fallback to naive string contains across key cols
+                logging.exception("Per-row employee filter failed; trying fallback contains filter.")
+                cols = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'EmployeeName']
+                mask2 = pd.Series(False, index=combined_df.index)
+                for c in cols:
+                    if c in combined_df.columns:
+                        try:
+                            mask2 = mask2 | combined_df[c].astype(str).fillna('').str.strip().isin(employees_tokens)
+                        except Exception:
+                            try:
+                                for t in employees_tokens:
+                                    mask2 = mask2 | combined_df[c].astype(str).str.contains(str(t), na=False, case=False)
+                            except Exception:
+                                continue
+                combined_df = combined_df[mask2].copy()
+
+            after_count = int(len(combined_df))
+            logging.info("Employee filter tokens=%s applied: rows_before=%d rows_after=%d", employees_tokens, before_count, after_count)
+
+            # If nothing matched, return friendly message for frontend
+            if combined_df.empty:
+                return jsonify({"message": "No scenario met", "rows": 0}), 200
+
+        except Exception:
+            logging.exception("Failed applying employee filter; continuing without employee filter.")
+    # ---------- END employee filtering ----------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Ok 
 Now Initailly Update only on Backend check below duration file 
 app.py if need inform me then will share you  trend runner.py file carefully dont make unnecessary changes keep all logic same 
