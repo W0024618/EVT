@@ -1,3 +1,225 @@
+        # after df returned from run_trend_for_date for date d and before we append file names
+        csv_path = DEFAULT_OUTDIR / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
+        # if caller requested hybrid mode also write per-city copy
+        try:
+            if str(params.get('hybrid', '')).lower() in ('1','true','yes'):
+                try:
+                    # create city-specific outdir under DEFAULT_OUTDIR (e.g. ./outputs/pune/)
+                    per_city_dir = DEFAULT_OUTDIR / (city_slug or 'unknown_city')
+                    per_city_dir.mkdir(parents=True, exist_ok=True)
+                    per_city_path = per_city_dir / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
+                    # write copy if df exists and not empty
+                    if df is not None and not (hasattr(df, 'empty') and df.empty):
+                        try:
+                            df.to_csv(per_city_path, index=False)
+                            logging.info("Hybrid store: wrote per-city file %s", per_city_path)
+                        except Exception:
+                            logging.exception("Failed writing per-city hybrid CSV %s", per_city_path)
+                except Exception:
+                    logging.exception("Hybrid-per-city write block failed")
+        except Exception:
+            pass
+
+        if csv_path.exists():
+            files.append(csv_path.name)
+
+
+
+
+
+
+
+
+
+
+
+# --- Extended main + CLI: add regions, primary-city and hybrid-store support ---
+try:
+    # optional import for region config discovery (duration_report used in backend)
+    from duration_report import REGION_CONFIG as _REGION_CONFIG
+except Exception:
+    _REGION_CONFIG = None
+
+def _maybe_filter_cities_by_region(cities_list, regions_input):
+    """
+    If regions_input provided (list of region names), try to filter the discovered city list.
+    If REGION_CONFIG is available and maps sites -> region, prefer that mapping.
+    Otherwise, do a best-effort substring match on the city string.
+    """
+    if not regions_input:
+        return cities_list
+    regions_normalized = [r.strip().lower() for r in regions_input if r and str(r).strip()]
+    if not regions_normalized:
+        return cities_list
+
+    if _REGION_CONFIG:
+        # REGION_CONFIG likely maps region_name -> config; try to build reverse map for site names
+        try:
+            site_to_region = {}
+            for rname, cfg in _REGION_CONFIG.items():
+                # cfg may include a 'sites' or 'cities' list - be permissive
+                sites = cfg.get('sites') if isinstance(cfg, dict) and cfg.get('sites') else cfg.get('cities') if isinstance(cfg, dict) and cfg.get('cities') else None
+                if sites:
+                    for s in sites:
+                        if s:
+                            site_to_region[str(s).strip().lower()] = str(rname).strip().lower()
+        except Exception:
+            site_to_region = {}
+
+        filtered = []
+        for c in cities_list:
+            slug = re.sub(r'[^a-z0-9]+', '_', str(c).strip().lower())
+            if site_to_region:
+                # direct exact match if exists
+                if slug in site_to_region and site_to_region[slug] in regions_normalized:
+                    filtered.append(c)
+                    continue
+            # fallback substring match
+            for r in regions_normalized:
+                if r in slug:
+                    filtered.append(c)
+                    break
+        return sorted(set(filtered), key=lambda x: str(x).lower())
+
+    # fallback: substring match against requested region tokens
+    out = []
+    for c in cities_list:
+        cl = str(c).strip().lower()
+        for r in regions_normalized:
+            if r in cl:
+                out.append(c)
+                break
+    return sorted(set(out), key=lambda x: str(x).lower()) if out else cities_list
+
+
+def main(end_date=None, window_days=90, outdir="./outputs", city="Pune", start_date_override=None, all_cities=False, regions=None, primary_city="Pune", hybrid_store=False):
+    if end_date:
+        end_dt = date.fromisoformat(end_date)
+    else:
+        end_dt = date.today()
+
+    if start_date_override:
+        start_dt = date.fromisoformat(start_date_override)
+    else:
+        start_dt = end_dt - timedelta(days=window_days - 1)
+
+    out_path = Path(outdir)
+    if TREND_OUTDIR and outdir in ("./outputs", None, ""):
+        try:
+            out_path = Path(TREND_OUTDIR)
+        except Exception:
+            pass
+
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # helper wrapper which lets us pass regions and hybrid_store through to run_trend_for_date where supported
+    def _run_for_city(city_name):
+        logging.info("Start generating trends for city=%s dates=%s..%s", city_name, start_dt.isoformat(), end_dt.isoformat())
+        # create city specific outdir
+        city_slug = _slug(city_name)
+        city_outdir = out_path if not hybrid_store else (out_path / city_slug)
+        city_outdir.mkdir(parents=True, exist_ok=True)
+        process_dates(start_dt, end_dt, city_outdir, city_name, max_retries=1, pause_seconds=1.0)
+
+    if all_cities:
+        # discover cities
+        discovery_start = start_dt
+        logging.info("Discovering cities in %s (duration files since %s)", out_path, discovery_start.isoformat())
+        cities = find_cities_from_duration_files(out_path, discovery_start)
+        if not cities:
+            logging.warning("No cities discovered. Exiting.")
+            return
+
+        # filter by regions param if provided
+        if regions:
+            cities = _maybe_filter_cities_by_region(cities, regions)
+
+        # ensure primary city runs first (if present)
+        primary = primary_city or city
+        ordered = []
+        primary_lower = str(primary).strip().lower()
+        for c in cities:
+            if str(c).strip().lower() == primary_lower:
+                ordered.append(c)
+        for c in cities:
+            if str(c).strip().lower() != primary_lower:
+                ordered.append(c)
+
+        logging.info("Will generate for %d cities, primary first: %s", len(ordered), ", ".join(ordered[:6]))
+        for c in ordered:
+            try:
+                _run_for_city(c)
+            except Exception:
+                logging.exception("Failed generating for city %s", c)
+    else:
+        # single city run (city param)
+        _run_for_city(city)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--end", help="end date (YYYY-MM-DD). default = today", default=None)
+    parser.add_argument("--start", help="start date (YYYY-MM-DD). optional, overrides window", default=None)
+    parser.add_argument("--outdir", help="outputs dir", default="./outputs")
+    parser.add_argument("--window", type=int, default=90, help="window days (default 90)")
+    parser.add_argument("--city", default="Pune")
+    parser.add_argument("--primary-city", default="Pune", help="Primary city to run first when --all-cities used")
+    parser.add_argument("--all-cities", action="store_true", help="discover cities from duration files and generate for each")
+    parser.add_argument("--regions", default=None, help="Optional comma-separated regions to filter when using --all-cities")
+    parser.add_argument("--hybrid-store", action="store_true", help="When set, write outputs into per-city subfolders instead of only root outdir")
+    args = parser.parse_args()
+
+    region_list = [r.strip() for r in args.regions.split(",")] if args.regions else None
+    main(end_date=args.end, window_days=args.window, outdir=args.outdir, city=args.city, start_date_override=args.start, all_cities=args.all_cities, regions=region_list, primary_city=args.primary_city, hybrid_store=args.hybrid_store)
+
+
+
+
+
+
+
+
+
+
+per_city_models_dir = models_path / csv.parent.name
+per_city_models_dir.mkdir(parents=True, exist_ok=True)
+
+
+
+def find_training_csvs(outdir: Path, pattern="training_person_*.csv"):
+    outdir = Path(outdir)
+    if not outdir.exists():
+        return []
+    found = sorted(list(outdir.glob(f"**/{pattern}")))
+    return found
+
+
+
+
+
+def find_training_csvs(outdir: Path, pattern="training_person_*.csv"):
+    outdir = Path(outdir)
+    if not outdir.exists():
+        return []
+    found = sorted(list(outdir.glob(f"**/{pattern}")))
+    return found
+
+
+GET /run?date=2025-11-23&city=Pune&hybrid=1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # backend/app.py
 from flask import Flask, jsonify, request, send_from_directory, jsonify, send_file
 from datetime import datetime, timedelta, date
