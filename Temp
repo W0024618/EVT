@@ -1,3 +1,510 @@
+def run_trend_for_date(target_date: date,
+                       regions: Optional[List[str]] = None,
+                       outdir: str = None,
+                       city: str = "pune",
+                       window_days: Optional[int] = None,
+                       as_dict: bool = False) -> pd.DataFrame:
+    city_slug = _slug_city(city)
+    if regions is None:
+        regions = []
+        try:
+            rcfg = REGION_CONFIG if isinstance(REGION_CONFIG, dict) else {}
+            city_norm = None
+            if city:
+                city_norm = re.sub(r'[^a-z0-9]', '', str(city).strip().lower())
+            # build list of candidate region keys
+            all_region_keys = list(rcfg.keys()) if rcfg else []
+            matched = []
+            if city_norm and rcfg:
+                for rkey, rc in rcfg.items():
+                    parts = rc.get("partitions", []) or []
+                    likes = rc.get("logical_like", []) or []
+                    tokens = set()
+                    for p in parts:
+                        if not p:
+                            continue
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(p).strip().lower()))
+                        # also split on punctuation/dot and add pieces
+                        for piece in re.split(r'[.\-/\s]', str(p)):
+                            if piece:
+                                tokens.add(re.sub(r'[^a-z0-9]', '', piece.strip().lower()))
+                    for lk in likes:
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(lk).strip().lower()))
+                    # also include servers/databases if present (safe fallback)
+                    serv = rc.get("server") or ""
+                    tokens.add(re.sub(r'[^a-z0-9]', '', str(serv).strip().lower()))
+                    # match
+                    if city_norm in tokens:
+                        matched.append(rkey)
+                # if matched regions found, use them
+                if matched:
+                    regions = matched
+                else:
+                    # fallback: if no match, default to all region keys
+                    regions = all_region_keys
+            else:
+                regions = all_region_keys
+        except Exception:
+            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+    # final normalization
+    regions = [r.lower() for r in regions if r]
+
+    outdir_path = Path(outdir) if outdir else OUTDIR
+    if run_for_date is None:
+        raise RuntimeError("duration_report.run_for_date is not available in this environment.")
+    # call run_for_date defensively
+    try:
+        results = run_for_date(target_date, regions, str(outdir_path), city)
+    except TypeError:
+        try:
+            results = run_for_date(target_date, regions, str(outdir_path))
+        except Exception:
+            try:
+                results = run_for_date(target_date)
+            except Exception as e:
+                logging.exception("run_for_date failed entirely.")
+                raise
+    # combine durations and swipes across regions
+    dur_list = []
+    swipe_list = []
+    try:
+        for rkey, rr in (results or {}).items():
+            try:
+                dfdur = rr.get('durations')
+                if dfdur is not None and not dfdur.empty:
+                    dfdur = dfdur.copy()
+                    dfdur['region'] = rkey
+                    dur_list.append(dfdur)
+            except Exception:
+                pass
+            try:
+                dfsw = rr.get('swipes')
+                if dfsw is not None and not dfsw.empty:
+                    dfcopy = dfsw.copy()
+                    dfcopy['region'] = rkey
+                    swipe_list.append(dfcopy)
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Failed to iterate results returned by run_for_date.")
+    combined = pd.concat(dur_list, ignore_index=True) if dur_list else pd.DataFrame()
+    sw_combined = pd.concat(swipe_list, ignore_index=True) if swipe_list else pd.DataFrame()
+
+    # Decide Pune 2AM boundary
+    use_pune_2am_boundary = False
+    try:
+        if city and isinstance(city, str) and 'pun' in city.strip().lower():
+            use_pune_2am_boundary = True
+        else:
+            if os.getenv("PUNE_2AM_BOUNDARY", "0") == "1":
+                use_pune_2am_boundary = True
+    except Exception:
+        use_pune_2am_boundary = False
+
+    # Prepare for features; possibly shift times for Pune 02:00 grouping
+    sw_for_features = sw_combined.copy() if sw_combined is not None else pd.DataFrame()
+    durations_for_features = combined.copy() if combined is not None else pd.DataFrame()
+
+    if use_pune_2am_boundary and (sw_for_features is not None) and (not sw_for_features.empty):
+        try:
+            if 'LocaleMessageTime' in sw_for_features.columns:
+                sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features['LocaleMessageTime'], errors='coerce')
+            else:
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_for_features.columns:
+                        sw_for_features['LocaleMessageTime'] = pd.to_datetime(sw_for_features[cand], errors='coerce')
+                        break
+            sw_for_features['OriginalLocaleMessageTime'] = sw_for_features['LocaleMessageTime']
+            sw_for_features['LocaleMessageTime'] = sw_for_features['LocaleMessageTime'] - pd.Timedelta(hours=2)
+            # recompute durations if compute_daily_durations is available
+            if callable(compute_daily_durations):
+                try:
+                    durations_for_features = compute_daily_durations(sw_for_features)
+                except Exception:
+                    logging.exception("compute_daily_durations failed for shifted swipes; falling back to original durations.")
+                    durations_for_features = combined.copy()
+            # save shifted raw optionally
+            try:
+                sw_shifted_out = Path(outdir_path) / f"swipes_{city_slug}_{target_date.strftime('%Y%m%d')}_shifted.csv"
+                cols_keep = [c for c in sw_for_features.columns if c in ('person_uid','EmployeeID','CardNumber','LocaleMessageTime','OriginalLocaleMessageTime','Door','Direction','PartitionName2')]
+                sw_for_features[cols_keep].to_csv(sw_shifted_out, index=False)
+            except Exception:
+                logging.debug("Could not write shifted swipes file.")
+        except Exception:
+            logging.exception("Failed to prepare shifted swipes for Pune 2AM logic.")
+            sw_for_features = sw_combined.copy()
+            durations_for_features = combined.copy()
+
+    # compute features once (use possibly-shifted data so grouping uses 02:00 boundary for Pune)
+    features = compute_features(sw_for_features, durations_for_features)
+    if features is None:
+        features = pd.DataFrame()
+    if features.empty:
+        logging.warning("run_trend_for_date: no features computed")
+        if as_dict:
+            return {'rows': 0, 'flagged_rows': 0, 'sample': [], 'reasons_count': {}, 'risk_counts': {}, 'aggregated_unique_persons': 0}
+        return pd.DataFrame()
+    # restore FirstSwipe/LastSwipe to original timeline if shifted (only once)
+    if use_pune_2am_boundary:
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in features.columns:
+                try:
+                    features[dtcol] = pd.to_datetime(features[dtcol], errors='coerce') + pd.Timedelta(hours=2)
+                except Exception:
+                    pass
+
+    # Save raw swipes for evidence
+    try:
+        if sw_combined is not None and not sw_combined.empty:
+            sw_out = Path(outdir_path) / f"swipes_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+            sw_combined.to_csv(sw_out, index=False)
+            logging.info("Saved raw swipes to %s", sw_out)
+    except Exception:
+        logging.warning("Failed to save raw swipes")
+
+    # Recompute per-row metrics from raw swipes and merge into features
+    try:
+        if sw_combined is not None and not sw_combined.empty:
+            if 'LocaleMessageTime' not in sw_combined.columns:
+                for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                    if cand in sw_combined.columns:
+                        sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined[cand], errors='coerce')
+                        break
+            else:
+                sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined['LocaleMessageTime'], errors='coerce')
+            if use_pune_2am_boundary:
+                sw_combined['DisplayDateKey'] = (sw_combined['LocaleMessageTime'] - pd.Timedelta(hours=2)).dt.date
+            else:
+                sw_combined['DisplayDateKey'] = sw_combined['LocaleMessageTime'].dt.date
+
+            def _agg_metrics(g):
+                times_sorted = sorted(list(pd.to_datetime(g['LocaleMessageTime'].dropna())))
+                count_swipes = len(times_sorted)
+                max_gap = 0
+                short_gap_count = 0
+                if len(times_sorted) >= 2:
+                    gaps = []
+                    for i in range(1, len(times_sorted)):
+                        s = (times_sorted[i] - times_sorted[i-1]).total_seconds()
+                        gaps.append(s)
+                        if s <= 5*60:
+                            short_gap_count += 1
+                    max_gap = int(max(gaps)) if gaps else 0
+                first_ts = times_sorted[0] if times_sorted else None
+                last_ts = times_sorted[-1] if times_sorted else None
+                unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+                unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+                def _pick_non_guid(colname):
+                    if colname in g.columns:
+                        for v in pd.unique(g[colname].dropna().astype(str).map(lambda x: x.strip())):
+                            if v and (not _GUID_RE.match(v)) and v.lower() not in _PLACEHOLDER_STRS:
+                                return v
+                    return None
+                card = _pick_non_guid('CardNumber')
+                empid = _pick_non_guid('EmployeeID') or _pick_non_guid('Int1') or _pick_non_guid('Text12')
+                empname = _pick_non_guid('EmployeeName') or _pick_non_guid('ObjectName1')
+                duration_sec = 0.0
+                if first_ts is not None and last_ts is not None:
+                    try:
+                        duration_sec = float((pd.to_datetime(last_ts) - pd.to_datetime(first_ts)).total_seconds())
+                        if duration_sec < 0:
+                            duration_sec = 0.0
+                    except Exception:
+                        duration_sec = 0.0
+                return pd.Series({
+                    'FirstSwipe_raw': first_ts,
+                    'LastSwipe_raw': last_ts,
+                    'CountSwipes_raw': int(count_swipes),
+                    'DurationSeconds_raw': float(duration_sec),
+                    'DurationMinutes_raw': float(duration_sec/60.0),
+                    'MaxSwipeGapSeconds_raw': int(max_gap),
+                    'ShortGapCount_raw': int(short_gap_count),
+                    'UniqueDoors_raw': int(unique_doors),
+                    'UniqueLocations_raw': int(unique_locations),
+                    'CardNumber_raw': card,
+                    'EmployeeID_raw': empid,
+                    'EmployeeName_raw': empname
+                })
+
+            grouped_raw = sw_combined.dropna(subset=['person_uid', 'DisplayDateKey'], how='any').groupby(['person_uid', 'DisplayDateKey'])
+            if not grouped_raw.ngroups:
+                raw_metrics_df = pd.DataFrame(columns=[
+                    'person_uid','DisplayDate','FirstSwipe_raw','LastSwipe_raw','CountSwipes_raw','DurationSeconds_raw',
+                    'DurationMinutes_raw','MaxSwipeGapSeconds_raw','ShortGapCount_raw','UniqueDoors_raw','UniqueLocations_raw',
+                    'CardNumber_raw','EmployeeID_raw','EmployeeName_raw'
+                ])
+            else:
+                raw_metrics_df = grouped_raw.apply(_agg_metrics).reset_index()
+                raw_metrics_df.rename(columns={'DisplayDateKey':'DisplayDate'}, inplace=True)
+
+            # --- robust creation of merge keys for DisplayDate ---
+            # We used to assume 'DisplayDate' exists; sometimes it doesn't which caused KeyError/AttributeError.
+            # Create two helper columns that are safe for joining: a normalized Timestamp and a safe string.
+            try:
+                if 'DisplayDate' in features.columns:
+                    try:
+                        features['_DisplayDate_for_merge'] = pd.to_datetime(features['DisplayDate'], errors='coerce').dt.normalize()
+                    except Exception:
+                        features['_DisplayDate_for_merge'] = pd.NaT
+                    try:
+                        features['_DisplayDate_for_merge_str'] = pd.to_datetime(features['DisplayDate'], errors='coerce').astype(str).fillna('')
+                    except Exception:
+                        # fallback to stringification of the original series
+                        try:
+                            features['_DisplayDate_for_merge_str'] = features['DisplayDate'].astype(str).fillna('')
+                        except Exception:
+                            features['_DisplayDate_for_merge_str'] = ''
+                else:
+                    features['_DisplayDate_for_merge'] = pd.NaT
+                    features['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build feature merge keys for DisplayDate; proceeding without them")
+                features['_DisplayDate_for_merge'] = pd.NaT
+                features['_DisplayDate_for_merge_str'] = ''
+
+            try:
+                if 'DisplayDate' in raw_metrics_df.columns:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').dt.normalize()
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = pd.to_datetime(raw_metrics_df['DisplayDate'], errors='coerce').astype(str).fillna('')
+                else:
+                    raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                    raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+            except Exception:
+                logging.exception("Failed to build raw_metrics merge keys; falling back to string keys")
+                raw_metrics_df['_DisplayDate_for_merge'] = pd.NaT
+                raw_metrics_df['_DisplayDate_for_merge_str'] = ''
+
+            # Prefer the datetime normalized join if available, else fall back to string join
+            merged_metrics = None
+            try:
+                merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                          left_on=['person_uid', '_DisplayDate_for_merge'],
+                                          right_on=['person_uid', '_DisplayDate_for_merge'],
+                                          suffixes=('','_rawagg'))
+            except Exception:
+                try:
+                    merged_metrics = pd.merge(features, raw_metrics_df, how='left',
+                                              left_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              right_on=['person_uid', '_DisplayDate_for_merge_str'],
+                                              suffixes=('','_rawagg'))
+                except Exception:
+                    logging.exception("Both merge attempts failed; continuing without raw-agg merge")
+                    merged_metrics = features.copy()
+
+            # coalesce raw columns back into features (if present)
+            try:
+                for base_col, raw_col in [
+                    ('FirstSwipe','FirstSwipe_raw'),
+                    ('LastSwipe','LastSwipe_raw'),
+                    ('CountSwipes','CountSwipes_raw'),
+                    ('DurationSeconds','DurationSeconds_raw'),
+                    ('DurationMinutes','DurationMinutes_raw'),
+                    ('MaxSwipeGapSeconds','MaxSwipeGapSeconds_raw'),
+                    ('ShortGapCount','ShortGapCount_raw'),
+                    ('UniqueDoors','UniqueDoors_raw'),
+                    ('UniqueLocations','UniqueLocations_raw'),
+                    ('CardNumber','CardNumber_raw'),
+                    ('EmployeeID','EmployeeID_raw'),
+                    ('EmployeeName','EmployeeName_raw')
+                ]:
+                    if raw_col in merged_metrics.columns:
+                        try:
+                            merged_metrics[base_col] = merged_metrics[raw_col].combine_first(merged_metrics.get(base_col))
+                        except Exception:
+                            # best-effort: if combine_first fails, keep original
+                            pass
+                feature_cols = list(features.columns)
+                if all(c in merged_metrics.columns for c in feature_cols):
+                    features = merged_metrics[feature_cols].copy()
+                else:
+                    features = merged_metrics.copy()
+                for helper_col in ['_DisplayDate_for_merge', '_DisplayDate_for_merge_str']:
+                    if helper_col in features.columns:
+                        try:
+                            features.drop(columns=[helper_col], inplace=True)
+                        except Exception:
+                            pass
+            except Exception:
+                logging.exception("Post-merge coalescing failed; leaving features as-is.")
+
+    except Exception:
+        logging.exception("Failed recomputing raw metrics (non-fatal)")
+
+    # If we used shifted timeline restore displayed times (safety)
+    if use_pune_2am_boundary:
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in features.columns:
+                try:
+                    features[dtcol] = pd.to_datetime(features[dtcol], errors='coerce') + pd.Timedelta(hours=2)
+                except Exception:
+                    pass
+
+    # Merge features with durations (prefer features)
+    try:
+        merged = pd.merge(features, combined, how='left', on=['person_uid', 'Date'], suffixes=('_feat', '_dur'))
+    except Exception:
+        merged = features
+
+    #trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date)
+
+    trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date, window_days=window_days)
+
+    # write csv (use city_slug, not hard-coded 'pune')
+    try:
+        write_df = trend_df.copy()
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in write_df.columns:
+                write_df[dtcol] = pd.to_datetime(write_df[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+        if 'Date' in write_df.columns:
+            try:
+                write_df['Date'] = pd.to_datetime(write_df['Date'], errors='coerce').dt.date
+                write_df['Date'] = write_df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+            except Exception:
+                pass
+        write_df = write_df.where(pd.notnull(write_df), None)
+        # IMPORTANT: write with city_slug so app.py can find the file
+        out_csv = Path(outdir_path) / f"trend_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+        write_df.to_csv(out_csv, index=False)
+        logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(write_df))
+    except Exception:
+        logging.exception("Failed to write trend CSV")
+
+    # Format DisplayDate
+    try:
+        if 'DisplayDate' in trend_df.columns:
+            trend_df['DisplayDate'] = pd.to_datetime(trend_df['DisplayDate'], errors='coerce').dt.date
+            trend_df['DisplayDate'] = trend_df['DisplayDate'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+    except Exception:
+        pass
+
+    if as_dict:
+        # ------------------ Ensure sample/aggregated rows contain enrichment (email/image) ------------------
+        try:
+            # make a copy we will return
+            rec_df = trend_df.copy()
+
+            # add friendly string times for First/Last for JSON output
+            for dtcol in ('FirstSwipe', 'LastSwipe'):
+                if dtcol in rec_df.columns:
+                    rec_df[dtcol] = pd.to_datetime(rec_df[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+            # add Date ISO strings
+            if 'Date' in rec_df.columns:
+                try:
+                    rec_df['Date'] = pd.to_datetime(rec_df['Date'], errors='coerce').dt.date
+                    rec_df['Date'] = rec_df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+                except Exception:
+                    pass
+
+            # Enrich with personnel info (email, imageUrl) using the helper already defined
+            try:
+                # use endpoint template that the frontend expects (it will call /employee/<id>/image)
+                rec_df = _enrich_with_personnel_info(rec_df, image_endpoint_template="/employee/{}/image")
+            except Exception:
+                # non-fatal - if enrichment fails, continue without email/image
+                logging.exception("Personnel enrichment failed (non-fatal).")
+
+            # Build files list (raw swipe files written earlier)
+            files_list = []
+            try:
+                # looks for swipes file for this city/date naming conventions saved earlier
+                # collect any swipes_*.csv in OUTDIR for this run date
+                globp = list(Path(outdir_path).glob("swipes_*_*.csv"))
+                files_list = [p.name for p in globp]
+            except Exception:
+                files_list = []
+
+            # Optionally build a raw_swipes map from sw_combined (if large, this can be trimmed later)
+            raw_swipes_all = []
+            try:
+                if sw_combined is not None and not sw_combined.empty:
+                    # ensure LocaleMessageTime parsed
+                    if 'LocaleMessageTime' in sw_combined.columns:
+                        sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined['LocaleMessageTime'], errors='coerce')
+                    else:
+                        # try common candidates
+                        for cand in ('MessageUTC','MessageTime','Timestamp','timestamp','Date'):
+                            if cand in sw_combined.columns:
+                                sw_combined['LocaleMessageTime'] = pd.to_datetime(sw_combined[cand], errors='coerce')
+                                break
+                    # minimal projection fields used by frontend screenshot timeline
+                    proj_cols = []
+                    for c in ('EmployeeName','EmployeeID','person_uid','CardNumber','Door','Direction','Zone','PartitionName2'):
+                        if c in sw_combined.columns:
+                            proj_cols.append(c)
+                    # add a safe time/date/time-string, and compute gap per door/person grouping if possible
+                    tmp = sw_combined.copy()
+                    tmp['Date'] = tmp['LocaleMessageTime'].dt.date.astype(str)
+                    tmp['Time'] = tmp['LocaleMessageTime'].dt.time.astype(str)
+                    # sort so gap calc is consistent
+                    tmp = tmp.sort_values(['person_uid','LocaleMessageTime'])
+                    tmp['SwipeGapSeconds'] = tmp.groupby(['person_uid','Date'])['LocaleMessageTime'].diff().dt.total_seconds().fillna(0).astype(int)
+                    tmp['SwipeGap'] = tmp['SwipeGapSeconds'].apply(lambda s: format_seconds_to_hms(s) if s is not None else "-")
+                    # include Zone column if map_door_to_zone produced it earlier - otherwise attempt mapping by door/direction
+                    if 'Zone' not in tmp.columns and 'Door' in tmp.columns:
+                        tmp['Zone'] = tmp.apply(lambda r: map_door_to_zone(r.get('Door'), r.get('Direction')), axis=1)
+                    raw_swipes_all = tmp.to_dict(orient='records')
+            except Exception:
+                logging.exception("Building raw_swipes list failed (non-fatal).")
+                raw_swipes_all = []
+
+            # Build reason counts and risk counts (existing logic)
+            reasons_count = {}
+            risk_counts = {}
+            try:
+                if 'Reasons' in rec_df.columns:
+                    for v in rec_df['Reasons'].dropna().astype(str):
+                        for part in re.split(r'[;,\|]', v):
+                            key = part.strip()
+                            if key:
+                                reasons_count[key] = reasons_count.get(key, 0) + 1
+                if 'RiskLevel' in rec_df.columns:
+                    for v in rec_df['RiskLevel'].fillna('').astype(str):
+                        if v:
+                            risk_counts[v] = risk_counts.get(v, 0) + 1
+            except Exception:
+                pass
+
+            # sample records (top 20)
+            sample_records = rec_df.head(20).to_dict(orient='records') if not rec_df.empty else []
+
+            return {
+                'rows': int(len(rec_df)),
+                'flagged_rows': int(rec_df['IsFlagged'].sum()) if 'IsFlagged' in rec_df.columns else 0,
+                'aggregated_unique_persons': int(len(rec_df)),
+                'sample': sample_records,
+                'reasons_count': reasons_count,
+                'risk_counts': risk_counts,
+                'files': files_list,
+                # convenience additions used by the frontend record endpoint for quick lookup
+                'raw_swipes_all': raw_swipes_all
+            }
+        except Exception:
+            logging.exception("Failed to build as_dict output for run_trend_for_date")
+            # fallback minimal structure
+            return {'rows': len(trend_df), 'flagged_rows': int(trend_df['IsFlagged'].sum() if 'IsFlagged' in trend_df.columns else 0),
+                    'sample': [], 'reasons_count': {}, 'risk_counts': {}, 'aggregated_unique_persons': len(trend_df), 'files': []}
+
+    return trend_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Before Move Forward fix trend runner.py issue i have made changes as per suggestion now fix below issue carefully...
 
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
