@@ -1,3 +1,277 @@
+# path 
+BASE_DIR = Path(__file__).parent.resolve()
+DEFAULT_OUTDIR = BASE_DIR / "outputs"
+DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
+
+OUTDIR = DEFAULT_OUTDIR
+
+# -------------------------------------------------------------------
+# Violation window (was hard-coded 90 days in many places)
+# Can be overridden by env var VIOLATION_DAYS (int)
+DEFAULT_VIOLATION_DAYS = int(os.getenv("VIOLATION_DAYS", "90"))
+# -------------------------------------------------------------------
+
+OVERRIDES_FILE = DEFAULT_OUTDIR / "overrides.csv"
+
+
+
+
+
+
+
+def _find_person_rows(identifier: str, days: int | None = None, outdir: Path = DEFAULT_OUTDIR):
+    """
+    Find person rows in past trend CSVs. `days` is optional; if None the
+    DEFAULT_VIOLATION_DAYS is used from configuration/env.
+    """
+    # resolve days to use
+    try:
+        days = int(days) if days is not None else int(DEFAULT_VIOLATION_DAYS)
+    except Exception:
+        days = int(DEFAULT_VIOLATION_DAYS)
+
+    if _normalize_id_val:
+        norm = _normalize_id_val(identifier)
+    else:
+        norm = str(identifier).strip()
+        if '.' in norm:
+            try:
+                f = float(norm)
+                if f.is_integer():
+                    norm = str(int(f))
+            except Exception:
+                pass
+    today = datetime.now().date()
+    try:
+        if _read_past_trend_csvs:
+            past = _read_past_trend_csvs(str(outdir), days, today)
+
+            
+        else:
+            files = sorted(Path(outdir).glob("trend_pune_*.csv"), reverse=True)
+            dfs = []
+            cutoff = today - timedelta(days=days)
+            for fp in files:
+                try:
+                    tmp = pd.read_csv(fp, parse_dates=['Date'])
+                    tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                    tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                    dfs.append(tmp)
+                except Exception:
+                    try:
+                        tmp = pd.read_csv(fp, dtype=str)
+                        if 'Date' in tmp.columns:
+                            tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+                            tmp = tmp[tmp['Date'].apply(lambda d: d is not None and d >= cutoff and d <= today)]
+                            dfs.append(tmp)
+                    except Exception:
+                        continue
+            past = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+    except Exception:
+        past = pd.DataFrame()
+
+    if past is None or past.empty:
+        return pd.DataFrame()
+
+    past = _replace_placeholder_strings(past)
+    match_mask = pd.Series(False, index=past.index)
+    for col in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+        if col in past.columns:
+            try:
+                match_mask = match_mask | (past[col].astype(str).fillna('').str.strip() == str(norm).strip())
+            except Exception:
+                continue
+
+    if not match_mask.any():
+        try:
+            qnum = float(norm)
+            for col in ('EmployeeID','Int1'):
+                if col in past.columns:
+                    try:
+                        numcol = pd.to_numeric(past[col], errors='coerce')
+                        match_mask = match_mask | (numcol == qnum)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    if not match_mask.any() and 'EmployeeName' in past.columns:
+        names = past['EmployeeName'].dropna().astype(str).unique().tolist()
+        close = difflib.get_close_matches(str(identifier), names, n=5, cutoff=0.7)
+        if close:
+            match_mask = match_mask | past['EmployeeName'].astype(str).isin(close)
+
+    return past[match_mask].copy()
+
+
+
+
+
+
+
+
+
+
+            dates_list = []
+            durations_list = []
+            reasons_set = set()
+            anomaly_scores = []
+            violation_days_total = 0
+            flagged_any = False
+            countswipes_list = []
+
+            # --- detect any ViolationDaysLast* column (prefer highest numeric suffix) ---
+            def _detect_violation_col(cols):
+                cand = [c for c in cols if isinstance(c, str) and c.startswith('ViolationDaysLast')]
+                if not cand:
+                    return None
+                # prefer column with largest numeric suffix (ViolationDaysLast180 > ViolationDaysLast90)
+                def _suffix_num(name):
+                    m = re.search(r'ViolationDaysLast(\d+)', name)
+                    if m:
+                        try:
+                            return int(m.group(1))
+                        except Exception:
+                            return 0
+                    return 0
+                cand_sorted = sorted(cand, key=_suffix_num, reverse=True)
+                return cand_sorted[0]
+
+            violation_col = _detect_violation_col(g_sorted.columns)
+
+            # iterate rows and collect
+            for _, rr in g_sorted.iterrows():
+                # date string
+                try:
+                    dval = rr.get('Date')
+                    if pd.notna(dval):
+                        if isinstance(dval, (str,)):
+                            ds = pd.to_datetime(dval, errors='coerce')
+                        else:
+                            ds = pd.to_datetime(dval, errors='coerce')
+                        if pd.notna(ds):
+                            dates_list.append(ds.date().strftime("%d/%m/%Y"))
+                        else:
+                            dates_list.append(str(dval))
+                    else:
+                        dates_list.append('')
+                except Exception:
+                    dates_list.append(str(rr.get('Date')))
+
+                # duration
+                dstr = _fmt_duration_from_row(rr)
+                if dstr:
+                    durations_list.append(dstr)
+                else:
+                    # keep blank placeholder for alignment if needed
+                    durations_list.append("")
+
+                # reasons: may be semicolon/comma separated; split and add unique
+                try:
+                    rs = rr.get('Reasons') or rr.get('DetectedScenarios') or None
+                    if rs:
+                        for part in re.split(r'[;,\|]', str(rs)):
+                            p = part.strip()
+                            if p and p.lower() not in ('nan','none',''):
+                                reasons_set.add(p)
+                except Exception:
+                    pass
+
+                # anomaly score
+                try:
+                    if 'AnomalyScore' in rr and rr.get('AnomalyScore') not in (None, '', float('nan')):
+                        anomaly_scores.append(float(rr.get('AnomalyScore')))
+                except Exception:
+                    pass
+
+                # violation days (dynamic column detection)
+                try:
+                    if violation_col:
+                        v = rr.get(violation_col)
+                        if v not in (None, '', float('nan')):
+                            violation_days_total += int(float(v))
+                except Exception:
+                    pass
+
+                # flagged
+                try:
+                    if 'IsFlagged' in rr and bool(rr.get('IsFlagged')):
+                        flagged_any = True
+                except Exception:
+                    pass
+
+                try:
+                    if 'CountSwipes' in rr and rr.get('CountSwipes') not in (None, '', float('nan')):
+                        countswipes_list.append(int(float(rr.get('CountSwipes'))))
+                except Exception:
+                    pass
+
+            # attach aggregated fields to picked row
+            # join date+duration entries as "DD/MM/YYYY: HH:MM:SS" pairs (semicolon separated)
+            pairs = []
+            for d, du in zip(dates_list, durations_list):
+                if d and du:
+                    pairs.append(f"{d} {du}")
+                elif d and not du:
+                    pairs.append(f"{d}")
+                elif du and not d:
+                    pairs.append(f"{du}")
+            picked['Dates'] = "; ".join([p for p in dates_list if p])
+            picked['Duration'] = "; ".join([p for p in durations_list if p])
+            # Also keep a combined 'DurationByDate' with date+value
+            picked['DurationByDate'] = "; ".join(pairs) if pairs else None
+
+            # Reasons combined (unique)
+            if reasons_set:
+                picked['Reasons'] = "; ".join(sorted(reasons_set))
+            else:
+                # ensure Reasons exists
+                if 'Reasons' not in picked or picked.get('Reasons') in (None, '', float('nan')):
+                    picked['Reasons'] = None
+
+            # Other metrics: AnomalyScore -> max, IsFlagged -> any True, CountSwipes -> max or sum (prefer max)
+            try:
+                picked['AnomalyScore'] = max(anomaly_scores) if anomaly_scores else picked.get('AnomalyScore')
+            except Exception:
+                pass
+            picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
+            try:
+                # neutral/standard aggregated key
+                picked['ViolationDaysLast'] = int(violation_days_total)
+                # also provide a window-specific key using DEFAULT_VIOLATION_DAYS
+                try:
+                    picked[f'ViolationDaysLast{int(DEFAULT_VIOLATION_DAYS)}'] = int(violation_days_total)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
+            except Exception:
+                pass
+
+
+
+
+
+
+hint = f"I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last {DEFAULT_VIOLATION_DAYS} days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 In below app.py add below updates carefully and share me Updated Snippet carefully i dont understand where need to insert 
 so Update as per suggestion and share me Updated relavant snippet carefully...
 
