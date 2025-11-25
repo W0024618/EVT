@@ -1,3 +1,214 @@
+USE [ACVSUJournal_00010022];
+GO
+
+SET NOCOUNT ON;
+
+;WITH EmpAgg AS (
+    SELECT
+      AP.ObjectID           AS EmployeeObjID,
+      AP.Name               AS EmpName,
+      CASE WHEN AP.Int1 = 0 OR AP.Int1 IS NULL
+           THEN AP.Text12
+           ELSE CAST(AP.Int1 AS NVARCHAR(50))
+      END AS EmployeeID,
+      ISNULL(PT.Name, '')   AS PersonnelType,
+      AP.Disabled           AS Profile_Disabled,
+      -- Primary location from Personnel.Text5
+      ISNULL(AP.Text5, '')  AS PrimaryLocation,
+
+      COUNT(ACR.Name)       AS Profile_Cards,
+
+      SUM(
+        CASE
+          WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+            AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+            AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+            AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+          THEN 1 ELSE 0
+        END
+      ) AS Active_Cards,
+
+      CASE
+        WHEN COUNT(ACR.Name) - SUM(
+          CASE
+            WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+              AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+              AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+              AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+            THEN 1 ELSE 0
+          END
+        ) < 0 THEN 0
+        ELSE COUNT(ACR.Name) - SUM(
+          CASE
+            WHEN (ACR.ExpirationDateTime IS NULL OR ACR.ExpirationDateTime >= GETDATE())
+              AND (ACR.Disabled IS NULL OR ACR.Disabled = 0)
+              AND (ACR.Lost IS NULL OR ACR.Lost = 0)
+              AND (ACR.Stolen IS NULL OR ACR.Stolen = 0)
+            THEN 1 ELSE 0
+          END
+        )
+      END AS Deactive_Cards,
+
+      -- Active card numbers (CAST CardNumber to NVARCHAR to avoid varchar->numeric conversion)
+      ISNULL(
+        STUFF(
+          (
+            SELECT ', ' + COALESCE(CAST(ACR2.CardNumber AS NVARCHAR(100)), CAST(ACR2.ObjectID AS NVARCHAR(50)))
+            FROM ACVSCore.Access.Credential ACR2
+            WHERE ACR2.Name = AP.Name
+              AND (
+                 (ACR2.ExpirationDateTime IS NULL OR ACR2.ExpirationDateTime >= GETDATE())
+                 AND (ACR2.Disabled IS NULL OR ACR2.Disabled = 0)
+                 AND (ACR2.Lost IS NULL OR ACR2.Lost = 0)
+                 AND (ACR2.Stolen IS NULL OR ACR2.Stolen = 0)
+              )
+            FOR XML PATH(''), TYPE
+          ).value('.', 'NVARCHAR(MAX)')
+        , 1, 2, '')
+      , '') AS Active_Card_Numbers,
+
+      -- Deactive card numbers (also cast)
+      ISNULL(
+        STUFF(
+          (
+            SELECT ', ' + COALESCE(CAST(ACR3.CardNumber AS NVARCHAR(100)), CAST(ACR3.ObjectID AS NVARCHAR(50)))
+            FROM ACVSCore.Access.Credential ACR3
+            WHERE ACR3.Name = AP.Name
+              AND NOT (
+                 (ACR3.ExpirationDateTime IS NULL OR ACR3.ExpirationDateTime >= GETDATE())
+                 AND (ACR3.Disabled IS NULL OR ACR3.Disabled = 0)
+                 AND (ACR3.Lost IS NULL OR ACR3.Lost = 0)
+                 AND (ACR3.Stolen IS NULL OR ACR3.Stolen = 0)
+              )
+            FOR XML PATH(''), TYPE
+          ).value('.', 'NVARCHAR(MAX)')
+        , 1, 2, '')
+      , '') AS Deactive_Card_Numbers
+
+    FROM ACVSCore.Access.Personnel AP
+    LEFT JOIN ACVSCore.Access.Credential ACR
+      ON AP.Name = ACR.Name
+    LEFT JOIN ACVSCore.Access.PersonnelType PT
+      ON PT.ObjectID = AP.PersonnelTypeID
+    GROUP BY
+      AP.ObjectID,
+      AP.Name,
+      AP.Int1,
+      AP.Text12,
+      PT.Name,
+      AP.Disabled,
+      AP.Text5
+),
+EmpAggWithStatus AS (
+    SELECT
+      EmployeeObjID,
+      EmpName,
+      EmployeeID,
+      PersonnelType,
+      Profile_Disabled,
+      Profile_Cards,
+      Active_Cards,
+      Deactive_Cards,
+      Active_Card_Numbers,
+      Deactive_Card_Numbers,
+      PrimaryLocation,
+      CASE
+        WHEN Profile_Disabled = 1 THEN 'Deactive'
+        WHEN Profile_Disabled = 0 AND Active_Cards > 0 THEN 'Active'
+        ELSE 'Deactive'
+      END AS Employee_Status
+    FROM EmpAgg
+)
+
+-- Final select: Clearance Count added BEFORE Clearance column
+SELECT
+  e.EmployeeObjID,
+  e.EmpName,
+  e.EmployeeID,
+  e.PersonnelType,
+  e.PrimaryLocation         AS [Primary Location],
+  e.Profile_Cards           AS [Profile cards],
+  e.Active_Cards,
+  e.Active_Card_Numbers     AS [Active card number],
+  e.Deactive_Cards,
+  e.Deactive_Card_Numbers   AS [Deactive card number],
+  CASE WHEN img.Image IS NULL THEN 'No' ELSE 'Yes' END AS [Image],
+  e.Employee_Status,
+  clr.ClearanceCount        AS [Clearance Count],      -- <-- NEW column
+  clr.Clearances            AS [Clearance]
+FROM EmpAggWithStatus e
+
+OUTER APPLY (
+    -- image presence check only (no binary returned)
+    SELECT TOP (1) AI.Image
+    FROM ACVSCore.Access.Images AI
+    WHERE AI.ParentId = e.EmployeeObjID
+      AND DATALENGTH(AI.Image) > 0
+    ORDER BY AI.ObjectID DESC
+) img
+
+OUTER APPLY (
+    -- return both clearance count and concatenated clearance names
+    SELECT
+      (SELECT COUNT(1) FROM ACVSCore.Access.PersonnelClearancePair APC_count WHERE APC_count.PersonnelID = e.EmployeeObjID) AS ClearanceCount,
+      STUFF((
+        SELECT ', ' + AC2.Name
+        FROM ACVSCore.Access.PersonnelClearancePair APC2
+        INNER JOIN ACVSCore.Access.Clearance AC2
+          ON AC2.ObjectID = APC2.ClearanceID
+        WHERE APC2.PersonnelID = e.EmployeeObjID
+        FOR XML PATH(''), TYPE
+      ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS Clearances
+) clr
+
+-- FILTER: only return personnel who have ANY of the listed clearances
+WHERE EXISTS (
+    SELECT 1
+    FROM ACVSCore.Access.PersonnelClearancePair APCF
+    INNER JOIN ACVSCore.Access.Clearance ACF
+      ON ACF.ObjectID = APCF.ClearanceID
+    WHERE APCF.PersonnelID = e.EmployeeObjID
+      AND ACF.Name IN (
+        'APAC IN MUM General access',
+        'APAC IN PUNE All Doors Except Restricted',
+        'APAC IN PUNE GENERAL ACCESS',
+        'EMEA All WU General Access Doors - SRVWUFRA0900',
+        'EMEA FR.PAR.La Defense.WUBS & WUIB 24/7 General',
+        'EMEA IRE.DUB.RichView.MainEntrance',
+        'EMEA LT  VNO EUROC Facility Management Team Restricted Access',
+        'EMEA LT VNO EUROC Delta Closed Floors Restricted Access',
+        'General Access HYD',
+        'HYD IT Room Restricted Clearance',
+        'HYD Maintenanace Restricted Clearance',
+        'HYD Server and MUX Room Restricted Clearance',
+        'LACA PE All Access Restricted Access',
+        'NAMER US CO HQ & DTC EUC Storage Restricted Access'
+      )
+)
+
+ORDER BY e.EmpName;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I want to Integrate below Query filter only Where Clearance is 
 in below Query add Clearance Filter 
 and share me Updated Query 
