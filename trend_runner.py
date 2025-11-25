@@ -15,28 +15,7 @@ from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from typing import Optional, List
 
-
-
 # ------------------ personnel enrichment (lazy) ------------------
-# def _get_personnel_funcs_lazy():
-#     """
-#     Try to import personnel helpers from app.py at call time (avoids circular imports).
-#     Returns tuple (get_personnel_info_fn_or_None, get_person_image_bytes_fn_or_None).
-#     """
-#     try:
-#         import importlib
-#         appmod = importlib.import_module('app')  # adjust if your app module name differs
-#         gpi = getattr(appmod, 'get_personnel_info', None)
-#         gpib = getattr(appmod, 'get_person_image_bytes', None)
-#         return gpi, gpib
-#     except Exception:
-#         return None, None
-
-
-
-
-
-
 def _get_personnel_funcs_lazy():
     """
     Try to import personnel helpers from (preferably) the app module at call time (avoids circular imports).
@@ -62,9 +41,6 @@ def _get_personnel_funcs_lazy():
     return None, None
 
 
-
-
-
 def _normalize_for_lookup(val):
     if val is None:
         return None
@@ -74,55 +50,6 @@ def _normalize_for_lookup(val):
     if len(s) > 36 and '-' in s:
         return s
     return s
-
-
-
-
-
-# def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"):
-#     if df is None or df.empty:
-#         return df
-#     get_personnel_info, get_person_image_bytes = _get_personnel_funcs_lazy()
-#     emails = []
-#     image_urls = []
-#     for _, row in df.iterrows():
-#         email = None
-#         image_url = None
-#         cand_empid = None
-#         for tok in ('EmployeeID', 'EmployeeID_feat', 'EmployeeID_dur', 'Int1', 'Text12'):
-#             if tok in row and row.get(tok) not in (None, '', float('nan')):
-#                 cand_empid = _normalize_for_lookup(row.get(tok))
-#                 break
-#         cand_uid = row.get('EmployeeIdentity') or row.get('person_uid') or None
-#         if get_personnel_info:
-#             try:
-#                 lookup = cand_empid or cand_uid
-#                 pi = get_personnel_info(lookup) if lookup else None
-#                 if pi and isinstance(pi, dict):
-#                     email = pi.get('EmployeeEmail') or pi.get('EmailAddress') or None
-#                     parent = pi.get('ObjectID') or pi.get('GUID') or cand_empid or cand_uid
-#                     if parent:
-#                         image_url = image_endpoint_template.format(str(parent))
-#             except Exception:
-#                 pass
-#         if email is None:
-#             for fld in ('EmployeeEmail', 'Email', 'EmailAddress', 'ManagerEmail'):
-#                 if fld in row and row.get(fld) not in (None, '', float('nan')):
-#                     email = row.get(fld)
-#                     break
-#         if image_url is None:
-#             if cand_empid:
-#                 image_url = image_endpoint_template.format(cand_empid)
-#             elif cand_uid:
-#                 image_url = image_endpoint_template.format(cand_uid)
-#             else:
-#                 image_url = None
-#         emails.append(email)
-#         image_urls.append(image_url)
-#     out = df.copy()
-#     out['EmployeeEmail'] = emails
-#     out['imageUrl'] = image_urls
-#     return out
 
 
 def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"):
@@ -456,10 +383,6 @@ def scenario_overtime(row):
 
 def scenario_very_long_duration(row):
     return (row.get('DurationMinutes') or 0) >= 16 * 60
-
-# def scenario_zero_swipes(row):
-#     return int(row.get('CountSwipes', 0)) == 0
-
 
 def scenario_zero_swipes(row):
     """
@@ -954,15 +877,16 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
             })
         sw['person_uid'] = sw.apply(make_person_uid_local, axis=1)
 
-    sel_cols = set(['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-                    'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
-                    'EmployeeIdentity'])
-    if name_col: sel_cols.add(name_col)
-    if empid_col: sel_cols.add(empid_col)
-    if card_col: sel_cols.add(card_col)
-    if door_col: sel_cols.add(door_col)
-    if dir_col: sel_cols.add(dir_col)
-    sel_cols = [c for c in sel_cols if c in sw.columns]
+    # Build a robust selection list for grouping (only include columns that exist)
+    sel_cols = ['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
+                'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
+                'EmployeeIdentity']
+    sel_cols_present = [c for c in sel_cols if c in sw.columns]
+
+    # selection for grouping should include person_uid and Date and only present sel_cols
+    selection_for_group = ['person_uid', 'Date'] + sel_cols_present
+    # ensure uniqueness and filter columns that actually exist (defensive)
+    selection_for_group = [c for i, c in enumerate(selection_for_group) if c in sw.columns and c not in selection_for_group[:i]]
 
     def agg_swipe_group(g):
         times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
@@ -983,8 +907,8 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
 
         # card extraction
         card_numbers = []
-        if card_col and card_col in g.columns:
-            card_numbers = list(pd.unique(g[card_col].dropna()))
+        if 'CardNumber' in g.columns:
+            card_numbers = list(pd.unique(g['CardNumber'].dropna()))
         if not card_numbers and 'CardNumber' in g.columns:
             card_numbers = list(pd.unique(g['CardNumber'].dropna()))
         if not card_numbers:
@@ -1019,15 +943,7 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
         employee_identity = None
         personnel_type = None
 
-        if empid_col and empid_col in g.columns:
-            vals = g[empid_col].dropna().astype(str).map(lambda x: x.strip())
-            employee_id = _pick_first_non_guid_value(vals)
-            if employee_id is None and not vals.empty:
-                v0 = vals.iloc[0]
-                normalized = _normalize_id_val(v0)
-                if normalized and not _looks_like_guid(normalized):
-                    employee_id = normalized
-        elif 'EmployeeID' in g.columns:
+        if 'EmployeeID' in g.columns:
             vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
             employee_id = _pick_first_non_guid_value(vals)
             if employee_id is None and not vals.empty:
@@ -1057,9 +973,7 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
                 employee_identity = vals.iloc[0]
 
         candidate_name_vals = None
-        if name_col and name_col in g.columns:
-            candidate_name_vals = g[name_col].dropna().astype(str).map(lambda x: x.strip())
-        elif 'EmployeeName' in g.columns:
+        if 'EmployeeName' in g.columns:
             candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
         elif 'ObjectName1' in g.columns:
             candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
@@ -1092,14 +1006,10 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
         for _, row in g.sort_values('LocaleMessageTime').iterrows():
             t = row.get('LocaleMessageTime')
             dname = None
-            if door_col and door_col in row and pd.notna(row.get(door_col)):
-                dname = row.get(door_col)
-            elif 'Door' in row and pd.notna(row.get('Door')):
+            if 'Door' in row and pd.notna(row.get('Door')):
                 dname = row.get('Door')
             direction = None
-            if dir_col and dir_col in row and pd.notna(row.get(dir_col)):
-                direction = row.get(dir_col)
-            elif 'Direction' in row and pd.notna(row.get('Direction')):
+            if 'Direction' in row and pd.notna(row.get('Direction')):
                 direction = row.get('Direction')
             zone = map_door_to_zone(dname, direction)
             timeline.append((t, dname, direction, zone))
@@ -1215,7 +1125,14 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
             'PatternSequence': None
         })
 
-    grouped = sw[['person_uid', 'Date'] + sel_cols].groupby(['person_uid', 'Date'])[sel_cols]
+    # safe grouping: use selection_for_group (only columns that exist)
+    try:
+        grouped = sw[selection_for_group].groupby(['person_uid', 'Date'])[sel_cols_present]
+    except Exception:
+        # defensive fallback: group on what we can
+        available = [c for c in ['person_uid', 'Date'] + sel_cols_present if c in sw.columns]
+        grouped = sw[available].groupby(['person_uid', 'Date'])[ [c for c in sel_cols_present if c in sw.columns] ]
+
     grouped = grouped.apply(agg_swipe_group).reset_index()
 
     # POST-PROCESS: merge early-morning fragments into previous day (heuristic)
@@ -1663,6 +1580,7 @@ def _strip_uid_prefix(s):
     except Exception:
         return s
 
+
 def compute_violation_days_map(outdir: str, window_days: int, target_date: date):
     df = _read_past_trend_csvs(outdir, window_days, target_date)
     if df is None or df.empty:
@@ -2078,12 +1996,65 @@ def run_trend_for_date(target_date: date,
                        city: str = "pune",
                        as_dict: bool = False) -> pd.DataFrame:
     city_slug = _slug_city(city)
+ 
+ 
+ 
+    # if regions is None:
+    #     try:
+    #         regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+    #     except Exception:
+    #         regions = []
+    # regions = [r.lower() for r in regions if r]
+
+
+    # Determine regions to run for. If caller provided regions -> use them.
+    # If regions is None but city is supplied, attempt to map the city to region keys
+    # using the same tokenization approach used in duration_report.run_for_date.
     if regions is None:
+        regions = []
         try:
-            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+            rcfg = REGION_CONFIG if isinstance(REGION_CONFIG, dict) else {}
+            city_norm = None
+            if city:
+                city_norm = re.sub(r'[^a-z0-9]', '', str(city).strip().lower())
+            # build list of candidate region keys
+            all_region_keys = list(rcfg.keys()) if rcfg else []
+            matched = []
+            if city_norm and rcfg:
+                for rkey, rc in rcfg.items():
+                    parts = rc.get("partitions", []) or []
+                    likes = rc.get("logical_like", []) or []
+                    tokens = set()
+                    for p in parts:
+                        if not p:
+                            continue
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(p).strip().lower()))
+                        # also split on punctuation/dot and add pieces
+                        for piece in re.split(r'[.\-/\s]', str(p)):
+                            if piece:
+                                tokens.add(re.sub(r'[^a-z0-9]', '', piece.strip().lower()))
+                    for lk in likes:
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(lk).strip().lower()))
+                    # also include servers/databases if present (safe fallback)
+                    serv = rc.get("server") or ""
+                    tokens.add(re.sub(r'[^a-z0-9]', '', str(serv).strip().lower()))
+                    # match
+                    if city_norm in tokens:
+                        matched.append(rkey)
+                # if matched regions found, use them
+                if matched:
+                    regions = matched
+                else:
+                    # fallback: if no match, default to all region keys
+                    regions = all_region_keys
+            else:
+                regions = all_region_keys
         except Exception:
-            regions = []
+            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+    # final normalization
     regions = [r.lower() for r in regions if r]
+
+
     outdir_path = Path(outdir) if outdir else OUTDIR
     if run_for_date is None:
         raise RuntimeError("duration_report.run_for_date is not available in this environment.")
