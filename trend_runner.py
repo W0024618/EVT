@@ -352,6 +352,8 @@ def map_score_to_label(score: float) -> (int, str):
             break
     return bucket, label
 
+
+
 # scenario functions (kept from your improved version)
 def scenario_long_gap(row):
     try:
@@ -364,7 +366,7 @@ def scenario_short_duration(row):
     return (row.get('DurationMinutes') or 0) < 240
 
 def scenario_coffee_badging(row):
-    return (row.get('CountSwipes') or 0) >= 4 and (row.get('DurationMinutes') or 0) < 60
+    return (row.get('CountSwipes') or 0) >= 5 and (row.get('DurationMinutes') or 0) < 60
 
 def scenario_low_swipe_count(row):
     return 0 < (row.get('CountSwipes') or 0) <= 2
@@ -379,7 +381,7 @@ def scenario_only_out(row):
     return int(row.get('OnlyOut', 0)) == 1
 
 def scenario_overtime(row):
-    return (row.get('DurationMinutes') or 0) >= 10 * 60
+    return (row.get('DurationMinutes') or 0) >= 14 * 60
 
 def scenario_very_long_duration(row):
     return (row.get('DurationMinutes') or 0) >= 16 * 60
@@ -1637,17 +1639,21 @@ def compute_violation_days_map(outdir: str, window_days: int, target_date: date)
 
 
 
-def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[pd.DataFrame] = None, outdir: Optional[str] = None, target_date: Optional[date] = None) -> pd.DataFrame:
+# def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[pd.DataFrame] = None, outdir: Optional[str] = None, target_date: Optional[date] = None) -> pd.DataFrame:
+  
+def score_trends_from_durations(combined_df: pd.DataFrame,
+                                swipes_df: Optional[pd.DataFrame] = None,
+                                outdir: Optional[str] = None,
+                                target_date: Optional[date] = None,
+                                window_days: Optional[int] = None) -> pd.DataFrame:
     """
-    Take combined durations DataFrame and optional swipes DataFrame and compute:
-      - scenario boolean columns
-      - Reasons (semicolon-separated scenario keys)
-      - ViolationExplanation (human text)
-      - AnomalyScore (weighted sum)
-      - IsFlagged (AnomalyScore >= ANOMALY_THRESHOLD)
-      - ViolationDaysLast90 (from history)
-      - historical bumps, weekly bump, MonitorFlag, etc.
+    window_days: number of days (inclusive) prior to target_date to read historical trend CSVs for
+                 scenario counts and violation-days. If None, falls back to VIOLATION_WINDOW_DAYS.
     """
+    # normalize window
+    if window_days is None:
+        window_days = VIOLATION_WINDOW_DAYS
+ 
     if combined_df is None or combined_df.empty:
         return pd.DataFrame()
 
@@ -1787,10 +1793,17 @@ def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[p
     try:
         df['PresentToday'] = df['CountSwipes'].fillna(0).astype(int) > 0
 
-        # historical scenario counts (for escalation)
-        hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'shortstay_longout_repeat')
-        hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'repeated_short_breaks')
-        hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'short_duration_<4h')
+        # # historical scenario counts (for escalation)
+        # hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'shortstay_longout_repeat')
+        # hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'repeated_short_breaks')
+        # hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'short_duration_<4h')
+
+        # historical scenario counts (for escalation) using the configured window_days
+        hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'shortstay_longout_repeat')
+        hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'repeated_short_breaks')
+        hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'short_duration_<4h')
+
+
 
         def get_hist_count_for_row(row, hist_map):
             for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
@@ -1806,26 +1819,128 @@ def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[p
                         continue
             return 0
 
-        df['HistPatternShortLongCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
-        df['HistRepeatedShortBreakCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
-        df['HistShortDurationCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
 
-        pat_mask = df['HistPatternShortLongCount90'].fillna(0).astype(int) >= 3
-        if pat_mask.any():
-            df.loc[pat_mask, 'AnomalyScore'] = df.loc[pat_mask, 'AnomalyScore'].astype(float)  # keep value but escalate risk below
-            df.loc[pat_mask, 'RiskScore'] = 5
-            df.loc[pat_mask, 'RiskLevel'] = 'High'
-            df.loc[pat_mask, 'IsFlagged'] = True
 
-        rep_mask = df['HistRepeatedShortBreakCount90'].fillna(0).astype(int) >= 5
-        if rep_mask.any():
-            df.loc[rep_mask, 'AnomalyScore'] = df.loc[rep_mask, 'AnomalyScore'].astype(float)
-            df.loc[rep_mask, 'RiskScore'] = 5
-            df.loc[rep_mask, 'RiskLevel'] = 'High'
-            df.loc[rep_mask, 'IsFlagged'] = True
 
-        # ViolationDaysLast90
-        vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
+
+        # df['HistPatternShortLongCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
+        # df['HistRepeatedShortBreakCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
+        # df['HistShortDurationCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
+
+        # pat_mask = df['HistPatternShortLongCount90'].fillna(0).astype(int) >= 3
+        # if pat_mask.any():
+        #     df.loc[pat_mask, 'AnomalyScore'] = df.loc[pat_mask, 'AnomalyScore'].astype(float)  # keep value but escalate risk below
+        #     df.loc[pat_mask, 'RiskScore'] = 5
+        #     df.loc[pat_mask, 'RiskLevel'] = 'High'
+        #     df.loc[pat_mask, 'IsFlagged'] = True
+
+        # rep_mask = df['HistRepeatedShortBreakCount90'].fillna(0).astype(int) >= 5
+        # if rep_mask.any():
+        #     df.loc[rep_mask, 'AnomalyScore'] = df.loc[rep_mask, 'AnomalyScore'].astype(float)
+        #     df.loc[rep_mask, 'RiskScore'] = 5
+        #     df.loc[rep_mask, 'RiskLevel'] = 'High'
+        #     df.loc[rep_mask, 'IsFlagged'] = True
+
+        # # ViolationDaysLast90
+        # vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
+        # def lookup_violation_days(row):
+        #     try:
+        #         candidates = []
+        #         for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+        #             v = row.get(k)
+        #             if v not in (None, '', float('nan')):
+        #                 candidates.append(_normalize_id_val(v))
+        #         for c in candidates:
+        #             if c is None:
+        #                 continue
+        #             if c in vmap:
+        #                 return int(vmap.get(c, 0))
+        #             stripped = _strip_uid_prefix(c)
+        #             if stripped != c and stripped in vmap:
+        #                 return int(vmap.get(stripped, 0))
+        #         return 0
+        #     except Exception:
+        #         return 0
+        # df['ViolationDaysLast90'] = df.apply(lookup_violation_days, axis=1)
+
+        # # Append monitoring note for persons who have past violations and are present today.
+        # def _append_monitor_note(idx, row):
+        #     try:
+        #         vd = int(row.get('ViolationDaysLast90') or 0)
+        #     except Exception:
+        #         vd = 0
+        #     if vd <= 0:
+        #         return row.get('ViolationExplanation') or row.get('Explanation')
+        #     if not row.get('PresentToday', False):
+        #         return row.get('ViolationExplanation') or row.get('Explanation')
+        #     note = f"Note: Previously flagged {vd} time{'s' if vd!=1 else ''} in the last {VIOLATION_WINDOW_DAYS} days — monitor when present today."
+        #     ex = row.get('ViolationExplanation') or row.get('Explanation') or ''
+        #     if ex and not ex.strip().endswith('.'):
+        #         ex = ex.strip() + '.'
+        #     if note in ex:
+        #         return ex
+        #     return (ex + ' ' + note).strip()
+        # df['ViolationExplanation'] = df.apply(lambda r: _append_monitor_note(r.name, r), axis=1)
+
+        # df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDaysLast90') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
+
+        # # Now compute consecutive-week short-duration runs (post scoring)
+        # past_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
+        # week_runs = _compute_weeks_with_threshold(past_df, person_col='person_uid', date_col='Date', scenario_col='short_duration_<4h', threshold_days=3)
+
+        # def _get_week_run_for_row(r):
+        #     for k in ('person_uid', 'EmployeeID'):
+        #         if k in r and r.get(k):
+        #             key = str(r.get(k))
+        #             if key in week_runs:
+        #                 return int(week_runs[key])
+        #             stripped = _strip_uid_prefix(key)
+        #             if stripped in week_runs:
+        #                 return int(week_runs[stripped])
+        #     return 0
+
+        # df['ConsecWeeksShort4hrs'] = df.apply(_get_week_run_for_row, axis=1)
+
+        # # Apply anomaly score bumps now that AnomalyScore exists
+        # df['AnomalyScore'] = df['AnomalyScore'].astype(float).fillna(0.0)
+
+        # mask1 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 1
+        # mask2 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 2
+
+        # if mask1.any():
+        #     df.loc[mask1, 'AnomalyScore'] = df.loc[mask1, 'AnomalyScore'].astype(float) + 0.5
+        # if mask2.any():
+        #     df.loc[mask2, 'AnomalyScore'] = df.loc[mask2, 'AnomalyScore'].astype(float) + 1.0
+
+        # # Recompute IsFlagged and RiskLevel after bumping AnomalyScore
+        # df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
+
+        # def _map_risk_after_bump(r):
+        #     score = r.get('AnomalyScore') or 0.0
+        #     bucket, label = map_score_to_label(score)
+        #     return int(bucket), label
+        # rs2 = df.apply(lambda r: pd.Series(_map_risk_after_bump(r), index=['RiskScore', 'RiskLevel']), axis=1)
+        # df['RiskScore'] = rs2['RiskScore']
+        # df['RiskLevel'] = rs2['RiskLevel']
+
+        # # OVERRIDE: force High risk when ViolationDaysLast90 >= 4
+        # try:
+        #     high_violation_mask = df['ViolationDaysLast90'] >= 4
+        #     if high_violation_mask.any():
+        #         df.loc[high_violation_mask, 'RiskScore'] = 5
+        #         df.loc[high_violation_mask, 'RiskLevel'] = 'High'
+        # except Exception:
+        #     pass
+
+
+
+        # historical aggregated counts (use window_days)
+        df['HistPatternShortLongCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
+        df['HistRepeatedShortBreakCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
+        df['HistShortDurationCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
+
+        # ViolationDays computed from history window_days (read from past trend CSVs)
+        vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today())
         def lookup_violation_days(row):
             try:
                 candidates = []
@@ -1844,19 +1959,21 @@ def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[p
                 return 0
             except Exception:
                 return 0
-        df['ViolationDaysLast90'] = df.apply(lookup_violation_days, axis=1)
+        df['ViolationDays'] = df.apply(lookup_violation_days, axis=1)
+        # expose the window used so front-end can render "Violation (N days)"
+        df['ViolationWindowDays'] = int(window_days)
 
         # Append monitoring note for persons who have past violations and are present today.
         def _append_monitor_note(idx, row):
             try:
-                vd = int(row.get('ViolationDaysLast90') or 0)
+                vd = int(row.get('ViolationDays') or 0)
             except Exception:
                 vd = 0
             if vd <= 0:
                 return row.get('ViolationExplanation') or row.get('Explanation')
             if not row.get('PresentToday', False):
                 return row.get('ViolationExplanation') or row.get('Explanation')
-            note = f"Note: Previously flagged {vd} time{'s' if vd!=1 else ''} in the last {VIOLATION_WINDOW_DAYS} days — monitor when present today."
+            note = f"Note: Previously flagged {vd} time{'s' if vd!=1 else ''} in the last {int(window_days)} days — monitor when present today."
             ex = row.get('ViolationExplanation') or row.get('Explanation') or ''
             if ex and not ex.strip().endswith('.'):
                 ex = ex.strip() + '.'
@@ -1865,55 +1982,19 @@ def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[p
             return (ex + ' ' + note).strip()
         df['ViolationExplanation'] = df.apply(lambda r: _append_monitor_note(r.name, r), axis=1)
 
-        df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDaysLast90') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
+        df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDays') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
 
-        # Now compute consecutive-week short-duration runs (post scoring)
-        past_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
-        week_runs = _compute_weeks_with_threshold(past_df, person_col='person_uid', date_col='Date', scenario_col='short_duration_<4h', threshold_days=3)
-
-        def _get_week_run_for_row(r):
-            for k in ('person_uid', 'EmployeeID'):
-                if k in r and r.get(k):
-                    key = str(r.get(k))
-                    if key in week_runs:
-                        return int(week_runs[key])
-                    stripped = _strip_uid_prefix(key)
-                    if stripped in week_runs:
-                        return int(week_runs[stripped])
-            return 0
-
-        df['ConsecWeeksShort4hrs'] = df.apply(_get_week_run_for_row, axis=1)
-
-        # Apply anomaly score bumps now that AnomalyScore exists
-        df['AnomalyScore'] = df['AnomalyScore'].astype(float).fillna(0.0)
-
-        mask1 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 1
-        mask2 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 2
-
-        if mask1.any():
-            df.loc[mask1, 'AnomalyScore'] = df.loc[mask1, 'AnomalyScore'].astype(float) + 0.5
-        if mask2.any():
-            df.loc[mask2, 'AnomalyScore'] = df.loc[mask2, 'AnomalyScore'].astype(float) + 1.0
-
-        # Recompute IsFlagged and RiskLevel after bumping AnomalyScore
-        df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
-
-        def _map_risk_after_bump(r):
-            score = r.get('AnomalyScore') or 0.0
-            bucket, label = map_score_to_label(score)
-            return int(bucket), label
-        rs2 = df.apply(lambda r: pd.Series(_map_risk_after_bump(r), index=['RiskScore', 'RiskLevel']), axis=1)
-        df['RiskScore'] = rs2['RiskScore']
-        df['RiskLevel'] = rs2['RiskLevel']
-
-        # OVERRIDE: force High risk when ViolationDaysLast90 >= 4
+        # OVERRIDE: force High risk when ViolationDays >= 4 (same threshold as before but on windowed count)
         try:
-            high_violation_mask = df['ViolationDaysLast90'] >= 4
+            high_violation_mask = df['ViolationDays'] >= 4
             if high_violation_mask.any():
                 df.loc[high_violation_mask, 'RiskScore'] = 5
                 df.loc[high_violation_mask, 'RiskLevel'] = 'High'
         except Exception:
             pass
+
+
+
 
     except Exception:
         logging.exception("Failed post-scoring weekly-run / monitoring augmentation.")
@@ -1990,26 +2071,16 @@ def _slug_city(city: str) -> str:
     return str(city).strip().lower().replace(" ", "_")
 
 
+
+
+
 def run_trend_for_date(target_date: date,
                        regions: Optional[List[str]] = None,
                        outdir: str = None,
                        city: str = "pune",
+                       window_days: Optional[int] = None,
                        as_dict: bool = False) -> pd.DataFrame:
     city_slug = _slug_city(city)
- 
- 
- 
-    # if regions is None:
-    #     try:
-    #         regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
-    #     except Exception:
-    #         regions = []
-    # regions = [r.lower() for r in regions if r]
-
-
-    # Determine regions to run for. If caller provided regions -> use them.
-    # If regions is None but city is supplied, attempt to map the city to region keys
-    # using the same tokenization approach used in duration_report.run_for_date.
     if regions is None:
         regions = []
         try:
@@ -2053,7 +2124,6 @@ def run_trend_for_date(target_date: date,
             regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
     # final normalization
     regions = [r.lower() for r in regions if r]
-
 
     outdir_path = Path(outdir) if outdir else OUTDIR
     if run_for_date is None:
@@ -2363,7 +2433,9 @@ def run_trend_for_date(target_date: date,
     except Exception:
         merged = features
 
-    trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date)
+    #trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date)
+
+    trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date, window_days=window_days)
 
     # write csv (use city_slug, not hard-coded 'pune')
     try:
