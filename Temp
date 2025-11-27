@@ -1,734 +1,53 @@
-# ---------- robust agg_swipe_group (replace existing definition) ----------
-def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
-    # times sorted
-    times = []
-    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
-        times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
-    gaps = []
-    short_gap_count = 0
-    for i in range(1, len(times)):
-        s = (times[i] - times[i-1]).total_seconds()
-        gaps.append(s)
-        if s <= 5 * 60:
-            short_gap_count += 1
-    max_gap = int(max(gaps)) if gaps else 0
-
-    # Direction detection: be tolerant (substring match, case-insensitive)
-    in_count = 0
-    out_count = 0
-    if 'Direction' in g.columns:
-        try:
-            sers = g['Direction'].astype(str).fillna('').str.lower()
-            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b|in\$|in$|in\W', regex=True).sum())
-            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|out\$|out$|out\W|exit', regex=True).sum())
-            # fallback: simple containment
-            if in_count == 0:
-                in_count = int(sers.str.contains('in', na=False).sum())
-            if out_count == 0:
-                out_count = int(sers.str.contains('out|exit', na=False).sum())
-        except Exception:
-            try:
-                in_count = int((g['Direction'] == 'IN').sum())
-                out_count = int((g['Direction'] == 'OUT').sum())
-            except Exception:
-                in_count = 0
-                out_count = 0
-
-    unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-    unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-    rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-
-    # card extraction: tolerant
-    card_numbers = []
-    try:
-        if 'CardNumber' in g.columns:
-            card_numbers = list(pd.unique(g['CardNumber'].dropna().astype(str)))
-        if not card_numbers:
-            for c in g.columns:
-                lc = c.lower()
-                if 'card' in lc or 'chuid' in lc or 'value' == lc or 'xml' in lc or 'msg' in lc:
-                    try:
-                        vals = list(pd.unique(g[c].dropna().astype(str)))
-                        if vals:
-                            card_numbers.extend(vals)
-                    except Exception:
-                        continue
-        # xml extraction fallback
-        if not card_numbers:
-            for c in g.columns:
-                if 'xml' in c.lower():
-                    for raw in g[c].dropna().astype(str):
-                        x = _extract_card_from_xml(raw)
-                        if x:
-                            card_numbers.append(x)
-    except Exception:
-        card_numbers = []
-    card_numbers = list(dict.fromkeys([_normalize_id_val(x) for x in card_numbers if _normalize_id_val(x)]))
-    card_number = card_numbers[0] if card_numbers else None
-
-    # stable id/name extraction (kept as before but robust)
-    employee_id = None
-    if 'EmployeeID' in g.columns:
-        try:
-            vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
-            employee_id = _pick_first_non_guid_value(vals)
-            if employee_id is None and not vals.empty:
-                v0 = vals.iloc[0]
-                normalized = _normalize_id_val(v0)
-                if normalized and not _looks_like_guid(normalized):
-                    employee_id = normalized
-        except Exception:
-            employee_id = None
-
-    employee_identity = None
-    if 'EmployeeIdentity' in g.columns:
-        try:
-            vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
-            if not vals.empty:
-                employee_identity = vals.iloc[0]
-        except Exception:
-            employee_identity = None
-
-    employee_name = None
-    candidate_name_vals = None
-    if 'EmployeeName' in g.columns:
-        candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
-    elif 'ObjectName1' in g.columns:
-        candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
-    if candidate_name_vals is not None and not candidate_name_vals.empty:
-        employee_name = _pick_first_non_guid_value(candidate_name_vals)
-        if employee_name is None:
-            for v in candidate_name_vals:
-                if _looks_like_name(v) and not _is_placeholder_str(v):
-                    employee_name = str(v).strip()
-                    break
-
-    personnel_type = None
-    if 'PersonnelTypeName' in g.columns:
-        try:
-            vals = g['PersonnelTypeName'].dropna()
-            if not vals.empty:
-                personnel_type = vals.iloc[0]
-        except Exception:
-            personnel_type = None
-    elif 'PersonnelType' in g.columns:
-        try:
-            vals = g['PersonnelType'].dropna()
-            if not vals.empty:
-                personnel_type = vals.iloc[0]
-        except Exception:
-            personnel_type = None
-
-    first_swipe = times[0] if times else None
-    last_swipe = times[-1] if times else None
-
-    # build timeline -> segments (zone aware)
-    timeline = []
-    if not times:
-        # still iterate rows to build timeline if times are not sorted above
-        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
-            t = row.get('LocaleMessageTime')
-            dname = row.get('Door') if 'Door' in row else None
-            direction = row.get('Direction') if 'Direction' in row else None
-            zone = map_door_to_zone(dname, direction)
-            timeline.append((t, dname, direction, zone))
-    else:
-        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
-            t = row.get('LocaleMessageTime')
-            dname = row.get('Door') if 'Door' in row else None
-            direction = row.get('Direction') if 'Direction' in row else None
-            zone = map_door_to_zone(dname, direction)
-            timeline.append((t, dname, direction, zone))
-
-    segments = []
-    if timeline:
-        cur_zone = None
-        seg_start = timeline[0][0]
-        seg_label = None
-        for (t, dname, direction, zone) in timeline:
-            lbl = 'work'
-            if zone is not None and zone in _BREAK_ZONES:
-                lbl = 'break'
-            elif zone == _OUT_OF_OFFICE_ZONE:
-                lbl = 'out_of_office'
-            else:
-                lbl = 'work'
-            if cur_zone is None:
-                cur_zone = zone
-                seg_label = lbl
-                seg_start = t
-            else:
-                if lbl != seg_label:
-                    segments.append({'label': seg_label, 'start': seg_start, 'end': t, 'start_zone': cur_zone})
-                    seg_start = t
-                    seg_label = lbl
-                    cur_zone = zone
-                else:
-                    cur_zone = cur_zone or zone
-        if seg_label is not None:
-            segments.append({'label': seg_label, 'start': seg_start, 'end': timeline[-1][0], 'start_zone': cur_zone})
-
-    # compute durations
-    total_work_minutes = 0.0
-    total_break_minutes = 0.0
-    longest_break_minutes = 0.0
-    break_segments_count = 0
-    for s in segments:
-        lbl = s.get('label')
-        start = s.get('start')
-        end = s.get('end')
-        try:
-            dur_mins = ((end - start).total_seconds() / 60.0) if (start is not None and end is not None) else 0.0
-        except Exception:
-            dur_mins = 0.0
-        if lbl == 'work':
-            total_work_minutes += dur_mins
-        elif lbl in ('break', 'out_of_office'):
-            break_segments_count += 1
-            total_break_minutes += dur_mins
-            if dur_mins > longest_break_minutes:
-                longest_break_minutes = dur_mins
-
-    break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
-    break_more_than_4h = bool(total_break_minutes >= 240)
-
-    break_count = int(break_segments_count)
-    long_break_count = int(sum(1 for s in segments
-                               if s.get('label') in ('break','out_of_office') and
-                                  (s.get('start') is not None and s.get('end') is not None and ((s['end'] - s['start']).total_seconds()/60.0) >= 120)))
-
-    # pattern detection (unchanged)
-    pattern_flag = False
-    pattern_sequence_readable = None
-    try:
-        seq = []
-        for s in segments:
-            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
-            seq.append((s['label'], int(round(dur_mins))))
-        for i in range(len(seq)-2):
-            a = seq[i]; b = seq[i+1]; c = seq[i+2]
-            if (a[0] == 'work' and a[1] < 60) and (b[0] in ('out_of_office','break') and b[1] >= 120) and (c[0] == 'work' and c[1] < 60):
-                pattern_flag = True
-                seq_fragment = [a,b,c]
-                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
-                break
-    except Exception:
-        pattern_flag = False
-        pattern_sequence_readable = None
-
-    return pd.Series({
-        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
-        'MaxSwipeGapSeconds': int(max_gap),
-        'ShortGapCount': int(short_gap_count),
-        'InCount': int(in_count),
-        'OutCount': int(out_count),
-        'UniqueDoors': int(unique_doors),
-        'UniqueLocations': int(unique_locations),
-        'RejectionCount': int(rejection_count),
-        'CardNumber': card_number,
-        'EmployeeID': employee_id,
-        'EmployeeIdentity': employee_identity,
-        'EmployeeName': employee_name,
-        'PersonnelType': personnel_type,
-        'FirstSwipe': first_swipe,
-        'LastSwipe': last_swipe,
-        'BreakCount': int(break_count),
-        'LongBreakCount': int(long_break_count),
-        'TotalBreakMinutes': float(round(total_break_minutes, 1)),
-        'TotalWorkMinutes': float(round(total_work_minutes, 1)),
-        'LongestBreakMinutes': float(round(longest_break_minutes, 1)),
-        'BreakSegmentsCount': int(break_segments_count),
-        'BreakDominant': bool(break_dominant),
-        'BreakMoreThan4h': bool(break_more_than_4h),
-        'PatternShortLongRepeat': bool(pattern_flag),
-        'PatternSequenceReadable': pattern_sequence_readable,
-        'PatternSequence': None
-    })
-
-
-
-
-
-
-
-
-
-
-
-    # ensure person_uid and Date exist
-    if 'person_uid' not in sw.columns:
-        def _make_uid_row(r):
-            return _canonical_person_uid({
-                'EmployeeID': r.get(empid_col) if empid_col in r else r.get('EmployeeID'),
-                'EmployeeIdentity': r.get('EmployeeIdentity', None),
-                'EmployeeName': r.get(name_col) if name_col in r else r.get('EmployeeName', None)
-            })
-        sw['person_uid'] = sw.apply(_make_uid_row, axis=1)
-
-    # ensure Date parsed
-    if 'Date' not in sw.columns or sw['Date'].isnull().all():
-        try:
-            sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
-        except Exception:
-            sw['Date'] = None
-
-    # final safe selection for grouping (only columns that actually exist)
+KeyboardInterrupt
+(.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
+ * Serving Flask app 'app'
+ * Debug mode: on
+INFO:werkzeug:WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8002
+ * Running on http://10.199.47.235:8002
+INFO:werkzeug:Press CTRL+C to quit
+INFO:werkzeug: * Restarting with stat
+WARNING:werkzeug: * Debugger is active!
+INFO:werkzeug: * Debugger PIN: 126-216-196
+INFO:root:Fetching swipes for region apac on 2025-11-16
+INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
+INFO:root:Built SQL for region apac, date 2025-11-16
+INFO:root:APAC PartitionName2 mapping counts example: {'Quezon City': 1380, 'SG.Singapore': 4, 'Taguig City': 4}
+INFO:root:City filter 'pune' applied for region apac: rows before=1388 after=0
+INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251116.csv (rows=0)
+INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251116.csv (rows=0)
+WARNING:root:run_trend_for_date: no features computed
+INFO:root:Fetching swipes for region apac on 2025-11-17
+INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
+INFO:root:Built SQL for region apac, date 2025-11-17
+INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 15867, 'Quezon City': 3299, 'IN.HYD': 320, 'SG.Singapore': 242, 'Taguig City': 23}
+INFO:root:City filter 'pune' applied for region apac: rows before=19751 after=15867
+C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
+  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251117.csv (rows=679)
+INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251117.csv (rows=15867)
+C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
+  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+INFO:root:PersonnelTypeName values example: ['Employee']
+INFO:root:PersonnelTypeName filter applied: before=15867 after=15867
+ERROR:root:run_trend_for_date failed for 2025-11-17
+Traceback (most recent call last):
+  File "C:\Users\W0024618\Desktop\Trend Analysis\backend\app.py", line 1374, in run_trend
+    df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug_safe)
+  File "C:\Users\W0024618\Desktop\Trend Analysis\backend\trend_runner.py", line 2311, in run_trend_for_date        
+    features = compute_features(sw_for_features, durations_for_features)
+  File "C:\Users\W0024618\Desktop\Trend Analysis\backend\trend_runner.py", line 940, in compute_features
     available_cols = [c for c in ['person_uid', 'Date'] + sel_cols_present if c in sw.columns]
-    if 'person_uid' not in available_cols or 'Date' not in available_cols:
-        # nothing to group on -> return empty
-        return pd.DataFrame()
+                                                          ^^^^^^^^^^^^^^^^
+NameError: name 'sel_cols_present' is not defined
+INFO:werkzeug:127.0.0.1 - - [27/Nov/2025 14:49:54] "GET /run?start=2025-11-16&end=2025-11-22&full=true&region=apac HTTP/1.1" 500 -
 
-    try:
-        grouped = sw[available_cols].groupby(['person_uid', 'Date'])
-        features = grouped.apply(agg_swipe_group).reset_index()
-    except Exception:
-        logging.exception("compute_features: groupby/apply failed")
-        # try a defensive fallback grouping without selecting columns slice
-        try:
-            grouped = sw.groupby(['person_uid', 'Date'])
-            features = grouped.apply(agg_swipe_group).reset_index()
-        except Exception:
-            logging.exception("compute_features: fallback groupby failed")
-            return pd.DataFrame()
 
-    # normalize column names (keep compatibility)
-    if 'person_uid' not in features.columns and 'level_0' in features.columns:
-        features.rename(columns={'level_0': 'person_uid', 'level_1': 'Date'}, inplace=True)
-    return features
 
 
 
-
-
-
-
-
-
-def map_door_to_zone(door, direction=None):
-    try:
-        if config_map_door_to_zone is not None:
-            return config_map_door_to_zone(door, direction)
-    except Exception:
-        pass
-    if not door:
-        return "Working Area"
-    s = str(door).strip().lower()
-    if 'canteen' in s or 'lunch' in s or 'caf' in s:
-        return "Canteen"
-    if 'exit' in s or 'out' in s:
-        return _OUT_OF_OFFICE_ZONE
-    # fallback
-    return "Working Area"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-When i update this Updated logic in trend runner we got 0 Count .means Those Who has do Violation this Employee alos are not Flagged 
-Why this happen how to resolve this 
-
-flagged those gap is greater than 4 hour also gap should be break zone or work --out --work 
-those who had done Violation this are also removed from Trend
-We need to Figure out this problem and need to fix this issue ...
-
-
-Check this Snippet and upadte this carefully..
-
-
-def agg_swipe_group(g):
-    times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
-    gaps = []
-    short_gap_count = 0
-    for i in range(1, len(times)):
-        s = (times[i] - times[i-1]).total_seconds()
-        gaps.append(s)
-        if s <= 5*60:
-            short_gap_count += 1
-    max_gap = int(max(gaps)) if gaps else 0
-
-    in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
-    out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-    unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-    unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-    rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
-
-    # card extraction
-    card_numbers = []
-    if 'CardNumber' in g.columns:
-        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
-    if not card_numbers and 'CardNumber' in g.columns:
-        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
-    if not card_numbers:
-        for c in g.columns:
-            cl = c.lower()
-            if 'value' == cl or 'xml' in cl or 'msg' in cl or 'shred' in cl:
-                try:
-                    vals = list(pd.unique(g[c].dropna()))
-                    if vals:
-                        card_numbers.extend(vals)
-                except Exception:
-                    continue
-    if not card_numbers:
-        for c in g.columns:
-            cl = c.lower()
-            if 'xml' in cl:
-                for raw in g[c].dropna().astype(str):
-                    extracted = _extract_card_from_xml(raw)
-                    if extracted:
-                        card_numbers.append(extracted)
-    card_numbers = list(dict.fromkeys(card_numbers))
-    card_number = None
-    for c in card_numbers:
-        n = _normalize_id_val(c)
-        if n and not _looks_like_guid(n):
-            card_number = n
-            break
-
-    # stable id/name
-    employee_id = None
-    employee_name = None
-    employee_identity = None
-    personnel_type = None
-
-    if 'EmployeeID' in g.columns:
-        vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
-        employee_id = _pick_first_non_guid_value(vals)
-        if employee_id is None and not vals.empty:
-            v0 = vals.iloc[0]
-            normalized = _normalize_id_val(v0)
-            if normalized and not _looks_like_guid(normalized):
-                employee_id = normalized
-
-    if (not employee_id) and 'PersonnelType' in g.columns:
-        try:
-            pvals = g['PersonnelType'].dropna().astype(str)
-            if not pvals.empty:
-                p0 = pvals.iloc[0]
-                if str(p0).strip().lower() in ('contractor', 'terminated contractor', 'contractor '):
-                    for c in g.columns:
-                        if c.lower() == 'text12':
-                            vals = g[c].dropna().astype(str).map(lambda x: x.strip())
-                            employee_id = _pick_first_non_guid_value(vals)
-                            if employee_id:
-                                break
-        except Exception:
-            pass
-
-    if 'EmployeeIdentity' in g.columns:
-        vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
-        if not vals.empty:
-            employee_identity = vals.iloc[0]
-
-    candidate_name_vals = None
-    if 'EmployeeName' in g.columns:
-        candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
-    elif 'ObjectName1' in g.columns:
-        candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
-
-    if candidate_name_vals is not None and not candidate_name_vals.empty:
-        employee_name = _pick_first_non_guid_value(candidate_name_vals)
-        if employee_name is None:
-            for v in candidate_name_vals:
-                if _looks_like_name(v) and not _is_placeholder_str(v):
-                    employee_name = str(v).strip()
-                    break
-
-    if 'PersonnelTypeName' in g.columns:
-        vals = g['PersonnelTypeName'].dropna()
-        if not vals.empty:
-            personnel_type = vals.iloc[0]
-    elif 'PersonnelType' in g.columns:
-        vals = g['PersonnelType'].dropna()
-        if not vals.empty:
-            personnel_type = vals.iloc[0]
-
-    first_swipe = None
-    last_swipe = None
-    if times:
-        first_swipe = times[0]
-        last_swipe = times[-1]
-
-    # timeline & segments with mapping to zones
-    timeline = []
-    for _, row in g.sort_values('LocaleMessageTime').iterrows():
-        t = row.get('LocaleMessageTime')
-        dname = None
-        if 'Door' in row and pd.notna(row.get('Door')):
-            dname = row.get('Door')
-        direction = None
-        if 'Direction' in row and pd.notna(row.get('Direction')):
-            direction = row.get('Direction')
-        zone = map_door_to_zone(dname, direction)
-        timeline.append((t, dname, direction, zone))
-
-    segments = []
-    if timeline:
-        cur_zone = None
-        seg_start = timeline[0][0]
-        seg_label = None
-        for (t, dname, direction, zone) in timeline:
-            if zone in _BREAK_ZONES:
-                lbl = 'break'
-            elif zone == _OUT_OF_OFFICE_ZONE:
-                lbl = 'out_of_office'
-            else:
-                lbl = 'work'
-            if cur_zone is None:
-                cur_zone = zone
-                seg_label = lbl
-                seg_start = t
-            else:
-                if lbl != seg_label:
-                    segments.append({
-                        'label': seg_label,
-                        'start': seg_start,
-                        'end': t,
-                        'start_zone': cur_zone
-                    })
-                    seg_start = t
-                    seg_label = lbl
-                    cur_zone = zone
-                else:
-                    cur_zone = cur_zone or zone
-        if seg_label is not None:
-            segments.append({
-                'label': seg_label,
-                'start': seg_start,
-                'end': timeline[-1][0],
-                'start_zone': cur_zone
-            })
-
-    # ---------- NEW: compute work vs break durations (zone aware) ----------
-    # We'll compute:
-    #   - TotalWorkMinutes : sum of durations labeled 'work'
-    #   - TotalBreakMinutes: sum of durations labeled 'break' or 'out_of_office'
-    #   - LongestBreakMinutes : longest single break segment (mins)
-    #   - BreakSegmentsCount : number of break segments detected
-    #   - BreakDominant : bool(total_break > total_work)
-    #   - BreakMoreThan4h : bool(total_break >= 240)
-    total_work_minutes = 0.0
-    total_break_minutes = 0.0
-    longest_break_minutes = 0.0
-    break_segments_count = 0
-
-    # We still compute ShortGapCount earlier; use it as fallback if needed.
-    for s in segments:
-        lbl = s.get('label')
-        start = s.get('start')
-        end = s.get('end')
-        dur_mins = ((end - start).total_seconds() / 60.0) if (start and end) else 0.0
-        if lbl == 'work':
-            total_work_minutes += dur_mins
-        elif lbl in ('break', 'out_of_office'):
-            # count ALL break/out_of_office durations (not only those >60m)
-            break_segments_count += 1
-            total_break_minutes += dur_mins
-            if dur_mins > longest_break_minutes:
-                longest_break_minutes = dur_mins
-
-    # derive boolean indicators used downstream
-    break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
-    break_more_than_4h = bool(total_break_minutes >= 240)
-
-    # For backward compatibility expose previous-like numeric fields too
-    # (BreakCount used to be number of 'long-enough' breaks; we replace it
-    #  with break_segments_count but keep an integer field so downstream code doesn't break)
-    break_count = int(break_segments_count)
-    long_break_count = int(sum(1 for s in segments
-                               if s.get('label') in ('break','out_of_office') and
-                                  ((s.get('end') and s.get('start')) and (((s['end'] - s['start']).total_seconds()/60.0) >= 120))))
-
-    # (pattern detection retained as before)
-    pattern_flag = False
-    pattern_sequence_readable = None
-    try:
-        seq = []
-        for s in segments:
-            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
-            seq.append((s['label'], int(round(dur_mins))))
-        for i in range(len(seq)-2):
-            a = seq[i]
-            b = seq[i+1]
-            c = seq[i+2]
-            if (a[0] == 'work' and a[1] < 60) and \
-               (b[0] in ('out_of_office','break') and b[1] >= 120) and \
-               (c[0] == 'work' and c[1] < 60):
-                pattern_flag = True
-                seq_fragment = [a, b, c]
-                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
-                break
-    except Exception:
-        pattern_flag = False
-        pattern_sequence_readable = None
-
-    return pd.Series({
-        'CountSwipes': int(len(g)),
-        'MaxSwipeGapSeconds': max_gap,
-        'ShortGapCount': int(short_gap_count),
-        'InCount': in_count,
-        'OutCount': out_count,
-        'UniqueDoors': unique_doors,
-        'UniqueLocations': unique_locations,
-        'RejectionCount': rejection_count,
-        'CardNumber': card_number,
-        'EmployeeID': employee_id,
-        'EmployeeIdentity': employee_identity,
-        'EmployeeName': employee_name,
-        'PersonnelType': personnel_type,
-        'FirstSwipe': first_swipe,
-        'LastSwipe': last_swipe,
-        # BREAK / WORK duration fields (new)
-        'BreakCount': int(break_count),
-        'LongBreakCount': int(long_break_count),
-        'TotalBreakMinutes': float(round(total_break_minutes, 1)),
-        'TotalWorkMinutes': float(round(total_work_minutes, 1)),
-        'LongestBreakMinutes': float(round(longest_break_minutes, 1)),
-        'BreakSegmentsCount': int(break_segments_count),
-        'BreakDominant': bool(break_dominant),
-        'BreakMoreThan4h': bool(break_more_than_4h),
-        'PatternShortLongRepeat': bool(pattern_flag),
-        'PatternSequenceReadable': pattern_sequence_readable,
-        'PatternSequence': None
-    })
-
-
-
-
-
-
-also check console details
-
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251103.csv (rows=691)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251103.csv (rows=15377)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=15377 after=15377
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Fetching swipes for region apac on 2025-11-04
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-04
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 18340, 'Quezon City': 4168, 'IN.HYD': 281, 'SG.Singapore': 203, 'Taguig City': 34}
-INFO:root:City filter 'pune' applied for region apac: rows before=23026 after=18340
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251104.csv (rows=794)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251104.csv (rows=18340)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=18340 after=18340
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Fetching swipes for region apac on 2025-11-05
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-05
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 12486, 'Quezon City': 6248, 'SG.Singapore': 292, 'IN.HYD': 221, 'Taguig City': 38}
-INFO:root:City filter 'pune' applied for region apac: rows before=19285 after=12486
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251105.csv (rows=577)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251105.csv (rows=12486)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=12486 after=12486
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Fetching swipes for region apac on 2025-11-06
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-06
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 12869, 'Quezon City': 5505, 'IN.HYD': 271, 'SG.Singapore': 224, 'Taguig City': 24}
-INFO:root:City filter 'pune' applied for region apac: rows before=18893 after=12869
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251106.csv (rows=598)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251106.csv (rows=12869)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=12869 after=12869
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Fetching swipes for region apac on 2025-11-07
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-07
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 8107, 'Quezon City': 3965, 'IN.HYD': 219, 'SG.Singapore': 194, 'Taguig City': 21}
-INFO:root:City filter 'pune' applied for region apac: rows before=12506 after=8107
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251107.csv (rows=390)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251107.csv (rows=8107)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=8107 after=8107
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Fetching swipes for region apac on 2025-11-08
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-08
-INFO:root:APAC PartitionName2 mapping counts example: {'Quezon City': 1871, 'IN.HYD': 8, 'SG.Singapore': 6, 'Pune': 2}
-INFO:root:City filter 'pune' applied for region apac: rows before=1887 after=2
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251108.csv (rows=1)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251108.csv (rows=2)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=2 after=2
-WARNING:root:run_trend_for_date: no features computed
-INFO:werkzeug:127.0.0.1 - - [27/Nov/2025 14:32:35] "GET /run?start=2025-11-02&end=2025-11-08&full=true&region=apac&city=Pune HTTP/1.1" 200 -
-INFO:root:Fetching swipes for region apac on 2025-11-26
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-26
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 15957, 'Quezon City': 6758, 'IN.HYD': 382, 'SG.Singapore': 273, 'Taguig City': 17}
-INFO:root:City filter 'pune' applied for region apac: rows before=23387 after=15957
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251126.csv (rows=709)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251126.csv (rows=15957)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=15957 after=15957
-WARNING:root:run_trend_for_date: no features computed
-INFO:werkzeug:127.0.0.1 - - [27/Nov/2025 14:35:03] "GET /run?start=2025-11-26&end=2025-11-26&full=true&region=apac HTTP/1.1" 200 -
-INFO:root:Fetching swipes for region apac on 2025-11-19
-INFO:root:Databases present for server SRVWUPNQ0986V: ['ACVSUJournal_00010030', 'ACVSUJournal_00010029', 'ACVSUJournal_00010028', 'ACVSUJournal_00010027', 'ACVSUJournal_00010026', 'ACVSUJournal_00010025']
-INFO:root:Built SQL for region apac, date 2025-11-19
-INFO:root:APAC PartitionName2 mapping counts example: {'Pune': 18666, 'Quezon City': 6931, 'IN.HYD': 309, 'SG.Singapore': 187, 'Taguig City': 26}
-INFO:root:City filter 'pune' applied for region apac: rows before=26119 after=18666
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:Wrote duration CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_duration_20251119.csv (rows=823)
-INFO:root:Wrote swipes CSV for apac to C:\Users\W0024618\Desktop\Trend Analysis\backend\outputs\apac_swipes_20251119.csv (rows=18666)
-C:\Users\W0024618\Desktop\Trend Analysis\backend\duration_report.py:918: FutureWarning: 'S' is deprecated and will be removed in a future version, please use 's' instead.
-  df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
-INFO:root:PersonnelTypeName values example: ['Employee']
-INFO:root:PersonnelTypeName filter applied: before=18666 after=18666
-WARNING:root:run_trend_for_date: no features computed
-INFO:root:Employee filter requested but no combined_df rows present.
-INFO:werkzeug:127.0.0.1 - - [27/Nov/2025 14:35:50] "GET /run?start=2025-11-19&end=2025-11-19&full=true&region=apac&city=Pune&employee_id=317745 HTTP/1.1" 200 -
-INFO:werkzeug:127.0.0.1 - - [27/Nov/2025 14:35:50] "GET /favicon.ico HTTP/1.1" 404 -
-
-
-
+When update above Snippet we got above error fix this error carefully and share me Updated Snipet..
 
 
 
@@ -1652,135 +971,147 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
         logging.info("compute_features: no rows after PersonnelType filter")
         return pd.DataFrame()
 
-    # person_uid canonical
+
+
+    # ensure person_uid and Date exist
     if 'person_uid' not in sw.columns:
-        def make_person_uid_local(r):
-            empid_val = None
-            if empid_col and empid_col in r and pd.notna(r.get(empid_col)):
-                empid_val = r.get(empid_col)
-            elif 'EmployeeID' in r and pd.notna(r.get('EmployeeID')):
-                empid_val = r.get('EmployeeID')
-            empident_val = r.get('EmployeeIdentity') if 'EmployeeIdentity' in r else None
-            name_val = None
-            if name_col and name_col in r:
-                name_val = r.get(name_col)
-            elif 'EmployeeName' in r:
-                name_val = r.get('EmployeeName')
-            elif 'ObjectName1' in r:
-                name_val = r.get('ObjectName1')
+        def _make_uid_row(r):
             return _canonical_person_uid({
-                'EmployeeID': empid_val,
-                'EmployeeIdentity': empident_val,
-                'EmployeeName': name_val
+                'EmployeeID': r.get(empid_col) if empid_col in r else r.get('EmployeeID'),
+                'EmployeeIdentity': r.get('EmployeeIdentity', None),
+                'EmployeeName': r.get(name_col) if name_col in r else r.get('EmployeeName', None)
             })
-        sw['person_uid'] = sw.apply(make_person_uid_local, axis=1)
+        sw['person_uid'] = sw.apply(_make_uid_row, axis=1)
 
-    # Build a robust selection list for grouping (only include columns that exist)
-    sel_cols = ['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-                'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
-                'EmployeeIdentity']
-    sel_cols_present = [c for c in sel_cols if c in sw.columns]
+    # ensure Date parsed
+    if 'Date' not in sw.columns or sw['Date'].isnull().all():
+        try:
+            sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
+        except Exception:
+            sw['Date'] = None
 
-    # selection for grouping should include person_uid and Date and only present sel_cols
-    selection_for_group = ['person_uid', 'Date'] + sel_cols_present
-    # ensure uniqueness and filter columns that actually exist (defensive)
-    selection_for_group = [c for i, c in enumerate(selection_for_group) if c in sw.columns and c not in selection_for_group[:i]]
+    # final safe selection for grouping (only columns that actually exist)
+    available_cols = [c for c in ['person_uid', 'Date'] + sel_cols_present if c in sw.columns]
+    if 'person_uid' not in available_cols or 'Date' not in available_cols:
+        # nothing to group on -> return empty
+        return pd.DataFrame()
+
+    try:
+        grouped = sw[available_cols].groupby(['person_uid', 'Date'])
+        features = grouped.apply(agg_swipe_group).reset_index()
+    except Exception:
+        logging.exception("compute_features: groupby/apply failed")
+        # try a defensive fallback grouping without selecting columns slice
+        try:
+            grouped = sw.groupby(['person_uid', 'Date'])
+            features = grouped.apply(agg_swipe_group).reset_index()
+        except Exception:
+            logging.exception("compute_features: fallback groupby failed")
+            return pd.DataFrame()
+
+    # normalize column names (keep compatibility)
+    if 'person_uid' not in features.columns and 'level_0' in features.columns:
+        features.rename(columns={'level_0': 'person_uid', 'level_1': 'Date'}, inplace=True)
+    return features
 
 
-
-
-
-
-def agg_swipe_group(g):
-    times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
+# ---------- robust agg_swipe_group (replace existing definition) ----------
+def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
+    # times sorted
+    times = []
+    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
+        times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
     gaps = []
     short_gap_count = 0
     for i in range(1, len(times)):
         s = (times[i] - times[i-1]).total_seconds()
         gaps.append(s)
-        if s <= 5*60:
+        if s <= 5 * 60:
             short_gap_count += 1
     max_gap = int(max(gaps)) if gaps else 0
 
-    in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
-    out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
+    # Direction detection: be tolerant (substring match, case-insensitive)
+    in_count = 0
+    out_count = 0
+    if 'Direction' in g.columns:
+        try:
+            sers = g['Direction'].astype(str).fillna('').str.lower()
+            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b|in\$|in$|in\W', regex=True).sum())
+            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|out\$|out$|out\W|exit', regex=True).sum())
+            # fallback: simple containment
+            if in_count == 0:
+                in_count = int(sers.str.contains('in', na=False).sum())
+            if out_count == 0:
+                out_count = int(sers.str.contains('out|exit', na=False).sum())
+        except Exception:
+            try:
+                in_count = int((g['Direction'] == 'IN').sum())
+                out_count = int((g['Direction'] == 'OUT').sum())
+            except Exception:
+                in_count = 0
+                out_count = 0
+
     unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
     unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
     rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
 
-    # card extraction
+    # card extraction: tolerant
     card_numbers = []
-    if 'CardNumber' in g.columns:
-        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
-    if not card_numbers and 'CardNumber' in g.columns:
-        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
-    if not card_numbers:
-        for c in g.columns:
-            cl = c.lower()
-            if 'value' == cl or 'xml' in cl or 'msg' in cl or 'shred' in cl:
-                try:
-                    vals = list(pd.unique(g[c].dropna()))
-                    if vals:
-                        card_numbers.extend(vals)
-                except Exception:
-                    continue
-    if not card_numbers:
-        for c in g.columns:
-            cl = c.lower()
-            if 'xml' in cl:
-                for raw in g[c].dropna().astype(str):
-                    extracted = _extract_card_from_xml(raw)
-                    if extracted:
-                        card_numbers.append(extracted)
-    card_numbers = list(dict.fromkeys(card_numbers))
-    card_number = None
-    for c in card_numbers:
-        n = _normalize_id_val(c)
-        if n and not _looks_like_guid(n):
-            card_number = n
-            break
+    try:
+        if 'CardNumber' in g.columns:
+            card_numbers = list(pd.unique(g['CardNumber'].dropna().astype(str)))
+        if not card_numbers:
+            for c in g.columns:
+                lc = c.lower()
+                if 'card' in lc or 'chuid' in lc or 'value' == lc or 'xml' in lc or 'msg' in lc:
+                    try:
+                        vals = list(pd.unique(g[c].dropna().astype(str)))
+                        if vals:
+                            card_numbers.extend(vals)
+                    except Exception:
+                        continue
+        # xml extraction fallback
+        if not card_numbers:
+            for c in g.columns:
+                if 'xml' in c.lower():
+                    for raw in g[c].dropna().astype(str):
+                        x = _extract_card_from_xml(raw)
+                        if x:
+                            card_numbers.append(x)
+    except Exception:
+        card_numbers = []
+    card_numbers = list(dict.fromkeys([_normalize_id_val(x) for x in card_numbers if _normalize_id_val(x)]))
+    card_number = card_numbers[0] if card_numbers else None
 
-    # stable id/name
+    # stable id/name extraction (kept as before but robust)
     employee_id = None
-    employee_name = None
-    employee_identity = None
-    personnel_type = None
-
     if 'EmployeeID' in g.columns:
-        vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
-        employee_id = _pick_first_non_guid_value(vals)
-        if employee_id is None and not vals.empty:
-            v0 = vals.iloc[0]
-            normalized = _normalize_id_val(v0)
-            if normalized and not _looks_like_guid(normalized):
-                employee_id = normalized
-
-    if (not employee_id) and 'PersonnelType' in g.columns:
         try:
-            pvals = g['PersonnelType'].dropna().astype(str)
-            if not pvals.empty:
-                p0 = pvals.iloc[0]
-                if str(p0).strip().lower() in ('contractor', 'terminated contractor', 'contractor '):
-                    for c in g.columns:
-                        if c.lower() == 'text12':
-                            vals = g[c].dropna().astype(str).map(lambda x: x.strip())
-                            employee_id = _pick_first_non_guid_value(vals)
-                            if employee_id:
-                                break
+            vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
+            employee_id = _pick_first_non_guid_value(vals)
+            if employee_id is None and not vals.empty:
+                v0 = vals.iloc[0]
+                normalized = _normalize_id_val(v0)
+                if normalized and not _looks_like_guid(normalized):
+                    employee_id = normalized
         except Exception:
-            pass
+            employee_id = None
 
+    employee_identity = None
     if 'EmployeeIdentity' in g.columns:
-        vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
-        if not vals.empty:
-            employee_identity = vals.iloc[0]
+        try:
+            vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
+            if not vals.empty:
+                employee_identity = vals.iloc[0]
+        except Exception:
+            employee_identity = None
 
+    employee_name = None
     candidate_name_vals = None
     if 'EmployeeName' in g.columns:
         candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
     elif 'ObjectName1' in g.columns:
         candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
-
     if candidate_name_vals is not None and not candidate_name_vals.empty:
         employee_name = _pick_first_non_guid_value(candidate_name_vals)
         if employee_name is None:
@@ -1789,33 +1120,42 @@ def agg_swipe_group(g):
                     employee_name = str(v).strip()
                     break
 
+    personnel_type = None
     if 'PersonnelTypeName' in g.columns:
-        vals = g['PersonnelTypeName'].dropna()
-        if not vals.empty:
-            personnel_type = vals.iloc[0]
+        try:
+            vals = g['PersonnelTypeName'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        except Exception:
+            personnel_type = None
     elif 'PersonnelType' in g.columns:
-        vals = g['PersonnelType'].dropna()
-        if not vals.empty:
-            personnel_type = vals.iloc[0]
+        try:
+            vals = g['PersonnelType'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        except Exception:
+            personnel_type = None
 
-    first_swipe = None
-    last_swipe = None
-    if times:
-        first_swipe = times[0]
-        last_swipe = times[-1]
+    first_swipe = times[0] if times else None
+    last_swipe = times[-1] if times else None
 
-    # timeline & segments with mapping to zones
+    # build timeline -> segments (zone aware)
     timeline = []
-    for _, row in g.sort_values('LocaleMessageTime').iterrows():
-        t = row.get('LocaleMessageTime')
-        dname = None
-        if 'Door' in row and pd.notna(row.get('Door')):
-            dname = row.get('Door')
-        direction = None
-        if 'Direction' in row and pd.notna(row.get('Direction')):
-            direction = row.get('Direction')
-        zone = map_door_to_zone(dname, direction)
-        timeline.append((t, dname, direction, zone))
+    if not times:
+        # still iterate rows to build timeline if times are not sorted above
+        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
+            t = row.get('LocaleMessageTime')
+            dname = row.get('Door') if 'Door' in row else None
+            direction = row.get('Direction') if 'Direction' in row else None
+            zone = map_door_to_zone(dname, direction)
+            timeline.append((t, dname, direction, zone))
+    else:
+        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
+            t = row.get('LocaleMessageTime')
+            dname = row.get('Door') if 'Door' in row else None
+            direction = row.get('Direction') if 'Direction' in row else None
+            zone = map_door_to_zone(dname, direction)
+            timeline.append((t, dname, direction, zone))
 
     segments = []
     if timeline:
@@ -1823,7 +1163,8 @@ def agg_swipe_group(g):
         seg_start = timeline[0][0]
         seg_label = None
         for (t, dname, direction, zone) in timeline:
-            if zone in _BREAK_ZONES:
+            lbl = 'work'
+            if zone is not None and zone in _BREAK_ZONES:
                 lbl = 'break'
             elif zone == _OUT_OF_OFFICE_ZONE:
                 lbl = 'out_of_office'
@@ -1835,66 +1176,45 @@ def agg_swipe_group(g):
                 seg_start = t
             else:
                 if lbl != seg_label:
-                    segments.append({
-                        'label': seg_label,
-                        'start': seg_start,
-                        'end': t,
-                        'start_zone': cur_zone
-                    })
+                    segments.append({'label': seg_label, 'start': seg_start, 'end': t, 'start_zone': cur_zone})
                     seg_start = t
                     seg_label = lbl
                     cur_zone = zone
                 else:
                     cur_zone = cur_zone or zone
         if seg_label is not None:
-            segments.append({
-                'label': seg_label,
-                'start': seg_start,
-                'end': timeline[-1][0],
-                'start_zone': cur_zone
-            })
+            segments.append({'label': seg_label, 'start': seg_start, 'end': timeline[-1][0], 'start_zone': cur_zone})
 
-    # ---------- NEW: compute work vs break durations (zone aware) ----------
-    # We'll compute:
-    #   - TotalWorkMinutes : sum of durations labeled 'work'
-    #   - TotalBreakMinutes: sum of durations labeled 'break' or 'out_of_office'
-    #   - LongestBreakMinutes : longest single break segment (mins)
-    #   - BreakSegmentsCount : number of break segments detected
-    #   - BreakDominant : bool(total_break > total_work)
-    #   - BreakMoreThan4h : bool(total_break >= 240)
+    # compute durations
     total_work_minutes = 0.0
     total_break_minutes = 0.0
     longest_break_minutes = 0.0
     break_segments_count = 0
-
-    # We still compute ShortGapCount earlier; use it as fallback if needed.
     for s in segments:
         lbl = s.get('label')
         start = s.get('start')
         end = s.get('end')
-        dur_mins = ((end - start).total_seconds() / 60.0) if (start and end) else 0.0
+        try:
+            dur_mins = ((end - start).total_seconds() / 60.0) if (start is not None and end is not None) else 0.0
+        except Exception:
+            dur_mins = 0.0
         if lbl == 'work':
             total_work_minutes += dur_mins
         elif lbl in ('break', 'out_of_office'):
-            # count ALL break/out_of_office durations (not only those >60m)
             break_segments_count += 1
             total_break_minutes += dur_mins
             if dur_mins > longest_break_minutes:
                 longest_break_minutes = dur_mins
 
-    # derive boolean indicators used downstream
     break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
     break_more_than_4h = bool(total_break_minutes >= 240)
 
-    # For backward compatibility expose previous-like numeric fields too
-    # (BreakCount used to be number of 'long-enough' breaks; we replace it
-    #  with break_segments_count but keep an integer field so downstream code doesn't break)
     break_count = int(break_segments_count)
     long_break_count = int(sum(1 for s in segments
                                if s.get('label') in ('break','out_of_office') and
-                                  ((s.get('end') and s.get('start')) and (((s['end'] - s['start']).total_seconds()/60.0) >= 120))))
+                                  (s.get('start') is not None and s.get('end') is not None and ((s['end'] - s['start']).total_seconds()/60.0) >= 120)))
 
-    # (pattern detection retained as before)
+    # pattern detection (unchanged)
     pattern_flag = False
     pattern_sequence_readable = None
     try:
@@ -1903,14 +1223,10 @@ def agg_swipe_group(g):
             dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
             seq.append((s['label'], int(round(dur_mins))))
         for i in range(len(seq)-2):
-            a = seq[i]
-            b = seq[i+1]
-            c = seq[i+2]
-            if (a[0] == 'work' and a[1] < 60) and \
-               (b[0] in ('out_of_office','break') and b[1] >= 120) and \
-               (c[0] == 'work' and c[1] < 60):
+            a = seq[i]; b = seq[i+1]; c = seq[i+2]
+            if (a[0] == 'work' and a[1] < 60) and (b[0] in ('out_of_office','break') and b[1] >= 120) and (c[0] == 'work' and c[1] < 60):
                 pattern_flag = True
-                seq_fragment = [a, b, c]
+                seq_fragment = [a,b,c]
                 pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
                 break
     except Exception:
@@ -1918,14 +1234,14 @@ def agg_swipe_group(g):
         pattern_sequence_readable = None
 
     return pd.Series({
-        'CountSwipes': int(len(g)),
-        'MaxSwipeGapSeconds': max_gap,
+        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
+        'MaxSwipeGapSeconds': int(max_gap),
         'ShortGapCount': int(short_gap_count),
-        'InCount': in_count,
-        'OutCount': out_count,
-        'UniqueDoors': unique_doors,
-        'UniqueLocations': unique_locations,
-        'RejectionCount': rejection_count,
+        'InCount': int(in_count),
+        'OutCount': int(out_count),
+        'UniqueDoors': int(unique_doors),
+        'UniqueLocations': int(unique_locations),
+        'RejectionCount': int(rejection_count),
         'CardNumber': card_number,
         'EmployeeID': employee_id,
         'EmployeeIdentity': employee_identity,
@@ -1933,7 +1249,6 @@ def agg_swipe_group(g):
         'PersonnelType': personnel_type,
         'FirstSwipe': first_swipe,
         'LastSwipe': last_swipe,
-        # BREAK / WORK duration fields (new)
         'BreakCount': int(break_count),
         'LongBreakCount': int(long_break_count),
         'TotalBreakMinutes': float(round(total_break_minutes, 1)),
@@ -1946,6 +1261,8 @@ def agg_swipe_group(g):
         'PatternSequenceReadable': pattern_sequence_readable,
         'PatternSequence': None
     })
+
+
 
     # safe grouping: use selection_for_group (only columns that exist)
     try:
@@ -3491,12 +2808,3 @@ if __name__ == "__main__":
     today = datetime.now().date()
     df = run_trend_for_date(today, as_dict=False)
     print("Completed; rows:", len(df) if df is not None else 0)
-
-
-
-
-
-
-
-
-
