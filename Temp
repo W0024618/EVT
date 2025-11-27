@@ -1,3 +1,345 @@
+# ---------- robust agg_swipe_group (replace existing definition) ----------
+def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
+    # times sorted
+    times = []
+    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
+        times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
+    gaps = []
+    short_gap_count = 0
+    for i in range(1, len(times)):
+        s = (times[i] - times[i-1]).total_seconds()
+        gaps.append(s)
+        if s <= 5 * 60:
+            short_gap_count += 1
+    max_gap = int(max(gaps)) if gaps else 0
+
+    # Direction detection: be tolerant (substring match, case-insensitive)
+    in_count = 0
+    out_count = 0
+    if 'Direction' in g.columns:
+        try:
+            sers = g['Direction'].astype(str).fillna('').str.lower()
+            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b|in\$|in$|in\W', regex=True).sum())
+            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|out\$|out$|out\W|exit', regex=True).sum())
+            # fallback: simple containment
+            if in_count == 0:
+                in_count = int(sers.str.contains('in', na=False).sum())
+            if out_count == 0:
+                out_count = int(sers.str.contains('out|exit', na=False).sum())
+        except Exception:
+            try:
+                in_count = int((g['Direction'] == 'IN').sum())
+                out_count = int((g['Direction'] == 'OUT').sum())
+            except Exception:
+                in_count = 0
+                out_count = 0
+
+    unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+    unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+    rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+
+    # card extraction: tolerant
+    card_numbers = []
+    try:
+        if 'CardNumber' in g.columns:
+            card_numbers = list(pd.unique(g['CardNumber'].dropna().astype(str)))
+        if not card_numbers:
+            for c in g.columns:
+                lc = c.lower()
+                if 'card' in lc or 'chuid' in lc or 'value' == lc or 'xml' in lc or 'msg' in lc:
+                    try:
+                        vals = list(pd.unique(g[c].dropna().astype(str)))
+                        if vals:
+                            card_numbers.extend(vals)
+                    except Exception:
+                        continue
+        # xml extraction fallback
+        if not card_numbers:
+            for c in g.columns:
+                if 'xml' in c.lower():
+                    for raw in g[c].dropna().astype(str):
+                        x = _extract_card_from_xml(raw)
+                        if x:
+                            card_numbers.append(x)
+    except Exception:
+        card_numbers = []
+    card_numbers = list(dict.fromkeys([_normalize_id_val(x) for x in card_numbers if _normalize_id_val(x)]))
+    card_number = card_numbers[0] if card_numbers else None
+
+    # stable id/name extraction (kept as before but robust)
+    employee_id = None
+    if 'EmployeeID' in g.columns:
+        try:
+            vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
+            employee_id = _pick_first_non_guid_value(vals)
+            if employee_id is None and not vals.empty:
+                v0 = vals.iloc[0]
+                normalized = _normalize_id_val(v0)
+                if normalized and not _looks_like_guid(normalized):
+                    employee_id = normalized
+        except Exception:
+            employee_id = None
+
+    employee_identity = None
+    if 'EmployeeIdentity' in g.columns:
+        try:
+            vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
+            if not vals.empty:
+                employee_identity = vals.iloc[0]
+        except Exception:
+            employee_identity = None
+
+    employee_name = None
+    candidate_name_vals = None
+    if 'EmployeeName' in g.columns:
+        candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
+    elif 'ObjectName1' in g.columns:
+        candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+    if candidate_name_vals is not None and not candidate_name_vals.empty:
+        employee_name = _pick_first_non_guid_value(candidate_name_vals)
+        if employee_name is None:
+            for v in candidate_name_vals:
+                if _looks_like_name(v) and not _is_placeholder_str(v):
+                    employee_name = str(v).strip()
+                    break
+
+    personnel_type = None
+    if 'PersonnelTypeName' in g.columns:
+        try:
+            vals = g['PersonnelTypeName'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        except Exception:
+            personnel_type = None
+    elif 'PersonnelType' in g.columns:
+        try:
+            vals = g['PersonnelType'].dropna()
+            if not vals.empty:
+                personnel_type = vals.iloc[0]
+        except Exception:
+            personnel_type = None
+
+    first_swipe = times[0] if times else None
+    last_swipe = times[-1] if times else None
+
+    # build timeline -> segments (zone aware)
+    timeline = []
+    if not times:
+        # still iterate rows to build timeline if times are not sorted above
+        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
+            t = row.get('LocaleMessageTime')
+            dname = row.get('Door') if 'Door' in row else None
+            direction = row.get('Direction') if 'Direction' in row else None
+            zone = map_door_to_zone(dname, direction)
+            timeline.append((t, dname, direction, zone))
+    else:
+        for _, row in g.sort_values('LocaleMessageTime', errors='ignore').iterrows():
+            t = row.get('LocaleMessageTime')
+            dname = row.get('Door') if 'Door' in row else None
+            direction = row.get('Direction') if 'Direction' in row else None
+            zone = map_door_to_zone(dname, direction)
+            timeline.append((t, dname, direction, zone))
+
+    segments = []
+    if timeline:
+        cur_zone = None
+        seg_start = timeline[0][0]
+        seg_label = None
+        for (t, dname, direction, zone) in timeline:
+            lbl = 'work'
+            if zone is not None and zone in _BREAK_ZONES:
+                lbl = 'break'
+            elif zone == _OUT_OF_OFFICE_ZONE:
+                lbl = 'out_of_office'
+            else:
+                lbl = 'work'
+            if cur_zone is None:
+                cur_zone = zone
+                seg_label = lbl
+                seg_start = t
+            else:
+                if lbl != seg_label:
+                    segments.append({'label': seg_label, 'start': seg_start, 'end': t, 'start_zone': cur_zone})
+                    seg_start = t
+                    seg_label = lbl
+                    cur_zone = zone
+                else:
+                    cur_zone = cur_zone or zone
+        if seg_label is not None:
+            segments.append({'label': seg_label, 'start': seg_start, 'end': timeline[-1][0], 'start_zone': cur_zone})
+
+    # compute durations
+    total_work_minutes = 0.0
+    total_break_minutes = 0.0
+    longest_break_minutes = 0.0
+    break_segments_count = 0
+    for s in segments:
+        lbl = s.get('label')
+        start = s.get('start')
+        end = s.get('end')
+        try:
+            dur_mins = ((end - start).total_seconds() / 60.0) if (start is not None and end is not None) else 0.0
+        except Exception:
+            dur_mins = 0.0
+        if lbl == 'work':
+            total_work_minutes += dur_mins
+        elif lbl in ('break', 'out_of_office'):
+            break_segments_count += 1
+            total_break_minutes += dur_mins
+            if dur_mins > longest_break_minutes:
+                longest_break_minutes = dur_mins
+
+    break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
+    break_more_than_4h = bool(total_break_minutes >= 240)
+
+    break_count = int(break_segments_count)
+    long_break_count = int(sum(1 for s in segments
+                               if s.get('label') in ('break','out_of_office') and
+                                  (s.get('start') is not None and s.get('end') is not None and ((s['end'] - s['start']).total_seconds()/60.0) >= 120)))
+
+    # pattern detection (unchanged)
+    pattern_flag = False
+    pattern_sequence_readable = None
+    try:
+        seq = []
+        for s in segments:
+            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
+            seq.append((s['label'], int(round(dur_mins))))
+        for i in range(len(seq)-2):
+            a = seq[i]; b = seq[i+1]; c = seq[i+2]
+            if (a[0] == 'work' and a[1] < 60) and (b[0] in ('out_of_office','break') and b[1] >= 120) and (c[0] == 'work' and c[1] < 60):
+                pattern_flag = True
+                seq_fragment = [a,b,c]
+                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
+                break
+    except Exception:
+        pattern_flag = False
+        pattern_sequence_readable = None
+
+    return pd.Series({
+        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
+        'MaxSwipeGapSeconds': int(max_gap),
+        'ShortGapCount': int(short_gap_count),
+        'InCount': int(in_count),
+        'OutCount': int(out_count),
+        'UniqueDoors': int(unique_doors),
+        'UniqueLocations': int(unique_locations),
+        'RejectionCount': int(rejection_count),
+        'CardNumber': card_number,
+        'EmployeeID': employee_id,
+        'EmployeeIdentity': employee_identity,
+        'EmployeeName': employee_name,
+        'PersonnelType': personnel_type,
+        'FirstSwipe': first_swipe,
+        'LastSwipe': last_swipe,
+        'BreakCount': int(break_count),
+        'LongBreakCount': int(long_break_count),
+        'TotalBreakMinutes': float(round(total_break_minutes, 1)),
+        'TotalWorkMinutes': float(round(total_work_minutes, 1)),
+        'LongestBreakMinutes': float(round(longest_break_minutes, 1)),
+        'BreakSegmentsCount': int(break_segments_count),
+        'BreakDominant': bool(break_dominant),
+        'BreakMoreThan4h': bool(break_more_than_4h),
+        'PatternShortLongRepeat': bool(pattern_flag),
+        'PatternSequenceReadable': pattern_sequence_readable,
+        'PatternSequence': None
+    })
+
+
+
+
+
+
+
+
+
+
+
+    # ensure person_uid and Date exist
+    if 'person_uid' not in sw.columns:
+        def _make_uid_row(r):
+            return _canonical_person_uid({
+                'EmployeeID': r.get(empid_col) if empid_col in r else r.get('EmployeeID'),
+                'EmployeeIdentity': r.get('EmployeeIdentity', None),
+                'EmployeeName': r.get(name_col) if name_col in r else r.get('EmployeeName', None)
+            })
+        sw['person_uid'] = sw.apply(_make_uid_row, axis=1)
+
+    # ensure Date parsed
+    if 'Date' not in sw.columns or sw['Date'].isnull().all():
+        try:
+            sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
+        except Exception:
+            sw['Date'] = None
+
+    # final safe selection for grouping (only columns that actually exist)
+    available_cols = [c for c in ['person_uid', 'Date'] + sel_cols_present if c in sw.columns]
+    if 'person_uid' not in available_cols or 'Date' not in available_cols:
+        # nothing to group on -> return empty
+        return pd.DataFrame()
+
+    try:
+        grouped = sw[available_cols].groupby(['person_uid', 'Date'])
+        features = grouped.apply(agg_swipe_group).reset_index()
+    except Exception:
+        logging.exception("compute_features: groupby/apply failed")
+        # try a defensive fallback grouping without selecting columns slice
+        try:
+            grouped = sw.groupby(['person_uid', 'Date'])
+            features = grouped.apply(agg_swipe_group).reset_index()
+        except Exception:
+            logging.exception("compute_features: fallback groupby failed")
+            return pd.DataFrame()
+
+    # normalize column names (keep compatibility)
+    if 'person_uid' not in features.columns and 'level_0' in features.columns:
+        features.rename(columns={'level_0': 'person_uid', 'level_1': 'Date'}, inplace=True)
+    return features
+
+
+
+
+
+
+
+
+
+def map_door_to_zone(door, direction=None):
+    try:
+        if config_map_door_to_zone is not None:
+            return config_map_door_to_zone(door, direction)
+    except Exception:
+        pass
+    if not door:
+        return "Working Area"
+    s = str(door).strip().lower()
+    if 'canteen' in s or 'lunch' in s or 'caf' in s:
+        return "Canteen"
+    if 'exit' in s or 'out' in s:
+        return _OUT_OF_OFFICE_ZONE
+    # fallback
+    return "Working Area"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 When i update this Updated logic in trend runner we got 0 Count .means Those Who has do Violation this Employee alos are not Flagged 
 Why this happen how to resolve this 
 
