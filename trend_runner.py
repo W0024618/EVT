@@ -533,7 +533,7 @@ def scenario_early_arrival_before_06(row):
 
 
 
-def scenario_late_exit_after_23(row):
+# def scenario_late_exit_after_23(row):
     ls = row.get('LastSwipe')
     if pd.isna(ls) or ls is None:
         return False
@@ -542,6 +542,31 @@ def scenario_late_exit_after_23(row):
         return t >= time(hour=23)
     except Exception:
         return False
+
+def scenario_late_exit_after_23(row):
+    ls = row.get('LastSwipe')
+    if pd.isna(ls) or ls is None:
+        return False
+    try:
+        t = pd.to_datetime(ls).time()
+        # treat last-swipe at or after 23:30 as late exit
+        return t >= time(hour=23, minute=30)
+    except Exception:
+        return False
+
+
+def scenario_first_swipe_after_20(row):
+    fs = row.get('FirstSwipe')
+    if pd.isna(fs) or fs is None:
+        return False
+    try:
+        t = pd.to_datetime(fs).time()
+        # first swipe between 20:00 and 23:59:59 (inclusive)
+        return t >= time(hour=20, minute=0) and t <= time(hour=23, minute=59, second=59)
+    except Exception:
+        return False
+
+
 
 def scenario_shift_inconsistency(row):
     empid = row.get('EmployeeID')
@@ -619,6 +644,7 @@ SCENARIOS = [
     ("repeated_rejection_count", scenario_repeated_rejection_count),
     ("badge_sharing_suspected", scenario_badge_sharing_suspected),
     ("early_arrival_before_06", scenario_early_arrival_before_06),
+    ("first_swipe_after_20", scenario_first_swipe_after_20),
     ("late_exit_after_23", scenario_late_exit_after_23),
     ("shift_inconsistency", scenario_shift_inconsistency),
     ("trending_decline", scenario_trending_decline),
@@ -672,7 +698,8 @@ SCENARIO_EXPLANATIONS = {
     "repeated_rejection_count": lambda r: "Multiple rejection events recorded.",
     "badge_sharing_suspected": lambda r: "Same card used by multiple users on same day — possible badge sharing.",
     "early_arrival_before_06": lambda r: "First swipe earlier than 06:00.",
-    "late_exit_after_23": lambda r: "Last swipe after 23:00.",
+    "late_exit_after_23": lambda r: "Last swipe after 23:30.",
+    "first_swipe_after_20": lambda r: "First swipe after 20:00 (night arrival).",
     "shift_inconsistency": lambda r: "Duration deviates from historical shift patterns.",
     "trending_decline": lambda r: "Employee shows trending decline in presence.",
     "consecutive_absent_days": lambda r: "Consecutive absent days observed historically.",
@@ -1392,6 +1419,7 @@ WEIGHTS = {
     "badge_sharing_suspected": 2.0,
     "early_arrival_before_06": 0.4,
     "late_exit_after_23": 0.4,
+    "first_swipe_after_20": 0.6,
     "shift_inconsistency": 1.2,
     "trending_decline": 0.7,
     "consecutive_absent_days": 1.2,
@@ -1766,6 +1794,7 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
             except Exception:
                 swipe_overlap_map = {}
 
+
     # Evaluate scenarios (use weighting to compute anomaly score)
     for name, fn in SCENARIOS:
         if name == "badge_sharing_suspected":
@@ -1774,6 +1803,129 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
             df[name] = df.apply(lambda r: scenario_swipe_overlap(r, swipe_overlap_map=swipe_overlap_map), axis=1)
         else:
             df[name] = df.apply(lambda r, f=fn: bool(f(r)), axis=1)
+
+
+
+
+
+
+    # --- Weekly suppression for short-duration / repeated-break / shortstay-longout / long-gap scenarios ---
+    try:
+        # include the extra scenario names you requested
+        _weekly_special = {"short_duration_<4h", "coffee_badging", "low_swipe_count_<=5",
+                           "repeated_short_breaks", "shortstay_longout_repeat", "long_gap_>=4.5h"}
+
+        # read up to 7 days (inclusive) of past trend csvs so we can compute week counts for escalation rule
+        week_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), 7, target_date if target_date else date.today())
+        if week_df is not None and not week_df.empty:
+            # normalise Date if present
+            if 'Date' in week_df.columns:
+                try:
+                    week_df['Date'] = pd.to_datetime(week_df['Date'], errors='coerce').dt.date
+                except Exception:
+                    pass
+
+            # build per-person summary maps for this week (present days and scenario-days)
+            present_map = defaultdict(int)  # pid -> number of days present in week
+            scen_map = {s: defaultdict(int) for s in _weekly_special}  # scenario -> (pid -> days flagged)
+
+            # iterate week history and populate maps
+            for _, wr in week_df.iterrows():
+                # determine if that historic row counts as present
+                present_flag = False
+                try:
+                    cs = wr.get('CountSwipes')
+                    if cs is not None:
+                        try:
+                            present_flag = int(cs) > 0
+                        except Exception:
+                            present_flag = str(cs).strip() not in ('0', 'nan', '')
+                except Exception:
+                    present_flag = False
+
+                # collect normalized identifiers for this historic row
+                ids = set()
+                for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                    try:
+                        v = wr.get(k)
+                        if v not in (None, '', float('nan')):
+                            nv = _normalize_id_val(v)
+                            if nv:
+                                ids.add(str(nv))
+                                stripped = _strip_uid_prefix(str(nv))
+                                if stripped != str(nv):
+                                    ids.add(str(stripped))
+                    except Exception:
+                        continue
+                if not ids:
+                    continue
+
+                # update maps
+                for pid in ids:
+                    if present_flag:
+                        present_map[pid] += 1
+                    for scen in _weekly_special:
+                        try:
+                            val = wr.get(scen)
+                            flag = False
+                            if val is not None:
+                                if isinstance(val, bool):
+                                    flag = val
+                                else:
+                                    flag = str(val).strip().lower() in ('true', '1', 'yes', 'y', 't')
+                            if flag:
+                                scen_map[scen][pid] += 1
+                        except Exception:
+                            continue
+
+            # Now apply suppression to today's df rows:
+            for idx, row in df.iterrows():
+                # gather normalized ids for current row
+                ids_curr = set()
+                for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                    try:
+                        v = row.get(k)
+                        if v not in (None, '', float('nan')):
+                            nv = _normalize_id_val(v)
+                            if nv:
+                                ids_curr.add(str(nv))
+                                stripped = _strip_uid_prefix(str(nv))
+                                if stripped != str(nv):
+                                    ids_curr.add(str(stripped))
+                    except Exception:
+                        continue
+                if not ids_curr:
+                    continue
+
+                # aggregate hist counts for this week for all matching ids
+                hist_present = 0
+                hist_scen_counts = {s: 0 for s in _weekly_special}
+                for pid in ids_curr:
+                    hist_present += int(present_map.get(pid, 0))
+                    for s in _weekly_special:
+                        hist_scen_counts[s] += int(scen_map[s].get(pid, 0))
+
+                # include today's presence and today's scenario flag in counts
+                present_today = int(row.get('CountSwipes') or 0) > 0
+                for s in _weekly_special:
+                    current_flag = bool(row.get(s))
+                    present_days = int(hist_present) + (1 if present_today else 0)
+                    scenario_days = int(hist_scen_counts.get(s, 0)) + (1 if current_flag else 0)
+
+                    # Compute the minimum scenario-days required to keep the flag, per your rules:
+                    # required = max(1, present_days - 2)
+                    try:
+                        required = max(1, int(present_days) - 2)
+                    except Exception:
+                        required = 1
+
+                    # If scenario_days is less than required -> suppress today's flag
+                    if scenario_days < required:
+                        if s in df.columns and bool(df.at[idx, s]):
+                            df.at[idx, s] = False
+
+    except Exception:
+        logging.exception("Weekly suppression check failed (non-fatal).")
 
     def compute_score(r):
         score = 0.0
@@ -1791,6 +1943,8 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
     df['DetectedScenarios'] = scores['DetectedScenarios'].apply(lambda x: "; ".join(x) if (isinstance(x, (list, tuple)) and len(x)>0) else None)
     df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
 
+
+
     # PresentToday flag, ViolationDays from history, and weekly adjustments
     try:
         df['PresentToday'] = df['CountSwipes'].fillna(0).astype(int) > 0
@@ -1800,7 +1954,6 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
         hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'shortstay_longout_repeat')
         hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'repeated_short_breaks')
         hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'short_duration_<4h')
-
 
 
         def get_hist_count_for_row(row, hist_map):
@@ -1877,8 +2030,6 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
                 df.loc[high_violation_mask, 'RiskLevel'] = 'High'
         except Exception:
             pass
-
-
 
 
     except Exception:
