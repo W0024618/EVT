@@ -1,3 +1,279 @@
+def agg_swipe_group(g):
+    times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
+    gaps = []
+    short_gap_count = 0
+    for i in range(1, len(times)):
+        s = (times[i] - times[i-1]).total_seconds()
+        gaps.append(s)
+        if s <= 5*60:
+            short_gap_count += 1
+    max_gap = int(max(gaps)) if gaps else 0
+
+    in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
+    out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
+    unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+    unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+    rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+
+    # card extraction
+    card_numbers = []
+    if 'CardNumber' in g.columns:
+        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
+    if not card_numbers and 'CardNumber' in g.columns:
+        card_numbers = list(pd.unique(g['CardNumber'].dropna()))
+    if not card_numbers:
+        for c in g.columns:
+            cl = c.lower()
+            if 'value' == cl or 'xml' in cl or 'msg' in cl or 'shred' in cl:
+                try:
+                    vals = list(pd.unique(g[c].dropna()))
+                    if vals:
+                        card_numbers.extend(vals)
+                except Exception:
+                    continue
+    if not card_numbers:
+        for c in g.columns:
+            cl = c.lower()
+            if 'xml' in cl:
+                for raw in g[c].dropna().astype(str):
+                    extracted = _extract_card_from_xml(raw)
+                    if extracted:
+                        card_numbers.append(extracted)
+    card_numbers = list(dict.fromkeys(card_numbers))
+    card_number = None
+    for c in card_numbers:
+        n = _normalize_id_val(c)
+        if n and not _looks_like_guid(n):
+            card_number = n
+            break
+
+    # stable id/name
+    employee_id = None
+    employee_name = None
+    employee_identity = None
+    personnel_type = None
+
+    if 'EmployeeID' in g.columns:
+        vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
+        employee_id = _pick_first_non_guid_value(vals)
+        if employee_id is None and not vals.empty:
+            v0 = vals.iloc[0]
+            normalized = _normalize_id_val(v0)
+            if normalized and not _looks_like_guid(normalized):
+                employee_id = normalized
+
+    if (not employee_id) and 'PersonnelType' in g.columns:
+        try:
+            pvals = g['PersonnelType'].dropna().astype(str)
+            if not pvals.empty:
+                p0 = pvals.iloc[0]
+                if str(p0).strip().lower() in ('contractor', 'terminated contractor', 'contractor '):
+                    for c in g.columns:
+                        if c.lower() == 'text12':
+                            vals = g[c].dropna().astype(str).map(lambda x: x.strip())
+                            employee_id = _pick_first_non_guid_value(vals)
+                            if employee_id:
+                                break
+        except Exception:
+            pass
+
+    if 'EmployeeIdentity' in g.columns:
+        vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
+        if not vals.empty:
+            employee_identity = vals.iloc[0]
+
+    candidate_name_vals = None
+    if 'EmployeeName' in g.columns:
+        candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
+    elif 'ObjectName1' in g.columns:
+        candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+
+    if candidate_name_vals is not None and not candidate_name_vals.empty:
+        employee_name = _pick_first_non_guid_value(candidate_name_vals)
+        if employee_name is None:
+            for v in candidate_name_vals:
+                if _looks_like_name(v) and not _is_placeholder_str(v):
+                    employee_name = str(v).strip()
+                    break
+
+    if 'PersonnelTypeName' in g.columns:
+        vals = g['PersonnelTypeName'].dropna()
+        if not vals.empty:
+            personnel_type = vals.iloc[0]
+    elif 'PersonnelType' in g.columns:
+        vals = g['PersonnelType'].dropna()
+        if not vals.empty:
+            personnel_type = vals.iloc[0]
+
+    first_swipe = None
+    last_swipe = None
+    if times:
+        first_swipe = times[0]
+        last_swipe = times[-1]
+
+    # timeline & segments with mapping to zones
+    timeline = []
+    for _, row in g.sort_values('LocaleMessageTime').iterrows():
+        t = row.get('LocaleMessageTime')
+        dname = None
+        if 'Door' in row and pd.notna(row.get('Door')):
+            dname = row.get('Door')
+        direction = None
+        if 'Direction' in row and pd.notna(row.get('Direction')):
+            direction = row.get('Direction')
+        zone = map_door_to_zone(dname, direction)
+        timeline.append((t, dname, direction, zone))
+
+    segments = []
+    if timeline:
+        cur_zone = None
+        seg_start = timeline[0][0]
+        seg_label = None
+        for (t, dname, direction, zone) in timeline:
+            if zone in _BREAK_ZONES:
+                lbl = 'break'
+            elif zone == _OUT_OF_OFFICE_ZONE:
+                lbl = 'out_of_office'
+            else:
+                lbl = 'work'
+            if cur_zone is None:
+                cur_zone = zone
+                seg_label = lbl
+                seg_start = t
+            else:
+                if lbl != seg_label:
+                    segments.append({
+                        'label': seg_label,
+                        'start': seg_start,
+                        'end': t,
+                        'start_zone': cur_zone
+                    })
+                    seg_start = t
+                    seg_label = lbl
+                    cur_zone = zone
+                else:
+                    cur_zone = cur_zone or zone
+        if seg_label is not None:
+            segments.append({
+                'label': seg_label,
+                'start': seg_start,
+                'end': timeline[-1][0],
+                'start_zone': cur_zone
+            })
+
+    # ---------- NEW: compute work vs break durations (zone aware) ----------
+    # We'll compute:
+    #   - TotalWorkMinutes : sum of durations labeled 'work'
+    #   - TotalBreakMinutes: sum of durations labeled 'break' or 'out_of_office'
+    #   - LongestBreakMinutes : longest single break segment (mins)
+    #   - BreakSegmentsCount : number of break segments detected
+    #   - BreakDominant : bool(total_break > total_work)
+    #   - BreakMoreThan4h : bool(total_break >= 240)
+    total_work_minutes = 0.0
+    total_break_minutes = 0.0
+    longest_break_minutes = 0.0
+    break_segments_count = 0
+
+    # We still compute ShortGapCount earlier; use it as fallback if needed.
+    for s in segments:
+        lbl = s.get('label')
+        start = s.get('start')
+        end = s.get('end')
+        dur_mins = ((end - start).total_seconds() / 60.0) if (start and end) else 0.0
+        if lbl == 'work':
+            total_work_minutes += dur_mins
+        elif lbl in ('break', 'out_of_office'):
+            # count ALL break/out_of_office durations (not only those >60m)
+            break_segments_count += 1
+            total_break_minutes += dur_mins
+            if dur_mins > longest_break_minutes:
+                longest_break_minutes = dur_mins
+
+    # derive boolean indicators used downstream
+    break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
+    break_more_than_4h = bool(total_break_minutes >= 240)
+
+    # For backward compatibility expose previous-like numeric fields too
+    # (BreakCount used to be number of 'long-enough' breaks; we replace it
+    #  with break_segments_count but keep an integer field so downstream code doesn't break)
+    break_count = int(break_segments_count)
+    long_break_count = int(sum(1 for s in segments
+                               if s.get('label') in ('break','out_of_office') and
+                                  ((s.get('end') and s.get('start')) and (((s['end'] - s['start']).total_seconds()/60.0) >= 120))))
+
+    # (pattern detection retained as before)
+    pattern_flag = False
+    pattern_sequence_readable = None
+    try:
+        seq = []
+        for s in segments:
+            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
+            seq.append((s['label'], int(round(dur_mins))))
+        for i in range(len(seq)-2):
+            a = seq[i]
+            b = seq[i+1]
+            c = seq[i+2]
+            if (a[0] == 'work' and a[1] < 60) and \
+               (b[0] in ('out_of_office','break') and b[1] >= 120) and \
+               (c[0] == 'work' and c[1] < 60):
+                pattern_flag = True
+                seq_fragment = [a, b, c]
+                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
+                break
+    except Exception:
+        pattern_flag = False
+        pattern_sequence_readable = None
+
+    return pd.Series({
+        'CountSwipes': int(len(g)),
+        'MaxSwipeGapSeconds': max_gap,
+        'ShortGapCount': int(short_gap_count),
+        'InCount': in_count,
+        'OutCount': out_count,
+        'UniqueDoors': unique_doors,
+        'UniqueLocations': unique_locations,
+        'RejectionCount': rejection_count,
+        'CardNumber': card_number,
+        'EmployeeID': employee_id,
+        'EmployeeIdentity': employee_identity,
+        'EmployeeName': employee_name,
+        'PersonnelType': personnel_type,
+        'FirstSwipe': first_swipe,
+        'LastSwipe': last_swipe,
+        # BREAK / WORK duration fields (new)
+        'BreakCount': int(break_count),
+        'LongBreakCount': int(long_break_count),
+        'TotalBreakMinutes': float(round(total_break_minutes, 1)),
+        'TotalWorkMinutes': float(round(total_work_minutes, 1)),
+        'LongestBreakMinutes': float(round(longest_break_minutes, 1)),
+        'BreakSegmentsCount': int(break_segments_count),
+        'BreakDominant': bool(break_dominant),
+        'BreakMoreThan4h': bool(break_more_than_4h),
+        'PatternShortLongRepeat': bool(pattern_flag),
+        'PatternSequenceReadable': pattern_sequence_readable,
+        'PatternSequence': None
+    })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i dont understnd Where update below block . so only update below block carefully in trend runner.py file and Share me only updated Snippet or 
 Updated Function so i can easily swap each other..
 
