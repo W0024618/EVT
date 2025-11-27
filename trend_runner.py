@@ -369,7 +369,7 @@ def scenario_coffee_badging(row):
     return (row.get('CountSwipes') or 0) >= 5 and (row.get('DurationMinutes') or 0) < 60
 
 def scenario_low_swipe_count(row):
-    return 0 < (row.get('CountSwipes') or 0) <= 2
+    return 0 < (row.get('CountSwipes') or 0) <= 5
 
 def scenario_single_door(row):
     return (row.get('UniqueDoors') or 0) <= 1
@@ -531,13 +531,15 @@ def scenario_early_arrival_before_06(row):
     except Exception:
         return False
 
-def scenario_late_exit_after_22(row):
+
+
+def scenario_late_exit_after_23(row):
     ls = row.get('LastSwipe')
     if pd.isna(ls) or ls is None:
         return False
     try:
         t = pd.to_datetime(ls).time()
-        return t >= time(hour=22)
+        return t >= time(hour=23)
     except Exception:
         return False
 
@@ -603,11 +605,11 @@ SCENARIOS = [
     ("long_gap_>=4.5h", scenario_long_gap),
     ("short_duration_<4h", scenario_short_duration),
     ("coffee_badging", scenario_coffee_badging),
-    ("low_swipe_count_<=2", scenario_low_swipe_count),
+    ("low_swipe_count_<=5", scenario_low_swipe_count),
     ("single_door", scenario_single_door),
     ("only_in", scenario_only_in),
     ("only_out", scenario_only_out),
-    ("overtime_>=10h", scenario_overtime),
+    ("overtime_>=14h", scenario_overtime),
     ("very_long_duration_>=16h", scenario_very_long_duration),
     ("zero_swipes", scenario_zero_swipes),
     ("unusually_high_swipes", scenario_unusually_high_swipes),
@@ -617,7 +619,7 @@ SCENARIOS = [
     ("repeated_rejection_count", scenario_repeated_rejection_count),
     ("badge_sharing_suspected", scenario_badge_sharing_suspected),
     ("early_arrival_before_06", scenario_early_arrival_before_06),
-    ("late_exit_after_22", scenario_late_exit_after_22),
+    ("late_exit_after_23", scenario_late_exit_after_23),
     ("shift_inconsistency", scenario_shift_inconsistency),
     ("trending_decline", scenario_trending_decline),
     ("consecutive_absent_days", scenario_consecutive_absent_days),
@@ -656,11 +658,11 @@ SCENARIO_EXPLANATIONS = {
         (lambda h: f"Short total presence (~{h} h)." if h is not None else "Short total presence.")(_hrs_from_minutes(r.get('DurationMinutes')))
     ),
     "coffee_badging": lambda r: "Multiple quick swipes in short time.",
-    "low_swipe_count_<=2": lambda r: "Very few swipes on day.",
+    "low_swipe_count_<=5": lambda r: "Very few swipes on day.",
     "single_door": lambda r: "Only a single door used during the day.",
     "only_in": lambda r: "Only 'IN' events recorded.",
     "only_out": lambda r: "Only 'OUT' events recorded.",
-    "overtime_>=10h": lambda r: "Overtime detected (>=10 hours).",
+    "overtime_>=14h": lambda r: "Overtime detected (>=14 hours).",
     "very_long_duration_>=16h": lambda r: "Very long presence (>=16 hours).",
     "zero_swipes": lambda r: "No swipes recorded on this day.",
     "unusually_high_swipes": lambda r: "Unusually high number of swipes compared to peers/history.",
@@ -670,7 +672,7 @@ SCENARIO_EXPLANATIONS = {
     "repeated_rejection_count": lambda r: "Multiple rejection events recorded.",
     "badge_sharing_suspected": lambda r: "Same card used by multiple users on same day — possible badge sharing.",
     "early_arrival_before_06": lambda r: "First swipe earlier than 06:00.",
-    "late_exit_after_22": lambda r: "Last swipe after 22:00.",
+    "late_exit_after_23": lambda r: "Last swipe after 23:00.",
     "shift_inconsistency": lambda r: "Duration deviates from historical shift patterns.",
     "trending_decline": lambda r: "Employee shows trending decline in presence.",
     "consecutive_absent_days": lambda r: "Consecutive absent days observed historically.",
@@ -1375,11 +1377,11 @@ WEIGHTS = {
     "long_gap_>=4.5h": 0.3,
     "short_duration_<4h": 1.0,
     "coffee_badging": 1.0,
-    "low_swipe_count_<=2": 0.5,
+    "low_swipe_count_<=5": 0.5,
     "single_door": 0.25,
     "only_in": 0.8,
     "only_out": 0.8,
-    "overtime_>=10h": 0.2,
+    "overtime_>=14h": 0.2,
     "very_long_duration_>=16h": 1.5,
     "zero_swipes": 0.4,
     "unusually_high_swipes": 1.5,
@@ -1389,7 +1391,7 @@ WEIGHTS = {
     "repeated_rejection_count": 0.8,
     "badge_sharing_suspected": 2.0,
     "early_arrival_before_06": 0.4,
-    "late_exit_after_22": 0.4,
+    "late_exit_after_23": 0.4,
     "shift_inconsistency": 1.2,
     "trending_decline": 0.7,
     "consecutive_absent_days": 1.2,
@@ -1793,11 +1795,7 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
     try:
         df['PresentToday'] = df['CountSwipes'].fillna(0).astype(int) > 0
 
-        # # historical scenario counts (for escalation)
-        # hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'shortstay_longout_repeat')
-        # hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'repeated_short_breaks')
-        # hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today(), 'short_duration_<4h')
-
+     
         # historical scenario counts (for escalation) using the configured window_days
         hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'shortstay_longout_repeat')
         hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'repeated_short_breaks')
@@ -1818,119 +1816,6 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
                     except Exception:
                         continue
             return 0
-
-
-
-
-
-        # df['HistPatternShortLongCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
-        # df['HistRepeatedShortBreakCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
-        # df['HistShortDurationCount90'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
-
-        # pat_mask = df['HistPatternShortLongCount90'].fillna(0).astype(int) >= 3
-        # if pat_mask.any():
-        #     df.loc[pat_mask, 'AnomalyScore'] = df.loc[pat_mask, 'AnomalyScore'].astype(float)  # keep value but escalate risk below
-        #     df.loc[pat_mask, 'RiskScore'] = 5
-        #     df.loc[pat_mask, 'RiskLevel'] = 'High'
-        #     df.loc[pat_mask, 'IsFlagged'] = True
-
-        # rep_mask = df['HistRepeatedShortBreakCount90'].fillna(0).astype(int) >= 5
-        # if rep_mask.any():
-        #     df.loc[rep_mask, 'AnomalyScore'] = df.loc[rep_mask, 'AnomalyScore'].astype(float)
-        #     df.loc[rep_mask, 'RiskScore'] = 5
-        #     df.loc[rep_mask, 'RiskLevel'] = 'High'
-        #     df.loc[rep_mask, 'IsFlagged'] = True
-
-        # # ViolationDaysLast90
-        # vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
-        # def lookup_violation_days(row):
-        #     try:
-        #         candidates = []
-        #         for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
-        #             v = row.get(k)
-        #             if v not in (None, '', float('nan')):
-        #                 candidates.append(_normalize_id_val(v))
-        #         for c in candidates:
-        #             if c is None:
-        #                 continue
-        #             if c in vmap:
-        #                 return int(vmap.get(c, 0))
-        #             stripped = _strip_uid_prefix(c)
-        #             if stripped != c and stripped in vmap:
-        #                 return int(vmap.get(stripped, 0))
-        #         return 0
-        #     except Exception:
-        #         return 0
-        # df['ViolationDaysLast90'] = df.apply(lookup_violation_days, axis=1)
-
-        # # Append monitoring note for persons who have past violations and are present today.
-        # def _append_monitor_note(idx, row):
-        #     try:
-        #         vd = int(row.get('ViolationDaysLast90') or 0)
-        #     except Exception:
-        #         vd = 0
-        #     if vd <= 0:
-        #         return row.get('ViolationExplanation') or row.get('Explanation')
-        #     if not row.get('PresentToday', False):
-        #         return row.get('ViolationExplanation') or row.get('Explanation')
-        #     note = f"Note: Previously flagged {vd} time{'s' if vd!=1 else ''} in the last {VIOLATION_WINDOW_DAYS} days — monitor when present today."
-        #     ex = row.get('ViolationExplanation') or row.get('Explanation') or ''
-        #     if ex and not ex.strip().endswith('.'):
-        #         ex = ex.strip() + '.'
-        #     if note in ex:
-        #         return ex
-        #     return (ex + ' ' + note).strip()
-        # df['ViolationExplanation'] = df.apply(lambda r: _append_monitor_note(r.name, r), axis=1)
-
-        # df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDaysLast90') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
-
-        # # Now compute consecutive-week short-duration runs (post scoring)
-        # past_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), VIOLATION_WINDOW_DAYS, target_date if target_date else date.today())
-        # week_runs = _compute_weeks_with_threshold(past_df, person_col='person_uid', date_col='Date', scenario_col='short_duration_<4h', threshold_days=3)
-
-        # def _get_week_run_for_row(r):
-        #     for k in ('person_uid', 'EmployeeID'):
-        #         if k in r and r.get(k):
-        #             key = str(r.get(k))
-        #             if key in week_runs:
-        #                 return int(week_runs[key])
-        #             stripped = _strip_uid_prefix(key)
-        #             if stripped in week_runs:
-        #                 return int(week_runs[stripped])
-        #     return 0
-
-        # df['ConsecWeeksShort4hrs'] = df.apply(_get_week_run_for_row, axis=1)
-
-        # # Apply anomaly score bumps now that AnomalyScore exists
-        # df['AnomalyScore'] = df['AnomalyScore'].astype(float).fillna(0.0)
-
-        # mask1 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 1
-        # mask2 = df['ConsecWeeksShort4hrs'].fillna(0).astype(int) >= 2
-
-        # if mask1.any():
-        #     df.loc[mask1, 'AnomalyScore'] = df.loc[mask1, 'AnomalyScore'].astype(float) + 0.5
-        # if mask2.any():
-        #     df.loc[mask2, 'AnomalyScore'] = df.loc[mask2, 'AnomalyScore'].astype(float) + 1.0
-
-        # # Recompute IsFlagged and RiskLevel after bumping AnomalyScore
-        # df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
-
-        # def _map_risk_after_bump(r):
-        #     score = r.get('AnomalyScore') or 0.0
-        #     bucket, label = map_score_to_label(score)
-        #     return int(bucket), label
-        # rs2 = df.apply(lambda r: pd.Series(_map_risk_after_bump(r), index=['RiskScore', 'RiskLevel']), axis=1)
-        # df['RiskScore'] = rs2['RiskScore']
-        # df['RiskLevel'] = rs2['RiskLevel']
-
-        # # OVERRIDE: force High risk when ViolationDaysLast90 >= 4
-        # try:
-        #     high_violation_mask = df['ViolationDaysLast90'] >= 4
-        #     if high_violation_mask.any():
-        #         df.loc[high_violation_mask, 'RiskScore'] = 5
-        #         df.loc[high_violation_mask, 'RiskLevel'] = 'High'
-        # except Exception:
-        #     pass
 
 
 
@@ -2069,9 +1954,6 @@ def _slug_city(city: str) -> str:
     if not city:
         return "pune"
     return str(city).strip().lower().replace(" ", "_")
-
-
-
 
 
 def run_trend_for_date(target_date: date,
@@ -2413,11 +2295,6 @@ def run_trend_for_date(target_date: date,
 
 
 
-
-
-
-
-
     # If we used shifted timeline restore displayed times (safety)
     if use_pune_2am_boundary:
         for dtcol in ('FirstSwipe', 'LastSwipe'):
@@ -2665,7 +2542,3 @@ if __name__ == "__main__":
     today = datetime.now().date()
     df = run_trend_for_date(today, as_dict=False)
     print("Completed; rows:", len(df) if df is not None else 0)
-
-
-
-
