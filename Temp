@@ -1,3 +1,631 @@
+def score_trends_from_durations(combined_df: pd.DataFrame,
+                                swipes_df: Optional[pd.DataFrame] = None,
+                                outdir: Optional[str] = None,
+                                target_date: Optional[date] = None,
+                                window_days: Optional[int] = None) -> pd.DataFrame:
+    """
+    window_days: number of days (inclusive) prior to target_date to read historical trend CSVs for
+                 scenario counts and violation-days. If None, falls back to VIOLATION_WINDOW_DAYS.
+    """
+    # normalize window
+    if window_days is None:
+        window_days = VIOLATION_WINDOW_DAYS
+ 
+    if combined_df is None or combined_df.empty:
+        return pd.DataFrame()
+
+    df = combined_df.copy()
+    # Ensure person_uid exists
+    if 'person_uid' not in df.columns:
+        df['person_uid'] = df.apply(lambda r: _canonical_person_uid(r), axis=1)
+
+    # Ensure key columns exist
+    for c in ['FirstSwipe','LastSwipe','CountSwipes','DurationMinutes','MaxSwipeGapSeconds','EmployeeID','CardNumber','person_uid','Date']:
+        if c not in df.columns:
+            df[c] = None
+
+    # reconcile zero CountSwipes with raw swipes (if provided)
+    if swipes_df is not None and not swipes_df.empty and 'person_uid' in swipes_df.columns:
+        tsw = swipes_df.copy()
+        # ensure LocaleMessageTime parsed
+        if 'LocaleMessageTime' in tsw.columns:
+            tsw['LocaleMessageTime'] = pd.to_datetime(tsw[found_time_col] if 'found_time_col' in globals() and found_time_col in tsw.columns else tsw['LocaleMessageTime'], errors='coerce')
+        else:
+            for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
+                if cand in tsw.columns:
+                    tsw['LocaleMessageTime'] = pd.to_datetime(tsw[cand], errors='coerce')
+                    break
+        if 'Date' not in tsw.columns:
+            if 'LocaleMessageTime' in tsw.columns:
+                tsw['Date'] = tsw['LocaleMessageTime'].dt.date
+            else:
+                for cand in ('date','Date'):
+                    if cand in tsw.columns:
+                        try:
+                            tsw['Date'] = pd.to_datetime(tsw[cand], errors='coerce').dt.date
+                        except Exception:
+                            tsw['Date'] = None
+                        break
+
+        try:
+            grp = tsw.dropna(subset=['person_uid', 'Date']).groupby(['person_uid', 'Date'])
+            counts = grp.size().to_dict()
+            firsts = grp['LocaleMessageTime'].min().to_dict()
+            lasts = grp['LocaleMessageTime'].max().to_dict()
+        except Exception:
+            counts = {}
+            firsts = {}
+            lasts = {}
+
+        def _fix_row_by_raw(idx, row):
+            key = (row.get('person_uid'), row.get('Date'))
+            if key in counts and (int(row.get('CountSwipes') or 0) == 0 or pd.isna(row.get('CountSwipes'))):
+                try:
+                    c = int(counts.get(key, 0))
+                    df.at[idx, 'CountSwipes'] = c
+                    f = firsts.get(key)
+                    l = lasts.get(key)
+                    if pd.notna(f) and (pd.isna(row.get('FirstSwipe')) or row.get('FirstSwipe') is None):
+                        df.at[idx, 'FirstSwipe'] = pd.to_datetime(f)
+                    if pd.notna(l) and (pd.isna(row.get('LastSwipe')) or row.get('LastSwipe') is None):
+                        df.at[idx, 'LastSwipe'] = pd.to_datetime(l)
+                    try:
+                        fs = df.at[idx, 'FirstSwipe']
+                        ls = df.at[idx, 'LastSwipe']
+                        if pd.notna(fs) and pd.notna(ls):
+                            dursec = (pd.to_datetime(ls) - pd.to_datetime(fs)).total_seconds()
+                            dursec = max(0, dursec)
+                            df.at[idx, 'DurationSeconds'] = float(dursec)
+                            df.at[idx, 'DurationMinutes'] = float(dursec / 60.0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        for ix, r in df[df['CountSwipes'].fillna(0).astype(int) == 0].iterrows():
+            try:
+                _fix_row_by_raw(ix, r)
+            except Exception:
+                logging.debug("Failed to reconcile row %s with raw swipes", ix)
+
+    # Build badge map and swipe overlap maps for higher-severity scenarios
+    badge_map = {}
+    swipe_overlap_map = {}
+    if swipes_df is not None and not swipes_df.empty:
+        try:
+            tmp = swipes_df[['CardNumber', 'person_uid', 'Date']].dropna(subset=['CardNumber'])
+            if not tmp.empty:
+                grouped_card = tmp.groupby(['Date', 'CardNumber'])['person_uid'].nunique().reset_index(name='distinct_users')
+                badge_map = {(row.Date, row.CardNumber): int(row.distinct_users) for row in grouped_card.itertuples(index=False)}
+        except Exception:
+            badge_map = {}
+
+        overlap_window_seconds = 2
+        if {'Door', 'LocaleMessageTime', 'person_uid', 'Date'}.issubset(swipes_df.columns):
+            try:
+                tmp2 = swipes_df[['Door', 'LocaleMessageTime', 'person_uid', 'Date']].dropna()
+                if not tmp2.empty:
+                    tmp2 = tmp2.sort_values(['Door', 'LocaleMessageTime'])
+                    for (d, door), g in tmp2.groupby(['Date', 'Door']):
+                        items = list(g[['LocaleMessageTime', 'person_uid']].itertuples(index=False, name=None))
+                        n = len(items)
+                        for i in range(n):
+                            t_i, uid_i = items[i]
+                            j = i+1
+                            while j < n and (items[j][0] - t_i).total_seconds() <= overlap_window_seconds:
+                                uid_j = items[j][1]
+                                if uid_i != uid_j:
+                                    swipe_overlap_map.setdefault((d, uid_i), set()).add(uid_j)
+                                    swipe_overlap_map.setdefault((d, uid_j), set()).add(uid_i)
+                                j += 1
+            except Exception:
+                swipe_overlap_map = {}
+
+
+    # Evaluate scenarios (use weighting to compute anomaly score)
+    for name, fn in SCENARIOS:
+        if name == "badge_sharing_suspected":
+            df[name] = df.apply(lambda r: scenario_badge_sharing_suspected(r, badge_map=badge_map), axis=1)
+        elif name == "swipe_overlap":
+            df[name] = df.apply(lambda r: scenario_swipe_overlap(r, swipe_overlap_map=swipe_overlap_map), axis=1)
+        else:
+            df[name] = df.apply(lambda r, f=fn: bool(f(r)), axis=1)
+
+
+
+
+
+
+    # --- Weekly suppression for short-duration / repeated-break / shortstay-longout / long-gap scenarios ---
+    try:
+        # include the extra scenario names you requested
+        _weekly_special = {"long_gap_>=4.5h", "short_duration_<4h", "coffee_badging",
+                           "low_swipe_count_<=5", "single_door", "only_in","only_out","overtime_>=14h",
+                           "very_long_duration_>=16h","unusually_high_swipes","repeated_short_breaks",
+                           "late_exit_after_23","first_swipe_after_20","shift_inconsistency",
+                           "high_swipes_benign","shortstay_longout_repeat"}
+
+        # read up to 7 days (inclusive) of past trend csvs so we can compute week counts for escalation rule
+        week_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), 7, target_date if target_date else date.today())
+        if week_df is not None and not week_df.empty:
+            # normalise Date if present
+            if 'Date' in week_df.columns:
+                try:
+                    week_df['Date'] = pd.to_datetime(week_df['Date'], errors='coerce').dt.date
+                except Exception:
+                    pass
+
+            # build per-person summary maps for this week (present days and scenario-days)
+            present_map = defaultdict(int)  # pid -> number of days present in week
+            scen_map = {s: defaultdict(int) for s in _weekly_special}  # scenario -> (pid -> days flagged)
+
+            # iterate week history and populate maps
+            for _, wr in week_df.iterrows():
+                # determine if that historic row counts as present
+                present_flag = False
+                try:
+                    cs = wr.get('CountSwipes')
+                    if cs is not None:
+                        try:
+                            present_flag = int(cs) > 0
+                        except Exception:
+                            present_flag = str(cs).strip() not in ('0', 'nan', '')
+                except Exception:
+                    present_flag = False
+
+                # collect normalized identifiers for this historic row
+                ids = set()
+                for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                    try:
+                        v = wr.get(k)
+                        if v not in (None, '', float('nan')):
+                            nv = _normalize_id_val(v)
+                            if nv:
+                                ids.add(str(nv))
+                                stripped = _strip_uid_prefix(str(nv))
+                                if stripped != str(nv):
+                                    ids.add(str(stripped))
+                    except Exception:
+                        continue
+                if not ids:
+                    continue
+
+                # update maps
+                for pid in ids:
+                    if present_flag:
+                        present_map[pid] += 1
+                    for scen in _weekly_special:
+                        try:
+                            val = wr.get(scen)
+                            flag = False
+                            if val is not None:
+                                if isinstance(val, bool):
+                                    flag = val
+                                else:
+                                    flag = str(val).strip().lower() in ('true', '1', 'yes', 'y', 't')
+                            if flag:
+                                scen_map[scen][pid] += 1
+                        except Exception:
+                            continue
+
+            # Now apply suppression to today's df rows:
+            for idx, row in df.iterrows():
+                # gather normalized ids for current row
+                ids_curr = set()
+                for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                    try:
+                        v = row.get(k)
+                        if v not in (None, '', float('nan')):
+                            nv = _normalize_id_val(v)
+                            if nv:
+                                ids_curr.add(str(nv))
+                                stripped = _strip_uid_prefix(str(nv))
+                                if stripped != str(nv):
+                                    ids_curr.add(str(stripped))
+                    except Exception:
+                        continue
+                if not ids_curr:
+                    continue
+
+                # aggregate hist counts for this week for all matching ids
+                hist_present = 0
+                hist_scen_counts = {s: 0 for s in _weekly_special}
+                for pid in ids_curr:
+                    hist_present += int(present_map.get(pid, 0))
+                    for s in _weekly_special:
+                        hist_scen_counts[s] += int(scen_map[s].get(pid, 0))
+
+                # include today's presence and today's scenario flag in counts
+                present_today = int(row.get('CountSwipes') or 0) > 0
+                for s in _weekly_special:
+                    current_flag = bool(row.get(s))
+                    present_days = int(hist_present) + (1 if present_today else 0)
+                    scenario_days = int(hist_scen_counts.get(s, 0)) + (1 if current_flag else 0)
+
+                    # Compute the minimum scenario-days required to keep the flag, per your rules:
+                    # required = max(1, present_days - 2)
+                    try:
+                        required = max(1, int(present_days) - 2)
+                    except Exception:
+                        required = 1
+
+                    # If scenario_days is less than required -> suppress today's flag
+                    if scenario_days < required:
+                        if s in df.columns and bool(df.at[idx, s]):
+                            df.at[idx, s] = False
+
+    except Exception:
+        logging.exception("Weekly suppression check failed (non-fatal).")
+
+    def compute_score(r):
+        score = 0.0
+        detected = []
+        for name, _ in SCENARIOS:
+            val = bool(r.get(name))
+            w = WEIGHTS.get(name, 0.0)
+            if val and w > 0:
+                score += float(w)
+                detected.append(name)
+        return score, detected
+
+    scores = df.apply(lambda r: pd.Series(compute_score(r), index=['AnomalyScore', 'DetectedScenarios']), axis=1)
+    df['AnomalyScore'] = scores['AnomalyScore'].astype(float)
+    df['DetectedScenarios'] = scores['DetectedScenarios'].apply(lambda x: "; ".join(x) if (isinstance(x, (list, tuple)) and len(x)>0) else None)
+    df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: bool(s >= ANOMALY_THRESHOLD))
+
+
+
+    # PresentToday flag, ViolationDays from history, and weekly adjustments
+    try:
+        df['PresentToday'] = df['CountSwipes'].fillna(0).astype(int) > 0
+
+     
+        # historical scenario counts (for escalation) using the configured window_days
+        hist_pattern_counts = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'shortstay_longout_repeat')
+        hist_rep_breaks = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'repeated_short_breaks')
+        hist_short_duration = _read_scenario_counts_by_person(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today(), 'short_duration_<4h')
+
+
+        def get_hist_count_for_row(row, hist_map):
+            for k in ('EmployeeID', 'person_uid', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12'):
+                if k in row and row.get(k) not in (None, '', float('nan')):
+                    try:
+                        norm = _normalize_id_val(row.get(k))
+                        if norm and str(norm) in hist_map:
+                            return int(hist_map.get(str(norm), 0))
+                        stripped = _strip_uid_prefix(str(norm)) if norm else None
+                        if stripped and str(stripped) in hist_map:
+                            return int(hist_map.get(str(stripped), 0))
+                    except Exception:
+                        continue
+            return 0
+
+
+
+        # historical aggregated counts (use window_days)
+        df['HistPatternShortLongCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_pattern_counts), axis=1)
+        df['HistRepeatedShortBreakCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_rep_breaks), axis=1)
+        df['HistShortDurationCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
+
+        # ViolationDays computed from history window_days (read from past trend CSVs)
+        # ViolationDays computed from history window_days (read from past trend CSVs)
+        vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today())
+
+        # lookup helper must be defined inside this try so it can see vmap
+     
+     
+     
+        # lookup helper must be defined inside this try so it can see vmap
+        def lookup_violation_days(row):
+            try:
+                # gather candidate id strings from many columns
+                candidates = []
+                for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+                    v = row.get(k)
+                    if v not in (None, '', float('nan')):
+                        nv = _normalize_id_val(v)
+                        if nv:
+                            candidates.append(str(nv))
+                            candidates.append(str(nv).lower())
+                            try:
+                                candidates.append(_strip_uid_prefix(str(nv)))
+                            except Exception:
+                                pass
+                # also try canonical person uid for this current row (best-effort)
+                try:
+                    can = _canonical_person_uid(row)
+                    if can:
+                        candidates.append(can)
+                        candidates.append(str(can).lower())
+                        try:
+                            candidates.append(_strip_uid_prefix(str(can)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # dedupe preserve order
+                seen = set()
+                for c in candidates:
+                    if not c or c in (None, '', 'nan'):
+                        continue
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    # direct match
+                    if c in vmap:
+                        return int(vmap.get(c, 0))
+                    # lowercase match
+                    if str(c).lower() in vmap:
+                        return int(vmap.get(str(c).lower(), 0))
+                    # stripped prefix match
+                    stripped = _strip_uid_prefix(str(c))
+                    if stripped != str(c) and stripped in vmap:
+                        return int(vmap.get(stripped, 0))
+                    if stripped.lower() in vmap:
+                        return int(vmap.get(stripped.lower(), 0))
+
+                # nothing in history — if the current day is flagged, count it as 1
+                try:
+                    if bool(row.get('IsFlagged')):
+                        return 1
+                except Exception:
+                    pass
+
+                return 0
+            except Exception:
+                return 0
+
+        # now apply function to dataframe (still inside same try)
+        df['ViolationDays'] = df.apply(lookup_violation_days, axis=1)
+        # backward-compatible alias expected by some frontends
+        df['ViolationDaysLast90'] = df['ViolationDays']
+        # expose the window used so front-end can render "Violation (N days)"
+        df['ViolationWindowDays'] = int(window_days)
+
+        # Append monitoring note for persons who have past violations and are present today.
+        def _append_monitor_note(idx, row):
+            try:
+                vd = int(row.get('ViolationDays') or 0)
+            except Exception:
+                vd = 0
+            if vd <= 0:
+                return row.get('ViolationExplanation') or row.get('Explanation')
+            if not row.get('PresentToday', False):
+                return row.get('ViolationExplanation') or row.get('Explanation')
+            note = f"Note: Previously flagged {vd} time{'s' if vd!=1 else ''} in the last {int(window_days)} days — monitor when present today."
+            ex = row.get('ViolationExplanation') or row.get('Explanation') or ''
+            if ex and not ex.strip().endswith('.'):
+                ex = ex.strip() + '.'
+            if note in ex:
+                return ex
+            return (ex + ' ' + note).strip()
+        df['ViolationExplanation'] = df.apply(lambda r: _append_monitor_note(r.name, r), axis=1)
+
+        df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDays') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
+
+        # OVERRIDE: force High risk when ViolationDays >= 4
+        try:
+            high_violation_mask = df['ViolationDays'] >= 4
+            if high_violation_mask.any():
+                df.loc[high_violation_mask, 'RiskScore'] = 5
+                df.loc[high_violation_mask, 'RiskLevel'] = 'High'
+        except Exception:
+            pass
+
+        # Ensure default RiskScore / RiskLevel are present (map from AnomalyScore if not set)
+        try:
+            if 'RiskLevel' not in df.columns or df['RiskLevel'].isnull().all():
+                df['RiskScore'] = None
+                df['RiskLevel'] = None
+            # fill per-row if missing using map_score_to_label
+            def _fill_risk(r):
+                try:
+                    if r.get('RiskLevel') not in (None, '', float('nan')):
+                        return r.get('RiskScore'), r.get('RiskLevel')
+                    sc = float(r.get('AnomalyScore') or 0.0)
+                    bucket, label = map_score_to_label(sc)
+                    return int(bucket), label
+                except Exception:
+                    return (None, None)
+            risk_pairs = df.apply(lambda r: pd.Series(_fill_risk(r), index=['RiskScore_temp','RiskLevel_temp']), axis=1)
+            # only set where missing (don't override forced High)
+            df['RiskScore'] = df['RiskScore'].combine_first(risk_pairs['RiskScore_temp'])
+            df['RiskLevel'] = df['RiskLevel'].combine_first(risk_pairs['RiskLevel_temp'])
+            # cleanup temps
+            if 'RiskScore_temp' in df.columns:
+                try:
+                    df.drop(columns=['RiskScore_temp','RiskLevel_temp'], inplace=True)
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("Failed to populate default RiskScore/RiskLevel")
+
+    except Exception:
+        logging.exception("Failed post-scoring weekly-run / monitoring augmentation.")
+
+    # -------------------------
+    # Scenario-based Risk Overrides (per requested rules)
+    # -------------------------
+    try:
+        # scenarios that follow the special escalation-by-ViolationDays rule
+        escalation_set = {"long_gap_>=4.5h", "coffee_badging", "single_door", "only_in", "only_out"}
+        # scenarios that when alone should be considered Low
+        low_only_set = {"short_duration_<4h", "overtime_>=14h", "early_arrival_before_06"}
+        label_to_score = {"Low": 1, "Low Medium": 2, "Medium": 3, "Medium High": 4, "High": 5}
+
+        def _extract_detected_set(r):
+            ds = r.get('DetectedScenarios') or r.get('Reasons') or ''
+            out = set()
+            try:
+                if isinstance(ds, (list, tuple)):
+                    for x in ds:
+                        if x:
+                            out.add(str(x).strip())
+                elif isinstance(ds, str):
+                    for p in re.split(r'[;,\|]', ds):
+                        p = (p or '').strip()
+                        if p:
+                            out.add(p)
+            except Exception:
+                pass
+            return out
+
+        def _compute_override_for_row(r):
+            try:
+                # only consider overriding flagged rows
+                if not bool(r.get('IsFlagged')):
+                    return (r.get('RiskScore'), r.get('RiskLevel'))
+
+                detected = _extract_detected_set(r)
+                vd = int(r.get('ViolationDays') or 0)
+
+                # 1) If any of escalation_set present -> escalate using ViolationDays
+                if detected & escalation_set:
+                    if vd <= 1:
+                        lab = "Low Medium"
+                    elif vd == 2:
+                        lab = "Medium"
+                    elif vd == 3:
+                        lab = "Medium High"
+                    else:
+                        lab = "High"
+                    return (label_to_score[lab], lab)
+
+                # 2) If exactly one detected scenario and it is in low_only_set -> Low
+                if len(detected) == 1 and next(iter(detected)) in low_only_set:
+                    return (label_to_score["Low"], "Low")
+
+                # 3) For other flagged rows, escalate by ViolationDays if > 0, else keep existing
+                if vd == 1:
+                    return (label_to_score["Low Medium"], "Low Medium")
+                if vd == 2:
+                    return (label_to_score["Medium"], "Medium")
+                if vd == 3:
+                    return (label_to_score["Medium High"], "Medium High")
+                if vd >= 4:
+                    return (label_to_score["High"], "High")
+
+                # 4) fallback — keep whatever was computed earlier
+                cur_label = r.get('RiskLevel') or None
+                cur_score = r.get('RiskScore') if r.get('RiskScore') is not None else (label_to_score.get(cur_label) if cur_label else None)
+                return (int(cur_score) if cur_score is not None else None, cur_label)
+            except Exception:
+                return (r.get('RiskScore'), r.get('RiskLevel'))
+
+        # apply override and set columns (only where override returns non-null)
+        overrides = df.apply(lambda r: pd.Series(_compute_override_for_row(r), index=['__rs_override', '__rl_override']), axis=1)
+        # prefer override values where provided (non-null)
+        def _coerce_int(v):
+            try:
+                if v is None:
+                    return None
+                return int(v)
+            except Exception:
+                return None
+
+        df['RiskScore'] = overrides['__rs_override'].combine_first(df.get('RiskScore'))
+        df['RiskLevel'] = overrides['__rl_override'].combine_first(df.get('RiskLevel'))
+
+        # ensure RiskScore is integer where possible
+        try:
+            df['RiskScore'] = df['RiskScore'].apply(lambda v: _coerce_int(v) if v is not None else None)
+        except Exception:
+            pass
+
+    except Exception:
+        logging.exception("Scenario-based risk override failed (non-fatal).")
+
+
+    # Build textual Reasons and Explanation (if not already)
+    def reasons_for_row(r):
+        if not bool(r.get('IsFlagged')):
+            return None, None
+        ds_raw = r.get('DetectedScenarios')
+        if ds_raw:
+            ds = [s.strip() for s in ds_raw.split(";") if s and s.strip()]
+            explanation = _explain_scenarios_detected(r, ds)
+            reasons_codes = "; ".join(ds) if ds else None
+            return reasons_codes, explanation
+        return None, None
+
+
+
+
+    reason_tuples = df.apply(lambda r: pd.Series(reasons_for_row(r), index=['Reasons', 'ViolationExplanation']), axis=1)
+    def _sanitize_reason_val(v):
+        if v is None:
+            return None
+        try:
+            s = str(v).strip()
+            if s == "" or _is_placeholder_str(s):
+                return None
+            return s
+        except Exception:
+            return None
+
+    df['Reasons'] = reason_tuples['Reasons'].apply(_sanitize_reason_val)
+    df['ViolationExplanation'] = reason_tuples['ViolationExplanation'].apply(lambda v: None if _is_placeholder_str(v) else (str(v).strip() if v is not None else None))
+
+    # If flagged but no Reasons, ensure fallback
+    def _ensure_reason_for_flagged(row):
+        if bool(row.get('IsFlagged')) and (row.get('Reasons') is None or row.get('Reasons') == ''):
+            ds = row.get('DetectedScenarios')
+            if ds and not _is_placeholder_str(ds):
+                parts = [p.strip() for p in re.split(r'[;,\|]', str(ds)) if p and not _is_placeholder_str(p)]
+                if parts:
+                    return "; ".join(parts)
+            if int(row.get('ConsecWeeksShort4hrs') or 0) >= 1:
+                return "consecutive_short_weeks"
+            if int(row.get('ViolationDaysLast90') or 0) > 0:
+                return "historical_monitoring"
+            return None
+        return row.get('Reasons')
+
+    if 'IsFlagged' in df.columns:
+        df['Reasons'] = df.apply(_ensure_reason_for_flagged, axis=1)
+    else:
+        df['Reasons'] = df['Reasons'].apply(_sanitize_reason_val)
+
+    if 'OverlapWith' not in df.columns:
+        def overlap_with_fn(r):
+            d = r.get('Date')
+            uid = r.get('person_uid')
+            if (d, uid) in swipe_overlap_map:
+                return ";".join(sorted(str(x) for x in swipe_overlap_map[(d, uid)]))
+            return None
+        df['OverlapWith'] = df.apply(overlap_with_fn, axis=1)
+
+    # ensure booleans native
+    for col in [name for name, _ in SCENARIOS] + ['IsFlagged']:
+        if col in df.columns:
+            df[col] = df[col].astype(bool)
+
+    # return DataFrame
+    return df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 i dont understand Where below block insert 
 insert  below block in correct after / before function and share me fully updated Function so i can easily swap function each other 
 
