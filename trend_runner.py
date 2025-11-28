@@ -386,7 +386,8 @@ def scenario_overtime(row):
 def scenario_very_long_duration(row):
     return (row.get('DurationMinutes') or 0) >= 16 * 60
 
-def scenario_zero_swipes(row):
+
+# def scenario_zero_swipes(row):
     """
     Return True if CountSwipes is zero (or effectively zero/empty).
     Be defensive: handle None, NaN, numeric strings, floats etc.
@@ -414,47 +415,48 @@ def scenario_zero_swipes(row):
         return False
 
 
-def scenario_unusually_high_swipes(row):
-    cur = int(row.get('CountSwipes') or 0)
-    dur = float(row.get('DurationMinutes') or 0.0)
-    empid = row.get('EmployeeID')
-    try:
-        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = rec.get('TotalSwipes_median', np.nan)
-            if pd.notna(median) and median > 0:
-                return (cur > 3 * float(median)) and (dur < 60)
-    except Exception:
-        pass
-    try:
-        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
-            global_med = HIST_DF['TotalSwipes_median'].median()
-            if pd.notna(global_med) and global_med > 0:
-                return (cur > 3 * float(global_med)) and (dur < 60)
-    except Exception:
-        pass
-    return (cur > 50) and (dur < 60)
+# def scenario_unusually_high_swipes(row):
+#     cur = int(row.get('CountSwipes') or 0)
+#     dur = float(row.get('DurationMinutes') or 0.0)
+#     empid = row.get('EmployeeID')
+#     try:
+#         if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+#             rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+#             median = rec.get('TotalSwipes_median', np.nan)
+#             if pd.notna(median) and median > 0:
+#                 return (cur > 3 * float(median)) and (dur < 60)
+#     except Exception:
+#         pass
+#     try:
+#         if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+#             global_med = HIST_DF['TotalSwipes_median'].median()
+#             if pd.notna(global_med) and global_med > 0:
+#                 return (cur > 3 * float(global_med)) and (dur < 60)
+#     except Exception:
+#         pass
+#     return (cur > 50) and (dur < 60)
 
-def scenario_high_swipes_benign(row):
-    cur = int(row.get('CountSwipes') or 0)
-    dur = float(row.get('DurationMinutes') or 0.0)
-    empid = row.get('EmployeeID')
-    try:
-        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
-            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-            median = rec.get('TotalSwipes_median', np.nan)
-            if pd.notna(median) and median > 0:
-                return (cur > 3 * float(median)) and (dur >= 60)
-    except Exception:
-        pass
-    try:
-        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
-            global_med = HIST_DF['TotalSwipes_median'].median()
-            if pd.notna(global_med) and global_med > 0:
-                return (cur > 3 * float(global_med)) and (dur >= 60)
-    except Exception:
-        pass
-    return (cur > 50) and (dur >= 60)
+
+# def scenario_high_swipes_benign(row):
+#     cur = int(row.get('CountSwipes') or 0)
+#     dur = float(row.get('DurationMinutes') or 0.0)
+#     empid = row.get('EmployeeID')
+#     try:
+#         if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+#             rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+#             median = rec.get('TotalSwipes_median', np.nan)
+#             if pd.notna(median) and median > 0:
+#                 return (cur > 3 * float(median)) and (dur >= 60)
+#     except Exception:
+#         pass
+#     try:
+#         if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+#             global_med = HIST_DF['TotalSwipes_median'].median()
+#             if pd.notna(global_med) and global_med > 0:
+#                 return (cur > 3 * float(global_med)) and (dur >= 60)
+#     except Exception:
+#         pass
+#     return (cur > 50) and (dur >= 60)
 
 def scenario_behaviour_shift(row, hist_df=None, minutes_threshold=180):
     try:
@@ -483,21 +485,37 @@ def scenario_behaviour_shift(row, hist_df=None, minutes_threshold=180):
     except Exception:
         return False
 
-def scenario_repeated_short_breaks(row):
-    try:
-        break_count = int(row.get('BreakCount') or 0)
-        total_break_mins = float(row.get('TotalBreakMinutes') or 0.0)
-        long_break_count = int(row.get('LongBreakCount') or 0)
-        short_gap_count = int(row.get('ShortGapCount') or 0)
-        if break_count >= 2:
-            return True
-        if short_gap_count >= 5:
-            return True
-        if total_break_mins >= 180 and short_gap_count >= 2:
-            return True
-        return False
-    except Exception:
-        return False
+
+# def scenario_repeated_short_breaks(row):
+#     """
+#     New logic:
+#       - Flag if total break minutes > total work minutes (break-dominant).
+#       - Flag if total break minutes >= 4 hours (240 minutes).
+#       - Keep a fallback: if many very short gaps exist (ShortGapCount >= 5) flag as before.
+#     This removes brittle "BreakCount == 2" style checks and relies on durations/ratios instead.
+#     """
+#     try:
+#         total_break_mins = float(row.get('TotalBreakMinutes') or 0.0)
+#         total_work_mins  = float(row.get('TotalWorkMinutes') or 0.0)
+#         longest_break_mins = float(row.get('LongestBreakMinutes') or 0.0)
+#         short_gap_count = int(row.get('ShortGapCount') or 0)
+
+#         # Primary rule: break duration dominates working duration
+#         if total_break_mins > total_work_mins and total_break_mins > 0:
+#             return True
+
+#         # Secondary rule: any break-zone total >= 4 hours => flag
+#         if total_break_mins >= 240:
+#             return True
+
+#         # Fallback / traditional indicator: lots of very short repeated gaps
+#         if short_gap_count >= 5:
+#             return True
+
+#         return False
+#     except Exception:
+#         return False
+
 
 def scenario_multiple_location_same_day(row):
     return (row.get('UniqueLocations') or 0) > 1
@@ -532,16 +550,6 @@ def scenario_early_arrival_before_06(row):
         return False
 
 
-
-# def scenario_late_exit_after_23(row):
-    ls = row.get('LastSwipe')
-    if pd.isna(ls) or ls is None:
-        return False
-    try:
-        t = pd.to_datetime(ls).time()
-        return t >= time(hour=23)
-    except Exception:
-        return False
 
 def scenario_late_exit_after_23(row):
     ls = row.get('LastSwipe')
@@ -636,9 +644,9 @@ SCENARIOS = [
     ("only_out", scenario_only_out),
     ("overtime_>=14h", scenario_overtime),
     ("very_long_duration_>=16h", scenario_very_long_duration),
-    ("zero_swipes", scenario_zero_swipes),
-    ("unusually_high_swipes", scenario_unusually_high_swipes),
-    ("repeated_short_breaks", scenario_repeated_short_breaks),
+    # ("zero_swipes", scenario_zero_swipes),
+    # ("unusually_high_swipes", scenario_unusually_high_swipes),
+    # ("repeated_short_breaks", scenario_repeated_short_breaks),
     ("multiple_location_same_day", scenario_multiple_location_same_day),
     ("weekend_activity", scenario_weekend_activity),
     ("repeated_rejection_count", scenario_repeated_rejection_count),
@@ -652,7 +660,7 @@ SCENARIOS = [
     ("high_variance_duration", scenario_high_variance_duration),
     ("short_duration_on_high_presence_days", scenario_short_duration_on_high_presence_days),
     ("swipe_overlap", scenario_swipe_overlap),
-    ("high_swipes_benign", scenario_high_swipes_benign),
+    # ("high_swipes_benign", scenario_high_swipes_benign),
     ("behaviour_shift", scenario_behaviour_shift),
     ("shortstay_longout_repeat", scenario_shortstay_longout_repeat)
 ]
@@ -885,96 +893,145 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
         logging.info("compute_features: no rows after PersonnelType filter")
         return pd.DataFrame()
 
-    # person_uid canonical
+
+
+    # ensure person_uid and Date exist
     if 'person_uid' not in sw.columns:
-        def make_person_uid_local(r):
-            empid_val = None
-            if empid_col and empid_col in r and pd.notna(r.get(empid_col)):
-                empid_val = r.get(empid_col)
-            elif 'EmployeeID' in r and pd.notna(r.get('EmployeeID')):
-                empid_val = r.get('EmployeeID')
-            empident_val = r.get('EmployeeIdentity') if 'EmployeeIdentity' in r else None
-            name_val = None
-            if name_col and name_col in r:
-                name_val = r.get(name_col)
-            elif 'EmployeeName' in r:
-                name_val = r.get('EmployeeName')
-            elif 'ObjectName1' in r:
-                name_val = r.get('ObjectName1')
+        def _make_uid_row(r):
             return _canonical_person_uid({
-                'EmployeeID': empid_val,
-                'EmployeeIdentity': empident_val,
-                'EmployeeName': name_val
+                'EmployeeID': r.get(empid_col) if empid_col in r else r.get('EmployeeID'),
+                'EmployeeIdentity': r.get('EmployeeIdentity', None),
+                'EmployeeName': r.get(name_col) if name_col in r else r.get('EmployeeName', None)
             })
-        sw['person_uid'] = sw.apply(make_person_uid_local, axis=1)
+        sw['person_uid'] = sw.apply(_make_uid_row, axis=1)
 
-    # Build a robust selection list for grouping (only include columns that exist)
-    sel_cols = ['LocaleMessageTime', 'Direction', 'Door', 'PartitionName2', 'Rejection_Type',
-                'CardNumber', 'EmployeeID', 'EmployeeName', 'ObjectName1', 'PersonnelType', 'PersonnelTypeName',
-                'EmployeeIdentity']
-    sel_cols_present = [c for c in sel_cols if c in sw.columns]
+    # ensure Date parsed
+    if 'Date' not in sw.columns or sw['Date'].isnull().all():
+        try:
+            sw['Date'] = pd.to_datetime(sw['LocaleMessageTime'], errors='coerce').dt.date
+        except Exception:
+            sw['Date'] = None
 
-    # selection for grouping should include person_uid and Date and only present sel_cols
+
+    # ---- prepare list of extra columns we may want to include when grouping ----
+    sel_cols_candidates = [
+        'LocaleMessageTime', 'Direction', 'Door', 'CardNumber', 'EmployeeID',
+        'EmployeeName', 'PartitionName2', 'Rejection_Type', 'PersonnelTypeName',
+        'EmployeeIdentity', 'Int1', 'Text12', 'ObjectName1'
+    ]
+    # keep only those actually present in the current swipe frame
+    sel_cols_present = [c for c in sel_cols_candidates if c in sw.columns]
+    # selection slice we will use for grouping (always include person_uid and Date)
     selection_for_group = ['person_uid', 'Date'] + sel_cols_present
-    # ensure uniqueness and filter columns that actually exist (defensive)
-    selection_for_group = [c for i, c in enumerate(selection_for_group) if c in sw.columns and c not in selection_for_group[:i]]
 
-    def agg_swipe_group(g):
-        times = sorted(g['LocaleMessageTime'].dropna().tolist()) if 'LocaleMessageTime' in g else []
-        gaps = []
-        short_gap_count = 0
-        for i in range(1, len(times)):
-            s = (times[i] - times[i-1]).total_seconds()
-            gaps.append(s)
-            if s <= 5*60:
-                short_gap_count += 1
-        max_gap = int(max(gaps)) if gaps else 0
+    # final safe selection for grouping (only columns that actually exist)
+    available_cols = [c for c in selection_for_group if c in sw.columns]
+    # must have both person_uid and Date to group
+    if 'person_uid' not in available_cols or 'Date' not in available_cols:
+        # nothing to group on -> return empty
+        return pd.DataFrame()
 
-        in_count = int((g['Direction'] == 'InDirection').sum()) if 'Direction' in g.columns else 0
-        out_count = int((g['Direction'] == 'OutDirection').sum()) if 'Direction' in g.columns else 0
-        unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
-        unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
-        rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+    try:
+        # group on the safe selection and apply aggregator
+        grouped = sw[available_cols].groupby(['person_uid', 'Date'])
+        features = grouped.apply(agg_swipe_group).reset_index()
+    except Exception:
+        logging.exception("compute_features: groupby/apply failed")
+        # try a defensive fallback grouping without selecting columns slice
+        try:
+            grouped = sw.groupby(['person_uid', 'Date'])
+            features = grouped.apply(agg_swipe_group).reset_index()
+        except Exception:
+            logging.exception("compute_features: fallback groupby failed")
+            return pd.DataFrame()
 
-        # card extraction
-        card_numbers = []
+    # normalize column names (keep compatibility)
+    if 'person_uid' not in features.columns and 'level_0' in features.columns:
+        features.rename(columns={'level_0': 'person_uid', 'level_1': 'Date'}, inplace=True)
+    return features
+
+
+
+
+# ---------- robust agg_swipe_group (replace existing definition) ----------
+def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
+    # times sorted
+    times = []
+    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
+        try:
+            times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
+        except Exception:
+            # fallback: attempt to coerce individually
+            try:
+                times = sorted([pd.to_datetime(x) for x in list(g['LocaleMessageTime'].dropna())])
+            except Exception:
+                times = []
+    gaps = []
+    short_gap_count = 0
+    for i in range(1, len(times)):
+        s = (times[i] - times[i-1]).total_seconds()
+        gaps.append(s)
+        if s <= 5 * 60:
+            short_gap_count += 1
+    max_gap = int(max(gaps)) if gaps else 0
+
+    # Direction detection: be tolerant (substring match, case-insensitive)
+    in_count = 0
+    out_count = 0
+    if 'Direction' in g.columns:
+        try:
+            sers = g['Direction'].astype(str).fillna('').str.lower()
+            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b|in\$|in$|in\W', regex=True).sum())
+            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|out\$|out$|out\W|exit', regex=True).sum())
+            # fallback: simple containment
+            if in_count == 0:
+                in_count = int(sers.str.contains('in', na=False).sum())
+            if out_count == 0:
+                out_count = int(sers.str.contains('out|exit', na=False).sum())
+        except Exception:
+            try:
+                in_count = int((g['Direction'] == 'IN').sum())
+                out_count = int((g['Direction'] == 'OUT').sum())
+            except Exception:
+                in_count = 0
+                out_count = 0
+
+    unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
+    unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
+    rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
+
+    # card extraction: tolerant
+    card_numbers = []
+    try:
         if 'CardNumber' in g.columns:
-            card_numbers = list(pd.unique(g['CardNumber'].dropna()))
-        if not card_numbers and 'CardNumber' in g.columns:
-            card_numbers = list(pd.unique(g['CardNumber'].dropna()))
+            card_numbers = list(pd.unique(g['CardNumber'].dropna().astype(str)))
         if not card_numbers:
             for c in g.columns:
-                cl = c.lower()
-                if 'value' == cl or 'xml' in cl or 'msg' in cl or 'shred' in cl:
+                lc = c.lower()
+                if 'card' in lc or 'chuid' in lc or 'value' == lc or 'xml' in lc or 'msg' in lc:
                     try:
-                        vals = list(pd.unique(g[c].dropna()))
+                        vals = list(pd.unique(g[c].dropna().astype(str)))
                         if vals:
                             card_numbers.extend(vals)
                     except Exception:
                         continue
+        # xml extraction fallback
         if not card_numbers:
             for c in g.columns:
-                cl = c.lower()
-                if 'xml' in cl:
+                if 'xml' in c.lower():
                     for raw in g[c].dropna().astype(str):
-                        extracted = _extract_card_from_xml(raw)
-                        if extracted:
-                            card_numbers.append(extracted)
-        card_numbers = list(dict.fromkeys(card_numbers))
-        card_number = None
-        for c in card_numbers:
-            n = _normalize_id_val(c)
-            if n and not _looks_like_guid(n):
-                card_number = n
-                break
+                        x = _extract_card_from_xml(raw)
+                        if x:
+                            card_numbers.append(x)
+    except Exception:
+        card_numbers = []
+    card_numbers = list(dict.fromkeys([_normalize_id_val(x) for x in card_numbers if _normalize_id_val(x)]))
+    card_number = card_numbers[0] if card_numbers else None
 
-        # stable id/name
-        employee_id = None
-        employee_name = None
-        employee_identity = None
-        personnel_type = None
-
-        if 'EmployeeID' in g.columns:
+    # stable id/name extraction (kept as before but robust)
+    employee_id = None
+    if 'EmployeeID' in g.columns:
+        try:
             vals = g['EmployeeID'].dropna().astype(str).map(lambda x: x.strip())
             employee_id = _pick_first_non_guid_value(vals)
             if employee_id is None and not vals.empty:
@@ -982,426 +1039,180 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
                 normalized = _normalize_id_val(v0)
                 if normalized and not _looks_like_guid(normalized):
                     employee_id = normalized
+        except Exception:
+            employee_id = None
 
-        if (not employee_id) and 'PersonnelType' in g.columns:
-            try:
-                pvals = g['PersonnelType'].dropna().astype(str)
-                if not pvals.empty:
-                    p0 = pvals.iloc[0]
-                    if str(p0).strip().lower() in ('contractor', 'terminated contractor', 'contractor '):
-                        for c in g.columns:
-                            if c.lower() == 'text12':
-                                vals = g[c].dropna().astype(str).map(lambda x: x.strip())
-                                employee_id = _pick_first_non_guid_value(vals)
-                                if employee_id:
-                                    break
-            except Exception:
-                pass
-
-        if 'EmployeeIdentity' in g.columns:
+    employee_identity = None
+    if 'EmployeeIdentity' in g.columns:
+        try:
             vals = g['EmployeeIdentity'].dropna().astype(str).map(lambda x: x.strip())
             if not vals.empty:
                 employee_identity = vals.iloc[0]
+        except Exception:
+            employee_identity = None
 
-        candidate_name_vals = None
-        if 'EmployeeName' in g.columns:
-            candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
-        elif 'ObjectName1' in g.columns:
-            candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+    employee_name = None
+    candidate_name_vals = None
+    if 'EmployeeName' in g.columns:
+        candidate_name_vals = g['EmployeeName'].dropna().astype(str).map(lambda x: x.strip())
+    elif 'ObjectName1' in g.columns:
+        candidate_name_vals = g['ObjectName1'].dropna().astype(str).map(lambda x: x.strip())
+    if candidate_name_vals is not None and not candidate_name_vals.empty:
+        employee_name = _pick_first_non_guid_value(candidate_name_vals)
+        if employee_name is None:
+            for v in candidate_name_vals:
+                if _looks_like_name(v) and not _is_placeholder_str(v):
+                    employee_name = str(v).strip()
+                    break
 
-        if candidate_name_vals is not None and not candidate_name_vals.empty:
-            employee_name = _pick_first_non_guid_value(candidate_name_vals)
-            if employee_name is None:
-                for v in candidate_name_vals:
-                    if _looks_like_name(v) and not _is_placeholder_str(v):
-                        employee_name = str(v).strip()
-                        break
-
-        if 'PersonnelTypeName' in g.columns:
+    personnel_type = None
+    if 'PersonnelTypeName' in g.columns:
+        try:
             vals = g['PersonnelTypeName'].dropna()
             if not vals.empty:
                 personnel_type = vals.iloc[0]
-        elif 'PersonnelType' in g.columns:
+        except Exception:
+            personnel_type = None
+    elif 'PersonnelType' in g.columns:
+        try:
             vals = g['PersonnelType'].dropna()
             if not vals.empty:
                 personnel_type = vals.iloc[0]
+        except Exception:
+            personnel_type = None
 
-        first_swipe = None
-        last_swipe = None
-        if times:
-            first_swipe = times[0]
-            last_swipe = times[-1]
+    first_swipe = times[0] if times else None
+    last_swipe = times[-1] if times else None
 
-        # timeline & segments with mapping to zones
-        timeline = []
-        for _, row in g.sort_values('LocaleMessageTime').iterrows():
-            t = row.get('LocaleMessageTime')
-            dname = None
-            if 'Door' in row and pd.notna(row.get('Door')):
-                dname = row.get('Door')
-            direction = None
-            if 'Direction' in row and pd.notna(row.get('Direction')):
-                direction = row.get('Direction')
-            zone = map_door_to_zone(dname, direction)
-            timeline.append((t, dname, direction, zone))
+    # build timeline -> segments (zone aware)
+    timeline = []
+    # SAFE sort/iterate: only sort when column exists, otherwise iterate rows as-is
+    if 'LocaleMessageTime' in g.columns:
+        try:
+            rows_to_iter = g.sort_values('LocaleMessageTime')
+        except Exception:
+            # older pandas or unexpected errors -> fall back to unsorted frame
+            rows_to_iter = g
+    else:
+        rows_to_iter = g
 
-        segments = []
-        if timeline:
-            cur_zone = None
-            seg_start = timeline[0][0]
-            seg_label = None
-            for (t, dname, direction, zone) in timeline:
-                if zone in _BREAK_ZONES:
-                    lbl = 'break'
-                elif zone == _OUT_OF_OFFICE_ZONE:
-                    lbl = 'out_of_office'
-                else:
-                    lbl = 'work'
-                if cur_zone is None:
-                    cur_zone = zone
-                    seg_label = lbl
+    for _, row in rows_to_iter.iterrows():
+        t = row.get('LocaleMessageTime')
+        dname = row.get('Door') if 'Door' in row else None
+        direction = row.get('Direction') if 'Direction' in row else None
+        zone = map_door_to_zone(dname, direction)
+        timeline.append((t, dname, direction, zone))
+
+    segments = []
+    if timeline:
+        cur_zone = None
+        seg_start = timeline[0][0]
+        seg_label = None
+        for (t, dname, direction, zone) in timeline:
+            lbl = 'work'
+            if zone is not None and zone in _BREAK_ZONES:
+                lbl = 'break'
+            elif zone == _OUT_OF_OFFICE_ZONE:
+                lbl = 'out_of_office'
+            else:
+                lbl = 'work'
+            if cur_zone is None:
+                cur_zone = zone
+                seg_label = lbl
+                seg_start = t
+            else:
+                if lbl != seg_label:
+                    segments.append({'label': seg_label, 'start': seg_start, 'end': t, 'start_zone': cur_zone})
                     seg_start = t
+                    seg_label = lbl
+                    cur_zone = zone
                 else:
-                    if lbl != seg_label:
-                        segments.append({
-                            'label': seg_label,
-                            'start': seg_start,
-                            'end': t,
-                            'start_zone': cur_zone
-                        })
-                        seg_start = t
-                        seg_label = lbl
-                        cur_zone = zone
-                    else:
-                        cur_zone = cur_zone or zone
-            if seg_label is not None:
-                segments.append({
-                    'label': seg_label,
-                    'start': seg_start,
-                    'end': timeline[-1][0],
-                    'start_zone': cur_zone
-                })
+                    cur_zone = cur_zone or zone
+        if seg_label is not None:
+            segments.append({'label': seg_label, 'start': seg_start, 'end': timeline[-1][0], 'start_zone': cur_zone})
 
-        break_count = 0
-        long_break_count = 0
-        total_break_minutes = 0.0
+    # compute durations
+    total_work_minutes = 0.0
+    total_break_minutes = 0.0
+    longest_break_minutes = 0.0
+    break_segments_count = 0
+    for s in segments:
+        lbl = s.get('label')
+        start = s.get('start')
+        end = s.get('end')
+        try:
+            dur_mins = ((end - start).total_seconds() / 60.0) if (start is not None and end is not None) else 0.0
+        except Exception:
+            dur_mins = 0.0
+        if lbl == 'work':
+            total_work_minutes += dur_mins
+        elif lbl in ('break', 'out_of_office'):
+            break_segments_count += 1
+            total_break_minutes += dur_mins
+            if dur_mins > longest_break_minutes:
+                longest_break_minutes = dur_mins
 
-        BREAK_MINUTES_THRESHOLD = 60
-        OUT_OFFICE_COUNT_MINUTES = 180
-        LONG_BREAK_FLAG_MINUTES = 120
+    break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
+    break_more_than_4h = bool(total_break_minutes >= 240)
 
-        for i, s in enumerate(segments):
-            lbl = s.get('label')
-            start = s.get('start')
-            end = s.get('end')
-            dur_mins = ((end - start).total_seconds() / 60.0) if (start and end) else 0.0
-            if lbl == 'break':
-                if dur_mins >= BREAK_MINUTES_THRESHOLD:
-                    break_count += 1
-                    total_break_minutes += dur_mins
-                    if dur_mins >= LONG_BREAK_FLAG_MINUTES:
-                        long_break_count += 1
-            elif lbl == 'out_of_office':
-                prev_lbl = segments[i-1]['label'] if i > 0 else None
-                next_lbl = segments[i+1]['label'] if i < len(segments)-1 else None
-                if prev_lbl == 'work' and next_lbl == 'work' and dur_mins >= OUT_OFFICE_COUNT_MINUTES:
-                    break_count += 1
-                    total_break_minutes += dur_mins
-                    if dur_mins >= LONG_BREAK_FLAG_MINUTES:
-                        long_break_count += 1
+    break_count = int(break_segments_count)
+    long_break_count = int(sum(1 for s in segments
+                               if s.get('label') in ('break','out_of_office') and
+                                  (s.get('start') is not None and s.get('end') is not None and ((s['end'] - s['start']).total_seconds()/60.0) >= 120)))
 
+    # pattern detection (unchanged)
+    pattern_flag = False
+    pattern_sequence_readable = None
+    try:
+        seq = []
+        for s in segments:
+            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
+            seq.append((s['label'], int(round(dur_mins))))
+        for i in range(len(seq)-2):
+            a = seq[i]; b = seq[i+1]; c = seq[i+2]
+            if (a[0] == 'work' and a[1] < 60) and (b[0] in ('out_of_office','break') and b[1] >= 120) and (c[0] == 'work' and c[1] < 60):
+                pattern_flag = True
+                seq_fragment = [a,b,c]
+                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
+                break
+    except Exception:
         pattern_flag = False
         pattern_sequence_readable = None
-        try:
-            seq = []
-            for s in segments:
-                dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
-                seq.append((s['label'], int(round(dur_mins))))
-            for i in range(len(seq)-2):
-                a = seq[i]
-                b = seq[i+1]
-                c = seq[i+2]
-                if (a[0] == 'work' and a[1] < 60) and \
-                   (b[0] in ('out_of_office','break') and b[1] >= LONG_BREAK_FLAG_MINUTES) and \
-                   (c[0] == 'work' and c[1] < 60):
-                    pattern_flag = True
-                    seq_fragment = [a, b, c]
-                    pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
-                    break
-        except Exception:
-            pattern_flag = False
-            pattern_sequence_readable = None
 
-        return pd.Series({
-            'CountSwipes': int(len(g)),
-            'MaxSwipeGapSeconds': max_gap,
-            'ShortGapCount': int(short_gap_count),
-            'InCount': in_count,
-            'OutCount': out_count,
-            'UniqueDoors': unique_doors,
-            'UniqueLocations': unique_locations,
-            'RejectionCount': rejection_count,
-            'CardNumber': card_number,
-            'EmployeeID': employee_id,
-            'EmployeeIdentity': employee_identity,
-            'EmployeeName': employee_name,
-            'PersonnelType': personnel_type,
-            'FirstSwipe': first_swipe,
-            'LastSwipe': last_swipe,
-            'BreakCount': int(break_count),
-            'LongBreakCount': int(long_break_count),
-            'TotalBreakMinutes': float(round(total_break_minutes,1)),
-            'PatternShortLongRepeat': bool(pattern_flag),
-            'PatternSequenceReadable': pattern_sequence_readable,
-            'PatternSequence': None
-        })
+    return pd.Series({
+        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
+        'MaxSwipeGapSeconds': int(max_gap),
+        'ShortGapCount': int(short_gap_count),
+        'InCount': int(in_count),
+        'OutCount': int(out_count),
+        'UniqueDoors': int(unique_doors),
+        'UniqueLocations': int(unique_locations),
+        'RejectionCount': int(rejection_count),
+        'CardNumber': card_number,
+        'EmployeeID': employee_id,
+        'EmployeeIdentity': employee_identity,
+        'EmployeeName': employee_name,
+        'PersonnelType': personnel_type,
+        'FirstSwipe': first_swipe,
+        'LastSwipe': last_swipe,
+        'BreakCount': int(break_count),
+        'LongBreakCount': int(long_break_count),
+        'TotalBreakMinutes': float(round(total_break_minutes, 1)),
+        'TotalWorkMinutes': float(round(total_work_minutes, 1)),
+        'LongestBreakMinutes': float(round(longest_break_minutes, 1)),
+        'BreakSegmentsCount': int(break_segments_count),
+        'BreakDominant': bool(break_dominant),
+        'BreakMoreThan4h': bool(break_more_than_4h),
+        'PatternShortLongRepeat': bool(pattern_flag),
+        'PatternSequenceReadable': pattern_sequence_readable,
+        'PatternSequence': None
+    })
 
-    # safe grouping: use selection_for_group (only columns that exist)
-    try:
-        grouped = sw[selection_for_group].groupby(['person_uid', 'Date'])[sel_cols_present]
-    except Exception:
-        # defensive fallback: group on what we can
-        available = [c for c in ['person_uid', 'Date'] + sel_cols_present if c in sw.columns]
-        grouped = sw[available].groupby(['person_uid', 'Date'])[ [c for c in sel_cols_present if c in sw.columns] ]
 
-    grouped = grouped.apply(agg_swipe_group).reset_index()
-
-    # POST-PROCESS: merge early-morning fragments into previous day (heuristic)
-    try:
-        grouped['FirstSwipe_dt'] = pd.to_datetime(grouped['FirstSwipe'], errors='coerce')
-        grouped['LastSwipe_dt']  = pd.to_datetime(grouped['LastSwipe'],  errors='coerce')
-        rows_to_drop = set()
-        MERGE_GAP_SECONDS = int(4 * 3600)
-        for pid, sub in grouped.sort_values(['person_uid','Date']).groupby('person_uid'):
-            prev_idx = None
-            for idx, r in sub.reset_index().iterrows():
-                real_idx = int(r['index']) if 'index' in r else r.name
-                cur_first = pd.to_datetime(grouped.at[real_idx, 'FirstSwipe_dt'])
-                if prev_idx is not None:
-                    prev_last = pd.to_datetime(grouped.at[prev_idx, 'LastSwipe_dt'])
-                    if (not pd.isna(cur_first)) and (not pd.isna(prev_last)):
-                        gap = (cur_first - prev_last).total_seconds()
-                        if 0 <= gap <= MERGE_GAP_SECONDS and cur_first.time().hour < 2:
-                            try:
-                                grouped.at[prev_idx, 'CountSwipes'] = int(grouped.at[prev_idx, 'CountSwipes']) + int(grouped.at[real_idx, 'CountSwipes'])
-                                grouped.at[prev_idx, 'MaxSwipeGapSeconds'] = max(int(grouped.at[prev_idx, 'MaxSwipeGapSeconds'] or 0), int(grouped.at[real_idx, 'MaxSwipeGapSeconds'] or 0), int(gap))
-                                if not pd.isna(grouped.at[real_idx, 'LastSwipe_dt']):
-                                    if pd.isna(grouped.at[prev_idx, 'LastSwipe_dt']) or grouped.at[real_idx, 'LastSwipe_dt'] > grouped.at[prev_idx, 'LastSwipe_dt']:
-                                        grouped.at[prev_idx, 'LastSwipe_dt'] = grouped.at[real_idx, 'LastSwipe_dt']
-                                        grouped.at[prev_idx, 'LastSwipe'] = grouped.at[real_idx, 'LastSwipe']
-                                if not grouped.at[prev_idx, 'CardNumber']:
-                                    grouped.at[prev_idx, 'CardNumber'] = grouped.at[real_idx, 'CardNumber']
-                                grouped.at[prev_idx, 'UniqueDoors'] = int(max(int(grouped.at[prev_idx].get('UniqueDoors') or 0), int(grouped.at[real_idx].get('UniqueDoors') or 0)))
-                                grouped.at[prev_idx, 'UniqueLocations'] = int(max(int(grouped.at[prev_idx].get('UniqueLocations') or 0), int(grouped.at[real_idx].get('UniqueLocations') or 0)))
-                                rows_to_drop.add(real_idx)
-                                continue
-                            except Exception:
-                                pass
-                prev_idx = real_idx
-        if rows_to_drop:
-            grouped = grouped.drop(index=list(rows_to_drop)).reset_index(drop=True)
-    except Exception:
-        logging.exception("Failed merge-early-morning fragments (non-fatal).")
-
-    dur = pd.DataFrame() if durations is None else durations.copy()
-    if not dur.empty and 'Date' in dur.columns:
-        dur['Date'] = pd.to_datetime(dur['Date'], errors='coerce').dt.date
-
-    merged = pd.merge(grouped, dur, how='left', on=['person_uid', 'Date'])
-
-    # coalesce duplicated columns (_x/_y) produced by merge
-    def _coalesce_merge_columns(df, bases):
-        for base in bases:
-            x = base + "_x"
-            y = base + "_y"
-            try:
-                has_base = base in df.columns
-                base_all_null = False
-                if has_base:
-                    base_all_null = df[base].isnull().all()
-            except Exception:
-                has_base = base in df.columns
-                base_all_null = True
-            if (not has_base) or base_all_null:
-                if x in df.columns and y in df.columns:
-                    try:
-                        df[base] = df[x].combine_first(df[y])
-                    except Exception:
-                        try:
-                            df[base] = df[x].where(df[x].notna(), df[y] if y in df.columns else None)
-                        except Exception:
-                            if x in df.columns:
-                                df[base] = df[x]
-                            elif y in df.columns:
-                                df[base] = df[y]
-                elif x in df.columns:
-                    df[base] = df[x]
-                elif y in df.columns:
-                    df[base] = df[y]
-    _coalesce_merge_columns(merged, [
-        "EmployeeID", "Int1", "Text12", "CardNumber", "EmployeeName", "EmployeeIdentity"
-    ])
-    drop_cols = [c for c in merged.columns if c.endswith("_x") or c.endswith("_y")]
-    if drop_cols:
-        try:
-            merged.drop(columns=drop_cols, inplace=True)
-        except Exception:
-            for c in drop_cols:
-                if c in merged.columns:
-                    try:
-                        merged.drop(columns=[c], inplace=True)
-                    except Exception:
-                        pass
-
-    # ensure columns exist and normalized
-    def ensure_col(df, col, default=None):
-        if col not in df.columns:
-            df[col] = default
-
-    ensure_col(merged, 'DurationSeconds', 0)
-    ensure_col(merged, 'FirstSwipe', pd.NaT)
-    ensure_col(merged, 'LastSwipe', pd.NaT)
-    ensure_col(merged, 'CountSwipes', 0)
-    ensure_col(merged, 'MaxSwipeGapSeconds', 0)
-    ensure_col(merged, 'ShortGapCount', 0)
-    ensure_col(merged, 'RejectionCount', 0)
-    ensure_col(merged, 'UniqueLocations', 0)
-    ensure_col(merged, 'UniqueDoors', 0)
-    ensure_col(merged, 'CardNumber', None)
-    ensure_col(merged, 'EmployeeID', None)
-    ensure_col(merged, 'EmployeeName', None)
-    ensure_col(merged, 'EmployeeIdentity', None)
-    ensure_col(merged, 'PersonnelType', None)
-    ensure_col(merged, 'BreakCount', 0)
-    ensure_col(merged, 'LongBreakCount', 0)
-    ensure_col(merged, 'TotalBreakMinutes', 0.0)
-    ensure_col(merged, 'PatternShortLongRepeat', False)
-    ensure_col(merged, 'PatternSequenceReadable', None)
-    ensure_col(merged, 'PatternSequence', None)
-
-    if 'EmployeeName' in merged.columns:
-        def choose_best_name(row):
-            gname = row.get('EmployeeName')
-            dname = None
-            for cand in ('EmployeeName', 'employee_name', 'objectname1', 'ObjectName1'):
-                if cand in row and row.get(cand) is not None:
-                    dname = row.get(cand)
-                    break
-            if _looks_like_name(gname):
-                return str(gname).strip()
-            if _looks_like_name(dname):
-                return str(dname).strip()
-            if gname and not _looks_like_guid(gname) and not _is_placeholder_str(gname):
-                return str(gname).strip()
-            if dname and not _is_placeholder_str(dname):
-                return str(dname).strip()
-            return None
-        merged['EmployeeName'] = merged.apply(choose_best_name, axis=1)
-    else:
-        if not dur.empty:
-            def fill_name_from_dur(row):
-                gname = row.get('EmployeeName')
-                if _looks_like_name(gname) and not _is_placeholder_str(gname):
-                    return gname
-                for cand in ('EmployeeName', 'EmployeeName_y', 'EmployeeName_x'):
-                    if cand in row and _looks_like_name(row[cand]) and not _is_placeholder_str(row[cand]):
-                        return row[cand]
-                return None
-            merged['EmployeeName'] = merged.apply(fill_name_from_dur, axis=1)
-
-    def normalize_empid(v):
-        if v is None:
-            return None
-        try:
-            s = str(v).strip()
-            if s == '' or s.lower() == 'nan' or _is_placeholder_str(s):
-                return None
-            if _looks_like_guid(s):
-                return None
-            try:
-                if '.' in s:
-                    f = float(s)
-                    if math.isfinite(f) and f.is_integer():
-                        return str(int(f))
-            except Exception:
-                pass
-            return s
-        except Exception:
-            return None
-
-    merged['EmployeeID'] = merged['EmployeeID'].apply(normalize_empid)
-
-    def normalize_card(v):
-        if v is None:
-            return None
-        try:
-            s = str(v).strip()
-            if s == '' or s.lower() == 'nan' or _is_placeholder_str(s):
-                return None
-            if _looks_like_guid(s):
-                return None
-            return s
-        except Exception:
-            return None
-
-    merged['CardNumber'] = merged['CardNumber'].apply(normalize_card)
-
-    if 'DurationSeconds' not in merged.columns or merged['DurationSeconds'].isnull().all():
-        try:
-            merged['DurationSeconds'] = (pd.to_datetime(merged['LastSwipe']) - pd.to_datetime(merged['FirstSwipe'])).dt.total_seconds().clip(lower=0).fillna(0)
-        except Exception:
-            merged['DurationSeconds'] = merged.get('DurationSeconds', 0)
-
-    merged['DurationSeconds'] = pd.to_numeric(merged['DurationSeconds'], errors='coerce').fillna(0).astype(float)
-    merged['DurationMinutes'] = (merged['DurationSeconds'] / 60.0).astype(float)
-    merged['CountSwipes'] = merged['CountSwipes'].fillna(0).astype(int)
-    merged['MaxSwipeGapSeconds'] = merged['MaxSwipeGapSeconds'].fillna(0).astype(int)
-    merged['ShortGapCount'] = merged['ShortGapCount'].fillna(0).astype(int)
-    merged['RejectionCount'] = merged['RejectionCount'].fillna(0).astype(int)
-    merged['UniqueLocations'] = merged['UniqueLocations'].fillna(0).astype(int)
-    merged['UniqueDoors'] = merged['UniqueDoors'].fillna(0).astype(int)
-    merged['BreakCount'] = merged['BreakCount'].fillna(0).astype(int)
-    merged['LongBreakCount'] = merged['LongBreakCount'].fillna(0).astype(int)
-    merged['TotalBreakMinutes'] = merged['TotalBreakMinutes'].fillna(0.0).astype(float)
-    merged['PatternShortLongRepeat'] = merged['PatternShortLongRepeat'].fillna(False).astype(bool)
-
-    for col in ['FirstSwipe', 'LastSwipe']:
-        try:
-            merged[col] = pd.to_datetime(merged[col], errors='coerce')
-        except Exception:
-            merged[col] = pd.NaT
-
-    merged['OnlyIn'] = ((merged.get('InCount', 0) > 0) & (merged.get('OutCount', 0) == 0)).astype(int)
-    merged['OnlyOut'] = ((merged.get('OutCount', 0) > 0) & (merged.get('InCount', 0) == 0)).astype(int)
-    merged['SingleDoor'] = (merged.get('UniqueDoors', 0) <= 1).astype(int)
-
-    hist_map = {}
-    if not HIST_DF.empty and 'EmployeeID' in HIST_DF.columns:
-        hist_map = HIST_DF.set_index('EmployeeID').to_dict(orient='index')
-    merged['EmpHistoryPresent'] = merged['EmployeeID'].apply(lambda x: _normalize_id_val(x) in hist_map if pd.notna(x) else False)
-
-    for c in ['EmployeeID', 'CardNumber', 'EmployeeIdentity', 'PersonnelType']:
-        if c in merged.columns:
-            def _clean_str_val(v):
-                if v is None:
-                    return None
-                try:
-                    s = str(v).strip()
-                    if s == '' or s.lower() == 'nan' or _is_placeholder_str(s):
-                        return None
-                    return s
-                except Exception:
-                    return None
-            merged[c] = merged[c].apply(_clean_str_val)
-
-    if 'EmployeeName' in merged.columns:
-        merged['EmployeeName'] = merged['EmployeeName'].apply(lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v)) or _looks_like_guid(v) or _is_placeholder_str(v)) else str(v).strip())
-
-    return merged
 
 # ---------------- SCENARIO WEIGHTS ----------------
 WEIGHTS = {
-    "long_gap_>=4.5h": 0.3,
+    "long_gap_>=4.5h": 1.3,
     "short_duration_<4h": 1.0,
     "coffee_badging": 1.0,
     "low_swipe_count_<=5": 0.5,
@@ -1432,10 +1243,11 @@ WEIGHTS = {
 ANOMALY_THRESHOLD = 1.5
 
 
+
+
+# ---------- small improvement in _read_past_trend_csvs: normalize 'date' column name ----------
 def _read_past_trend_csvs(outdir: str, window_days: int, target_date: date):
     p = Path(outdir)
-    # Previously this was hard-coded to "trend_pune_*.csv" which misses other city files.
-    # Use a permissive pattern to capture trend_<city>_YYYYMMDD.csv for all cities.
     csvs = sorted(p.glob("trend_*.csv"), reverse=True)
     if not csvs:
         return pd.DataFrame()
@@ -1444,36 +1256,38 @@ def _read_past_trend_csvs(outdir: str, window_days: int, target_date: date):
     for fp in csvs:
         try:
             df = pd.read_csv(fp, parse_dates=['Date'])
-            if 'Date' in df.columns:
-                try:
-                    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-                except Exception:
-                    pass
-                # include target_date in the window (cutoff <= Date <= target_date)
-                def _date_in_window(d):
-                    try:
-                        return d is not None and (d >= cutoff and d <= target_date)
-                    except Exception:
-                        return False
-                df = df[df['Date'].apply(_date_in_window)]
-            dfs.append(df)
         except Exception:
             try:
                 df = pd.read_csv(fp, dtype=str)
-                if 'Date' in df.columns:
-                    try:
-                        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-                        def _date_in_window(d):
-                            try:
-                                return d is not None and (d >= cutoff and d <= target_date)
-                            except Exception:
-                                return False
-                        df = df[df['Date'].apply(_date_in_window)]
-                    except Exception:
-                        pass
-                dfs.append(df)
             except Exception:
                 continue
+
+        # normalize case-insensitive 'date' -> 'Date' so subsequent logic is consistent
+        if 'Date' not in df.columns:
+            for c in df.columns:
+                if c.lower() == 'date':
+                    df.rename(columns={c: 'Date'}, inplace=True)
+                    break
+
+        if 'Date' in df.columns:
+            try:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            except Exception:
+                pass
+
+            def _date_in_window(d):
+                try:
+                    return d is not None and (d >= cutoff and d <= target_date)
+                except Exception:
+                    return False
+
+            try:
+                df = df[df['Date'].apply(_date_in_window)]
+            except Exception:
+                # if filtering fails, keep as-is (we'll handle later)
+                pass
+
+        dfs.append(df)
     if not dfs:
         return pd.DataFrame()
     try:
@@ -1481,6 +1295,179 @@ def _read_past_trend_csvs(outdir: str, window_days: int, target_date: date):
         return out
     except Exception:
         return pd.DataFrame()
+
+
+
+# ---------- consolidated compute_violation_days_map (robust, improved) ----------
+def compute_violation_days_map(outdir: str, window_days: int, target_date: date):
+    """
+    Build a map {normalized_id_string -> number_of_distinct_flagged_days}
+    from trend_*.csv files in outdir within the window_days before target_date (inclusive).
+
+    Robust to:
+      - case/format differences in 'Date' column
+      - historic files missing 'IsFlagged' but having 'AnomalyScore'
+      - various identifier columns (person_uid, EmployeeID, CardNumber, Int1, Text12, ...)
+      - storing both prefixed ids (emp:..., uid:...) and stripped ids
+      - uses canonical person uid when possible to match different identifier schemes
+    """
+    df = _read_past_trend_csvs(outdir, window_days, target_date)
+    if df is None or df.empty:
+        logging.info("compute_violation_days_map: no historic trend rows found in %s", outdir)
+        return {}
+
+    # normalize Date column if present (try multiple common names)
+    date_col = None
+    for c in df.columns:
+        if c.lower() == 'date':
+            date_col = c
+            break
+        if c.lower() in ('displaydate', 'display_date', 'displaydatekey', 'displaydate_key'):
+            date_col = c
+    if date_col:
+        try:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
+            df.rename(columns={date_col: 'Date'}, inplace=True)
+        except Exception:
+            pass
+
+    # ensure Date is date-typed where possible
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    # determine ID columns to consider (broad coverage)
+    candidate_id_cols = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12',
+                         'EmployeeID_feat', 'EmployeeID_dur']
+    id_cols = [c for c in candidate_id_cols if c in df.columns]
+
+    # Build IsFlagged robustly if missing
+    if 'IsFlagged' not in df.columns:
+        if 'AnomalyScore' in df.columns:
+            try:
+                df['IsFlagged'] = pd.to_numeric(df['AnomalyScore'], errors='coerce').fillna(0).astype(float) >= ANOMALY_THRESHOLD
+            except Exception:
+                df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: (float(s) >= ANOMALY_THRESHOLD) if (s is not None and str(s).strip()!='') else False)
+        else:
+            df['IsFlagged'] = False
+            for cand in ('Reasons', 'DetectedScenarios', 'IsAnomaly', 'Flagged'):
+                if cand in df.columns:
+                    try:
+                        df['IsFlagged'] = df[cand].astype(str).str.strip().str.lower().isin({'true','1','yes','y','t'}) | df['IsFlagged']
+                    except Exception:
+                        pass
+
+    flagged = df[df.get('IsFlagged') == True].copy()
+    if flagged.empty:
+        return {}
+
+    ident_dates = defaultdict(set)
+
+    def _add_ident(id_value, the_date):
+        if the_date is None:
+            return
+        try:
+            norm = _normalize_id_val(id_value)
+            if not norm:
+                return
+            # primary exact form
+            keys = set()
+            keys.add(str(norm))
+            # lowercase variant
+            try:
+                keys.add(str(norm).lower())
+            except Exception:
+                pass
+            # stripped uid prefix if present (emp:, uid:, name:)
+            try:
+                stripped = _strip_uid_prefix(str(norm))
+                if stripped and stripped != str(norm):
+                    keys.add(str(stripped))
+                    keys.add(str(stripped).lower())
+            except Exception:
+                pass
+            # numeric-only variant (useful when old files store plain numbers)
+            try:
+                numeric = re.sub(r'\D', '', str(norm))
+                if numeric:
+                    keys.add(str(numeric))
+            except Exception:
+                pass
+            for k in keys:
+                ident_dates[k].add(the_date)
+        except Exception:
+            pass
+
+    # iterate flagged rows and collect ids + date, but also try canonical uid
+    for _, r in flagged.iterrows():
+        d = r.get('Date')
+        if d is None:
+            for c in ('DisplayDate', 'DisplayDateKey'):
+                if c in r and pd.notna(r.get(c)):
+                    try:
+                        d = pd.to_datetime(r.get(c), errors='coerce').date()
+                        break
+                    except Exception:
+                        d = None
+        if d is None:
+            continue
+
+        # collect ids from known columns
+        for col in id_cols:
+            try:
+                raw = r.get(col)
+                if raw in (None, '', float('nan')):
+                    continue
+                _add_ident(raw, d)
+            except Exception:
+                continue
+
+        # also attempt to capture IDs from fallback fields
+        for fallback in ('Int1', 'Text12', 'CardNumber', 'EmployeeID_feat', 'EmployeeID_dur'):
+            try:
+                if fallback in r and r.get(fallback) not in (None, '', float('nan')):
+                    _add_ident(r.get(fallback), d)
+            except Exception:
+                continue
+
+        # attempt weak-extraction from other columns (EmployeeName maybe encoded as 'uid:...' or 'emp:123')
+        for cand in ('person_uid', 'EmployeeIdentity', 'personid', 'EmployeeID', 'EmployeeName'):
+            try:
+                if cand in r and r.get(cand) not in (None, '', float('nan')):
+                    _add_ident(r.get(cand), d)
+            except Exception:
+                pass
+
+        # --- add canonical person uid (best-effort) for the historic row to help cross-matching ---
+        try:
+            # build a small dict like compute_features expects
+            tmp_row = {
+                'EmployeeID': r.get('EmployeeID', None),
+                'EmployeeIdentity': r.get('EmployeeIdentity', None),
+                'EmployeeName': r.get('EmployeeName', None)
+            }
+            can = _canonical_person_uid(tmp_row)
+            if can:
+                _add_ident(can, d)
+                # stripped of prefix too
+                try:
+                    _add_ident(_strip_uid_prefix(can), d)
+                except Exception:
+                    pass
+            # also add lower-case canonical
+            if can:
+                try:
+                    ident_dates[str(can).lower()].add(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    out = {k: int(len(v)) for k, v in ident_dates.items()}
+    logging.info("compute_violation_days_map: produced map with %d ids", len(out))
+    return out
 
 
 
@@ -1613,64 +1600,8 @@ def _strip_uid_prefix(s):
         return s
 
 
-def compute_violation_days_map(outdir: str, window_days: int, target_date: date):
-    df = _read_past_trend_csvs(outdir, window_days, target_date)
-    if df is None or df.empty:
-        return {}
-    if 'Date' in df.columns:
-        try:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-        except Exception:
-            pass
-    id_cols = []
-    for c in ('person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber'):
-        if c in df.columns:
-            id_cols.append(c)
-    if 'IsFlagged' not in df.columns:
-        if 'AnomalyScore' in df.columns:
-            df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: float(s) >= ANOMALY_THRESHOLD if not pd.isna(s) else False)
-        else:
-            df['IsFlagged'] = False
-    ident_dates = defaultdict(set)
-    try:
-        flagged = df[df['IsFlagged'] == True]
-        for _, r in flagged.iterrows():
-            d = r.get('Date')
-            if d is None:
-                continue
-            for col in id_cols:
-                try:
-                    raw = r.get(col)
-                    if raw is None:
-                        continue
-                    norm = _normalize_id_val(raw)
-                    if norm:
-                        ident_dates[str(norm)].add(d)
-                        stripped = _strip_uid_prefix(str(norm))
-                        if stripped != str(norm):
-                            ident_dates[str(stripped)].add(d)
-                except Exception:
-                    continue
-            for fallback in ('Int1', 'Text12'):
-                if fallback in r and r.get(fallback) not in (None, '', 'nan'):
-                    try:
-                        norm = _normalize_id_val(r.get(fallback))
-                        if norm:
-                            ident_dates[str(norm)].add(d)
-                            stripped = _strip_uid_prefix(str(norm))
-                            if stripped != str(norm):
-                                ident_dates[str(stripped)].add(d)
-                    except Exception:
-                        continue
-    except Exception:
-        logging.exception("Error building violation days map from history.")
-    out = {k: int(len(v)) for k, v in ident_dates.items()}
-    return out
 
 
-
-# def score_trends_from_durations(combined_df: pd.DataFrame, swipes_df: Optional[pd.DataFrame] = None, outdir: Optional[str] = None, target_date: Optional[date] = None) -> pd.DataFrame:
-  
 def score_trends_from_durations(combined_df: pd.DataFrame,
                                 swipes_df: Optional[pd.DataFrame] = None,
                                 outdir: Optional[str] = None,
@@ -1702,7 +1633,7 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
         tsw = swipes_df.copy()
         # ensure LocaleMessageTime parsed
         if 'LocaleMessageTime' in tsw.columns:
-            tsw['LocaleMessageTime'] = pd.to_datetime(tsw['LocaleMessageTime'], errors='coerce')
+            tsw['LocaleMessageTime'] = pd.to_datetime(tsw[found_time_col] if 'found_time_col' in globals() and found_time_col in tsw.columns else tsw['LocaleMessageTime'], errors='coerce')
         else:
             for cand in ('MessageUTC','MessageTime','Timestamp','timestamp'):
                 if cand in tsw.columns:
@@ -1812,8 +1743,11 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
     # --- Weekly suppression for short-duration / repeated-break / shortstay-longout / long-gap scenarios ---
     try:
         # include the extra scenario names you requested
-        _weekly_special = {"short_duration_<4h", "coffee_badging", "low_swipe_count_<=5",
-                           "repeated_short_breaks", "shortstay_longout_repeat", "long_gap_>=4.5h"}
+        _weekly_special = {"long_gap_>=4.5h", "short_duration_<4h", "coffee_badging",
+                           "low_swipe_count_<=5", "single_door", "only_in","only_out","overtime_>=14h",
+                           "very_long_duration_>=16h","unusually_high_swipes","repeated_short_breaks",
+                           "late_exit_after_23","first_swipe_after_20","shift_inconsistency",
+                           "high_swipes_benign","shortstay_longout_repeat"}
 
         # read up to 7 days (inclusive) of past trend csvs so we can compute week counts for escalation rule
         week_df = _read_past_trend_csvs(str(outdir) if outdir else str(OUTDIR), 7, target_date if target_date else date.today())
@@ -1978,26 +1912,66 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
         df['HistShortDurationCount'] = df.apply(lambda r: get_hist_count_for_row(r, hist_short_duration), axis=1)
 
         # ViolationDays computed from history window_days (read from past trend CSVs)
+        # ViolationDays computed from history window_days (read from past trend CSVs)
         vmap = compute_violation_days_map(str(outdir) if outdir else str(OUTDIR), int(window_days), target_date if target_date else date.today())
+
+        # lookup helper must be defined inside this try so it can see vmap
         def lookup_violation_days(row):
             try:
+                # gather candidate id strings from many columns
                 candidates = []
                 for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
                     v = row.get(k)
                     if v not in (None, '', float('nan')):
-                        candidates.append(_normalize_id_val(v))
+                        nv = _normalize_id_val(v)
+                        if nv:
+                            candidates.append(str(nv))
+                            candidates.append(str(nv).lower())
+                            try:
+                                candidates.append(_strip_uid_prefix(str(nv)))
+                            except Exception:
+                                pass
+                # also try canonical person uid for this current row (best-effort)
+                try:
+                    can = _canonical_person_uid(row)
+                    if can:
+                        candidates.append(can)
+                        candidates.append(str(can).lower())
+                        try:
+                            candidates.append(_strip_uid_prefix(str(can)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # dedupe preserve order
+                seen = set()
                 for c in candidates:
-                    if c is None:
+                    if not c or c in (None, '', 'nan'):
                         continue
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    # direct match
                     if c in vmap:
                         return int(vmap.get(c, 0))
-                    stripped = _strip_uid_prefix(c)
-                    if stripped != c and stripped in vmap:
+                    # lowercase match
+                    if str(c).lower() in vmap:
+                        return int(vmap.get(str(c).lower(), 0))
+                    # stripped prefix match
+                    stripped = _strip_uid_prefix(str(c))
+                    if stripped != str(c) and stripped in vmap:
                         return int(vmap.get(stripped, 0))
+                    if stripped.lower() in vmap:
+                        return int(vmap.get(stripped.lower(), 0))
                 return 0
             except Exception:
                 return 0
+
+        # now apply function to dataframe (still inside same try)
         df['ViolationDays'] = df.apply(lookup_violation_days, axis=1)
+        # backward-compatible alias expected by some frontends
+        df['ViolationDaysLast90'] = df['ViolationDays']
         # expose the window used so front-end can render "Violation (N days)"
         df['ViolationWindowDays'] = int(window_days)
 
@@ -2022,7 +1996,7 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
 
         df['MonitorFlag'] = df.apply(lambda r: (int(r.get('ViolationDays') or 0) > 0) and bool(r.get('PresentToday')), axis=1)
 
-        # OVERRIDE: force High risk when ViolationDays >= 4 (same threshold as before but on windowed count)
+        # OVERRIDE: force High risk when ViolationDays >= 4
         try:
             high_violation_mask = df['ViolationDays'] >= 4
             if high_violation_mask.any():
@@ -2030,6 +2004,36 @@ def score_trends_from_durations(combined_df: pd.DataFrame,
                 df.loc[high_violation_mask, 'RiskLevel'] = 'High'
         except Exception:
             pass
+
+        # Ensure default RiskScore / RiskLevel are present (map from AnomalyScore if not set)
+        try:
+            if 'RiskLevel' not in df.columns or df['RiskLevel'].isnull().all():
+                df['RiskScore'] = None
+                df['RiskLevel'] = None
+            # fill per-row if missing using map_score_to_label
+            def _fill_risk(r):
+                try:
+                    if r.get('RiskLevel') not in (None, '', float('nan')):
+                        return r.get('RiskScore'), r.get('RiskLevel')
+                    sc = float(r.get('AnomalyScore') or 0.0)
+                    bucket, label = map_score_to_label(sc)
+                    return int(bucket), label
+                except Exception:
+                    return (None, None)
+            risk_pairs = df.apply(lambda r: pd.Series(_fill_risk(r), index=['RiskScore_temp','RiskLevel_temp']), axis=1)
+            # only set where missing (don't override forced High)
+            df['RiskScore'] = df['RiskScore'].combine_first(risk_pairs['RiskScore_temp'])
+            df['RiskLevel'] = df['RiskLevel'].combine_first(risk_pairs['RiskLevel_temp'])
+            # cleanup temps
+            if 'RiskScore_temp' in df.columns:
+                try:
+                    df.drop(columns=['RiskScore_temp','RiskLevel_temp'], inplace=True)
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("Failed to populate default RiskScore/RiskLevel")
+
+
 
 
     except Exception:
