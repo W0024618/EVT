@@ -1,3 +1,387 @@
+# ---------- consolidated compute_violation_days_map (robust, improved) ----------
+def compute_violation_days_map(outdir: str, window_days: int, target_date: date):
+    """
+    Build a map {normalized_id_string -> number_of_distinct_flagged_days}
+    from trend_*.csv files in outdir within the window_days before target_date (inclusive).
+
+    Robust to:
+      - case/format differences in 'Date' column
+      - historic files missing 'IsFlagged' but having 'AnomalyScore'
+      - various identifier columns (person_uid, EmployeeID, CardNumber, Int1, Text12, ...)
+      - storing both prefixed ids (emp:..., uid:...) and stripped ids
+      - uses canonical person uid when possible to match different identifier schemes
+    """
+    df = _read_past_trend_csvs(outdir, window_days, target_date)
+    if df is None or df.empty:
+        logging.info("compute_violation_days_map: no historic trend rows found in %s", outdir)
+        return {}
+
+    # normalize Date column if present (try multiple common names)
+    date_col = None
+    for c in df.columns:
+        if c.lower() == 'date':
+            date_col = c
+            break
+        if c.lower() in ('displaydate', 'display_date', 'displaydatekey', 'displaydate_key'):
+            date_col = c
+    if date_col:
+        try:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
+            df.rename(columns={date_col: 'Date'}, inplace=True)
+        except Exception:
+            pass
+
+    # ensure Date is date-typed where possible
+    if 'Date' in df.columns:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+        except Exception:
+            pass
+
+    # determine ID columns to consider (broad coverage)
+    candidate_id_cols = ['person_uid', 'EmployeeID', 'EmployeeIdentity', 'CardNumber', 'Int1', 'Text12',
+                         'EmployeeID_feat', 'EmployeeID_dur']
+    id_cols = [c for c in candidate_id_cols if c in df.columns]
+
+    # Build IsFlagged robustly if missing
+    if 'IsFlagged' not in df.columns:
+        if 'AnomalyScore' in df.columns:
+            try:
+                df['IsFlagged'] = pd.to_numeric(df['AnomalyScore'], errors='coerce').fillna(0).astype(float) >= ANOMALY_THRESHOLD
+            except Exception:
+                df['IsFlagged'] = df['AnomalyScore'].apply(lambda s: (float(s) >= ANOMALY_THRESHOLD) if (s is not None and str(s).strip()!='') else False)
+        else:
+            df['IsFlagged'] = False
+            for cand in ('Reasons', 'DetectedScenarios', 'IsAnomaly', 'Flagged'):
+                if cand in df.columns:
+                    try:
+                        df['IsFlagged'] = df[cand].astype(str).str.strip().str.lower().isin({'true','1','yes','y','t'}) | df['IsFlagged']
+                    except Exception:
+                        pass
+
+    flagged = df[df.get('IsFlagged') == True].copy()
+    if flagged.empty:
+        return {}
+
+    ident_dates = defaultdict(set)
+
+    def _add_ident(id_value, the_date):
+        if the_date is None:
+            return
+        try:
+            norm = _normalize_id_val(id_value)
+            if not norm:
+                return
+            # primary exact form
+            keys = set()
+            keys.add(str(norm))
+            # lowercase variant
+            try:
+                keys.add(str(norm).lower())
+            except Exception:
+                pass
+            # stripped uid prefix if present (emp:, uid:, name:)
+            try:
+                stripped = _strip_uid_prefix(str(norm))
+                if stripped and stripped != str(norm):
+                    keys.add(str(stripped))
+                    keys.add(str(stripped).lower())
+            except Exception:
+                pass
+            # numeric-only variant (useful when old files store plain numbers)
+            try:
+                numeric = re.sub(r'\D', '', str(norm))
+                if numeric:
+                    keys.add(str(numeric))
+            except Exception:
+                pass
+            for k in keys:
+                ident_dates[k].add(the_date)
+        except Exception:
+            pass
+
+    # iterate flagged rows and collect ids + date, but also try canonical uid
+    for _, r in flagged.iterrows():
+        d = r.get('Date')
+        if d is None:
+            for c in ('DisplayDate', 'DisplayDateKey'):
+                if c in r and pd.notna(r.get(c)):
+                    try:
+                        d = pd.to_datetime(r.get(c), errors='coerce').date()
+                        break
+                    except Exception:
+                        d = None
+        if d is None:
+            continue
+
+        # collect ids from known columns
+        for col in id_cols:
+            try:
+                raw = r.get(col)
+                if raw in (None, '', float('nan')):
+                    continue
+                _add_ident(raw, d)
+            except Exception:
+                continue
+
+        # also attempt to capture IDs from fallback fields
+        for fallback in ('Int1', 'Text12', 'CardNumber', 'EmployeeID_feat', 'EmployeeID_dur'):
+            try:
+                if fallback in r and r.get(fallback) not in (None, '', float('nan')):
+                    _add_ident(r.get(fallback), d)
+            except Exception:
+                continue
+
+        # attempt weak-extraction from other columns (EmployeeName maybe encoded as 'uid:...' or 'emp:123')
+        for cand in ('person_uid', 'EmployeeIdentity', 'personid', 'EmployeeID', 'EmployeeName'):
+            try:
+                if cand in r and r.get(cand) not in (None, '', float('nan')):
+                    _add_ident(r.get(cand), d)
+            except Exception:
+                pass
+
+        # --- add canonical person uid (best-effort) for the historic row to help cross-matching ---
+        try:
+            # build a small dict like compute_features expects
+            tmp_row = {
+                'EmployeeID': r.get('EmployeeID', None),
+                'EmployeeIdentity': r.get('EmployeeIdentity', None),
+                'EmployeeName': r.get('EmployeeName', None)
+            }
+            can = _canonical_person_uid(tmp_row)
+            if can:
+                _add_ident(can, d)
+                # stripped of prefix too
+                try:
+                    _add_ident(_strip_uid_prefix(can), d)
+                except Exception:
+                    pass
+            # also add lower-case canonical
+            if can:
+                try:
+                    ident_dates[str(can).lower()].add(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    out = {k: int(len(v)) for k, v in ident_dates.items()}
+    logging.info("compute_violation_days_map: produced map with %d ids", len(out))
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+def lookup_violation_days(row):
+    try:
+        candidates = []
+        for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+            v = row.get(k)
+            if v not in (None, '', float('nan')):
+                candidates.append(_normalize_id_val(v))
+        for c in candidates:
+            if c is None:
+                continue
+            if c in vmap:
+                return int(vmap.get(c, 0))
+            stripped = _strip_uid_prefix(c)
+            if stripped != c and stripped in vmap:
+                return int(vmap.get(stripped, 0))
+        return 0
+    except Exception:
+        return 0
+
+
+
+
+
+
+
+
+def lookup_violation_days(row):
+    try:
+        # gather candidate id strings from many columns
+        candidates = []
+        for k in ('EmployeeID','person_uid','EmployeeIdentity','CardNumber','Int1','Text12'):
+            v = row.get(k)
+            if v not in (None, '', float('nan')):
+                nv = _normalize_id_val(v)
+                if nv:
+                    candidates.append(str(nv))
+                    candidates.append(str(nv).lower())
+                    try:
+                        candidates.append(_strip_uid_prefix(str(nv)))
+                    except Exception:
+                        pass
+        # also try canonical person uid for this current row (best-effort)
+        try:
+            can = _canonical_person_uid(row)
+            if can:
+                candidates.append(can)
+                candidates.append(str(can).lower())
+                candidates.append(_strip_uid_prefix(str(can)))
+        except Exception:
+            pass
+
+        # dedupe preserve order
+        seen = set()
+        for c in candidates:
+            if not c or c in (None, '', 'nan'):
+                continue
+            if c in seen:
+                continue
+            seen.add(c)
+            # direct match
+            if c in vmap:
+                return int(vmap.get(c, 0))
+            # lowercase match
+            if str(c).lower() in vmap:
+                return int(vmap.get(str(c).lower(), 0))
+            # stripped prefix match
+            stripped = _strip_uid_prefix(str(c))
+            if stripped != str(c) and stripped in vmap:
+                return int(vmap.get(stripped, 0))
+            if stripped.lower() in vmap:
+                return int(vmap.get(stripped.lower(), 0))
+        return 0
+    except Exception:
+        return 0
+
+
+
+
+
+
+
+
+
+
+
+
+function buildAggregated(rowsArr) {
+  var map = new Map();
+  rowsArr.forEach(function (r) {
+    var id = r.EmployeeID || r.person_uid || (sanitizeName(r) + '|' + (r.CardNumber || r.Card || ''));
+    var key = String(id);
+    if (!map.has(key)) {
+      map.set(key, {
+        EmployeeName: sanitizeName(r),
+        EmployeeID: r.EmployeeID || r.person_uid || "",
+        CardNumber: r.CardNumber || r.Card || "",
+        ViolationCount: 0,
+        ReasonsSet: new Set(),
+        ViolationDays: 0,
+        ViolationWindowDays: null,
+        ViolationDaysLast90: 0,
+        RiskLevel: null,
+        RiskScore: null,
+        FirstRow: r,
+        _rows: []
+      });
+    }
+    var agg = map.get(key);
+    agg.ViolationCount += 1;
+    agg._rows.push(r);
+
+    // collect reasons
+    var reasonsField = r.Reasons || r.DetectedScenarios || r.Detected || "";
+    String(reasonsField).split(";").map(function (s) { return s.trim(); }).filter(Boolean).forEach(function (p) { agg.ReasonsSet.add(p); });
+
+    // pick candidate ViolationDays from row and maintain max across rows
+    var candidateCount = null;
+    if (r.ViolationDays !== undefined && r.ViolationDays !== null && r.ViolationDays !== "") candidateCount = Number(r.ViolationDays);
+    else if (r.ViolationDaysLast !== undefined && r.ViolationDaysLast !== null && r.ViolationDaysLast !== "") candidateCount = Number(r.ViolationDaysLast);
+    else if (r.ViolationDaysLast90 !== undefined && r.ViolationDaysLast90 !== null && r.ViolationDaysLast90 !== "") candidateCount = Number(r.ViolationDaysLast90);
+    else if (r.ViolationDaysLast_90 !== undefined && r.ViolationDaysLast_90 !== null && r.ViolationDaysLast_90 !== "") candidateCount = Number(r.ViolationDaysLast_90);
+
+    if (candidateCount !== null && !isNaN(candidateCount)) {
+      agg.ViolationDays = Math.max(agg.ViolationDays || 0, candidateCount);
+    }
+
+    // capture window if present (prefer largest)
+    if (r.ViolationWindowDays !== undefined && r.ViolationWindowDays !== null && r.ViolationWindowDays !== "") {
+      var w = Number(r.ViolationWindowDays);
+      if (!isNaN(w) && (agg.ViolationWindowDays === null || w > agg.ViolationWindowDays)) {
+        agg.ViolationWindowDays = w;
+      }
+    }
+
+    // pick highest severity risk label for this person across their rows
+    try {
+      var rowRisk = getRiskLabelForRow(r) || null;
+      var rowScore = (r.RiskScore !== undefined && r.RiskScore !== null) ? Number(r.RiskScore) : null;
+      function severityForLabel(label) {
+        var map = { "Low": 1, "Low Medium": 2, "Medium": 3, "Medium High": 4, "High": 5 };
+        if (!label) return 1;
+        return map[String(label)] || 1;
+      }
+      if (rowRisk) {
+        var currentSeverity = severityForLabel(agg.RiskLevel);
+        var thisSeverity = severityForLabel(rowRisk);
+        if (!agg.RiskLevel || thisSeverity > currentSeverity) {
+          agg.RiskLevel = rowRisk;
+        }
+      }
+      if (rowScore !== null && (!agg.RiskScore || Number(rowScore) > Number(agg.RiskScore))) {
+        agg.RiskScore = Number(rowScore);
+      }
+    } catch (err) {
+      // ignore - keep fallbacks
+    }
+  });
+
+  var out = [];
+  map.forEach(function (val, key) {
+    out.push({
+      EmployeeName: val.EmployeeName,
+      EmployeeID: val.EmployeeID,
+      CardNumber: val.CardNumber,
+      ViolationCount: val.ViolationCount,
+      Reasons: Array.from(val.ReasonsSet).join(";"),
+      ViolationDays: val.ViolationDays || 0,
+      ViolationWindowDays: val.ViolationWindowDays || null,
+      ViolationDaysLast90: val.ViolationDaysLast90 || 0,
+      RiskLevel: val.RiskLevel || null,
+      RiskScore: val.RiskScore || null,
+      FirstRow: val.FirstRow,
+      _rows: val._rows
+    });
+  });
+
+  // sort aggregated by ViolationDays (if present) else ViolationCount, descending, then by name
+  out.sort(function (a, b) {
+    var aVal = (a.ViolationDays !== undefined && a.ViolationDays !== null) ? Number(a.ViolationDays) : (a.ViolationCount || 0);
+    var bVal = (b.ViolationDays !== undefined && b.ViolationDays !== null) ? Number(b.ViolationDays) : (b.ViolationCount || 0);
+    if (bVal !== aVal) return bVal - aVal;
+    return (a.EmployeeName || "").localeCompare(b.EmployeeName || "");
+  });
+
+  return out;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # backend/trend_runner.py
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
