@@ -64,7 +64,13 @@
     function EmeaPinApp() {
       const [year, setYear] = useState(new Date().getFullYear());
       const [location, setLocation] = useState('All locations');
-      const [live, setLive] = useState(true);
+
+      // IMPORTANT: default live=false so no automatic polling starts on load.
+      const [live, setLive] = useState(false);
+
+      // month selector in header. 0 === All months, 1..12 specific month
+      const [selectedMonth, setSelectedMonth] = useState(0);
+
       const [loading, setLoading] = useState(false);
       const [lastFetch, setLastFetch] = useState(null);
 
@@ -72,17 +78,18 @@
       const [uniqueEmployees, setUniqueEmployees] = useState(0);
       const [repeatersCount, setRepeatersCount] = useState(0);
 
-      // main lists
-      const [byLocation, setByLocation] = useState([]);
-      const [byEmployee, setByEmployee] = useState([]);
+      // main lists (raw normalized arrays from API)
+      const [byLocationRaw, setByLocationRaw] = useState([]); // array of {name, count}
+      const [byEmployeeRaw, setByEmployeeRaw] = useState([]); // array of {id, count, EmployeeID, EmployeeName}
       const [recent, setRecent] = useState([]);
 
-      // month-wise
-      const [monthTotals, setMonthTotals] = useState([]);
-      const [monthByLocation, setMonthByLocation] = useState([]);
-      const [monthByEmployee, setMonthByEmployee] = useState([]);
+      // person map from API: { person_uid: { EmployeeID, EmployeeName } }
+      const [personMap, setPersonMap] = useState({});
 
-      const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth()+1);
+      // month-wise raw arrays from API
+      const [monthTotalsRaw, setMonthTotalsRaw] = useState([]); // {Month, MonthName, count}
+      const [monthByLocationRaw, setMonthByLocationRaw] = useState([]); // {Month, MonthName, PartitionName2, count}
+      const [monthByEmployeeRaw, setMonthByEmployeeRaw] = useState([]); // {Month, MonthName, person_uid, count, EmployeeID, EmployeeName}
 
       const pollingRef = useRef(null);
       const inFlightRef = useRef(false);
@@ -98,7 +105,6 @@
         if (!canvas) return;
         try {
           if (instRef.current) {
-            // update data & options if possible (silent)
             instRef.current.data = config.data;
             instRef.current.options = config.options || instRef.current.options;
             instRef.current.update();
@@ -114,11 +120,78 @@
         }
       }
 
+      // Utilities for client-side aggregation & filtering
+      function aggregateMonthByLocationForAllMonths(raw) {
+        const map = {};
+        (raw || []).forEach(r => {
+          const loc = r.PartitionName2 || r.Partition || r.location || '';
+          const c = Number(r.count || 0);
+          if (!map[loc]) map[loc] = 0;
+          map[loc] += c;
+        });
+        return Object.keys(map).map(k => ({ PartitionName2: k, count: map[k] })).sort((a,b)=>b.count-a.count);
+      }
+
+      function aggregateMonthByEmployeeForAllMonths(raw) {
+        const map = {};
+        (raw || []).forEach(r => {
+          const id = r.person_uid || r.EmployeeID || r.employee_id || r.id || '';
+          const c = Number(r.count || 0);
+          if (!map[id]) map[id] = 0;
+          map[id] += c;
+        });
+        return Object.keys(map).map(k => ({ person_uid: k, count: map[k] })).sort((a,b)=>b.count-a.count);
+      }
+
+      // Build data for Location chart depending on selected month & location
+      function buildLocationChartData(byLocation, monthByLocation, selMonth, selLocation) {
+        if (selLocation && selLocation !== 'All locations') {
+          const monthArr = Array.from({length:12}, (_,i) => {
+            const m = i+1;
+            let found = null;
+            for (let i2=0;i2<monthByLocation.length;i2++){
+              const r = monthByLocation[i2];
+              if (Number(r.Month) === m) {
+                const part = r.PartitionName2 || r.Partition || r.location || '';
+                if (String(part) === String(selLocation)) {
+                  found = r; break;
+                }
+              }
+            }
+            return found && Number(found.count) ? Number(found.count) : 0;
+          });
+          if (selMonth === 0) {
+            return { labels: MONTH_NAMES, data: monthArr, type: 'line' };
+          } else {
+            const mIndex = selMonth - 1;
+            const val = monthArr[mIndex] || 0;
+            return { labels: [MONTH_NAMES[mIndex]], data: [val], type: 'bar' };
+          }
+        } else {
+          if (selMonth === 0) {
+            const top = (byLocation || []).slice(0,12);
+            const labels = top.map(x => x.name || x.PartitionName2 || '');
+            const values = top.map(x => Number(x.count || 0));
+            return { labels, data: values, type: 'line' };
+          } else {
+            const rows = (monthByLocation || []).filter(r => Number(r.Month) === Number(selMonth));
+            const ag = {};
+            rows.forEach(r => {
+              const loc = r.PartitionName2 || r.Partition || r.location || '';
+              ag[loc] = (ag[loc] || 0) + Number(r.count || 0);
+            });
+            const arr = Object.keys(ag).map(k => ({ PartitionName2: k, count: ag[k] })).sort((a,b)=>b.count-a.count).slice(0,12);
+            const labels = arr.map(x => x.PartitionName2 || '');
+            const values = arr.map(x => x.count || 0);
+            return { labels, data: values, type: 'line' };
+          }
+        }
+      }
+
       // Core fetch — silent update pattern:
       async function fetchOnce() {
         if (inFlightRef.current) return;
         inFlightRef.current = true;
-        // setLoading just for indicator; we MUST NOT clear UI state here
         setLoading(true);
 
         try {
@@ -149,7 +222,9 @@
           const normalizedByEmp = Array.isArray(rawByEmp) ? rawByEmp.map(function(x) {
             var id = x.person_uid || x.EmployeeID || x.employee_id || x.id || x.person || '';
             var c = x.count !== undefined ? x.count : (x.value !== undefined ? x.value : 0);
-            return { id: String(id || '').trim(), count: Number(c || 0) };
+            var empIdCol = x.EmployeeID || x.EmployeeId || x.employee_id || '';
+            var empNameCol = x.EmployeeName || x.Employee || x.EmployeeName || '';
+            return { id: String(id || '').trim(), count: Number(c || 0), EmployeeID: empIdCol || '', EmployeeName: empNameCol || '' };
           }) : [];
 
           const rawRecent = js.recent || js.rows || js.events || js.recent_rows || [];
@@ -180,9 +255,22 @@
               Month: Number(x.Month || x.month || 0),
               MonthName: x.MonthName || x.monthName || x.monthname || "",
               person_uid: x.person_uid || x.EmployeeID || x.employee_id || x.id || "",
-              count: Number(x.count || x.value || 0)
+              count: Number(x.count || x.value || 0),
+              EmployeeID: x.EmployeeID || x.employee_id || '',
+              EmployeeName: x.EmployeeName || ''
             };
           }) : [];
+
+          // parse person_map (if provided)
+          const rawPersonMap = js.person_map || js.personMap || {};
+          const normalizedPersonMap = {};
+          Object.keys(rawPersonMap || {}).forEach(k => {
+            const v = rawPersonMap[k] || {};
+            normalizedPersonMap[String(k)] = {
+              EmployeeID: v.EmployeeID || v.employeeId || v.EmployeeId || '',
+              EmployeeName: v.EmployeeName || v.EmployeeName || v.name || ''
+            };
+          });
 
           // compute derived metrics locally
           const unique = new Set((normalizedByEmp || []).map(function(e){ return e.id; }).filter(Boolean));
@@ -200,9 +288,9 @@
           setMonthByLocation(normalizedMonthByLoc);
           setMonthByEmployee(normalizedMonthByEmp);
 
-          // update charts in-place (no flicker)
+          setPersonMap(normalizedPersonMap);
 
-          // Location chart (keep as original LINE chart, do not change to bar)
+          // update charts in-place (no flicker)
           if (locChartRef.current) {
             const topLoc = (normalizedByLoc || []).slice(0,12);
             const labels = topLoc.map(function(x){ return x.name || 'Unknown'; });
@@ -233,7 +321,7 @@
             });
           }
 
-          // Month totals chart — build array length 12 safely (no optional chaining)
+          // Month totals chart
           if (monthChartRef.current) {
             var monthArr = Array.from({length:12}, function(_,i) {
               var m = i + 1;
@@ -263,11 +351,11 @@
 
       // start / stop polling
       useEffect(function() {
-        // immediate first fetch (do not clear UI)
+        // single immediate fetch on mount or when filters change
         fetchOnce();
 
         if (live) {
-          pollingRef.current = setInterval(fetchOnce, 1000); // keep 1s but updates are silent
+          pollingRef.current = setInterval(fetchOnce, 1000); // silent updates
         }
         return function() {
           if (pollingRef.current) {
@@ -275,11 +363,10 @@
             pollingRef.current = null;
           }
         };
-      }, [live, year, location]);
+      }, [live, year, location, selectedMonth]); // re-fetch when these change
 
       // when page mounts create empty charts to avoid flash
       useEffect(function() {
-        // create empty loc chart stub to keep UI stable (LINE chart)
         if (locChartRef.current && !locChartInst.current) {
           updateOrCreateChart(locChartInst, locChartRef.current, {
             type: 'line',
@@ -296,23 +383,106 @@
         }
       }, []);
 
-      // helper to derive top locations/employees for selected month
+      // helper to derive top locations/employees for selectedMonth (0=All months)
       function topForSelectedMonthByLocation(limit=20) {
-        const rows = (monthByLocation || []).filter(function(r) { return Number(r.Month) === Number(selectedMonth); });
-        return rows.sort(function(a,b){ return b.count - a.count; }).slice(0,limit);
+        if (selectedMonth === 0) {
+          const agg = aggregateMonthByLocationForAllMonths(monthByLocationRaw);
+          return agg.slice(0,limit);
+        } else {
+          const rows = (monthByLocationRaw || []).filter(r => Number(r.Month) === Number(selectedMonth));
+          const map = {};
+          rows.forEach(r => {
+            const loc = r.PartitionName2 || r.Partition || r.location || '';
+            map[loc] = (map[loc] || 0) + Number(r.count || 0);
+          });
+          return Object.keys(map).map(k => ({ PartitionName2: k, count: map[k] })).sort((a,b)=>b.count-a.count).slice(0,limit);
+        }
       }
+
       function topForSelectedMonthByEmployee(limit=20) {
-        const rows = (monthByEmployee || []).filter(function(r) { return Number(r.Month) === Number(selectedMonth); });
-        return rows.sort(function(a,b){ return b.count - a.count; }).slice(0,limit);
+        // returns [{person_uid, count, EmployeeID, EmployeeName}]
+        if (selectedMonth === 0) {
+          // aggregate across all months if monthByEmployeeRaw present
+          if (monthByEmployeeRaw && monthByEmployeeRaw.length > 0) {
+            const agg = aggregateMonthByEmployeeForAllMonths(monthByEmployeeRaw).slice(0,limit);
+            return agg.map(x => ({
+              person_uid: x.person_uid,
+              count: x.count,
+              EmployeeID: (personMap[String(x.person_uid)] || {}).EmployeeID || '',
+              EmployeeName: (personMap[String(x.person_uid)] || {}).EmployeeName || ''
+            }));
+          } else {
+            return (byEmployeeRaw || []).slice(0,limit).map(x => ({
+              person_uid: x.id,
+              count: x.count,
+              EmployeeID: x.EmployeeID || ((personMap[String(x.id)] || {}).EmployeeID || ''),
+              EmployeeName: x.EmployeeName || ((personMap[String(x.id)] || {}).EmployeeName || '')
+            }));
+          }
+        } else {
+          const rows = (monthByEmployeeRaw || []).filter(r => Number(r.Month) === Number(selectedMonth));
+          const map = {};
+          rows.forEach(r => {
+            const id = r.person_uid || '';
+            map[id] = (map[id] || 0) + Number(r.count || 0);
+          });
+          return Object.keys(map).map(k => ({
+            person_uid: k,
+            count: map[k],
+            EmployeeID: (personMap[String(k)] || {}).EmployeeID || '',
+            EmployeeName: (personMap[String(k)] || {}).EmployeeName || ''
+          })).sort((a,b)=>b.count-a.count).slice(0,limit);
+        }
       }
 
       function exportMonthByLocationCSV() {
-        const rows = topForSelectedMonthByLocation(500).map(function(r) {
-          return { Month: r.Month, MonthName: r.MonthName, Location: r.PartitionName2, Count: r.count };
-        });
+        const rows = topForSelectedMonthByLocation(500).map(r => ({
+          Month: selectedMonth || 'All',
+          MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
+          Location: r.PartitionName2 || r.name || '',
+          Count: r.count
+        }));
         if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
-        downloadCSV(rows, `emea_pin_month_${selectedMonth}_by_location.csv`);
+        downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
       }
+
+      // produce final repeaters list to show in the sidebar (id, name, count)
+      function getTopRepeatersForDisplay(limit=50) {
+        // Use personMap to map id -> name reliably
+        if (selectedMonth === 0) {
+          let base = (byEmployeeRaw && byEmployeeRaw.length > 0) ? byEmployeeRaw.slice(0) : [];
+          if (base.length === 0 && monthByEmployeeRaw && monthByEmployeeRaw.length > 0) {
+            base = aggregateMonthByEmployeeForAllMonths(monthByEmployeeRaw).map(x => ({ id: x.person_uid, count: x.count }));
+          } else {
+            base = base.map(x => ({ id: x.id, count: x.count }));
+          }
+          return base.sort((a,b)=>b.count - a.count).slice(0,limit).map(x => {
+            const pid = String(x.id || '');
+            const mapping = personMap[pid] || {};
+            return {
+              id: mapping.EmployeeID || pid || '',
+              name: mapping.EmployeeName || '',
+              count: x.count || 0
+            };
+          });
+        } else {
+          const monthTop = topForSelectedMonthByEmployee(limit);
+          return monthTop.map(x => ({
+            id: x.EmployeeID || x.person_uid || '',
+            name: x.EmployeeName || '',
+            count: x.count || 0
+          }));
+        }
+      }
+
+      const displayTopRepeaters = getTopRepeatersForDisplay(50);
+
+      // setState helper wrappers (avoid lint)
+      function setByLocation(v){ setByLocationRaw(v); }
+      function setByEmployee(v){ setByEmployeeRaw(v); }
+      function setMonthTotals(v){ setMonthTotalsRaw(v); }
+      function setMonthByLocation(v){ setMonthByLocationRaw(v); }
+      function setMonthByEmployee(v){ setMonthByEmployeeRaw(v); }
 
       return (
         <div className="container" >
@@ -329,6 +499,13 @@
               <div style={{ display:'flex', gap:8, alignItems:'center' }} className="top-controls">
                 <label className="small" style={{ color:'#e6e6e6' }}>Year</label>
                 <input type="number" value={year} onChange={(e)=>setYear(Number(e.target.value||new Date().getFullYear()))} style={{ width:100, padding:6, borderRadius:6 }} />
+
+                <label className="small" style={{ color:'#e6e6e6' }}>Month</label>
+                <select value={selectedMonth} onChange={e=>setSelectedMonth(Number(e.target.value))} style={{ padding:6, borderRadius:6 }}>
+                  <option value={0}>All months</option>
+                  {Array.from({length:12},(_,i)=>i+1).map(m => <option key={m} value={m}>{MONTH_NAMES[m-1]} ({m})</option>)}
+                </select>
+
                 <label className="small" style={{ color:'#e6e6e6' }}>Location</label>
                 <select value={location} onChange={e=>setLocation(e.target.value)} style={{ padding:6, borderRadius:6 }}>
                   <option>All locations</option>
@@ -377,44 +554,6 @@
                   <canvas ref={locChartRef}></canvas>
                 </div>
 
-                <div style={{ display:'flex', gap:12 }}>
-                  <div style={{ flex:1 }}>
-                    <h4 style={{ margin: '6px 0' }}>Top repeaters</h4>
-                    <div className="table-scroll" style={{ maxHeight:220 }}>
-                      <table className="compact-table">
-                        <thead>
-                          <tr><th>Employee</th><th>Count</th></tr>
-                        </thead>
-                        <tbody>
-                          {(byEmployee || []).slice(0,15).map((r,i) => (
-                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.id}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
-                          ))}
-                          {(!byEmployee || byEmployee.length===0) && <tr><td colSpan="2" className="muted">No data</td></tr>}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  <div style={{ width: 320 }}>
-                    <h4 style={{ margin: '6px 0' }}>Recent events</h4>
-                    <div className="table-scroll" style={{ maxHeight:220 }}>
-                      <table className="compact-table">
-                        <thead><tr><th>Time</th><th>Loc</th><th>Emp</th></tr></thead>
-                        <tbody>
-                          {(recent || []).slice(0,12).map((r,i) => (
-                            <tr key={i}>
-                              <td style={{ padding:'6px 8px' }}>{formatDateShort(r.LocaleMessageTime || r.Date || r.Timestamp)}</td>
-                              <td style={{ padding:'6px 8px' }}>{r.PartitionName2 || r.Partition || r.location || '-'}</td>
-                              <td style={{ padding:'6px 8px' }}>{r.EmployeeName || r.EmployeeID || r.person_uid || '-'}</td>
-                            </tr>
-                          ))}
-                          {(!recent || recent.length===0) && <tr><td colSpan="3" className="muted">No recent events</td></tr>}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
-
                 <div style={{ marginTop:10, fontSize:13, color:'#64748b' }}>
                   Last fetch: {lastFetch ? new Date(lastFetch).toLocaleString() : 'never'} {loading ? ' • loading…' : ''}
                 </div>
@@ -425,11 +564,6 @@
                 <h3 style={{ marginTop:0 }}>Month-wise analysis</h3>
 
                 <div className="month-panel">
-                  <label className="small muted">Select month</label>
-                  <select value={selectedMonth} onChange={e=>setSelectedMonth(Number(e.target.value))} style={{ padding:6, borderRadius:6 }}>
-                    {Array.from({length:12},(_,i)=>i+1).map(m => <option key={m} value={m}>{MONTH_NAMES[m-1]} ({m})</option>)}
-                  </select>
-
                   <div style={{ marginLeft: 8 }}>
                     <button className="small-button" onClick={() => exportMonthByLocationCSV()}>Export Month Location CSV</button>
                   </div>
@@ -438,39 +572,6 @@
                 <div className="chart-wrap month-chart-wrap" style={{ marginTop:10 }}>
                   <canvas ref={monthChartRef}></canvas>
                 </div>
-
-                <div style={{ display:'flex', gap:12, marginTop:12 }}>
-                  <div style={{ flex:1 }}>
-                    <h4 style={{ margin:'6px 0' }}>Top locations — {MONTH_NAMES[selectedMonth-1]}</h4>
-                    <div className="table-scroll" style={{ maxHeight:220 }}>
-                      <table className="compact-table">
-                        <thead><tr><th>Location</th><th>Count</th></tr></thead>
-                        <tbody>
-                          {topForSelectedMonthByLocation(50).map((r,i)=>(
-                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.PartitionName2 || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
-                          ))}
-                          {(topForSelectedMonthByLocation(50).length===0) && <tr><td colSpan="2" className="muted">No data for selected month</td></tr>}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  <div style={{ width: 320 }}>
-                    <h4 style={{ margin:'6px 0' }}>Top employees — {MONTH_NAMES[selectedMonth-1]}</h4>
-                    <div className="table-scroll" style={{ maxHeight:220 }}>
-                      <table className="compact-table">
-                        <thead><tr><th>Employee</th><th>Count</th></tr></thead>
-                        <tbody>
-                          {topForSelectedMonthByEmployee(50).map((r,i)=>(
-                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.person_uid || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
-                          ))}
-                          {(topForSelectedMonthByEmployee(50).length===0) && <tr><td colSpan="2" className="muted">No data for selected month</td></tr>}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
-
               </div>
 
             </div>
@@ -478,8 +579,8 @@
             <aside style={{ width: 340 }}>
               <div className="card" style={{ padding:10 }}>
                 <h4 style={{ marginTop:0 }}>Details</h4>
-                <div className="small muted">This dashboard polls the API every second. UI will update silently — no blank flashes.</div>
-                <hr />
+               
+                 <hr />
                 <div>
                   <b>Total rejections:</b> {total}
                 </div>
@@ -487,15 +588,17 @@
                 <div><b>Repeaters:</b> {repeatersCount}</div>
                 <hr />
                 <div>
-                  <h5 style={{ margin:'6px 0' }}>Top locations</h5>
+                  <h5 style={{ margin:'6px 0' }}>
+                    Top locations{selectedMonth === 0 ? " — All months" : ` - ${MONTH_NAMES[selectedMonth-1]}`}
+                  </h5>
                   <div style={{ maxHeight:300, overflow:'auto' }}>
                     <table className="compact-table">
                       <thead><tr><th>Location</th><th>Count</th></tr></thead>
                       <tbody>
-                        {(byLocation || []).slice(0,50).map((r,i) => (
-                          <tr key={i}><td style={{ padding:'6px 8px' }}>{r.name || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
+                        {topForSelectedMonthByLocation(50).map((r,i) => (
+                          <tr key={i}><td style={{ padding:'6px 8px' }}>{r.PartitionName2 || r.name || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
                         ))}
-                        {(!byLocation || byLocation.length===0) && <tr><td colSpan="2" className="muted">No location data</td></tr>}
+                        {(topForSelectedMonthByLocation(50).length===0) && <tr><td colSpan="2" className="muted">No location data</td></tr>}
                       </tbody>
                     </table>
                   </div>
@@ -503,10 +606,32 @@
               </div>
 
               <div style={{ height:12 }} />
+
+              {/* NEW: Top repeaters card (merged view) */}
+              <div className="card" style={{ padding:10 }}>
+                <h4 style={{ marginTop:0 }}>Top repeaters{selectedMonth === 0 ? " — All months" : ` - ${MONTH_NAMES[selectedMonth-1]}`}</h4>
+                <div style={{ maxHeight:260, overflow:'auto' }}>
+                  <table className="compact-table">
+                    <thead><tr><th>EmployeeID</th><th>Name</th><th>Count</th></tr></thead>
+                    <tbody>
+                      {displayTopRepeaters.map((r,i)=>(
+                        <tr key={i}>
+                          <td style={{ padding:'6px 8px' }}>{r.id || '-'}</td>
+                          <td style={{ padding:'6px 8px' }}>{r.name || '-'}</td>
+                          <td style={{ padding:'6px 8px' }}>{r.count}</td>
+                        </tr>
+                      ))}
+                      {(displayTopRepeaters.length===0) && <tr><td colSpan="3" className="muted">No repeaters data</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div style={{ height:12 }} />
               <div className="card" style={{ padding:10 }}>
                 <h4 style={{ marginTop:0 }}>Actions</h4>
                 <div style={{ display:'flex', gap:8 }}>
-                  <button className="small-button" onClick={() => { setLocation('All locations'); setYear(new Date().getFullYear()); }}>Reset</button>
+                  <button className="small-button" onClick={() => { setLocation('All locations'); setYear(new Date().getFullYear()); setSelectedMonth(0); }}>Reset</button>
                   <button className="small-button" onClick={() => downloadCSV((recent||[]).slice(0,200), `emea_pin_recent_${year}.csv`)}>Export Recent</button>
                 </div>
               </div>
@@ -523,5 +648,3 @@
   </script>
 </body>
 </html>
-
-
