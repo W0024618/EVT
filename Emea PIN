@@ -1,670 +1,540 @@
-Now I have review 
-When i filter month 
-like select Jan , Feb , Mar, ....etc
+# backend/api_server.py
+from pathlib import Path
+from datetime import datetime, date
+import time
+import traceback
+import sys
+import importlib
+import logging
+from typing import Any
 
+# ----- ensure project root on sys.path (do this before other imports) -----
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parent.parent  # <project-root> (one level above backend/)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-then 
-Location wise (top)
-Count is not Upadted ned to fix this issue 
-alo month Wise and Location wise 
-24,260
-Total rejections
+# now safe to import FastAPI etc.
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import pandas as pd
 
-1,173
-Unique employees
+LOG = logging.getLogger("emea.api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-1,083
-Repeat offenders
+# ----- try to import backend.emea_pin in a robust way (clear error if fails) -----
+ep = None
+try:
+    ep = importlib.import_module("backend.emea_pin")
+    LOG.info("Imported backend.emea_pin via package import")
+except Exception as first_exc:
+    LOG.warning("Package import backend.emea_pin failed: %s", first_exc)
+    try:
+        ep = importlib.import_module("emea_pin")
+        LOG.info("Imported emea_pin as top-level module")
+    except Exception as second_exc:
+        tb = traceback.format_exc()
+        LOG.error("Failed to import emea_pin module.\nPackage import error: %s\nFallback error: %s\nTrace:\n%s",
+                  first_exc, second_exc, tb)
+        raise RuntimeError(f"Failed to import emea_pin module (see server logs). Primary error: {first_exc}") from second_exc
 
-Summary cards Count is not upadte need to fix this isue ..
+# create app
+app = FastAPI(title="EMEA PIN API (wrapper)")
 
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>EMEA PIN Dashboard — Live</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script crossorigin src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+# permissive CORS for local/dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
 
-  <link rel="stylesheet" href="style.css">
-  <style>
-    .topbar { margin-bottom: 8px; }
-    .small-card { padding: 12px; text-align: center; }
-    .top-controls { display:flex; gap:8px; align-items:center; }
-    .chart-small { height:220px; }
-    .compact-table td { padding:6px; font-size:13px; }
-    .muted { color:#9aa4b2; }
-    .month-panel { display:flex; gap:12px; margin-top:12px; align-items:center; }
-    .month-chart-wrap { height:200px; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
+# cache for DataFrame
+CACHE = {"ts": 0.0, "year": None, "df": None}
+CACHE_TTL = 5  # seconds
 
-  <script type="text/babel">
-  (function () {
-    const { useState, useEffect, useRef } = React;
+def _load_fallback_csv(project_root: Path):
+    fallback = project_root / "out" / "emea_pin_raw.csv"
+    if fallback.exists():
+        LOG.info("Loading fallback CSV: %s", fallback)
+        try:
+            df = pd.read_csv(fallback, parse_dates=["LocaleMessageTime"], keep_default_na=False)
+            # sanitize DateOnly if present: ensure string
+            if "LocaleMessageTime" in df.columns:
+                df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+            if "DateOnly" in df.columns:
+                # ensure DateOnly is string
+                df["DateOnly"] = df["DateOnly"].astype(str)
+            return df
+        except Exception as e:
+            LOG.exception("Failed to parse fallback CSV: %s", e)
+            raise
+    raise FileNotFoundError(str(fallback))
 
-    // CHANGE THESE as needed:
-    const API_BASE = "http://localhost:8003";
-    const API_ENDPOINT = API_BASE + "/api/emea_pin_live";
+# --- sanitizer helpers to make response JSON-safe ---
+def _serialize_value(v: Any) -> Any:
+    """Convert common non-JSON types to JSON-safe primitives."""
+    if v is None:
+        return None
+    if isinstance(v, (str, bool, int, float)):
+        return v
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    try:
+        import pandas as pd
+        if isinstance(v, pd.Timestamp):
+            if pd.isna(v):
+                return None
+            return v.isoformat()
+        if isinstance(v, pd.Timedelta):
+            return str(v)
+        if v is pd.NaT:
+            return None
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+        if isinstance(v, _np.generic):
+            return v.item()
+        if isinstance(v, _np.datetime64):
+            try:
+                ts = pd.to_datetime(v)
+                return ts.isoformat()
+            except Exception:
+                return str(v)
+    except Exception:
+        pass
+    try:
+        return str(v)
+    except Exception:
+        return None
 
-    const EMEA_PARTITIONS = ["LT.Vilnius","IT.Rome","UK.London","IE.DUblin","DU.Abu Dhab","ES.Madrid","AUT.Vienna","MA.Casablanca","RU.Moscow"];
-    const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+def _sanitize(obj: Any) -> Any:
+    """Recursively walk `obj` and convert values to JSON-safe types."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, pd.DataFrame):
+        try:
+            return _sanitize(obj.fillna("").to_dict(orient="records"))
+        except Exception:
+            return []
+    if isinstance(obj, pd.Series):
+        try:
+            return _sanitize(obj.fillna("").to_list())
+        except Exception:
+            return []
+    return _serialize_value(obj)
 
-    function formatDateShort(d) {
-      if (!d) return '-';
-      try {
-        const dt = new Date(d);
-        if (isNaN(dt.getTime())) return String(d).slice(0,19);
-        return dt.toLocaleString();
-      } catch (e) { return String(d); }
+@app.get("/api/emea_pin_live")
+def emea_pin_live(year: int | None = None, location: str | None = Query(None)):
+    target_year = int(year or datetime.now().year)
+    now = time.time()
+
+    # refresh cache as needed
+    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+        try:
+            df = ep.fetch_pin_rows_for_year(target_year)
+            LOG.info("Fetched df from emea_pin (rows=%d)", len(df) if getattr(df, "shape", None) is not None else -1)
+        except Exception as e:
+            LOG.warning("fetch_pin_rows_for_year failed: %s", e)
+            try:
+                df = _load_fallback_csv(PROJECT_ROOT)
+            except Exception as e2:
+                tb = traceback.format_exc()
+                LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
+                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
+
+        if df is None:
+            df = pd.DataFrame()
+        CACHE.update({"ts": now, "year": target_year, "df": df})
+    else:
+        df = CACHE["df"]
+
+    # defensive column existence
+    for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber", "DateOnly", "Month", "MonthName"]:
+        if col not in df.columns:
+            if col == "Month":
+                df[col] = pd.NA
+            else:
+                df[col] = pd.NA
+
+    # ensure LocaleMessageTime parsed
+    if "LocaleMessageTime" in df.columns:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # ensure Month/MonthName derived (in case they weren't present)
+    if "Month" not in df.columns or df["Month"].isnull().all():
+        df["Month"] = df["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")
+    if "MonthName" not in df.columns or df["MonthName"].isnull().all():
+        df["MonthName"] = df["LocaleMessageTime"].dt.strftime("%b").fillna("")
+
+    # optional location filter for recent rows (kept internal)
+    df_for_recent = df
+    if location and location.strip() and location.strip().lower() != "all locations":
+        try:
+            df_for_recent = df_for_recent[df_for_recent["PartitionName2"].astype(str) == location]
+        except Exception:
+            LOG.exception("Location filtering failed; using unfiltered df_for_recent")
+            df_for_recent = df
+
+    # compute aggregates safely
+    try:
+        by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
+    try:
+        # Basic employee counts (group by canonical person_uid)
+        by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_emp = pd.DataFrame(columns=["person_uid", "count"])
+
+    # Build person_map (person_uid -> EmployeeID, EmployeeName) from full df
+    person_map = {}
+    try:
+        for _, r in df.iterrows():
+            pu = r.get("person_uid")
+            if pu is None or (isinstance(pu, float) and pd.isna(pu)):
+                continue
+            key = str(pu)
+            entry = person_map.get(key, {"EmployeeID": "", "EmployeeName": ""})
+            eid = r.get("EmployeeID") or ""
+            ename = r.get("EmployeeName") or ""
+            if eid and not entry["EmployeeID"]:
+                entry["EmployeeID"] = str(eid)
+            if ename and not entry["EmployeeName"]:
+                entry["EmployeeName"] = str(ename)
+            person_map[key] = entry
+    except Exception:
+        LOG.exception("Failed to build person_map; proceeding without enriched names")
+        person_map = {}
+
+    # Enrich by_emp with EmployeeID and EmployeeName (if present)
+    try:
+        if not by_emp.empty:
+            by_emp["EmployeeID"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID", ""))
+            by_emp["EmployeeName"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName", ""))
+    except Exception:
+        LOG.exception("Failed to enrich by_emp with names")
+
+    # MONTH-WISE aggregates (location & employee)
+    try:
+        month_totals_df = (df.groupby(["Month", "MonthName"], dropna=False)
+                           .size()
+                           .reset_index(name="count")
+                           .sort_values(["Month"]))
+    except Exception:
+        month_totals_df = pd.DataFrame(columns=["Month", "MonthName", "count"])
+
+    try:
+        month_by_location_df = (df.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+                                 .size()
+                                 .reset_index(name="count")
+                                 .sort_values(["Month", "count"], ascending=[True, False]))
+    except Exception:
+        month_by_location_df = pd.DataFrame(columns=["Month", "MonthName", "PartitionName2", "count"])
+
+    try:
+        month_by_employee_df = (df.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+                                 .size()
+                                 .reset_index(name="count")
+                                 .sort_values(["Month", "count"], ascending=[True, False]))
+        # attach employee id / name to monthly employee counts
+        if not month_by_employee_df.empty:
+            month_by_employee_df["EmployeeID"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID",""))
+            month_by_employee_df["EmployeeName"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName",""))
+    except Exception:
+        month_by_employee_df = pd.DataFrame(columns=["Month", "MonthName", "person_uid", "count", "EmployeeID", "EmployeeName"])
+
+    # convert to records (strings / primitives) and sanitize recursively
+    by_loc_records = _sanitize(by_loc.fillna("").to_dict(orient="records"))
+    by_emp_records = _sanitize(by_emp.fillna("").to_dict(orient="records"))
+    recent = df_for_recent.copy()
+    if "LocaleMessageTime" in recent.columns:
+        try:
+            recent = recent.sort_values("LocaleMessageTime", ascending=False)
+        except Exception:
+            LOG.debug("Could not sort recent by LocaleMessageTime")
+    recent = recent.head(500)
+    recent_records = _sanitize(recent.fillna("").to_dict(orient="records"))
+
+    month_totals_records = _sanitize(month_totals_df.fillna("").to_dict(orient="records"))
+    month_by_location_records = _sanitize(month_by_location_df.fillna("").to_dict(orient="records"))
+    month_by_employee_records = _sanitize(month_by_employee_df.fillna("").to_dict(orient="records"))
+
+    # Ensure person_map values are primitive types (strings)
+    safe_person_map = {}
+    for k, v in person_map.items():
+        safe_person_map[str(k)] = {
+            "EmployeeID": _serialize_value(v.get("EmployeeID","")),
+            "EmployeeName": _serialize_value(v.get("EmployeeName",""))
+        }
+
+    resp = {
+        "total_rejections": int(len(df)),
+        "by_location": by_loc_records,
+        "by_employee": by_emp_records,
+        "recent": recent_records,
+        # month-wise additions
+        "month_totals": month_totals_records,
+        "month_by_location": month_by_location_records,
+        "month_by_employee": month_by_employee_records,
+        # helper map for frontend name lookups
+        "person_map": safe_person_map,
     }
 
-    function downloadCSV(rows, filename = 'export.csv') {
-      if (!rows || rows.length === 0) { alert("No data to export"); return; }
-      const cols = Object.keys(rows[0]);
-      const lines = [];
-      lines.push(cols.join(','));
-      rows.forEach(r => {
-        const line = cols.map(c => {
-          const v = r[c] === null || r[c] === undefined ? '' : String(r[c]).replace(/\n/g,' ');
-          return JSON.stringify(v);
-        }).join(',');
-        lines.push(line);
-      });
-      const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
-    }
+    safe_resp = _sanitize(resp)
+    return JSONResponse(safe_resp)
 
-    function EmeaPinApp() {
-      const [year, setYear] = useState(new Date().getFullYear());
-      const [location, setLocation] = useState('All locations');
 
-      // IMPORTANT: default live=false so no automatic polling starts on load.
-      const [live, setLive] = useState(false);
 
-      // month selector in header. 0 === All months, 1..12 specific month
-      const [selectedMonth, setSelectedMonth] = useState(0);
 
-      const [loading, setLoading] = useState(false);
-      const [lastFetch, setLastFetch] = useState(null);
 
-      const [total, setTotal] = useState(0);
-      const [uniqueEmployees, setUniqueEmployees] = useState(0);
-      const [repeatersCount, setRepeatersCount] = useState(0);
 
-      // main lists (raw normalized arrays from API)
-      const [byLocationRaw, setByLocationRaw] = useState([]); // array of {name, count}
-      const [byEmployeeRaw, setByEmployeeRaw] = useState([]); // array of {id, count, EmployeeID, EmployeeName}
-      const [recent, setRecent] = useState([]);
 
-      // person map from API: { person_uid: { EmployeeID, EmployeeName } }
-      const [personMap, setPersonMap] = useState({});
 
-      // month-wise raw arrays from API
-      const [monthTotalsRaw, setMonthTotalsRaw] = useState([]); // {Month, MonthName, count}
-      const [monthByLocationRaw, setMonthByLocationRaw] = useState([]); // {Month, MonthName, PartitionName2, count}
-      const [monthByEmployeeRaw, setMonthByEmployeeRaw] = useState([]); // {Month, MonthName, person_uid, count, EmployeeID, EmployeeName}
 
-      const pollingRef = useRef(null);
-      const inFlightRef = useRef(false);
 
-      // chart refs
-      const locChartRef = useRef(null);
-      const locChartInst = useRef(null);
-      const monthChartRef = useRef(null);
-      const monthChartInst = useRef(null);
 
-      // Helper: update (or create) a Chart.js instance cleanly (silent update)
-      function updateOrCreateChart(instRef, canvas, config) {
-        if (!canvas) return;
-        try {
-          if (instRef.current) {
-            instRef.current.data = config.data;
-            instRef.current.options = config.options || instRef.current.options;
-            instRef.current.update();
-            return instRef.current;
-          } else {
-            instRef.current = new Chart(canvas.getContext('2d'), config);
-            return instRef.current;
-          }
-        } catch (e) {
-          try { if (instRef.current) instRef.current.destroy(); } catch (_) {}
-          instRef.current = new Chart(canvas.getContext('2d'), config);
-          return instRef.current;
-        }
-      }
+#C:\Users\W0024618\Desktop\Trend Analysis\backend\emea_pin.py
+"""
+EMEA PIN violation analysis.
 
-      // Utilities for client-side aggregation & filtering
-      function aggregateMonthByLocationForAllMonths(raw) {
-        const map = {};
-        (raw || []).forEach(r => {
-          const loc = r.PartitionName2 || r.Partition || r.location || '';
-          const c = Number(r.count || 0);
-          if (!map[loc]) map[loc] = 0;
-          map[loc] += c;
-        });
-        return Object.keys(map).map(k => ({ PartitionName2: k, count: map[k] })).sort((a,b)=>b.count-a.count);
-      }
+Usage:
+    python -m backend.emea_pin --year 2024 --outdir ./out
+"""
+from __future__ import annotations
 
-      function aggregateMonthByEmployeeForAllMonths(raw) {
-        const map = {};
-        (raw || []).forEach(r => {
-          const id = r.person_uid || r.EmployeeID || r.employee_id || r.id || '';
-          const c = Number(r.count || 0);
-          if (!map[id]) map[id] = 0;
-          map[id] += c;
-        });
-        return Object.keys(map).map(k => ({ person_uid: k, count: map[k] })).sort((a,b)=>b.count-a.count);
-      }
+import argparse
+import logging
+from datetime import date
+from pathlib import Path
+from typing import List
+import sys
 
-      // Build data for Location chart depending on selected month & location
-      function buildLocationChartData(byLocation, monthByLocation, selMonth, selLocation) {
-        if (selLocation && selLocation !== 'All locations') {
-          const monthArr = Array.from({length:12}, (_,i) => {
-            const m = i+1;
-            let found = null;
-            for (let i2=0;i2<monthByLocation.length;i2++){
-              const r = monthByLocation[i2];
-              if (Number(r.Month) === m) {
-                const part = r.PartitionName2 || r.Partition || r.location || '';
-                if (String(part) === String(selLocation)) {
-                  found = r; break;
-                }
-              }
-            }
-            return found && Number(found.count) ? Number(found.count) : 0;
-          });
-          if (selMonth === 0) {
-            return { labels: MONTH_NAMES, data: monthArr, type: 'line' };
-          } else {
-            const mIndex = selMonth - 1;
-            const val = monthArr[mIndex] || 0;
-            return { labels: [MONTH_NAMES[mIndex]], data: [val], type: 'bar' };
-          }
-        } else {
-          if (selMonth === 0) {
-            const top = (byLocation || []).slice(0,12);
-            const labels = top.map(x => x.name || x.PartitionName2 || '');
-            const values = top.map(x => Number(x.count || 0));
-            return { labels, data: values, type: 'line' };
-          } else {
-            const rows = (monthByLocation || []).filter(r => Number(r.Month) === Number(selMonth));
-            const ag = {};
-            rows.forEach(r => {
-              const loc = r.PartitionName2 || r.Partition || r.location || '';
-              ag[loc] = (ag[loc] || 0) + Number(r.count || 0);
-            });
-            const arr = Object.keys(ag).map(k => ({ PartitionName2: k, count: ag[k] })).sort((a,b)=>b.count-a.count).slice(0,12);
-            const labels = arr.map(x => x.PartitionName2 || '');
-            const values = arr.map(x => x.count || 0);
-            return { labels, data: values, type: 'line' };
-          }
-        }
-      }
+import pandas as pd
 
-      // Core fetch — silent update pattern:
-      async function fetchOnce() {
-        if (inFlightRef.current) return;
-        inFlightRef.current = true;
-        setLoading(true);
+# Robust import for duration_report (works when module loaded as package or as plain module)
+try:
+    from backend import duration_report as dr
+except Exception:
+    try:
+        import duration_report as dr
+    except Exception as e:
+        raise RuntimeError(f"Could not import duration_report (tried 'backend.duration_report' and 'duration_report'): {e}") from e
 
-        try {
-          const params = new URLSearchParams();
-          if (year) params.set('year', String(year));
-          if (location && location !== 'All locations') params.set('location', location);
-          const url = API_ENDPOINT + '?' + params.toString();
+# local alias (may be None if duration_report couldn't supply it)
+pyodbc = getattr(dr, "pyodbc", None)
 
-          const r = await fetch(url, { cache: 'no-store' });
-          if (!r.ok) {
-            const txt = await r.text().catch(()=>'');
-            throw new Error('API error: ' + r.status + ' ' + txt);
-          }
-          const js = await r.json();
+LOG = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-          // parse results into local variables first (do not mutate state yet)
-          const total_rejections = (js.total_rejections !== undefined) ? js.total_rejections
-            : (js.total !== undefined ? js.total : (js.totalRejections || 0));
 
-          const rawByLoc = js.by_location || js.byLocation || js.location_counts || [];
-          const normalizedByLoc = Array.isArray(rawByLoc) ? rawByLoc.map(function(x) {
-            var k = x.PartitionName2 || x.partition || x.location || x.name || x.PartitionName || '';
-            var c = x.count !== undefined ? x.count : (x.value !== undefined ? x.value : 0);
-            return { name: String(k || '').trim(), count: Number(c || 0) };
-          }) : [];
+SQL_DB_TEMPLATE = r"""
+SELECT
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.ObjectName1 AS EmployeeName,
+    t1.PartitionName2 AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t5rej.value AS Rejection_Type,
+    CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+    t3.Name AS PersonnelType,
+    t1.ObjectName2 AS DoorName,
+    t1.XmlGUID
+FROM [{db}].dbo.ACVSUJournalLog t1
+LEFT JOIN ACVSCore.Access.Personnel t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred sc ON t1.XmlGUID = sc.GUID AND sc.Name IN ('Card','CHUID')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5rej ON t1.XmlGUID = t5rej.GUID AND t5rej.Name = 'RejectCode'
+WHERE
+    t1.MessageType = 'CardRejected'
+    AND t5rej.value = 'PIN'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+"""
 
-          const rawByEmp = js.by_employee || js.byEmployee || js.employee_counts || [];
-          const normalizedByEmp = Array.isArray(rawByEmp) ? rawByEmp.map(function(x) {
-            var id = x.person_uid || x.EmployeeID || x.employee_id || x.id || x.person || '';
-            var c = x.count !== undefined ? x.count : (x.value !== undefined ? x.value : 0);
-            var empIdCol = x.EmployeeID || x.EmployeeId || x.employee_id || '';
-            var empNameCol = x.EmployeeName || x.Employee || x.EmployeeName || '';
-            return { id: String(id || '').trim(), count: Number(c || 0), EmployeeID: empIdCol || '', EmployeeName: empNameCol || '' };
-          }) : [];
+def _get_emea_databases() -> List[str]:
+    rc = dr.REGION_CONFIG.get("emea")
+    if not rc:
+        raise RuntimeError("No 'emea' region config found in duration_report.py")
+    candidates = dr._get_candidate_databases(rc)
+    valid = dr._filter_existing_databases(rc, candidates)
+    return valid or candidates
 
-          const rawRecent = js.recent || js.rows || js.events || js.recent_rows || [];
+def _connect_to_db(server: str, database: str, user: str, password: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not available; install pyodbc to run queries.")
+    conn_str = (
+        f"DRIVER={{{dr.ODBC_DRIVER}}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
 
-          // month-wise
-          const rawMonthTotals = js.month_totals || js.monthTotals || [];
-          const normalizedMonthTotals = Array.isArray(rawMonthTotals) ? rawMonthTotals.map(function(x) {
-            return {
-              Month: Number(x.Month || x.month || 0),
-              MonthName: x.MonthName || x.monthName || x.monthname || "",
-              count: Number(x.count || x.value || 0)
-            };
-          }) : [];
+def fetch_pin_rows_for_year(target_year: int) -> pd.DataFrame:
+    rc = dr.REGION_CONFIG["emea"]
+    start = date(target_year, 1, 1).strftime("%Y-%m-%d")
+    end = date(target_year, 12, 31).strftime("%Y-%m-%d")
+    dbs = _get_emea_databases()
+    LOG.info("Querying EMEA databases: %s", dbs)
 
-          const rawMonthByLoc = js.month_by_location || js.monthByLocation || [];
-          const normalizedMonthByLoc = Array.isArray(rawMonthByLoc) ? rawMonthByLoc.map(function(x) {
-            return {
-              Month: Number(x.Month || x.month || 0),
-              MonthName: x.MonthName || x.monthName || x.monthname || "",
-              PartitionName2: x.PartitionName2 || x.Partition || x.location || "",
-              count: Number(x.count || x.value || 0)
-            };
-          }) : [];
+    frames = []
+    for db in dbs:
+        sql = SQL_DB_TEMPLATE.format(db=db, start=start, end=end)
+        LOG.info("Running query against %s.%s (rows may be large)", rc["server"], db)
+        conn = None
+        try:
+            conn = _connect_to_db(rc["server"], db, rc["user"], rc["password"])
+            # pandas will pull the results into a DataFrame
+            df = pd.read_sql(sql, conn)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            LOG.exception("Failed to fetch from database %s", db)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
 
-          const rawMonthByEmp = js.month_by_employee || js.monthByEmployee || [];
-          const normalizedMonthByEmp = Array.isArray(rawMonthByEmp) ? rawMonthByEmp.map(function(x) {
-            return {
-              Month: Number(x.Month || x.month || 0),
-              MonthName: x.MonthName || x.monthName || x.monthname || "",
-              person_uid: x.person_uid || x.EmployeeID || x.employee_id || x.id || "",
-              count: Number(x.count || x.value || 0),
-              EmployeeID: x.EmployeeID || x.employee_id || '',
-              EmployeeName: x.EmployeeName || ''
-            };
-          }) : [];
+    if not frames:
+        return pd.DataFrame(columns=[
+            "LocaleMessageTime", "EmployeeName", "PartitionName2", "CardNumber",
+            "Rejection_Type", "EmployeeID", "PersonnelType", "DoorName", "XmlGUID"
+        ])
+    out = pd.concat(frames, ignore_index=True)
+    # normalize types
+    out["LocaleMessageTime"] = pd.to_datetime(out["LocaleMessageTime"], errors="coerce")
 
-          // parse person_map (if provided)
-          const rawPersonMap = js.person_map || js.personMap || {};
-          const normalizedPersonMap = {};
-          Object.keys(rawPersonMap || {}).forEach(k => {
-            const v = rawPersonMap[k] || {};
-            normalizedPersonMap[String(k)] = {
-              EmployeeID: v.EmployeeID || v.employeeId || v.EmployeeId || '',
-              EmployeeName: v.EmployeeName || v.EmployeeName || v.name || ''
-            };
-          });
+    # IMPORTANT CHANGE: store DateOnly AS STRING (ISO) to avoid python date objects
+    out["DateOnly"] = out["LocaleMessageTime"].dt.strftime("%Y-%m-%d")
 
-          // compute derived metrics locally
-          const unique = new Set((normalizedByEmp || []).map(function(e){ return e.id; }).filter(Boolean));
-          const repeaters = (normalizedByEmp || []).filter(function(e){ return e.count > 1; });
+    # Add Month and MonthName for month-wise analysis
+    out["Month"] = out["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")  # pandas nullable int
+    out["MonthName"] = out["LocaleMessageTime"].dt.strftime("%b").fillna("")
 
-          // Now update React state in one go
-          setTotal(Number(total_rejections || 0));
-          setByLocation(normalizedByLoc);
-          setByEmployee(normalizedByEmp);
-          setRecent(Array.isArray(rawRecent) ? rawRecent : []);
-          setUniqueEmployees(unique.size);
-          setRepeatersCount(repeaters.length);
+    # ensure columns exist
+    for c in ["EmployeeID", "EmployeeName", "CardNumber", "PartitionName2"]:
+        if c not in out.columns:
+            out[c] = None
+    # restrict to PersonnelType == 'Employee' (defensive)
+    if "PersonnelType" in out.columns:
+        out = out[out["PersonnelType"].fillna("").str.strip().str.lower() == "employee"].copy()
+    # canonical person uid using helper from duration_report
+    def make_person_uid(row):
+        try:
+            return dr._canonical_person_uid_from_row(row)
+        except Exception:
+            # fallback: prefer EmployeeID -> CardNumber -> EmployeeName
+            for cand in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(cand)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            return None
+    if not out.empty:
+        out["person_uid"] = out.apply(make_person_uid, axis=1)
+    return out
 
-          setMonthTotals(normalizedMonthTotals);
-          setMonthByLocation(normalizedMonthByLoc);
-          setMonthByEmployee(normalizedMonthByEmp);
+def analyze_pin_df(df: pd.DataFrame, outdir: Path) -> dict:
+    outdir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    total = len(df)
+    results["total_rejections"] = int(total)
+    LOG.info("Total PIN rejections in dataset: %d", total)
 
-          setPersonMap(normalizedPersonMap);
+    # ensure month columns exist and are in friendly form
+    if "Month" not in df.columns:
+        df["Month"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.month.fillna(0).astype(int)
+    if "MonthName" not in df.columns:
+        df["MonthName"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.strftime("%b").fillna("")
 
-          // update charts in-place (no flicker)
-          if (locChartRef.current) {
-            const topLoc = (normalizedByLoc || []).slice(0,12);
-            const labels = topLoc.map(function(x){ return x.name || 'Unknown'; });
-            const values = topLoc.map(function(x){ return x.count || 0; });
-            updateOrCreateChart(locChartInst, locChartRef.current, {
-              type: 'line',
-              data: {
-                labels: labels,
-                datasets: [{
-                  label: 'PIN rejections',
-                  data: values,
-                  borderColor: '#2563eb',
-                  backgroundColor: 'rgba(37,99,235,0.2)',
-                  fill: true,
-                  tension: 0.3,
-                  pointBackgroundColor: '#2563eb',
-                  pointRadius: 5,
-                  pointHoverRadius: 7,
-                  borderWidth: 2
-                }]
-              },
-              options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
-                scales: { x: { type: 'category' }, y: { beginAtZero: true, ticks: { precision: 0 } } }
-              }
-            });
-          }
+    # by location (PartitionName2)
+    by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_location"] = by_loc
+    by_loc.to_csv(outdir / "emea_pin_by_location.csv", index=False)
 
-          // Month totals chart
-          if (monthChartRef.current) {
-            var monthArr = Array.from({length:12}, function(_,i) {
-              var m = i + 1;
-              var rec = null;
-              for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
-                var cand = normalizedMonthTotals[ri];
-                if (Number(cand.Month) === m) { rec = cand; break; }
-              }
-              return rec && rec.count ? Number(rec.count) : 0;
-            });
-            updateOrCreateChart(monthChartInst, monthChartRef.current, {
-              type: 'line',
-              data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
-              options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-            });
-          }
+    # by employee (person_uid) - top offenders
+    by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_employee"] = by_emp
+    by_emp.to_csv(outdir / "emea_pin_by_employee.csv", index=False)
 
-          setLastFetch(new Date().toISOString());
+    # repeaters: employees with count > 1
+    repeaters = by_emp[by_emp["count"] > 1].copy()
+    results["repeaters"] = repeaters
+    repeaters.to_csv(outdir / "emea_pin_repeaters.csv", index=False)
 
-        } catch (err) {
-          console.error("Fetch EMEA PIN failed", err);
-        } finally {
-          setLoading(false);
-          inFlightRef.current = false;
-        }
-      }
+    # MONTH-WISE: total by month
+    month_totals = (df.groupby(["Month", "MonthName"], dropna=False)
+                    .size()
+                    .reset_index(name="count")
+                    .sort_values(["Month"]))
+    results["month_totals"] = month_totals
+    month_totals.to_csv(outdir / "emea_pin_month_totals.csv", index=False)
 
-      // start / stop polling
-      useEffect(function() {
-        // single immediate fetch on mount or when filters change
-        fetchOnce();
+    # MONTH-WISE: location-wise counts per month
+    month_loc = (df.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_location"] = month_loc
+    month_loc.to_csv(outdir / "emea_pin_month_by_location.csv", index=False)
 
-        if (live) {
-          pollingRef.current = setInterval(fetchOnce, 1000); // silent updates
-        }
-        return function() {
-          if (pollingRef.current) {
-            clearInterval(pollingRef.current);
-            pollingRef.current = null;
-          }
-        };
-      }, [live, year, location, selectedMonth]); // re-fetch when these change
+    # MONTH-WISE: employee-wise counts per month
+    month_emp = (df.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_employee"] = month_emp
+    month_emp.to_csv(outdir / "emea_pin_month_by_employee.csv", index=False)
 
-      // when page mounts create empty charts to avoid flash
-      useEffect(function() {
-        if (locChartRef.current && !locChartInst.current) {
-          updateOrCreateChart(locChartInst, locChartRef.current, {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'PIN rejections', data: [], borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.2)', fill:true, tension:0.3 }]},
-            options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-          });
-        }
-        if (monthChartRef.current && !monthChartInst.current) {
-          updateOrCreateChart(monthChartInst, monthChartRef.current, {
-            type: 'line',
-            data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: Array(12).fill(0), fill:false, tension:0.3 }]},
-            options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-          });
-        }
-      }, []);
+    # summary stats
+    results["unique_employees"] = int(by_emp["person_uid"].nunique()) if "person_uid" in by_emp.columns else int(by_emp.shape[0])
+    results["repeat_count_total"] = int(repeaters["count"].sum()) if not repeaters.empty else 0
+    results["num_repeaters"] = int(len(repeaters))
+    LOG.info("Unique employees with PIN rejects: %s", results["unique_employees"])
+    LOG.info("Number of repeaters (count>1): %s, total repeat events: %s", results["num_repeaters"], results["repeat_count_total"])
 
-      // helper to derive top locations/employees for selectedMonth (0=All months)
-      function topForSelectedMonthByLocation(limit=20) {
-        if (selectedMonth === 0) {
-          const agg = aggregateMonthByLocationForAllMonths(monthByLocationRaw);
-          return agg.slice(0,limit);
-        } else {
-          const rows = (monthByLocationRaw || []).filter(r => Number(r.Month) === Number(selectedMonth));
-          const map = {};
-          rows.forEach(r => {
-            const loc = r.PartitionName2 || r.Partition || r.location || '';
-            map[loc] = (map[loc] || 0) + Number(r.count || 0);
-          });
-          return Object.keys(map).map(k => ({ PartitionName2: k, count: map[k] })).sort((a,b)=>b.count-a.count).slice(0,limit);
-        }
-      }
+    # Save full raw dataframe for audit (DateOnly as string avoids JSON issues)
+    df.to_csv(outdir / "emea_pin_raw.csv", index=False)
 
-      function topForSelectedMonthByEmployee(limit=20) {
-        // returns [{person_uid, count, EmployeeID, EmployeeName}]
-        if (selectedMonth === 0) {
-          // aggregate across all months if monthByEmployeeRaw present
-          if (monthByEmployeeRaw && monthByEmployeeRaw.length > 0) {
-            const agg = aggregateMonthByEmployeeForAllMonths(monthByEmployeeRaw).slice(0,limit);
-            return agg.map(x => ({
-              person_uid: x.person_uid,
-              count: x.count,
-              EmployeeID: (personMap[String(x.person_uid)] || {}).EmployeeID || '',
-              EmployeeName: (personMap[String(x.person_uid)] || {}).EmployeeName || ''
-            }));
-          } else {
-            return (byEmployeeRaw || []).slice(0,limit).map(x => ({
-              person_uid: x.id,
-              count: x.count,
-              EmployeeID: x.EmployeeID || ((personMap[String(x.id)] || {}).EmployeeID || ''),
-              EmployeeName: x.EmployeeName || ((personMap[String(x.id)] || {}).EmployeeName || '')
-            }));
-          }
-        } else {
-          const rows = (monthByEmployeeRaw || []).filter(r => Number(r.Month) === Number(selectedMonth));
-          const map = {};
-          rows.forEach(r => {
-            const id = r.person_uid || '';
-            map[id] = (map[id] || 0) + Number(r.count || 0);
-          });
-          return Object.keys(map).map(k => ({
-            person_uid: k,
-            count: map[k],
-            EmployeeID: (personMap[String(k)] || {}).EmployeeID || '',
-            EmployeeName: (personMap[String(k)] || {}).EmployeeName || ''
-          })).sort((a,b)=>b.count-a.count).slice(0,limit);
-        }
-      }
+    return results
 
-      function exportMonthByLocationCSV() {
-        const rows = topForSelectedMonthByLocation(500).map(r => ({
-          Month: selectedMonth || 'All',
-          MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
-          Location: r.PartitionName2 || r.name || '',
-          Count: r.count
-        }));
-        if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
-        downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
-      }
+def main():
+    parser = argparse.ArgumentParser(description="EMEA PIN rejection analysis (yearly).")
+    parser.add_argument("--year", type=int, required=False, default=date.today().year, help="Year to analyze (e.g. 2024)")
+    parser.add_argument("--outdir", required=False, default="./out", help="Output directory for CSVs")
+    args = parser.parse_args()
 
-      // produce final repeaters list to show in the sidebar (id, name, count)
-      function getTopRepeatersForDisplay(limit=50) {
-        // Use personMap to map id -> name reliably
-        if (selectedMonth === 0) {
-          let base = (byEmployeeRaw && byEmployeeRaw.length > 0) ? byEmployeeRaw.slice(0) : [];
-          if (base.length === 0 && monthByEmployeeRaw && monthByEmployeeRaw.length > 0) {
-            base = aggregateMonthByEmployeeForAllMonths(monthByEmployeeRaw).map(x => ({ id: x.person_uid, count: x.count }));
-          } else {
-            base = base.map(x => ({ id: x.id, count: x.count }));
-          }
-          return base.sort((a,b)=>b.count - a.count).slice(0,limit).map(x => {
-            const pid = String(x.id || '');
-            const mapping = personMap[pid] || {};
-            return {
-              id: mapping.EmployeeID || pid || '',
-              name: mapping.EmployeeName || '',
-              count: x.count || 0
-            };
-          });
-        } else {
-          const monthTop = topForSelectedMonthByEmployee(limit);
-          return monthTop.map(x => ({
-            id: x.EmployeeID || x.person_uid || '',
-            name: x.EmployeeName || '',
-            count: x.count || 0
-          }));
-        }
-      }
+    target_year = int(args.year)
+    outdir = Path(args.outdir)
 
-      const displayTopRepeaters = getTopRepeatersForDisplay(50);
+    LOG.info("Starting EMEA PIN analysis for year %d", target_year)
+    df = fetch_pin_rows_for_year(target_year)
+    LOG.info("Rows fetched: %d", len(df))
+    results = analyze_pin_df(df, outdir)
+    # print short summary
+    print("==== EMEA PIN analysis summary ====")
+    print(f"Year: {target_year}")
+    print(f"Total PIN rejections: {results.get('total_rejections', 0)}")
+    print(f"Unique employees with rejects: {results.get('unique_employees', 0)}")
+    print(f"Repeaters (employees with >1 reject): {results.get('num_repeaters', 0)}  (repeat events total: {results.get('repeat_count_total', 0)})")
+    print(f"CSV outputs saved to: {outdir.resolve()}")
 
-      // setState helper wrappers (avoid lint)
-      function setByLocation(v){ setByLocationRaw(v); }
-      function setByEmployee(v){ setByEmployeeRaw(v); }
-      function setMonthTotals(v){ setMonthTotalsRaw(v); }
-      function setMonthByLocation(v){ setMonthByLocationRaw(v); }
-      function setMonthByEmployee(v){ setMonthByEmployeeRaw(v); }
+if __name__ == "__main__":
+    main()
 
-      return (
-        <div className="container" >
-          <div className="topbar" role="banner" style={{ marginBottom: 10 }}>
-            <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-              <div className="wu-logo">WU</div>
-              <div>
-                <h1 style={{ margin: 0, color: 'var(--wu-yellow)',fontSize: 18 }}>EMEA PIN — Live Dashboard</h1>
-                <div style={{ fontSize: 13, color: '#e6e6e6' }}>Live PIN rejections</div>
-              </div>
-            </div>
 
-            <div className="header-actions" style={{ alignItems:'center' }}>
-              <div style={{ display:'flex', gap:8, alignItems:'center' }} className="top-controls">
-                <label className="small" style={{ color:'#e6e6e6' }}>Year</label>
-                <input type="number" value={year} onChange={(e)=>setYear(Number(e.target.value||new Date().getFullYear()))} style={{ width:100, padding:6, borderRadius:6 }} />
 
-                <label className="small" style={{ color:'#e6e6e6' }}>Month</label>
-                <select value={selectedMonth} onChange={e=>setSelectedMonth(Number(e.target.value))} style={{ padding:6, borderRadius:6 }}>
-                  <option value={0}>All months</option>
-                  {Array.from({length:12},(_,i)=>i+1).map(m => <option key={m} value={m}>{MONTH_NAMES[m-1]} ({m})</option>)}
-                </select>
 
-                <label className="small" style={{ color:'#e6e6e6' }}>Location</label>
-                <select value={location} onChange={e=>setLocation(e.target.value)} style={{ padding:6, borderRadius:6 }}>
-                  <option>All locations</option>
-                  {EMEA_PARTITIONS.map(p => <option key={p} value={p}>{p}</option>)}
-                </select>
 
-                <button className="btn-ghost" onClick={() => { setLive(!live); }}>{live ? 'Pause' : 'Resume'}</button>
-                <button className="btn-primary" onClick={fetchOnce} disabled={loading}>Refresh</button>
-                <button className="small-button" onClick={() => exportMonthByLocationCSV()}>Export Month-By-Location</button>
-              </div>
-            </div>
-          </div>
 
-          <div style={{ display:'flex', gap:12 }}>
-            <div style={{ flex:1 }}>
-              <div className="cards" style={{ marginBottom:10 }}>
-                <div className="card">
-                  <div className="card-content">
-                    <div className="card-text">
-                      <h3>{total.toLocaleString()}</h3>
-                      <p>Total rejections</p>
-                    </div>
-                  </div>
-                </div>
-                <div className="card">
-                  <div className="card-content">
-                    <div className="card-text">
-                      <h3>{uniqueEmployees.toLocaleString()}</h3>
-                      <p>Unique employees</p>
-                    </div>
-                  </div>
-                </div>
-                <div className="card">
-                  <div className="card-content">
-                    <div className="card-text">
-                      <h3>{repeatersCount.toLocaleString()}</h3>
-                      <p>Repeat offenders</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ background:'#fff', padding:12, borderRadius:10, boxShadow:'0 6px 18px rgba(2,6,23,0.04)' }}>
-                <h3 style={{ marginTop:0 }}>Location wise (top)</h3>
-                <div className="chart-wrap chart-small" style={{ marginBottom:12 }}>
-                  <canvas ref={locChartRef}></canvas>
-                </div>
-
-                <div style={{ marginTop:10, fontSize:13, color:'#64748b' }}>
-                  Last fetch: {lastFetch ? new Date(lastFetch).toLocaleString() : 'never'} {loading ? ' • loading…' : ''}
-                </div>
-              </div>
-
-              {/* Month panel */}
-              <div style={{ marginTop:12, background:'#fff', padding:12, borderRadius:10, boxShadow:'0 6px 18px rgba(2,6,23,0.04)' }}>
-                <h3 style={{ marginTop:0 }}>Month-wise analysis</h3>
-
-                <div className="month-panel">
-                  <div style={{ marginLeft: 8 }}>
-                    <button className="small-button" onClick={() => exportMonthByLocationCSV()}>Export Month Location CSV</button>
-                  </div>
-                </div>
-
-                <div className="chart-wrap month-chart-wrap" style={{ marginTop:10 }}>
-                  <canvas ref={monthChartRef}></canvas>
-                </div>
-              </div>
-
-            </div>
-
-            <aside style={{ width: 340 }}>
-              <div className="card" style={{ padding:10 }}>
-                <h4 style={{ marginTop:0 }}>Details</h4>
-               
-                 <hr />
-                <div>
-                  <b>Total rejections:</b> {total}
-                </div>
-                <div><b>Unique employees:</b> {uniqueEmployees}</div>
-                <div><b>Repeaters:</b> {repeatersCount}</div>
-                <hr />
-                <div>
-                  <h5 style={{ margin:'6px 0' }}>
-                    Top locations{selectedMonth === 0 ? " — All months" : ` - ${MONTH_NAMES[selectedMonth-1]}`}
-                  </h5>
-                  <div style={{ maxHeight:300, overflow:'auto' }}>
-                    <table className="compact-table">
-                      <thead><tr><th>Location</th><th>Count</th></tr></thead>
-                      <tbody>
-                        {topForSelectedMonthByLocation(50).map((r,i) => (
-                          <tr key={i}><td style={{ padding:'6px 8px' }}>{r.PartitionName2 || r.name || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
-                        ))}
-                        {(topForSelectedMonthByLocation(50).length===0) && <tr><td colSpan="2" className="muted">No location data</td></tr>}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ height:12 }} />
-
-              {/* NEW: Top repeaters card (merged view) */}
-              <div className="card" style={{ padding:10 }}>
-                <h4 style={{ marginTop:0 }}>Top repeaters{selectedMonth === 0 ? " — All months" : ` - ${MONTH_NAMES[selectedMonth-1]}`}</h4>
-                <div style={{ maxHeight:260, overflow:'auto' }}>
-                  <table className="compact-table">
-                    <thead><tr><th>EmployeeID</th><th>Name</th><th>Count</th></tr></thead>
-                    <tbody>
-                      {displayTopRepeaters.map((r,i)=>(
-                        <tr key={i}>
-                          <td style={{ padding:'6px 8px' }}>{r.id || '-'}</td>
-                          <td style={{ padding:'6px 8px' }}>{r.name || '-'}</td>
-                          <td style={{ padding:'6px 8px' }}>{r.count}</td>
-                        </tr>
-                      ))}
-                      {(displayTopRepeaters.length===0) && <tr><td colSpan="3" className="muted">No repeaters data</td></tr>}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              <div style={{ height:12 }} />
-              <div className="card" style={{ padding:10 }}>
-                <h4 style={{ marginTop:0 }}>Actions</h4>
-                <div style={{ display:'flex', gap:8 }}>
-                  <button className="small-button" onClick={() => { setLocation('All locations'); setYear(new Date().getFullYear()); setSelectedMonth(0); }}>Reset</button>
-                  <button className="small-button" onClick={() => downloadCSV((recent||[]).slice(0,200), `emea_pin_recent_${year}.csv`)}>Export Recent</button>
-                </div>
-              </div>
-
-            </aside>
-          </div>
-        </div>
-      );
-    }
-
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(React.createElement(EmeaPinApp));
-  })();
-  </script>
-</body>
-</html>
