@@ -1,3 +1,547 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EMEA PIN Dashboard — Live</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .topbar { margin-bottom: 8px; }
+    .small-card { padding: 12px; text-align: center; }
+    .top-controls { display:flex; gap:8px; align-items:center; }
+    .chart-small { height:220px; }
+    .compact-table td { padding:6px; font-size:13px; }
+    .muted { color:#9aa4b2; }
+    .month-panel { display:flex; gap:12px; margin-top:12px; align-items:center; }
+    .month-chart-wrap { height:200px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  (function () {
+    const { useState, useEffect, useRef } = React;
+
+    // CHANGE THESE as needed:
+    const API_BASE = "http://localhost:8003";
+    const API_ENDPOINT = API_BASE + "/api/emea_pin_live";
+
+    const EMEA_PARTITIONS = ["LT.Vilnius","IT.Rome","UK.London","IE.DUblin","DU.Abu Dhab","ES.Madrid","AUT.Vienna","MA.Casablanca","RU.Moscow"];
+    const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+    function formatDateShort(d) {
+      if (!d) return '-';
+      try {
+        const dt = new Date(d);
+        if (isNaN(dt.getTime())) return String(d).slice(0,19);
+        return dt.toLocaleString();
+      } catch (e) { return String(d); }
+    }
+
+    function downloadCSV(rows, filename = 'export.csv') {
+      if (!rows || rows.length === 0) { alert("No data to export"); return; }
+      const cols = Object.keys(rows[0]);
+      const lines = [];
+      lines.push(cols.join(','));
+      rows.forEach(r => {
+        const line = cols.map(c => {
+          const v = r[c] === null || r[c] === undefined ? '' : String(r[c]).replace(/\n/g,' ');
+          return JSON.stringify(v);
+        }).join(',');
+        lines.push(line);
+      });
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+    }
+
+    function EmeaPinApp() {
+      const [year, setYear] = useState(new Date().getFullYear());
+      const [location, setLocation] = useState('All locations');
+      const [live, setLive] = useState(true);
+      const [loading, setLoading] = useState(false);
+      const [lastFetch, setLastFetch] = useState(null);
+
+      const [total, setTotal] = useState(0);
+      const [uniqueEmployees, setUniqueEmployees] = useState(0);
+      const [repeatersCount, setRepeatersCount] = useState(0);
+
+      // main lists
+      const [byLocation, setByLocation] = useState([]);
+      const [byEmployee, setByEmployee] = useState([]);
+      const [recent, setRecent] = useState([]);
+
+      // month-wise
+      const [monthTotals, setMonthTotals] = useState([]);
+      const [monthByLocation, setMonthByLocation] = useState([]);
+      const [monthByEmployee, setMonthByEmployee] = useState([]);
+
+      const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth()+1);
+
+      const pollingRef = useRef(null);
+      const inFlightRef = useRef(false);
+
+      // chart refs
+      const locChartRef = useRef(null);
+      const locChartInst = useRef(null);
+      const monthChartRef = useRef(null);
+      const monthChartInst = useRef(null);
+
+      // Helper: update (or create) a Chart.js instance cleanly (silent update)
+      function updateOrCreateChart(instRef, canvas, config) {
+        if (!canvas) return;
+        try {
+          if (instRef.current) {
+            // update data & options if possible (silent)
+            instRef.current.data = config.data;
+            instRef.current.options = config.options || instRef.current.options;
+            instRef.current.update();
+            return instRef.current;
+          } else {
+            instRef.current = new Chart(canvas.getContext('2d'), config);
+            return instRef.current;
+          }
+        } catch (e) {
+          try { if (instRef.current) instRef.current.destroy(); } catch (_) {}
+          instRef.current = new Chart(canvas.getContext('2d'), config);
+          return instRef.current;
+        }
+      }
+
+      // Core fetch — silent update pattern:
+      async function fetchOnce() {
+        if (inFlightRef.current) return;
+        inFlightRef.current = true;
+        // setLoading just for indicator; we MUST NOT clear UI state here
+        setLoading(true);
+
+        try {
+          const params = new URLSearchParams();
+          if (year) params.set('year', String(year));
+          if (location && location !== 'All locations') params.set('location', location);
+          const url = API_ENDPOINT + '?' + params.toString();
+
+          const r = await fetch(url, { cache: 'no-store' });
+          if (!r.ok) {
+            const txt = await r.text().catch(()=>'');
+            throw new Error('API error: ' + r.status + ' ' + txt);
+          }
+          const js = await r.json();
+
+          // parse results into local variables first (do not mutate state yet)
+          const total_rejections = (js.total_rejections !== undefined) ? js.total_rejections
+            : (js.total !== undefined ? js.total : (js.totalRejections || 0));
+
+          const rawByLoc = js.by_location || js.byLocation || js.location_counts || [];
+          const normalizedByLoc = Array.isArray(rawByLoc) ? rawByLoc.map(function(x) {
+            var k = x.PartitionName2 || x.partition || x.location || x.name || x.PartitionName || '';
+            var c = x.count !== undefined ? x.count : (x.value !== undefined ? x.value : 0);
+            return { name: String(k || '').trim(), count: Number(c || 0) };
+          }) : [];
+
+          const rawByEmp = js.by_employee || js.byEmployee || js.employee_counts || [];
+          const normalizedByEmp = Array.isArray(rawByEmp) ? rawByEmp.map(function(x) {
+            var id = x.person_uid || x.EmployeeID || x.employee_id || x.id || x.person || '';
+            var c = x.count !== undefined ? x.count : (x.value !== undefined ? x.value : 0);
+            return { id: String(id || '').trim(), count: Number(c || 0) };
+          }) : [];
+
+          const rawRecent = js.recent || js.rows || js.events || js.recent_rows || [];
+
+          // month-wise
+          const rawMonthTotals = js.month_totals || js.monthTotals || [];
+          const normalizedMonthTotals = Array.isArray(rawMonthTotals) ? rawMonthTotals.map(function(x) {
+            return {
+              Month: Number(x.Month || x.month || 0),
+              MonthName: x.MonthName || x.monthName || x.monthname || "",
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+          const rawMonthByLoc = js.month_by_location || js.monthByLocation || [];
+          const normalizedMonthByLoc = Array.isArray(rawMonthByLoc) ? rawMonthByLoc.map(function(x) {
+            return {
+              Month: Number(x.Month || x.month || 0),
+              MonthName: x.MonthName || x.monthName || x.monthname || "",
+              PartitionName2: x.PartitionName2 || x.Partition || x.location || "",
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+          const rawMonthByEmp = js.month_by_employee || js.monthByEmployee || [];
+          const normalizedMonthByEmp = Array.isArray(rawMonthByEmp) ? rawMonthByEmp.map(function(x) {
+            return {
+              Month: Number(x.Month || x.month || 0),
+              MonthName: x.MonthName || x.monthName || x.monthname || "",
+              person_uid: x.person_uid || x.EmployeeID || x.employee_id || x.id || "",
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+          // compute derived metrics locally
+          const unique = new Set((normalizedByEmp || []).map(function(e){ return e.id; }).filter(Boolean));
+          const repeaters = (normalizedByEmp || []).filter(function(e){ return e.count > 1; });
+
+          // Now update React state in one go
+          setTotal(Number(total_rejections || 0));
+          setByLocation(normalizedByLoc);
+          setByEmployee(normalizedByEmp);
+          setRecent(Array.isArray(rawRecent) ? rawRecent : []);
+          setUniqueEmployees(unique.size);
+          setRepeatersCount(repeaters.length);
+
+          setMonthTotals(normalizedMonthTotals);
+          setMonthByLocation(normalizedMonthByLoc);
+          setMonthByEmployee(normalizedMonthByEmp);
+
+          // update charts in-place (no flicker)
+
+          // Location chart (keep as original LINE chart, do not change to bar)
+          if (locChartRef.current) {
+            const topLoc = (normalizedByLoc || []).slice(0,12);
+            const labels = topLoc.map(function(x){ return x.name || 'Unknown'; });
+            const values = topLoc.map(function(x){ return x.count || 0; });
+            updateOrCreateChart(locChartInst, locChartRef.current, {
+              type: 'line',
+              data: {
+                labels: labels,
+                datasets: [{
+                  label: 'PIN rejections',
+                  data: values,
+                  borderColor: '#2563eb',
+                  backgroundColor: 'rgba(37,99,235,0.2)',
+                  fill: true,
+                  tension: 0.3,
+                  pointBackgroundColor: '#2563eb',
+                  pointRadius: 5,
+                  pointHoverRadius: 7,
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: { x: { type: 'category' }, y: { beginAtZero: true, ticks: { precision: 0 } } }
+              }
+            });
+          }
+
+          // Month totals chart — build array length 12 safely (no optional chaining)
+          if (monthChartRef.current) {
+            var monthArr = Array.from({length:12}, function(_,i) {
+              var m = i + 1;
+              var rec = null;
+              for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
+                var cand = normalizedMonthTotals[ri];
+                if (Number(cand.Month) === m) { rec = cand; break; }
+              }
+              return rec && rec.count ? Number(rec.count) : 0;
+            });
+            updateOrCreateChart(monthChartInst, monthChartRef.current, {
+              type: 'line',
+              data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
+              options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+            });
+          }
+
+          setLastFetch(new Date().toISOString());
+
+        } catch (err) {
+          console.error("Fetch EMEA PIN failed", err);
+        } finally {
+          setLoading(false);
+          inFlightRef.current = false;
+        }
+      }
+
+      // start / stop polling
+      useEffect(function() {
+        // immediate first fetch (do not clear UI)
+        fetchOnce();
+
+        if (live) {
+          pollingRef.current = setInterval(fetchOnce, 1000); // keep 1s but updates are silent
+        }
+        return function() {
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+        };
+      }, [live, year, location]);
+
+      // when page mounts create empty charts to avoid flash
+      useEffect(function() {
+        // create empty loc chart stub to keep UI stable (LINE chart)
+        if (locChartRef.current && !locChartInst.current) {
+          updateOrCreateChart(locChartInst, locChartRef.current, {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'PIN rejections', data: [], borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.2)', fill:true, tension:0.3 }]},
+            options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+          });
+        }
+        if (monthChartRef.current && !monthChartInst.current) {
+          updateOrCreateChart(monthChartInst, monthChartRef.current, {
+            type: 'line',
+            data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: Array(12).fill(0), fill:false, tension:0.3 }]},
+            options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+          });
+        }
+      }, []);
+
+      // helper to derive top locations/employees for selected month
+      function topForSelectedMonthByLocation(limit=20) {
+        const rows = (monthByLocation || []).filter(function(r) { return Number(r.Month) === Number(selectedMonth); });
+        return rows.sort(function(a,b){ return b.count - a.count; }).slice(0,limit);
+      }
+      function topForSelectedMonthByEmployee(limit=20) {
+        const rows = (monthByEmployee || []).filter(function(r) { return Number(r.Month) === Number(selectedMonth); });
+        return rows.sort(function(a,b){ return b.count - a.count; }).slice(0,limit);
+      }
+
+      function exportMonthByLocationCSV() {
+        const rows = topForSelectedMonthByLocation(500).map(function(r) {
+          return { Month: r.Month, MonthName: r.MonthName, Location: r.PartitionName2, Count: r.count };
+        });
+        if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
+        downloadCSV(rows, `emea_pin_month_${selectedMonth}_by_location.csv`);
+      }
+
+      return (
+        <div className="container" >
+          <div className="topbar" role="banner" style={{ marginBottom: 10 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+              <div className="wu-logo">WU</div>
+              <div>
+                <h1 style={{ margin: 0, color: 'var(--wu-yellow)',fontSize: 18 }}>EMEA PIN — Live Dashboard</h1>
+                <div style={{ fontSize: 13, color: '#e6e6e6' }}>Live PIN rejections</div>
+              </div>
+            </div>
+
+            <div className="header-actions" style={{ alignItems:'center' }}>
+              <div style={{ display:'flex', gap:8, alignItems:'center' }} className="top-controls">
+                <label className="small" style={{ color:'#e6e6e6' }}>Year</label>
+                <input type="number" value={year} onChange={(e)=>setYear(Number(e.target.value||new Date().getFullYear()))} style={{ width:100, padding:6, borderRadius:6 }} />
+                <label className="small" style={{ color:'#e6e6e6' }}>Location</label>
+                <select value={location} onChange={e=>setLocation(e.target.value)} style={{ padding:6, borderRadius:6 }}>
+                  <option>All locations</option>
+                  {EMEA_PARTITIONS.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+
+                <button className="btn-ghost" onClick={() => { setLive(!live); }}>{live ? 'Pause' : 'Resume'}</button>
+                <button className="btn-primary" onClick={fetchOnce} disabled={loading}>Refresh</button>
+                <button className="small-button" onClick={() => exportMonthByLocationCSV()}>Export Month-By-Location</button>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display:'flex', gap:12 }}>
+            <div style={{ flex:1 }}>
+              <div className="cards" style={{ marginBottom:10 }}>
+                <div className="card">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{total.toLocaleString()}</h3>
+                      <p>Total rejections</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{uniqueEmployees.toLocaleString()}</h3>
+                      <p>Unique employees</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-content">
+                    <div className="card-text">
+                      <h3>{repeatersCount.toLocaleString()}</h3>
+                      <p>Repeat offenders</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ background:'#fff', padding:12, borderRadius:10, boxShadow:'0 6px 18px rgba(2,6,23,0.04)' }}>
+                <h3 style={{ marginTop:0 }}>Location wise (top)</h3>
+                <div className="chart-wrap chart-small" style={{ marginBottom:12 }}>
+                  <canvas ref={locChartRef}></canvas>
+                </div>
+
+                <div style={{ display:'flex', gap:12 }}>
+                  <div style={{ flex:1 }}>
+                    <h4 style={{ margin: '6px 0' }}>Top repeaters</h4>
+                    <div className="table-scroll" style={{ maxHeight:220 }}>
+                      <table className="compact-table">
+                        <thead>
+                          <tr><th>Employee</th><th>Count</th></tr>
+                        </thead>
+                        <tbody>
+                          {(byEmployee || []).slice(0,15).map((r,i) => (
+                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.id}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
+                          ))}
+                          {(!byEmployee || byEmployee.length===0) && <tr><td colSpan="2" className="muted">No data</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div style={{ width: 320 }}>
+                    <h4 style={{ margin: '6px 0' }}>Recent events</h4>
+                    <div className="table-scroll" style={{ maxHeight:220 }}>
+                      <table className="compact-table">
+                        <thead><tr><th>Time</th><th>Loc</th><th>Emp</th></tr></thead>
+                        <tbody>
+                          {(recent || []).slice(0,12).map((r,i) => (
+                            <tr key={i}>
+                              <td style={{ padding:'6px 8px' }}>{formatDateShort(r.LocaleMessageTime || r.Date || r.Timestamp)}</td>
+                              <td style={{ padding:'6px 8px' }}>{r.PartitionName2 || r.Partition || r.location || '-'}</td>
+                              <td style={{ padding:'6px 8px' }}>{r.EmployeeName || r.EmployeeID || r.person_uid || '-'}</td>
+                            </tr>
+                          ))}
+                          {(!recent || recent.length===0) && <tr><td colSpan="3" className="muted">No recent events</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ marginTop:10, fontSize:13, color:'#64748b' }}>
+                  Last fetch: {lastFetch ? new Date(lastFetch).toLocaleString() : 'never'} {loading ? ' • loading…' : ''}
+                </div>
+              </div>
+
+              {/* Month panel */}
+              <div style={{ marginTop:12, background:'#fff', padding:12, borderRadius:10, boxShadow:'0 6px 18px rgba(2,6,23,0.04)' }}>
+                <h3 style={{ marginTop:0 }}>Month-wise analysis</h3>
+
+                <div className="month-panel">
+                  <label className="small muted">Select month</label>
+                  <select value={selectedMonth} onChange={e=>setSelectedMonth(Number(e.target.value))} style={{ padding:6, borderRadius:6 }}>
+                    {Array.from({length:12},(_,i)=>i+1).map(m => <option key={m} value={m}>{MONTH_NAMES[m-1]} ({m})</option>)}
+                  </select>
+
+                  <div style={{ marginLeft: 8 }}>
+                    <button className="small-button" onClick={() => exportMonthByLocationCSV()}>Export Month Location CSV</button>
+                  </div>
+                </div>
+
+                <div className="chart-wrap month-chart-wrap" style={{ marginTop:10 }}>
+                  <canvas ref={monthChartRef}></canvas>
+                </div>
+
+                <div style={{ display:'flex', gap:12, marginTop:12 }}>
+                  <div style={{ flex:1 }}>
+                    <h4 style={{ margin:'6px 0' }}>Top locations — {MONTH_NAMES[selectedMonth-1]}</h4>
+                    <div className="table-scroll" style={{ maxHeight:220 }}>
+                      <table className="compact-table">
+                        <thead><tr><th>Location</th><th>Count</th></tr></thead>
+                        <tbody>
+                          {topForSelectedMonthByLocation(50).map((r,i)=>(
+                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.PartitionName2 || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
+                          ))}
+                          {(topForSelectedMonthByLocation(50).length===0) && <tr><td colSpan="2" className="muted">No data for selected month</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div style={{ width: 320 }}>
+                    <h4 style={{ margin:'6px 0' }}>Top employees — {MONTH_NAMES[selectedMonth-1]}</h4>
+                    <div className="table-scroll" style={{ maxHeight:220 }}>
+                      <table className="compact-table">
+                        <thead><tr><th>Employee</th><th>Count</th></tr></thead>
+                        <tbody>
+                          {topForSelectedMonthByEmployee(50).map((r,i)=>(
+                            <tr key={i}><td style={{ padding:'6px 8px' }}>{r.person_uid || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
+                          ))}
+                          {(topForSelectedMonthByEmployee(50).length===0) && <tr><td colSpan="2" className="muted">No data for selected month</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+
+            </div>
+
+            <aside style={{ width: 340 }}>
+              <div className="card" style={{ padding:10 }}>
+                <h4 style={{ marginTop:0 }}>Details</h4>
+                <div className="small muted">This dashboard polls the API every second. UI will update silently — no blank flashes.</div>
+                <hr />
+                <div>
+                  <b>Total rejections:</b> {total}
+                </div>
+                <div><b>Unique employees:</b> {uniqueEmployees}</div>
+                <div><b>Repeaters:</b> {repeatersCount}</div>
+                <hr />
+                <div>
+                  <h5 style={{ margin:'6px 0' }}>Top locations</h5>
+                  <div style={{ maxHeight:300, overflow:'auto' }}>
+                    <table className="compact-table">
+                      <thead><tr><th>Location</th><th>Count</th></tr></thead>
+                      <tbody>
+                        {(byLocation || []).slice(0,50).map((r,i) => (
+                          <tr key={i}><td style={{ padding:'6px 8px' }}>{r.name || '-'}</td><td style={{ padding:'6px 8px' }}>{r.count}</td></tr>
+                        ))}
+                        {(!byLocation || byLocation.length===0) && <tr><td colSpan="2" className="muted">No location data</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ height:12 }} />
+              <div className="card" style={{ padding:10 }}>
+                <h4 style={{ marginTop:0 }}>Actions</h4>
+                <div style={{ display:'flex', gap:8 }}>
+                  <button className="small-button" onClick={() => { setLocation('All locations'); setYear(new Date().getFullYear()); }}>Reset</button>
+                  <button className="small-button" onClick={() => downloadCSV((recent||[]).slice(0,200), `emea_pin_recent_${year}.csv`)}>Export Recent</button>
+                </div>
+              </div>
+
+            </aside>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(EmeaPinApp));
+  })();
+  </script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 check our 1 st Previous html file 
 refer this file 
 Dont make unnecessary changes 
