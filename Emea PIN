@@ -1,3 +1,375 @@
+PS> cd "C:\Users\W0024618\Desktop\Trend Analysis"
+PS> if (-not (Test-Path backend\__init__.py)) { New-Item backend\__init__.py -ItemType File | Out-Null; Write-Host "created backend\__init__.py" } else { Write-Host "backend/__init__.py already exists" }
+
+
+
+
+
+
+
+# backend/api_server.py
+from pathlib import Path
+from datetime import datetime
+import time
+import traceback
+import sys
+
+# Ensure project root is on sys.path so `import backend.*` works regardless of CWD
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parent.parent  # two levels up: <project-root>/backend/api_server.py
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+import pandas as pd
+
+# import your existing analysis functions (robust import fallback)
+try:
+    import backend.emea_pin as ep
+except Exception:
+    try:
+        # fallback if module is invoked without package context
+        import emea_pin as ep
+    except Exception as e:
+        raise RuntimeError(f"Failed to import emea_pin module: {e}") from e
+
+app = FastAPI(title="EMEA PIN API (wrapper)")
+
+# Very permissive CORS for local/dev. Tighten for production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# simple in-memory cache to avoid repeated heavy DB queries (TTL seconds)
+CACHE = {"ts": 0.0, "year": None, "df": None}
+CACHE_TTL = 5  # seconds
+
+@app.get("/api/emea_pin_live")
+def emea_pin_live(year: int | None = None, location: str | None = Query(None)):
+    """
+    Return JSON summary for EMEA PIN rejections.
+    Query params:
+      - year (int) — defaults to current year
+      - location (string) — optional PartitionName2 to filter recent rows shown (UI also filters client-side)
+    """
+    target_year = int(year or datetime.now().year)
+    now = time.time()
+
+    # Use cached DF if fresh & same year
+    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+        try:
+            df = ep.fetch_pin_rows_for_year(target_year)
+        except Exception as e:
+            # Helpful debug: if DB not reachable, attempt to load previously saved CSV (out/emea_pin_raw.csv)
+            try:
+                fallback = Path(PROJECT_ROOT) / "out" / "emea_pin_raw.csv"
+                if fallback.exists():
+                    df = pd.read_csv(fallback, parse_dates=["LocaleMessageTime"], keep_default_na=False)
+                else:
+                    raise
+            except Exception:
+                tb = traceback.format_exc()
+                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\n{tb}")
+
+        # normalize df (ensure expected columns)
+        if df is None:
+            df = pd.DataFrame()
+        # store cache
+        CACHE.update({"ts": now, "year": target_year, "df": df})
+    else:
+        df = CACHE["df"]
+
+    # Defensive: ensure expected columns exist
+    for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # If location filter provided, create a filtered view for recent rows (but keep overall totals same)
+    df_for_recent = df
+    if location and location.strip() and location.strip().lower() != "all locations":
+        df_for_recent = df_for_recent[df_for_recent["PartitionName2"].astype(str) == location]
+
+    # build by_location & by_employee using the full df (so totals stay stable)
+    try:
+        by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+        by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        # in case df empty or not a DataFrame
+        by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
+        by_emp = pd.DataFrame(columns=["person_uid", "count"])
+
+    # take recent events (sorted by LocaleMessageTime desc) — limit to 500 rows
+    recent = df_for_recent.copy()
+    if "LocaleMessageTime" in recent.columns:
+        try:
+            recent = recent.sort_values("LocaleMessageTime", ascending=False)
+        except Exception:
+            recent = recent
+    recent = recent.head(500)
+
+    # Convert DataFrames to JSON-serializable lists
+    def df_to_records(dfb):
+        if isinstance(dfb, (pd.Series, pd.DataFrame)):
+            try:
+                # ensure native python types
+                recs = dfb.fillna("").to_dict(orient="records")
+            except Exception:
+                recs = []
+        else:
+            recs = []
+        return recs
+
+    by_loc_records = df_to_records(by_loc)
+    by_emp_records = df_to_records(by_emp)
+
+    recent_records = []
+    if not recent.empty:
+        recent_records = recent.fillna("").to_dict(orient="records")
+        # ensure LocaleMessageTime is ISO string for any pandas timestamps
+        for r in recent_records:
+            v = r.get("LocaleMessageTime")
+            try:
+                # pandas.Timestamp -> isoformat
+                if hasattr(v, "isoformat"):
+                    r["LocaleMessageTime"] = v.isoformat()
+            except Exception:
+                r["LocaleMessageTime"] = str(v)
+
+    resp = {
+        "total_rejections": int(len(df)),
+        "by_location": by_loc_records,
+        "by_employee": by_emp_records,
+        "recent": recent_records,
+    }
+    return JSONResponse(resp)
+
+
+
+
+
+
+
+
+
+
+
+# backend/emea_pin.py
+"""
+EMEA PIN violation analysis.
+
+Usage:
+    python -m backend.emea_pin --year 2024 --outdir ./out
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import date
+from pathlib import Path
+from typing import List
+import sys
+
+import pandas as pd
+
+# Robust import for duration_report (works when module loaded as package or as plain module)
+try:
+    from backend import duration_report as dr
+except Exception:
+    try:
+        import duration_report as dr
+    except Exception as e:
+        raise RuntimeError(f"Could not import duration_report (tried 'backend.duration_report' and 'duration_report'): {e}") from e
+
+# local alias (may be None if duration_report couldn't supply it)
+pyodbc = getattr(dr, "pyodbc", None)
+
+LOG = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+SQL_DB_TEMPLATE = r"""
+SELECT
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.ObjectName1 AS EmployeeName,
+    t1.PartitionName2 AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t5rej.value AS Rejection_Type,
+    CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+    t3.Name AS PersonnelType,
+    t1.ObjectName2 AS DoorName,
+    t1.XmlGUID
+FROM [{db}].dbo.ACVSUJournalLog t1
+LEFT JOIN ACVSCore.Access.Personnel t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred sc ON t1.XmlGUID = sc.GUID AND sc.Name IN ('Card','CHUID')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5rej ON t1.XmlGUID = t5rej.GUID AND t5rej.Name = 'RejectCode'
+WHERE
+    t1.MessageType = 'CardRejected'
+    AND t5rej.value = 'PIN'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+"""
+
+def _get_emea_databases() -> List[str]:
+    rc = dr.REGION_CONFIG.get("emea")
+    if not rc:
+        raise RuntimeError("No 'emea' region config found in duration_report.py")
+    candidates = dr._get_candidate_databases(rc)
+    valid = dr._filter_existing_databases(rc, candidates)
+    return valid or candidates
+
+def _connect_to_db(server: str, database: str, user: str, password: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not available; install pyodbc to run queries.")
+    conn_str = (
+        f"DRIVER={{{dr.ODBC_DRIVER}}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_pin_rows_for_year(target_year: int) -> pd.DataFrame:
+    rc = dr.REGION_CONFIG["emea"]
+    start = date(target_year, 1, 1).strftime("%Y-%m-%d")
+    end = date(target_year, 12, 31).strftime("%Y-%m-%d")
+    dbs = _get_emea_databases()
+    LOG.info("Querying EMEA databases: %s", dbs)
+
+    frames = []
+    for db in dbs:
+        sql = SQL_DB_TEMPLATE.format(db=db, start=start, end=end)
+        LOG.info("Running query against %s.%s (rows may be large)", rc["server"], db)
+        conn = None
+        try:
+            conn = _connect_to_db(rc["server"], db, rc["user"], rc["password"])
+            # pandas will pull the results into a DataFrame
+            df = pd.read_sql(sql, conn)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            LOG.exception("Failed to fetch from database %s", db)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    if not frames:
+        return pd.DataFrame(columns=[
+            "LocaleMessageTime", "EmployeeName", "PartitionName2", "CardNumber",
+            "Rejection_Type", "EmployeeID", "PersonnelType", "DoorName", "XmlGUID"
+        ])
+    out = pd.concat(frames, ignore_index=True)
+    # normalize types
+    out["LocaleMessageTime"] = pd.to_datetime(out["LocaleMessageTime"], errors="coerce")
+    out["DateOnly"] = out["LocaleMessageTime"].dt.date
+    # ensure columns exist
+    for c in ["EmployeeID", "EmployeeName", "CardNumber", "PartitionName2"]:
+        if c not in out.columns:
+            out[c] = None
+    # restrict to PersonnelType == 'Employee' (defensive)
+    if "PersonnelType" in out.columns:
+        out = out[out["PersonnelType"].fillna("").str.strip().str.lower() == "employee"].copy()
+    # canonical person uid using helper from duration_report
+    def make_person_uid(row):
+        try:
+            return dr._canonical_person_uid_from_row(row)
+        except Exception:
+            # fallback: prefer EmployeeID -> CardNumber -> EmployeeName
+            for cand in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(cand)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            return None
+    if not out.empty:
+        out["person_uid"] = out.apply(make_person_uid, axis=1)
+    return out
+
+def analyze_pin_df(df: pd.DataFrame, outdir: Path) -> dict:
+    outdir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    total = len(df)
+    results["total_rejections"] = int(total)
+    LOG.info("Total PIN rejections in dataset: %d", total)
+
+    # by location (PartitionName2)
+    by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_location"] = by_loc
+    by_loc.to_csv(outdir / "emea_pin_by_location.csv", index=False)
+
+    # by employee (person_uid) - top offenders
+    by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_employee"] = by_emp
+    by_emp.to_csv(outdir / "emea_pin_by_employee.csv", index=False)
+
+    # repeaters: employees with count > 1
+    repeaters = by_emp[by_emp["count"] > 1].copy()
+    results["repeaters"] = repeaters
+    repeaters.to_csv(outdir / "emea_pin_repeaters.csv", index=False)
+
+    # summary stats
+    results["unique_employees"] = int(by_emp["person_uid"].nunique()) if "person_uid" in by_emp.columns else int(by_emp.shape[0])
+    results["repeat_count_total"] = int(repeaters["count"].sum()) if not repeaters.empty else 0
+    results["num_repeaters"] = int(len(repeaters))
+    LOG.info("Unique employees with PIN rejects: %s", results["unique_employees"])
+    LOG.info("Number of repeaters (count>1): %s, total repeat events: %s", results["num_repeaters"], results["repeat_count_total"])
+
+    # Save full raw dataframe for audit
+    df.to_csv(outdir / "emea_pin_raw.csv", index=False)
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="EMEA PIN rejection analysis (yearly).")
+    parser.add_argument("--year", type=int, required=False, default=date.today().year, help="Year to analyze (e.g. 2024)")
+    parser.add_argument("--outdir", required=False, default="./out", help="Output directory for CSVs")
+    args = parser.parse_args()
+
+    target_year = int(args.year)
+    outdir = Path(args.outdir)
+
+    LOG.info("Starting EMEA PIN analysis for year %d", target_year)
+    df = fetch_pin_rows_for_year(target_year)
+    LOG.info("Rows fetched: %d", len(df))
+    results = analyze_pin_df(df, outdir)
+    # print short summary
+    print("==== EMEA PIN analysis summary ====")
+    print(f"Year: {target_year}")
+    print(f"Total PIN rejections: {results.get('total_rejections', 0)}")
+    print(f"Unique employees with rejects: {results.get('unique_employees', 0)}")
+    print(f"Repeaters (employees with >1 reject): {results.get('num_repeaters', 0)}  (repeat events total: {results.get('repeat_count_total', 0)})")
+    print(f"CSV outputs saved to: {outdir.resolve()}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 check all file line by line and fix this issue carefully
 
 
