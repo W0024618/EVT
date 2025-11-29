@@ -1,3 +1,179 @@
+# backend/api_server.py
+from pathlib import Path
+from datetime import datetime
+import time
+import traceback
+import sys
+import importlib
+import logging
+
+# ----- ensure project root on sys.path (do this before other imports) -----
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parent.parent  # <project-root> (one level above backend/)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# now safe to import FastAPI etc.
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import pandas as pd
+
+LOG = logging.getLogger("emea.api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ----- try to import backend.emea_pin in a robust way (clear error if fails) -----
+ep = None
+try:
+    # primary: package import
+    ep = importlib.import_module("backend.emea_pin")
+    LOG.info("Imported backend.emea_pin via package import")
+except Exception as first_exc:
+    LOG.warning("Package import backend.emea_pin failed: %s", first_exc)
+    try:
+        # fallback: import by module name if running inside backend/ CWD
+        ep = importlib.import_module("emea_pin")
+        LOG.info("Imported emea_pin as top-level module")
+    except Exception as second_exc:
+        # final: give a detailed error and re-raise so startup fails with helpful info
+        tb = traceback.format_exc()
+        LOG.error("Failed to import emea_pin module.\nPackage import error: %s\nFallback error: %s\nTrace:\n%s",
+                  first_exc, second_exc, tb)
+        raise RuntimeError(f"Failed to import emea_pin module (see server logs). Primary error: {first_exc}") from second_exc
+
+# create app
+app = FastAPI(title="EMEA PIN API (wrapper)")
+
+# permissive CORS for local/dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+
+# cache for DataFrame
+CACHE = {"ts": 0.0, "year": None, "df": None}
+CACHE_TTL = 5  # seconds
+
+def _load_fallback_csv(project_root: Path):
+    fallback = project_root / "out" / "emea_pin_raw.csv"
+    if fallback.exists():
+        LOG.info("Loading fallback CSV: %s", fallback)
+        try:
+            df = pd.read_csv(fallback, parse_dates=["LocaleMessageTime"], keep_default_na=False)
+            return df
+        except Exception as e:
+            LOG.exception("Failed to parse fallback CSV: %s", e)
+            raise
+    raise FileNotFoundError(str(fallback))
+
+@app.get("/api/emea_pin_live")
+def emea_pin_live(year: int | None = None, location: str | None = Query(None)):
+    target_year = int(year or datetime.now().year)
+    now = time.time()
+
+    # refresh cache as needed
+    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+        try:
+            # call the function from emea_pin (this may raise; we catch below)
+            df = ep.fetch_pin_rows_for_year(target_year)
+            LOG.info("Fetched df from emea_pin (rows=%d)", len(df) if getattr(df, "shape", None) is not None else -1)
+        except Exception as e:
+            LOG.warning("fetch_pin_rows_for_year failed: %s", e)
+            # try fallback CSV in project root/out
+            try:
+                df = _load_fallback_csv(PROJECT_ROOT)
+            except Exception as e2:
+                tb = traceback.format_exc()
+                LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
+                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
+
+        # ensure df (defensive)
+        if df is None:
+            df = pd.DataFrame()
+        CACHE.update({"ts": now, "year": target_year, "df": df})
+    else:
+        df = CACHE["df"]
+
+    # defensive column existence
+    for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # optional location filter for recent rows
+    df_for_recent = df
+    if location and location.strip() and location.strip().lower() != "all locations":
+        try:
+            df_for_recent = df_for_recent[df_for_recent["PartitionName2"].astype(str) == location]
+        except Exception:
+            LOG.exception("Location filtering failed; using unfiltered df_for_recent")
+            df_for_recent = df
+
+    # compute aggregates safely
+    try:
+        by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
+    try:
+        by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_emp = pd.DataFrame(columns=["person_uid", "count"])
+
+    recent = df_for_recent.copy()
+    if "LocaleMessageTime" in recent.columns:
+        try:
+            recent = recent.sort_values("LocaleMessageTime", ascending=False)
+        except Exception:
+            LOG.debug("Could not sort recent by LocaleMessageTime")
+    recent = recent.head(500)
+
+    def df_to_records(dfb):
+        if isinstance(dfb, (pd.Series, pd.DataFrame)):
+            try:
+                return dfb.fillna("").to_dict(orient="records")
+            except Exception:
+                return []
+        return []
+
+    by_loc_records = df_to_records(by_loc)
+    by_emp_records = df_to_records(by_emp)
+    recent_records = df_to_records(recent)
+
+    # ensure ISO strings for timestamps
+    for r in recent_records:
+        v = r.get("LocaleMessageTime")
+        try:
+            if hasattr(v, "isoformat"):
+                r["LocaleMessageTime"] = v.isoformat()
+        except Exception:
+            r["LocaleMessageTime"] = str(v)
+
+    resp = {
+        "total_rejections": int(len(df)),
+        "by_location": by_loc_records,
+        "by_employee": by_emp_records,
+        "recent": recent_records,
+    }
+    return JSONResponse(resp)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Now When i run this we got error Which i need to fix...
 
   File "C:\Users\W0024618\Desktop\Trend Analysis\backend\.venv\Lib\site-packages\anyio\to_thread.py", line 61, in run_sync
