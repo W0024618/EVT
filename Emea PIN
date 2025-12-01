@@ -1,3 +1,357 @@
+@app.get("/api/emea_pin_live")
+def emea_pin_live(year: int | None = None, month: int | None = Query(None), location: str | None = Query(None)):
+    """
+    Returns aggregates for the requested year, optional month, and optional location.
+
+    - month: if provided (1..12) the API returns day-level aggregates for that month:
+      `day_totals` (per-day counts for the month) and `day_by_location`.
+    - All month/day aggregates are computed for the location scope first (i.e. location filter
+      is applied before computing month/day breakdowns).
+    """
+    target_year = int(year or datetime.now().year)
+    now = time.time()
+
+    # refresh cache as needed
+    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+        try:
+            df = ep.fetch_pin_rows_for_year(target_year)
+            LOG.info("Fetched df from emea_pin (rows=%d)", len(df) if getattr(df, "shape", None) is not None else -1)
+        except Exception as e:
+            LOG.warning("fetch_pin_rows_for_year failed: %s", e)
+            try:
+                df = _load_fallback_csv(PROJECT_ROOT)
+            except Exception as e2:
+                tb = traceback.format_exc()
+                LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
+                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
+
+        if df is None:
+            df = pd.DataFrame()
+        CACHE.update({"ts": now, "year": target_year, "df": df})
+    else:
+        df = CACHE["df"]
+
+    # defensive column existence
+    for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber", "DateOnly", "Month", "MonthName"]:
+        if col not in df.columns:
+            if col == "Month":
+                df[col] = pd.NA
+            else:
+                df[col] = pd.NA
+
+    # ensure LocaleMessageTime parsed
+    if "LocaleMessageTime" in df.columns:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # ensure Month/MonthName derived
+    if "Month" not in df.columns or df["Month"].isnull().all():
+        df["Month"] = df["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")
+    if "MonthName" not in df.columns or df["MonthName"].isnull().all():
+        df["MonthName"] = df["LocaleMessageTime"].dt.strftime("%b").fillna("")
+
+    # Build person_map (used for enriching employee display)
+    person_map = {}
+    try:
+        for _, r in df.iterrows():
+            pu = r.get("person_uid")
+            if pu is None or (isinstance(pu, float) and pd.isna(pu)):
+                continue
+            key = str(pu)
+            entry = person_map.get(key, {"EmployeeID": "", "EmployeeName": ""})
+            eid = r.get("EmployeeID") or ""
+            ename = r.get("EmployeeName") or ""
+            if eid and not entry["EmployeeID"]:
+                entry["EmployeeID"] = str(eid)
+            if ename and not entry["EmployeeName"]:
+                entry["EmployeeName"] = str(ename)
+            person_map[key] = entry
+    except Exception:
+        LOG.exception("Failed to build person_map; proceeding without enriched names")
+        person_map = {}
+
+    # --- Apply location filter first (so month/day breakdowns are location-scoped) ---
+    df_loc_filtered = df
+    if location and str(location).strip() and str(location).strip().lower() != "all locations":
+        try:
+            df_loc_filtered = df_loc_filtered[df_loc_filtered["PartitionName2"].astype(str) == str(location)]
+        except Exception:
+            LOG.exception("Location filtering failed; using unfiltered df_loc_filtered")
+            df_loc_filtered = df
+
+    # Month-level breakdowns for the (possibly location-filtered) dataset
+    try:
+        month_totals_df = (df_loc_filtered.groupby(["Month", "MonthName"], dropna=False)
+                           .size()
+                           .reset_index(name="count")
+                           .sort_values(["Month"]))
+    except Exception:
+        month_totals_df = pd.DataFrame(columns=["Month", "MonthName", "count"])
+
+    try:
+        month_by_location_df = (df_loc_filtered.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+                                 .size()
+                                 .reset_index(name="count")
+                                 .sort_values(["Month", "count"], ascending=[True, False]))
+    except Exception:
+        month_by_location_df = pd.DataFrame(columns=["Month", "MonthName", "PartitionName2", "count"])
+
+    try:
+        month_by_employee_df = (df_loc_filtered.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+                                 .size()
+                                 .reset_index(name="count")
+                                 .sort_values(["Month", "count"], ascending=[True, False]))
+        if not month_by_employee_df.empty:
+            month_by_employee_df["EmployeeID"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID",""))
+            month_by_employee_df["EmployeeName"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName",""))
+    except Exception:
+        month_by_employee_df = pd.DataFrame(columns=["Month", "MonthName", "person_uid", "count", "EmployeeID", "EmployeeName"])
+
+    # parse month param into integer (m) for later use
+    m = None
+    if month is not None:
+        try:
+            m = int(month)
+        except Exception:
+            m = None
+
+    # If a specific month is requested: compute day-level aggregates for that month (scoped by location)
+    day_totals_df = pd.DataFrame(columns=["Day", "count"])
+    day_by_location_df = pd.DataFrame(columns=["Day", "PartitionName2", "count"])
+    if m is not None and 1 <= m <= 12:
+        try:
+            df_month_scope = df_loc_filtered[df_loc_filtered["Month"].fillna(0).astype(int) == m].copy()
+            if "LocaleMessageTime" in df_month_scope.columns:
+                df_month_scope["Day"] = df_month_scope["LocaleMessageTime"].dt.day.fillna(0).astype("Int64")
+            day_totals_df = (df_month_scope.groupby(["Day"], dropna=False)
+                             .size().reset_index(name="count").sort_values(["Day"]))
+            day_by_location_df = (df_month_scope.groupby(["Day", "PartitionName2"], dropna=False)
+                                  .size().reset_index(name="count").sort_values(["Day", "count"], ascending=[True, False]))
+        except Exception:
+            LOG.exception("Failed to compute day-level aggregates for month %s", m)
+            day_totals_df = pd.DataFrame(columns=["Day", "count"])
+            day_by_location_df = pd.DataFrame(columns=["Day", "PartitionName2", "count"])
+
+    # --- Now apply month filter (if any) to produce the main aggregates used by cards/recent/by_location/by_employee ---
+    df_agg = df_loc_filtered
+    if m is not None and 1 <= m <= 12:
+        try:
+            df_agg = df_loc_filtered[df_loc_filtered["Month"].fillna(0).astype(int) == m].copy()
+        except Exception:
+            LOG.exception("Month filtering failed; using unfiltered df_loc_filtered")
+            df_agg = df_loc_filtered
+
+    try:
+        by_loc = df_agg.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
+
+    try:
+        by_emp = df_agg.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    except Exception:
+        by_emp = pd.DataFrame(columns=["person_uid", "count"])
+
+    # Enrich by_emp with EmployeeID and EmployeeName
+    try:
+        if not by_emp.empty:
+            by_emp["EmployeeID"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID", ""))
+            by_emp["EmployeeName"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName", ""))
+    except Exception:
+        LOG.exception("Failed to enrich by_emp with names")
+
+    # totals and recent (df_agg honors location+month)
+    total_rejections_value = int(len(df_agg))
+    recent = df_agg.copy()
+    if "LocaleMessageTime" in recent.columns:
+        try:
+            recent = recent.sort_values("LocaleMessageTime", ascending=False)
+        except Exception:
+            LOG.debug("Could not sort recent by LocaleMessageTime")
+    recent = recent.head(500)
+
+    # sanitize outputs
+    by_loc_records = _sanitize(by_loc.fillna("").to_dict(orient="records"))
+    by_emp_records = _sanitize(by_emp.fillna("").to_dict(orient="records"))
+    recent_records = _sanitize(recent.fillna("").to_dict(orient="records"))
+
+    month_totals_records = _sanitize(month_totals_df.fillna("").to_dict(orient="records"))
+    month_by_location_records = _sanitize(month_by_location_df.fillna("").to_dict(orient="records"))
+    month_by_employee_records = _sanitize(month_by_employee_df.fillna("").to_dict(orient="records"))
+
+    day_totals_records = _sanitize(day_totals_df.fillna("").to_dict(orient="records"))
+    day_by_location_records = _sanitize(day_by_location_df.fillna("").to_dict(orient="records"))
+
+    # Ensure person_map values are primitive types (strings)
+    safe_person_map = {}
+    for k, v in person_map.items():
+        safe_person_map[str(k)] = {
+            "EmployeeID": _serialize_value(v.get("EmployeeID","")),
+            "EmployeeName": _serialize_value(v.get("EmployeeName",""))
+        }
+
+    resp = {
+        "total_rejections": total_rejections_value,
+        "by_location": by_loc_records,
+        "by_employee": by_emp_records,
+        "recent": recent_records,
+        # month-wise (location scoped)
+        "month_totals": month_totals_records,
+        "month_by_location": month_by_location_records,
+        "month_by_employee": month_by_employee_records,
+        # day-wise for selected month (if month provided)
+        "day_totals": day_totals_records,
+        "day_by_location": day_by_location_records,
+        # helper map for frontend name lookups
+        "person_map": safe_person_map,
+    }
+
+    safe_resp = _sanitize(resp)
+    return JSONResponse(safe_resp)
+
+
+
+
+
+
+
+
+
+
+      // day-wise arrays returned by API when a specific month is requested
+      const [dayTotalsRaw, setDayTotalsRaw] = useState([]); // {Day, count}
+      const [dayByLocationRaw, setDayByLocationRaw] = useState([]); // {Day, PartitionName2, count}
+
+
+      function setDayTotals(v){ setDayTotalsRaw(v); }
+      function setDayByLocation(v){ setDayByLocationRaw(v); }
+
+
+
+
+
+
+
+          // day-wise (for selected month) — optional
+          const rawDayTotals = js.day_totals || js.dayTotals || [];
+          const normalizedDayTotals = Array.isArray(rawDayTotals) ? rawDayTotals.map(function(x) {
+            return {
+              Day: Number(x.Day || x.day || 0),
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+          const rawDayByLoc = js.day_by_location || js.dayByLocation || [];
+          const normalizedDayByLoc = Array.isArray(rawDayByLoc) ? rawDayByLoc.map(function(x) {
+            return {
+              Day: Number(x.Day || x.day || 0),
+              PartitionName2: x.PartitionName2 || x.Partition || x.location || "",
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+
+
+
+
+
+          setDayTotals(normalizedDayTotals);
+          setDayByLocation(normalizedDayByLoc);
+
+
+
+
+
+
+
+
+
+
+          // Month / Day totals chart
+          if (monthChartRef.current) {
+            if (selectedMonth === 0) {
+              // monthly view (12 month buckets)
+              var monthArr = Array.from({length:12}, function(_,i) {
+                var m = i + 1;
+                var rec = null;
+                for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
+                  var cand = normalizedMonthTotals[ri];
+                  if (Number(cand.Month) === m) { rec = cand; break; }
+                }
+                return rec && rec.count ? Number(rec.count) : 0;
+              });
+              updateOrCreateChart(monthChartInst, monthChartRef.current, {
+                type: 'line',
+                data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
+                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+              });
+            } else {
+              // day-wise view for the selected month
+              // determine days in selected month
+              const daysInMonth = new Date(Number(year), Number(selectedMonth), 0).getDate();
+              const labels = Array.from({length: daysInMonth}, (_,i) => String(i+1));
+              const dayArr = Array.from({length: daysInMonth}, function(_,i) {
+                const d = i + 1;
+                var rec = null;
+                for (var ri = 0; ri < normalizedDayTotals.length; ri++) {
+                  var cand = normalizedDayTotals[ri];
+                  if (Number(cand.Day) === d) { rec = cand; break; }
+                }
+                return rec && rec.count ? Number(rec.count) : 0;
+              });
+              updateOrCreateChart(monthChartInst, monthChartRef.current, {
+                type: 'line',
+                data: { labels: labels, datasets: [{ label: `Day-wise for ${MONTH_NAMES[selectedMonth-1]}`, data: dayArr, fill:false, tension:0.3 }] },
+                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+              });
+            }
+          }
+
+
+
+
+
+
+
+
+      function exportMonthByLocationCSV() {
+        if (selectedMonth === 0) {
+          const rows = topForSelectedMonthByLocation(500).map(r => ({
+            Month: selectedMonth || 'All',
+            MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
+            Location: r.PartitionName2 || r.name || '',
+            Count: r.count
+          }));
+          if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
+          downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
+        } else {
+          // day-by-location export if available
+          const rows = (dayByLocationRaw || []).map(r => ({
+            Month: selectedMonth,
+            MonthName: MONTH_NAMES[selectedMonth-1],
+            Day: r.Day,
+            Location: r.PartitionName2 || '',
+            Count: r.count
+          }));
+          if (rows.length===0) { alert("No day-by-location data for selected month"); return; }
+          downloadCSV(rows, `emea_pin_month_${selectedMonth}_day_by_location.csv`);
+        }
+      }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Great now i want update data day wise 
 When Select Month 
 ex- january
