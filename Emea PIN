@@ -1,3 +1,322 @@
+#C:\Users\W0024618\Desktop\Trend Analysis\backend\api_server.py
+from pathlib import Path
+from datetime import datetime, date
+import time
+import traceback
+import sys
+import importlib
+import logging
+from typing import Any
+
+# ----- ensure project root on sys.path (do this before other imports) -----
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parent.parent  # <project-root> (one level above backend/)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# now safe to import FastAPI etc.
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import pandas as pd
+
+LOG = logging.getLogger("emea.api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ----- try to import backend.emea_pin in a robust way (clear error if fails) -----
+ep = None
+try:
+    ep = importlib.import_module("backend.emea_pin")
+    LOG.info("Imported backend.emea_pin via package import")
+except Exception as first_exc:
+    LOG.warning("Package import backend.emea_pin failed: %s", first_exc)
+    try:
+        ep = importlib.import_module("emea_pin")
+        LOG.info("Imported emea_pin as top-level module")
+    except Exception as second_exc:
+        tb = traceback.format_exc()
+        LOG.error("Failed to import emea_pin module.\nPackage import error: %s\nFallback error: %s\nTrace:\n%s",
+                  first_exc, second_exc, tb)
+        raise RuntimeError(f"Failed to import emea_pin module (see server logs). Primary error: {first_exc}") from second_exc
+
+# create app
+app = FastAPI(title="EMEA PIN API (wrapper)")
+
+# permissive CORS for local/dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+
+# cache for DataFrame
+CACHE = {"ts": 0.0, "year": None, "df": None}
+CACHE_TTL = 5  # seconds
+
+def _load_fallback_csv(project_root: Path):
+    fallback = project_root / "out" / "emea_pin_raw.csv"
+    if fallback.exists():
+        LOG.info("Loading fallback CSV: %s", fallback)
+        try:
+            df = pd.read_csv(fallback, parse_dates=["LocaleMessageTime"], keep_default_na=False)
+            # sanitize DateOnly if present: ensure string
+            if "LocaleMessageTime" in df.columns:
+                df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+            if "DateOnly" in df.columns:
+                # ensure DateOnly is string
+                df["DateOnly"] = df["DateOnly"].astype(str)
+            return df
+        except Exception as e:
+            LOG.exception("Failed to parse fallback CSV: %s", e)
+            raise
+    raise FileNotFoundError(str(fallback))
+
+# --- sanitizer helpers to make response JSON-safe ---
+def _serialize_value(v: Any) -> Any:
+    """Convert common non-JSON types to JSON-safe primitives."""
+    if v is None:
+        return None
+    if isinstance(v, (str, bool, int, float)):
+        return v
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    try:
+        import pandas as pd
+        if isinstance(v, pd.Timestamp):
+            if pd.isna(v):
+                return None
+            return v.isoformat()
+        if isinstance(v, pd.Timedelta):
+            return str(v)
+        if v is pd.NaT:
+            return None
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+        if isinstance(v, _np.generic):
+            return v.item()
+        if isinstance(v, _np.datetime64):
+            try:
+                ts = pd.to_datetime(v)
+                return ts.isoformat()
+            except Exception:
+                return str(v)
+    except Exception:
+        pass
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+def _sanitize(obj: Any) -> Any:
+    """Recursively walk `obj` and convert values to JSON-safe types."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, pd.DataFrame):
+        try:
+            return _sanitize(obj.fillna("").to_dict(orient="records"))
+        except Exception:
+            return []
+    if isinstance(obj, pd.Series):
+        try:
+            return _sanitize(obj.fillna("").to_list())
+        except Exception:
+            return []
+    return _serialize_value(obj)
+
+
+
+# @app.get("/api/emea_pin_live")
+# def emea_pin_live(year: int | None = None, month: int | None = Query(None), location: str | None = Query(None)):
+#     """
+#     Returns aggregates for the requested year, optional month, and optional location.
+
+#     Behavior:
+#     - Loads cached dataframe for `year`.
+#     - Builds month-wise breakdowns for the (optional) location.
+#     - If `month` provided (1..12) it further filters results to that month before computing
+#       top-by-location / top-by-employee / recent rows / total_rejections so the API honors
+#       both month and location filters (frontend selects month + location).
+#     """
+#     target_year = int(year or datetime.now().year)
+#     now = time.time()
+
+#     # refresh cache as needed (cache is year-based; month filtering applied below)
+#     if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+#         try:
+#             df = ep.fetch_pin_rows_for_year(target_year)
+#             LOG.info("Fetched df from emea_pin (rows=%d)", len(df) if getattr(df, "shape", None) is not None else -1)
+#         except Exception as e:
+#             LOG.warning("fetch_pin_rows_for_year failed: %s", e)
+#             try:
+#                 df = _load_fallback_csv(PROJECT_ROOT)
+#             except Exception as e2:
+#                 tb = traceback.format_exc()
+#                 LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
+#                 raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
+
+#         if df is None:
+#             df = pd.DataFrame()
+#         CACHE.update({"ts": now, "year": target_year, "df": df})
+#     else:
+#         df = CACHE["df"]
+
+#     # defensive column existence
+#     for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber", "DateOnly", "Month", "MonthName"]:
+#         if col not in df.columns:
+#             if col == "Month":
+#                 df[col] = pd.NA
+#             else:
+#                 df[col] = pd.NA
+
+#     # ensure LocaleMessageTime parsed
+#     if "LocaleMessageTime" in df.columns:
+#         df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+#     # ensure Month/MonthName derived (in case they weren't present)
+#     if "Month" not in df.columns or df["Month"].isnull().all():
+#         df["Month"] = df["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")
+#     if "MonthName" not in df.columns or df["MonthName"].isnull().all():
+#         df["MonthName"] = df["LocaleMessageTime"].dt.strftime("%b").fillna("")
+
+#     # Build person_map (from full df) — used to enrich employee display
+#     person_map = {}
+#     try:
+#         for _, r in df.iterrows():
+#             pu = r.get("person_uid")
+#             if pu is None or (isinstance(pu, float) and pd.isna(pu)):
+#                 continue
+#             key = str(pu)
+#             entry = person_map.get(key, {"EmployeeID": "", "EmployeeName": ""})
+#             eid = r.get("EmployeeID") or ""
+#             ename = r.get("EmployeeName") or ""
+#             if eid and not entry["EmployeeID"]:
+#                 entry["EmployeeID"] = str(eid)
+#             if ename and not entry["EmployeeName"]:
+#                 entry["EmployeeName"] = str(ename)
+#             person_map[key] = entry
+#     except Exception:
+#         LOG.exception("Failed to build person_map; proceeding without enriched names")
+#         person_map = {}
+
+#     # --- Apply location filter first (so month-wise breakdowns are location-scoped) ---
+#     df_loc_filtered = df
+#     if location and str(location).strip() and str(location).strip().lower() != "all locations":
+#         try:
+#             df_loc_filtered = df_loc_filtered[df_loc_filtered["PartitionName2"].astype(str) == str(location)]
+#         except Exception:
+#             LOG.exception("Location filtering failed; using unfiltered df_loc_filtered")
+#             df_loc_filtered = df
+
+#     # MONTH-WISE breakdowns for the (possibly location-filtered) dataset.
+#     try:
+#         month_totals_df = (df_loc_filtered.groupby(["Month", "MonthName"], dropna=False)
+#                            .size()
+#                            .reset_index(name="count")
+#                            .sort_values(["Month"]))
+#     except Exception:
+#         month_totals_df = pd.DataFrame(columns=["Month", "MonthName", "count"])
+
+#     try:
+#         month_by_location_df = (df_loc_filtered.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+#                                  .size()
+#                                  .reset_index(name="count")
+#                                  .sort_values(["Month", "count"], ascending=[True, False]))
+#     except Exception:
+#         month_by_location_df = pd.DataFrame(columns=["Month", "MonthName", "PartitionName2", "count"])
+
+#     try:
+#         month_by_employee_df = (df_loc_filtered.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+#                                  .size()
+#                                  .reset_index(name="count")
+#                                  .sort_values(["Month", "count"], ascending=[True, False]))
+#         if not month_by_employee_df.empty:
+#             month_by_employee_df["EmployeeID"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID",""))
+#             month_by_employee_df["EmployeeName"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName",""))
+#     except Exception:
+#         month_by_employee_df = pd.DataFrame(columns=["Month", "MonthName", "person_uid", "count", "EmployeeID", "EmployeeName"])
+
+#     # --- If a specific month is requested, filter to that month for the primary aggregates ---
+#     df_agg = df_loc_filtered
+#     if month is not None:
+#         try:
+#             m = int(month)
+#             if 1 <= m <= 12:
+#                 # safe comparison: fillna(0) then cast to int for comparison
+#                 df_agg = df_loc_filtered[df_loc_filtered["Month"].fillna(0).astype(int) == m].copy()
+#         except Exception:
+#             LOG.exception("Month filtering failed; using unfiltered df_loc_filtered")
+#             df_agg = df_loc_filtered
+
+#     # compute aggregates using df_agg (which honors location and optional month)
+#     try:
+#         by_loc = df_agg.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+#     except Exception:
+#         by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
+
+#     try:
+#         by_emp = df_agg.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+#     except Exception:
+#         by_emp = pd.DataFrame(columns=["person_uid", "count"])
+
+#     # Enrich by_emp with EmployeeID and EmployeeName (if present)
+#     try:
+#         if not by_emp.empty:
+#             by_emp["EmployeeID"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID", ""))
+#             by_emp["EmployeeName"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName", ""))
+#     except Exception:
+#         LOG.exception("Failed to enrich by_emp with names")
+
+#     # total_rejections should reflect df_agg (i.e., location+month filter applied).
+#     total_rejections_value = int(len(df_agg))
+
+#     # Prepare recent rows (from df_agg so recent honors filters)
+#     recent = df_agg.copy()
+#     if "LocaleMessageTime" in recent.columns:
+#         try:
+#             recent = recent.sort_values("LocaleMessageTime", ascending=False)
+#         except Exception:
+#             LOG.debug("Could not sort recent by LocaleMessageTime")
+#     recent = recent.head(500)
+
+#     # convert to records and sanitize
+#     by_loc_records = _sanitize(by_loc.fillna("").to_dict(orient="records"))
+#     by_emp_records = _sanitize(by_emp.fillna("").to_dict(orient="records"))
+#     recent_records = _sanitize(recent.fillna("").to_dict(orient="records"))
+
+#     month_totals_records = _sanitize(month_totals_df.fillna("").to_dict(orient="records"))
+#     month_by_location_records = _sanitize(month_by_location_df.fillna("").to_dict(orient="records"))
+#     month_by_employee_records = _sanitize(month_by_employee_df.fillna("").to_dict(orient="records"))
+
+#     # Ensure person_map values are primitive types (strings)
+#     safe_person_map = {}
+#     for k, v in person_map.items():
+#         safe_person_map[str(k)] = {
+#             "EmployeeID": _serialize_value(v.get("EmployeeID","")),
+#             "EmployeeName": _serialize_value(v.get("EmployeeName",""))
+#         }
+
+#     resp = {
+#         "total_rejections": total_rejections_value,
+#         "by_location": by_loc_records,
+#         "by_employee": by_emp_records,
+#         "recent": recent_records,
+#         # month-wise additions (these are computed for the current location scope)
+#         "month_totals": month_totals_records,
+#         "month_by_location": month_by_location_records,
+#         "month_by_employee": month_by_employee_records,
+#         # helper map for frontend name lookups
+#         "person_map": safe_person_map,
+#     }
+
+#     safe_resp = _sanitize(resp)
+#     return JSONResponse(safe_resp)
+
 @app.get("/api/emea_pin_live")
 def emea_pin_live(year: int | None = None, month: int | None = Query(None), location: str | None = Query(None)):
     """
@@ -212,155 +531,245 @@ def emea_pin_live(year: int | None = None, month: int | None = Query(None), loca
 
 
 
+#C:\Users\W0024618\Desktop\Trend Analysis\backend\emea_pin.py
+"""
+EMEA PIN violation analysis.
+
+Usage:
+    python -m backend.emea_pin --year 2024 --outdir ./out
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import date
+from pathlib import Path
+from typing import List
+import sys
+
+import pandas as pd
+
+# Robust import for duration_report (works when module loaded as package or as plain module)
+try:
+    from backend import duration_report as dr
+except Exception:
+    try:
+        import duration_report as dr
+    except Exception as e:
+        raise RuntimeError(f"Could not import duration_report (tried 'backend.duration_report' and 'duration_report'): {e}") from e
+
+# local alias (may be None if duration_report couldn't supply it)
+pyodbc = getattr(dr, "pyodbc", None)
+
+LOG = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+SQL_DB_TEMPLATE = r"""
+SELECT
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.ObjectName1 AS EmployeeName,
+    t1.PartitionName2 AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t5rej.value AS Rejection_Type,
+    CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+    t3.Name AS PersonnelType,
+    t1.ObjectName2 AS DoorName,
+    t1.XmlGUID
+FROM [{db}].dbo.ACVSUJournalLog t1
+LEFT JOIN ACVSCore.Access.Personnel t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred sc ON t1.XmlGUID = sc.GUID AND sc.Name IN ('Card','CHUID')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5rej ON t1.XmlGUID = t5rej.GUID AND t5rej.Name = 'RejectCode'
+WHERE
+    t1.MessageType = 'CardRejected'
+    AND t5rej.value = 'PIN'
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+"""
+
+def _get_emea_databases() -> List[str]:
+    rc = dr.REGION_CONFIG.get("emea")
+    if not rc:
+        raise RuntimeError("No 'emea' region config found in duration_report.py")
+    candidates = dr._get_candidate_databases(rc)
+    valid = dr._filter_existing_databases(rc, candidates)
+    return valid or candidates
+
+def _connect_to_db(server: str, database: str, user: str, password: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not available; install pyodbc to run queries.")
+    conn_str = (
+        f"DRIVER={{{dr.ODBC_DRIVER}}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_pin_rows_for_year(target_year: int) -> pd.DataFrame:
+    rc = dr.REGION_CONFIG["emea"]
+    start = date(target_year, 1, 1).strftime("%Y-%m-%d")
+    end = date(target_year, 12, 31).strftime("%Y-%m-%d")
+    dbs = _get_emea_databases()
+    LOG.info("Querying EMEA databases: %s", dbs)
+
+    frames = []
+    for db in dbs:
+        sql = SQL_DB_TEMPLATE.format(db=db, start=start, end=end)
+        LOG.info("Running query against %s.%s (rows may be large)", rc["server"], db)
+        conn = None
+        try:
+            conn = _connect_to_db(rc["server"], db, rc["user"], rc["password"])
+            # pandas will pull the results into a DataFrame
+            df = pd.read_sql(sql, conn)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            LOG.exception("Failed to fetch from database %s", db)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    if not frames:
+        return pd.DataFrame(columns=[
+            "LocaleMessageTime", "EmployeeName", "PartitionName2", "CardNumber",
+            "Rejection_Type", "EmployeeID", "PersonnelType", "DoorName", "XmlGUID"
+        ])
+    out = pd.concat(frames, ignore_index=True)
+    # normalize types
+    out["LocaleMessageTime"] = pd.to_datetime(out["LocaleMessageTime"], errors="coerce")
+
+    # IMPORTANT CHANGE: store DateOnly AS STRING (ISO) to avoid python date objects
+    out["DateOnly"] = out["LocaleMessageTime"].dt.strftime("%Y-%m-%d")
+
+    # Add Month and MonthName for month-wise analysis
+    out["Month"] = out["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")  # pandas nullable int
+    out["MonthName"] = out["LocaleMessageTime"].dt.strftime("%b").fillna("")
+
+    # ensure columns exist
+    for c in ["EmployeeID", "EmployeeName", "CardNumber", "PartitionName2"]:
+        if c not in out.columns:
+            out[c] = None
+    # restrict to PersonnelType == 'Employee' (defensive)
+    if "PersonnelType" in out.columns:
+        out = out[out["PersonnelType"].fillna("").str.strip().str.lower() == "employee"].copy()
+    # canonical person uid using helper from duration_report
+    def make_person_uid(row):
+        try:
+            return dr._canonical_person_uid_from_row(row)
+        except Exception:
+            # fallback: prefer EmployeeID -> CardNumber -> EmployeeName
+            for cand in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(cand)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            return None
+    if not out.empty:
+        out["person_uid"] = out.apply(make_person_uid, axis=1)
+    return out
+
+def analyze_pin_df(df: pd.DataFrame, outdir: Path) -> dict:
+    outdir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    total = len(df)
+    results["total_rejections"] = int(total)
+    LOG.info("Total PIN rejections in dataset: %d", total)
+
+    # ensure month columns exist and are in friendly form
+    if "Month" not in df.columns:
+        df["Month"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.month.fillna(0).astype(int)
+    if "MonthName" not in df.columns:
+        df["MonthName"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.strftime("%b").fillna("")
+
+    # by location (PartitionName2)
+    by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_location"] = by_loc
+    by_loc.to_csv(outdir / "emea_pin_by_location.csv", index=False)
+
+    # by employee (person_uid) - top offenders
+    by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_employee"] = by_emp
+    by_emp.to_csv(outdir / "emea_pin_by_employee.csv", index=False)
+
+    # repeaters: employees with count > 1
+    repeaters = by_emp[by_emp["count"] > 1].copy()
+    results["repeaters"] = repeaters
+    repeaters.to_csv(outdir / "emea_pin_repeaters.csv", index=False)
+
+    # MONTH-WISE: total by month
+    month_totals = (df.groupby(["Month", "MonthName"], dropna=False)
+                    .size()
+                    .reset_index(name="count")
+                    .sort_values(["Month"]))
+    results["month_totals"] = month_totals
+    month_totals.to_csv(outdir / "emea_pin_month_totals.csv", index=False)
+
+    # MONTH-WISE: location-wise counts per month
+    month_loc = (df.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_location"] = month_loc
+    month_loc.to_csv(outdir / "emea_pin_month_by_location.csv", index=False)
+
+    # MONTH-WISE: employee-wise counts per month
+    month_emp = (df.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_employee"] = month_emp
+    month_emp.to_csv(outdir / "emea_pin_month_by_employee.csv", index=False)
+
+    # summary stats
+    results["unique_employees"] = int(by_emp["person_uid"].nunique()) if "person_uid" in by_emp.columns else int(by_emp.shape[0])
+    results["repeat_count_total"] = int(repeaters["count"].sum()) if not repeaters.empty else 0
+    results["num_repeaters"] = int(len(repeaters))
+    LOG.info("Unique employees with PIN rejects: %s", results["unique_employees"])
+    LOG.info("Number of repeaters (count>1): %s, total repeat events: %s", results["num_repeaters"], results["repeat_count_total"])
+
+    # Save full raw dataframe for audit (DateOnly as string avoids JSON issues)
+    df.to_csv(outdir / "emea_pin_raw.csv", index=False)
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="EMEA PIN rejection analysis (yearly).")
+    parser.add_argument("--year", type=int, required=False, default=date.today().year, help="Year to analyze (e.g. 2024)")
+    parser.add_argument("--outdir", required=False, default="./out", help="Output directory for CSVs")
+    args = parser.parse_args()
+
+    target_year = int(args.year)
+    outdir = Path(args.outdir)
+
+    LOG.info("Starting EMEA PIN analysis for year %d", target_year)
+    df = fetch_pin_rows_for_year(target_year)
+    LOG.info("Rows fetched: %d", len(df))
+    results = analyze_pin_df(df, outdir)
+    # print short summary
+    print("==== EMEA PIN analysis summary ====")
+    print(f"Year: {target_year}")
+    print(f"Total PIN rejections: {results.get('total_rejections', 0)}")
+    print(f"Unique employees with rejects: {results.get('unique_employees', 0)}")
+    print(f"Repeaters (employees with >1 reject): {results.get('num_repeaters', 0)}  (repeat events total: {results.get('repeat_count_total', 0)})")
+    print(f"CSV outputs saved to: {outdir.resolve()}")
+
+if __name__ == "__main__":
+    main()
 
 
 
 
-      // day-wise arrays returned by API when a specific month is requested
-      const [dayTotalsRaw, setDayTotalsRaw] = useState([]); // {Day, count}
-      const [dayByLocationRaw, setDayByLocationRaw] = useState([]); // {Day, PartitionName2, count}
 
 
-      function setDayTotals(v){ setDayTotalsRaw(v); }
-      function setDayByLocation(v){ setDayByLocationRaw(v); }
-
-
-
-
-
-
-
-          // day-wise (for selected month) — optional
-          const rawDayTotals = js.day_totals || js.dayTotals || [];
-          const normalizedDayTotals = Array.isArray(rawDayTotals) ? rawDayTotals.map(function(x) {
-            return {
-              Day: Number(x.Day || x.day || 0),
-              count: Number(x.count || x.value || 0)
-            };
-          }) : [];
-
-          const rawDayByLoc = js.day_by_location || js.dayByLocation || [];
-          const normalizedDayByLoc = Array.isArray(rawDayByLoc) ? rawDayByLoc.map(function(x) {
-            return {
-              Day: Number(x.Day || x.day || 0),
-              PartitionName2: x.PartitionName2 || x.Partition || x.location || "",
-              count: Number(x.count || x.value || 0)
-            };
-          }) : [];
-
-
-
-
-
-
-          setDayTotals(normalizedDayTotals);
-          setDayByLocation(normalizedDayByLoc);
-
-
-
-
-
-
-
-
-
-
-          // Month / Day totals chart
-          if (monthChartRef.current) {
-            if (selectedMonth === 0) {
-              // monthly view (12 month buckets)
-              var monthArr = Array.from({length:12}, function(_,i) {
-                var m = i + 1;
-                var rec = null;
-                for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
-                  var cand = normalizedMonthTotals[ri];
-                  if (Number(cand.Month) === m) { rec = cand; break; }
-                }
-                return rec && rec.count ? Number(rec.count) : 0;
-              });
-              updateOrCreateChart(monthChartInst, monthChartRef.current, {
-                type: 'line',
-                data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
-                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-              });
-            } else {
-              // day-wise view for the selected month
-              // determine days in selected month
-              const daysInMonth = new Date(Number(year), Number(selectedMonth), 0).getDate();
-              const labels = Array.from({length: daysInMonth}, (_,i) => String(i+1));
-              const dayArr = Array.from({length: daysInMonth}, function(_,i) {
-                const d = i + 1;
-                var rec = null;
-                for (var ri = 0; ri < normalizedDayTotals.length; ri++) {
-                  var cand = normalizedDayTotals[ri];
-                  if (Number(cand.Day) === d) { rec = cand; break; }
-                }
-                return rec && rec.count ? Number(rec.count) : 0;
-              });
-              updateOrCreateChart(monthChartInst, monthChartRef.current, {
-                type: 'line',
-                data: { labels: labels, datasets: [{ label: `Day-wise for ${MONTH_NAMES[selectedMonth-1]}`, data: dayArr, fill:false, tension:0.3 }] },
-                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-              });
-            }
-          }
-
-
-
-
-
-
-
-
-      function exportMonthByLocationCSV() {
-        if (selectedMonth === 0) {
-          const rows = topForSelectedMonthByLocation(500).map(r => ({
-            Month: selectedMonth || 'All',
-            MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
-            Location: r.PartitionName2 || r.name || '',
-            Count: r.count
-          }));
-          if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
-          downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
-        } else {
-          // day-by-location export if available
-          const rows = (dayByLocationRaw || []).map(r => ({
-            Month: selectedMonth,
-            MonthName: MONTH_NAMES[selectedMonth-1],
-            Day: r.Day,
-            Location: r.PartitionName2 || '',
-            Count: r.count
-          }));
-          if (rows.length===0) { alert("No day-by-location data for selected month"); return; }
-          downloadCSV(rows, `emea_pin_month_${selectedMonth}_day_by_location.csv`);
-        }
-      }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Great now i want update data day wise 
-When Select Month 
-ex- january
-then upadte Month wise analysis Chart as per day wise 
-like 1, 2, 3 .....30  , 31 etc 
-day wise graph for that specific month..
-
-
-Update this as per in frontend as well Backend 
 
 
 <!doctype html>
@@ -399,6 +808,7 @@ Update this as per in frontend as well Backend
 
     const EMEA_PARTITIONS = ["LT.Vilnius","IT.Rome","UK.London","IE.DUblin","DU.Abu Dhab","ES.Madrid","AUT.Vienna","MA.Casablanca","RU.Moscow"];
     const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    
 
     function formatDateShort(d) {
       if (!d) return '-';
@@ -429,6 +839,7 @@ Update this as per in frontend as well Backend
     function EmeaPinApp() {
       const [year, setYear] = useState(new Date().getFullYear());
       const [location, setLocation] = useState('All locations');
+        // day-wise arrays returned by API when a specific month is requested
 
       // IMPORTANT: default live=false so no automatic polling starts on load.
       const [live, setLive] = useState(false);
@@ -455,6 +866,11 @@ Update this as per in frontend as well Backend
       const [monthTotalsRaw, setMonthTotalsRaw] = useState([]); // {Month, MonthName, count}
       const [monthByLocationRaw, setMonthByLocationRaw] = useState([]); // {Month, MonthName, PartitionName2, count}
       const [monthByEmployeeRaw, setMonthByEmployeeRaw] = useState([]); // {Month, MonthName, person_uid, count, EmployeeID, EmployeeName}
+
+      // day-wise arrays returned by API when a specific month is requested
+      const [dayTotalsRaw, setDayTotalsRaw] = useState([]); // {Day, count}
+      const [dayByLocationRaw, setDayByLocationRaw] = useState([]); // {Day, PartitionName2, count}
+
 
       const pollingRef = useRef(null);
       const inFlightRef = useRef(false);
@@ -608,6 +1024,7 @@ Update this as per in frontend as well Backend
             };
           }) : [];
 
+
           const rawMonthByLoc = js.month_by_location || js.monthByLocation || [];
           const normalizedMonthByLoc = Array.isArray(rawMonthByLoc) ? rawMonthByLoc.map(function(x) {
             return {
@@ -629,6 +1046,26 @@ Update this as per in frontend as well Backend
               EmployeeName: x.EmployeeName || ''
             };
           }) : [];
+
+
+          // day-wise (for selected month) — optional
+          const rawDayTotals = js.day_totals || js.dayTotals || [];
+          const normalizedDayTotals = Array.isArray(rawDayTotals) ? rawDayTotals.map(function(x) {
+            return {
+              Day: Number(x.Day || x.day || 0),
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
+          const rawDayByLoc = js.day_by_location || js.dayByLocation || [];
+          const normalizedDayByLoc = Array.isArray(rawDayByLoc) ? rawDayByLoc.map(function(x) {
+            return {
+              Day: Number(x.Day || x.day || 0),
+              PartitionName2: x.PartitionName2 || x.Partition || x.location || "",
+              count: Number(x.count || x.value || 0)
+            };
+          }) : [];
+
 
           // parse person_map (if provided)
           const rawPersonMap = js.person_map || js.personMap || {};
@@ -658,6 +1095,9 @@ Update this as per in frontend as well Backend
           setMonthByEmployee(normalizedMonthByEmp);
 
           setPersonMap(normalizedPersonMap);
+        setDayTotals(normalizedDayTotals);
+        setDayByLocation(normalizedDayByLoc);
+
 
           // update charts in-place (no flicker)
           if (locChartRef.current) {
@@ -690,23 +1130,71 @@ Update this as per in frontend as well Backend
             });
           }
 
+     
+     
+     
           // Month totals chart
+        //   if (monthChartRef.current) {
+        //     var monthArr = Array.from({length:12}, function(_,i) {
+        //       var m = i + 1;
+        //       var rec = null;
+        //       for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
+        //         var cand = normalizedMonthTotals[ri];
+        //         if (Number(cand.Month) === m) { rec = cand; break; }
+        //       }
+        //       return rec && rec.count ? Number(rec.count) : 0;
+        //     });
+        //     updateOrCreateChart(monthChartInst, monthChartRef.current, {
+        //       type: 'line',
+        //       data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
+        //       options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+        //     });
+        //   }
+
+
+          // Month / Day totals chart
           if (monthChartRef.current) {
-            var monthArr = Array.from({length:12}, function(_,i) {
-              var m = i + 1;
-              var rec = null;
-              for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
-                var cand = normalizedMonthTotals[ri];
-                if (Number(cand.Month) === m) { rec = cand; break; }
-              }
-              return rec && rec.count ? Number(rec.count) : 0;
-            });
-            updateOrCreateChart(monthChartInst, monthChartRef.current, {
-              type: 'line',
-              data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
-              options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-            });
+            if (selectedMonth === 0) {
+              // monthly view (12 month buckets)
+              var monthArr = Array.from({length:12}, function(_,i) {
+                var m = i + 1;
+                var rec = null;
+                for (var ri = 0; ri < normalizedMonthTotals.length; ri++) {
+                  var cand = normalizedMonthTotals[ri];
+                  if (Number(cand.Month) === m) { rec = cand; break; }
+                }
+                return rec && rec.count ? Number(rec.count) : 0;
+              });
+              updateOrCreateChart(monthChartInst, monthChartRef.current, {
+                type: 'line',
+                data: { labels: MONTH_NAMES, datasets: [{ label: 'Monthly PIN rejections', data: monthArr, fill:false, tension:0.3 }] },
+                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+              });
+            } else {
+              // day-wise view for the selected month
+              // determine days in selected month
+              const daysInMonth = new Date(Number(year), Number(selectedMonth), 0).getDate();
+              const labels = Array.from({length: daysInMonth}, (_,i) => String(i+1));
+              const dayArr = Array.from({length: daysInMonth}, function(_,i) {
+                const d = i + 1;
+                var rec = null;
+                for (var ri = 0; ri < normalizedDayTotals.length; ri++) {
+                  var cand = normalizedDayTotals[ri];
+                  if (Number(cand.Day) === d) { rec = cand; break; }
+                }
+                return rec && rec.count ? Number(rec.count) : 0;
+              });
+              updateOrCreateChart(monthChartInst, monthChartRef.current, {
+                type: 'line',
+                data: { labels: labels, datasets: [{ label: `Day-wise for ${MONTH_NAMES[selectedMonth-1]}`, data: dayArr, fill:false, tension:0.3 }] },
+                options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+              });
+            }
           }
+
+
+
+
 
           setLastFetch(new Date().toISOString());
 
@@ -804,16 +1292,34 @@ Update this as per in frontend as well Backend
         }
       }
 
+
+
+
+      
       function exportMonthByLocationCSV() {
-        const rows = topForSelectedMonthByLocation(500).map(r => ({
-          Month: selectedMonth || 'All',
-          MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
-          Location: r.PartitionName2 || r.name || '',
-          Count: r.count
-        }));
-        if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
-        downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
+        if (selectedMonth === 0) {
+          const rows = topForSelectedMonthByLocation(500).map(r => ({
+            Month: selectedMonth || 'All',
+            MonthName: (selectedMonth === 0 ? 'All' : MONTH_NAMES[selectedMonth-1]),
+            Location: r.PartitionName2 || r.name || '',
+            Count: r.count
+          }));
+          if (rows.length===0) { alert("No month-by-location data for selected month"); return; }
+          downloadCSV(rows, `emea_pin_month_${selectedMonth || 'all'}_by_location.csv`);
+        } else {
+          // day-by-location export if available
+          const rows = (dayByLocationRaw || []).map(r => ({
+            Month: selectedMonth,
+            MonthName: MONTH_NAMES[selectedMonth-1],
+            Day: r.Day,
+            Location: r.PartitionName2 || '',
+            Count: r.count
+          }));
+          if (rows.length===0) { alert("No day-by-location data for selected month"); return; }
+          downloadCSV(rows, `emea_pin_month_${selectedMonth}_day_by_location.csv`);
+        }
       }
+
 
       // produce final repeaters list to show in the sidebar (id, name, count)
       function getTopRepeatersForDisplay(limit=50) {
@@ -852,6 +1358,8 @@ Update this as per in frontend as well Backend
       function setMonthTotals(v){ setMonthTotalsRaw(v); }
       function setMonthByLocation(v){ setMonthByLocationRaw(v); }
       function setMonthByEmployee(v){ setMonthByEmployeeRaw(v); }
+      function setDayTotals(v){ setDayTotalsRaw(v); }
+      function setDayByLocation(v){ setDayByLocationRaw(v); }
 
       return (
         <div className="container" >
@@ -1022,326 +1530,5 @@ Update this as per in frontend as well Backend
 
 
 
-
-
-
-
-#C:\Users\W0024618\Desktop\Trend Analysis\backend\api_server.py
-from pathlib import Path
-from datetime import datetime, date
-import time
-import traceback
-import sys
-import importlib
-import logging
-from typing import Any
-
-# ----- ensure project root on sys.path (do this before other imports) -----
-HERE = Path(__file__).resolve()
-PROJECT_ROOT = HERE.parent.parent  # <project-root> (one level above backend/)
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-# now safe to import FastAPI etc.
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import pandas as pd
-
-LOG = logging.getLogger("emea.api")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-# ----- try to import backend.emea_pin in a robust way (clear error if fails) -----
-ep = None
-try:
-    ep = importlib.import_module("backend.emea_pin")
-    LOG.info("Imported backend.emea_pin via package import")
-except Exception as first_exc:
-    LOG.warning("Package import backend.emea_pin failed: %s", first_exc)
-    try:
-        ep = importlib.import_module("emea_pin")
-        LOG.info("Imported emea_pin as top-level module")
-    except Exception as second_exc:
-        tb = traceback.format_exc()
-        LOG.error("Failed to import emea_pin module.\nPackage import error: %s\nFallback error: %s\nTrace:\n%s",
-                  first_exc, second_exc, tb)
-        raise RuntimeError(f"Failed to import emea_pin module (see server logs). Primary error: {first_exc}") from second_exc
-
-# create app
-app = FastAPI(title="EMEA PIN API (wrapper)")
-
-# permissive CORS for local/dev
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "OPTIONS", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
-)
-
-# cache for DataFrame
-CACHE = {"ts": 0.0, "year": None, "df": None}
-CACHE_TTL = 5  # seconds
-
-def _load_fallback_csv(project_root: Path):
-    fallback = project_root / "out" / "emea_pin_raw.csv"
-    if fallback.exists():
-        LOG.info("Loading fallback CSV: %s", fallback)
-        try:
-            df = pd.read_csv(fallback, parse_dates=["LocaleMessageTime"], keep_default_na=False)
-            # sanitize DateOnly if present: ensure string
-            if "LocaleMessageTime" in df.columns:
-                df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-            if "DateOnly" in df.columns:
-                # ensure DateOnly is string
-                df["DateOnly"] = df["DateOnly"].astype(str)
-            return df
-        except Exception as e:
-            LOG.exception("Failed to parse fallback CSV: %s", e)
-            raise
-    raise FileNotFoundError(str(fallback))
-
-# --- sanitizer helpers to make response JSON-safe ---
-def _serialize_value(v: Any) -> Any:
-    """Convert common non-JSON types to JSON-safe primitives."""
-    if v is None:
-        return None
-    if isinstance(v, (str, bool, int, float)):
-        return v
-    if isinstance(v, (datetime, date)):
-        return v.isoformat()
-    try:
-        import pandas as pd
-        if isinstance(v, pd.Timestamp):
-            if pd.isna(v):
-                return None
-            return v.isoformat()
-        if isinstance(v, pd.Timedelta):
-            return str(v)
-        if v is pd.NaT:
-            return None
-    except Exception:
-        pass
-    try:
-        import numpy as _np
-        if isinstance(v, _np.generic):
-            return v.item()
-        if isinstance(v, _np.datetime64):
-            try:
-                ts = pd.to_datetime(v)
-                return ts.isoformat()
-            except Exception:
-                return str(v)
-    except Exception:
-        pass
-    try:
-        return str(v)
-    except Exception:
-        return None
-
-def _sanitize(obj: Any) -> Any:
-    """Recursively walk `obj` and convert values to JSON-safe types."""
-    if isinstance(obj, dict):
-        return {str(k): _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize(v) for v in obj]
-    if isinstance(obj, pd.DataFrame):
-        try:
-            return _sanitize(obj.fillna("").to_dict(orient="records"))
-        except Exception:
-            return []
-    if isinstance(obj, pd.Series):
-        try:
-            return _sanitize(obj.fillna("").to_list())
-        except Exception:
-            return []
-    return _serialize_value(obj)
-
-
-
-@app.get("/api/emea_pin_live")
-def emea_pin_live(year: int | None = None, month: int | None = Query(None), location: str | None = Query(None)):
-    """
-    Returns aggregates for the requested year, optional month, and optional location.
-
-    Behavior:
-    - Loads cached dataframe for `year`.
-    - Builds month-wise breakdowns for the (optional) location.
-    - If `month` provided (1..12) it further filters results to that month before computing
-      top-by-location / top-by-employee / recent rows / total_rejections so the API honors
-      both month and location filters (frontend selects month + location).
-    """
-    target_year = int(year or datetime.now().year)
-    now = time.time()
-
-    # refresh cache as needed (cache is year-based; month filtering applied below)
-    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
-        try:
-            df = ep.fetch_pin_rows_for_year(target_year)
-            LOG.info("Fetched df from emea_pin (rows=%d)", len(df) if getattr(df, "shape", None) is not None else -1)
-        except Exception as e:
-            LOG.warning("fetch_pin_rows_for_year failed: %s", e)
-            try:
-                df = _load_fallback_csv(PROJECT_ROOT)
-            except Exception as e2:
-                tb = traceback.format_exc()
-                LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
-                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
-
-        if df is None:
-            df = pd.DataFrame()
-        CACHE.update({"ts": now, "year": target_year, "df": df})
-    else:
-        df = CACHE["df"]
-
-    # defensive column existence
-    for col in ["LocaleMessageTime", "PartitionName2", "person_uid", "EmployeeName", "EmployeeID", "CardNumber", "DateOnly", "Month", "MonthName"]:
-        if col not in df.columns:
-            if col == "Month":
-                df[col] = pd.NA
-            else:
-                df[col] = pd.NA
-
-    # ensure LocaleMessageTime parsed
-    if "LocaleMessageTime" in df.columns:
-        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
-
-    # ensure Month/MonthName derived (in case they weren't present)
-    if "Month" not in df.columns or df["Month"].isnull().all():
-        df["Month"] = df["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")
-    if "MonthName" not in df.columns or df["MonthName"].isnull().all():
-        df["MonthName"] = df["LocaleMessageTime"].dt.strftime("%b").fillna("")
-
-    # Build person_map (from full df) — used to enrich employee display
-    person_map = {}
-    try:
-        for _, r in df.iterrows():
-            pu = r.get("person_uid")
-            if pu is None or (isinstance(pu, float) and pd.isna(pu)):
-                continue
-            key = str(pu)
-            entry = person_map.get(key, {"EmployeeID": "", "EmployeeName": ""})
-            eid = r.get("EmployeeID") or ""
-            ename = r.get("EmployeeName") or ""
-            if eid and not entry["EmployeeID"]:
-                entry["EmployeeID"] = str(eid)
-            if ename and not entry["EmployeeName"]:
-                entry["EmployeeName"] = str(ename)
-            person_map[key] = entry
-    except Exception:
-        LOG.exception("Failed to build person_map; proceeding without enriched names")
-        person_map = {}
-
-    # --- Apply location filter first (so month-wise breakdowns are location-scoped) ---
-    df_loc_filtered = df
-    if location and str(location).strip() and str(location).strip().lower() != "all locations":
-        try:
-            df_loc_filtered = df_loc_filtered[df_loc_filtered["PartitionName2"].astype(str) == str(location)]
-        except Exception:
-            LOG.exception("Location filtering failed; using unfiltered df_loc_filtered")
-            df_loc_filtered = df
-
-    # MONTH-WISE breakdowns for the (possibly location-filtered) dataset.
-    try:
-        month_totals_df = (df_loc_filtered.groupby(["Month", "MonthName"], dropna=False)
-                           .size()
-                           .reset_index(name="count")
-                           .sort_values(["Month"]))
-    except Exception:
-        month_totals_df = pd.DataFrame(columns=["Month", "MonthName", "count"])
-
-    try:
-        month_by_location_df = (df_loc_filtered.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
-                                 .size()
-                                 .reset_index(name="count")
-                                 .sort_values(["Month", "count"], ascending=[True, False]))
-    except Exception:
-        month_by_location_df = pd.DataFrame(columns=["Month", "MonthName", "PartitionName2", "count"])
-
-    try:
-        month_by_employee_df = (df_loc_filtered.groupby(["Month", "MonthName", "person_uid"], dropna=False)
-                                 .size()
-                                 .reset_index(name="count")
-                                 .sort_values(["Month", "count"], ascending=[True, False]))
-        if not month_by_employee_df.empty:
-            month_by_employee_df["EmployeeID"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID",""))
-            month_by_employee_df["EmployeeName"] = month_by_employee_df["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName",""))
-    except Exception:
-        month_by_employee_df = pd.DataFrame(columns=["Month", "MonthName", "person_uid", "count", "EmployeeID", "EmployeeName"])
-
-    # --- If a specific month is requested, filter to that month for the primary aggregates ---
-    df_agg = df_loc_filtered
-    if month is not None:
-        try:
-            m = int(month)
-            if 1 <= m <= 12:
-                # safe comparison: fillna(0) then cast to int for comparison
-                df_agg = df_loc_filtered[df_loc_filtered["Month"].fillna(0).astype(int) == m].copy()
-        except Exception:
-            LOG.exception("Month filtering failed; using unfiltered df_loc_filtered")
-            df_agg = df_loc_filtered
-
-    # compute aggregates using df_agg (which honors location and optional month)
-    try:
-        by_loc = df_agg.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-    except Exception:
-        by_loc = pd.DataFrame(columns=["PartitionName2", "count"])
-
-    try:
-        by_emp = df_agg.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-    except Exception:
-        by_emp = pd.DataFrame(columns=["person_uid", "count"])
-
-    # Enrich by_emp with EmployeeID and EmployeeName (if present)
-    try:
-        if not by_emp.empty:
-            by_emp["EmployeeID"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeID", ""))
-            by_emp["EmployeeName"] = by_emp["person_uid"].apply(lambda x: person_map.get(str(x), {}).get("EmployeeName", ""))
-    except Exception:
-        LOG.exception("Failed to enrich by_emp with names")
-
-    # total_rejections should reflect df_agg (i.e., location+month filter applied).
-    total_rejections_value = int(len(df_agg))
-
-    # Prepare recent rows (from df_agg so recent honors filters)
-    recent = df_agg.copy()
-    if "LocaleMessageTime" in recent.columns:
-        try:
-            recent = recent.sort_values("LocaleMessageTime", ascending=False)
-        except Exception:
-            LOG.debug("Could not sort recent by LocaleMessageTime")
-    recent = recent.head(500)
-
-    # convert to records and sanitize
-    by_loc_records = _sanitize(by_loc.fillna("").to_dict(orient="records"))
-    by_emp_records = _sanitize(by_emp.fillna("").to_dict(orient="records"))
-    recent_records = _sanitize(recent.fillna("").to_dict(orient="records"))
-
-    month_totals_records = _sanitize(month_totals_df.fillna("").to_dict(orient="records"))
-    month_by_location_records = _sanitize(month_by_location_df.fillna("").to_dict(orient="records"))
-    month_by_employee_records = _sanitize(month_by_employee_df.fillna("").to_dict(orient="records"))
-
-    # Ensure person_map values are primitive types (strings)
-    safe_person_map = {}
-    for k, v in person_map.items():
-        safe_person_map[str(k)] = {
-            "EmployeeID": _serialize_value(v.get("EmployeeID","")),
-            "EmployeeName": _serialize_value(v.get("EmployeeName",""))
-        }
-
-    resp = {
-        "total_rejections": total_rejections_value,
-        "by_location": by_loc_records,
-        "by_employee": by_emp_records,
-        "recent": recent_records,
-        # month-wise additions (these are computed for the current location scope)
-        "month_totals": month_totals_records,
-        "month_by_location": month_by_location_records,
-        "month_by_employee": month_by_employee_records,
-        # helper map for frontend name lookups
-        "person_map": safe_person_map,
-    }
-
-    safe_resp = _sanitize(resp)
-    return JSONResponse(safe_resp)
+take refrance of all above file and make new page carefully
 
