@@ -1,3 +1,282 @@
+#C:\Users\W0024618\Desktop\Trend Analysis\backend\emea_pin.py
+"""
+EMEA PIN violation analysis.
+
+Usage:
+    python -m backend.emea_pin --year 2024 --outdir ./out
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import date
+from pathlib import Path
+from typing import List
+import sys
+
+import pandas as pd
+
+# Robust import for duration_report (works when module loaded as package or as plain module)
+try:
+    from backend import duration_report as dr
+except Exception:
+    try:
+        import duration_report as dr
+    except Exception as e:
+        raise RuntimeError(f"Could not import duration_report (tried 'backend.duration_report' and 'duration_report'): {e}") from e
+
+# local alias (may be None if duration_report couldn't supply it)
+pyodbc = getattr(dr, "pyodbc", None)
+
+LOG = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+SQL_DB_TEMPLATE = r"""
+SELECT
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    t1.ObjectName1 AS EmployeeName,
+    t1.PartitionName2 AS PartitionName2,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t5rej.value AS Rejection_Type,
+    CASE WHEN t3.Name IN ('Contractor','Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS EmployeeID,
+    t3.Name AS PersonnelType,
+    t1.ObjectName2 AS DoorName,
+    t5dir.value AS Direction,
+    t1.XmlGUID
+FROM [{db}].dbo.ACVSUJournalLog t1
+LEFT JOIN ACVSCore.Access.Personnel t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred sc ON t1.XmlGUID = sc.GUID AND sc.Name IN ('Card','CHUID')
+-- shredded RejectCode
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5rej ON t1.XmlGUID = t5rej.GUID AND t5rej.Name = 'RejectCode'
+-- shredded Direction: sometimes value contains InDirection / OutDirection
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5dir ON t1.XmlGUID = t5dir.GUID AND (t5dir.Value IN ('InDirection','OutDirection') OR t5dir.Name IN ('Direction','Dir'))
+WHERE
+    t1.MessageType = 'CardRejected'
+    AND t5rej.value = 'PIN'
+  
+    AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) BETWEEN '{start}' AND '{end}'
+"""
+
+def _get_emea_databases() -> List[str]:
+    rc = dr.REGION_CONFIG.get("emea")
+    if not rc:
+        raise RuntimeError("No 'emea' region config found in duration_report.py")
+    candidates = dr._get_candidate_databases(rc)
+    valid = dr._filter_existing_databases(rc, candidates)
+    return valid or candidates
+
+def _connect_to_db(server: str, database: str, user: str, password: str):
+    if pyodbc is None:
+        raise RuntimeError("pyodbc not available; install pyodbc to run queries.")
+    conn_str = (
+        f"DRIVER={{{dr.ODBC_DRIVER}}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        "TrustServerCertificate=Yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def fetch_pin_rows_for_year(target_year: int) -> pd.DataFrame:
+    rc = dr.REGION_CONFIG["emea"]
+    start = date(target_year, 1, 1).strftime("%Y-%m-%d")
+    end = date(target_year, 12, 31).strftime("%Y-%m-%d")
+    dbs = _get_emea_databases()
+    LOG.info("Querying EMEA databases: %s", dbs)
+
+    frames = []
+    for db in dbs:
+        sql = SQL_DB_TEMPLATE.format(db=db, start=start, end=end)
+        LOG.info("Running query against %s.%s (rows may be large)", rc["server"], db)
+        conn = None
+        try:
+            conn = _connect_to_db(rc["server"], db, rc["user"], rc["password"])
+            # pandas will pull the results into a DataFrame
+            df = pd.read_sql(sql, conn)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            LOG.exception("Failed to fetch from database %s", db)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    if not frames:
+        return pd.DataFrame(columns=[
+            "LocaleMessageTime", "EmployeeName", "PartitionName2", "CardNumber",
+            "Rejection_Type", "EmployeeID", "PersonnelType", "DoorName", "Direction", "XmlGUID"
+        ])
+    out = pd.concat(frames, ignore_index=True)
+    # normalize types
+    out["LocaleMessageTime"] = pd.to_datetime(out["LocaleMessageTime"], errors="coerce")
+
+    # IMPORTANT CHANGE: store DateOnly AS STRING (ISO) to avoid python date objects
+    out["DateOnly"] = out["LocaleMessageTime"].dt.strftime("%Y-%m-%d")
+
+    # Add Month and MonthName for month-wise analysis
+    out["Month"] = out["LocaleMessageTime"].dt.month.fillna(0).astype("Int64")  # pandas nullable int
+    out["MonthName"] = out["LocaleMessageTime"].dt.strftime("%b").fillna("")
+
+    # ensure columns exist
+    for c in ["EmployeeID", "EmployeeName", "CardNumber", "PartitionName2", "Direction"]:
+        if c not in out.columns:
+            out[c] = None
+
+    # Normalize Direction values to friendly 'In'/'Out'
+    if "Direction" in out.columns:
+        try:
+            def _norm_dir(v):
+                if v is None:
+                    return None
+                s = str(v).strip()
+                if not s:
+                    return None
+                ls = s.lower()
+                if "in" in ls:
+                    return "In"
+                if "out" in ls:
+                    return "Out"
+                # fallback: common labels
+                if ls in ("entry", "enter", "entered"):
+                    return "In"
+                if ls in ("exit", "leave", "left"):
+                    return "Out"
+                return s  # keep original as last resort
+            out["Direction"] = out["Direction"].apply(_norm_dir)
+        except Exception:
+            LOG.exception("Failed to normalize Direction values; leaving raw values")
+
+    # restrict to PersonnelType == 'Employee' (defensive)
+    if "PersonnelType" in out.columns:
+        out = out[out["PersonnelType"].fillna("").str.strip().str.lower() == "employee"].copy()
+    # canonical person uid using helper from duration_report
+    def make_person_uid(row):
+        try:
+            return dr._canonical_person_uid_from_row(row)
+        except Exception:
+            # fallback: prefer EmployeeID -> CardNumber -> EmployeeName
+            for cand in ("EmployeeID", "CardNumber", "EmployeeName"):
+                v = row.get(cand)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            return None
+    if not out.empty:
+        out["person_uid"] = out.apply(make_person_uid, axis=1)
+    return out
+
+def analyze_pin_df(df: pd.DataFrame, outdir: Path) -> dict:
+    outdir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    total = len(df)
+    results["total_rejections"] = int(total)
+    LOG.info("Total PIN rejections in dataset: %d", total)
+
+    # ensure month columns exist and are in friendly form
+    if "Month" not in df.columns:
+        df["Month"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.month.fillna(0).astype(int)
+    if "MonthName" not in df.columns:
+        df["MonthName"] = pd.to_datetime(df.get("LocaleMessageTime", None), errors="coerce").dt.strftime("%b").fillna("")
+
+    # by location (PartitionName2)
+    by_loc = df.groupby("PartitionName2", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_location"] = by_loc
+    by_loc.to_csv(outdir / "emea_pin_by_location.csv", index=False)
+
+    # by employee (person_uid) - top offenders
+    by_emp = df.groupby("person_uid", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+    results["by_employee"] = by_emp
+    by_emp.to_csv(outdir / "emea_pin_by_employee.csv", index=False)
+
+    # repeaters: employees with count > 1
+    repeaters = by_emp[by_emp["count"] > 1].copy()
+    results["repeaters"] = repeaters
+    repeaters.to_csv(outdir / "emea_pin_repeaters.csv", index=False)
+
+    # MONTH-WISE: total by month
+    month_totals = (df.groupby(["Month", "MonthName"], dropna=False)
+                    .size()
+                    .reset_index(name="count")
+                    .sort_values(["Month"]))
+    results["month_totals"] = month_totals
+    month_totals.to_csv(outdir / "emea_pin_month_totals.csv", index=False)
+
+    # MONTH-WISE: location-wise counts per month
+    month_loc = (df.groupby(["Month", "MonthName", "PartitionName2"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_location"] = month_loc
+    month_loc.to_csv(outdir / "emea_pin_month_by_location.csv", index=False)
+
+    # MONTH-WISE: employee-wise counts per month
+    month_emp = (df.groupby(["Month", "MonthName", "person_uid"], dropna=False)
+                 .size()
+                 .reset_index(name="count")
+                 .sort_values(["Month", "count"], ascending=[True, False]))
+    results["month_by_employee"] = month_emp
+    month_emp.to_csv(outdir / "emea_pin_month_by_employee.csv", index=False)
+
+    # summary stats
+    results["unique_employees"] = int(by_emp["person_uid"].nunique()) if "person_uid" in by_emp.columns else int(by_emp.shape[0])
+    results["repeat_count_total"] = int(repeaters["count"].sum()) if not repeaters.empty else 0
+    results["num_repeaters"] = int(len(repeaters))
+    LOG.info("Unique employees with PIN rejects: %s", results["unique_employees"])
+    LOG.info("Number of repeaters (count>1): %s, total repeat events: %s", results["num_repeaters"], results["repeat_count_total"])
+
+    # Save full raw dataframe for audit (DateOnly as string avoids JSON issues)
+    df.to_csv(outdir / "emea_pin_raw.csv", index=False)
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="EMEA PIN rejection analysis (yearly).")
+    parser.add_argument("--year", type=int, required=False, default=date.today().year, help="Year to analyze (e.g. 2024)")
+    parser.add_argument("--outdir", required=False, default="./out", help="Output directory for CSVs")
+    args = parser.parse_args()
+
+    target_year = int(args.year)
+    outdir = Path(args.outdir)
+
+    LOG.info("Starting EMEA PIN analysis for year %d", target_year)
+    df = fetch_pin_rows_for_year(target_year)
+    LOG.info("Rows fetched: %d", len(df))
+    results = analyze_pin_df(df, outdir)
+    # print short summary
+    print("==== EMEA PIN analysis summary ====")
+    print(f"Year: {target_year}")
+    print(f"Total PIN rejections: {results.get('total_rejections', 0)}")
+    print(f"Unique employees with rejects: {results.get('unique_employees', 0)}")
+    print(f"Repeaters (employees with >1 reject): {results.get('num_repeaters', 0)}  (repeat events total: {results.get('repeat_count_total', 0)})")
+    print(f"CSV outputs saved to: {outdir.resolve()}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 From backend We dont get Direction correct once check Direction logic carefully and fix Direction logic in backned 
 Check this Direction 
   t5_dir.Value AS Direction,
