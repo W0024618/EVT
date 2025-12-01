@@ -1,3 +1,208 @@
+# add at top with other imports if not present:
+from fastapi.responses import JSONResponse, Response
+
+# --- New endpoint: details with filtering + export ---
+@app.get("/api/emea_pin_details")
+def emea_pin_details(
+    year: int | None = None,
+    location: str | None = Query(None),
+    employee_id: str | None = Query(None),
+    person_uid: str | None = Query(None),
+    from_date: str | None = Query(None),   # "YYYY-MM-DD"
+    to_date: str | None = Query(None),     # "YYYY-MM-DD"
+    limit: int = 200,
+    offset: int = 0,
+    export: str | None = Query(None)       # "csv" to download CSV
+):
+    """
+    Return row-level details (filtered). If export=csv, returns CSV download of full filtered results (no pagination).
+    Columns returned (JSON / CSV): EmployeeID, EmployeeName, Date, Time, CardNumber, Direction, DoorName, Rejection_Type, PartitionName2, person_uid, XmlGUID
+    """
+    target_year = int(year or datetime.now().year)
+    now = time.time()
+
+    # ensure cache for requested year
+    if CACHE["df"] is None or CACHE["year"] != target_year or (now - CACHE["ts"]) > CACHE_TTL:
+        try:
+            df = ep.fetch_pin_rows_for_year(target_year)
+        except Exception as e:
+            LOG.exception("Failed to fetch rows for details: %s", e)
+            try:
+                df = _load_fallback_csv(PROJECT_ROOT)
+            except Exception as e2:
+                tb = traceback.format_exc()
+                LOG.error("Failed both live fetch and fallback CSV: %s\n%s", e2, tb)
+                raise HTTPException(status_code=500, detail=f"Failed to fetch PIN rows: {e}\nFallback error: {e2}\n{tb}")
+        if df is None:
+            df = pd.DataFrame()
+        CACHE.update({"ts": now, "year": target_year, "df": df})
+    else:
+        df = CACHE["df"]
+
+    # defensive columns & parse time
+    if "LocaleMessageTime" in df.columns:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+
+    # Make sure DateOnly exists (string) and Time
+    if "DateOnly" not in df.columns:
+        if "LocaleMessageTime" in df.columns:
+            df["DateOnly"] = df["LocaleMessageTime"].dt.strftime("%Y-%m-%d")
+        else:
+            df["DateOnly"] = ""
+
+    if "TimeOnly" not in df.columns:
+        if "LocaleMessageTime" in df.columns:
+            df["TimeOnly"] = df["LocaleMessageTime"].dt.strftime("%H:%M:%S")
+        else:
+            df["TimeOnly"] = ""
+
+    # ensure important columns exist
+    for c in ["EmployeeID", "EmployeeName", "CardNumber", "PartitionName2", "DoorName", "Rejection_Type", "person_uid", "XmlGUID"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    # copy df to filter
+    df_f = df.copy()
+
+    # location filter
+    if location and location.strip() and location.strip().lower() != "all locations":
+        try:
+            df_f = df_f[df_f["PartitionName2"].astype(str) == str(location)]
+        except Exception:
+            LOG.exception("Location filter failed for details; ignoring location filter")
+
+    # employee_id or person_uid filter
+    if person_uid and str(person_uid).strip():
+        df_f = df_f[df_f["person_uid"].astype(str) == str(person_uid).strip()]
+    elif employee_id and str(employee_id).strip():
+        # match EmployeeID or person_uid fallback
+        emp = str(employee_id).strip()
+        df_f = df_f[
+            (df_f["EmployeeID"].astype(str) == emp) |
+            (df_f["person_uid"].astype(str) == emp)
+        ]
+
+    # date range filter (DateOnly expected format YYYY-MM-DD)
+    try:
+        if from_date:
+            from_ts = pd.to_datetime(from_date, format="%Y-%m-%d", errors="coerce")
+            if not pd.isna(from_ts):
+                df_f = df_f[df_f["LocaleMessageTime"] >= from_ts]
+        if to_date:
+            # include to_date end of day
+            to_ts = pd.to_datetime(to_date, format="%Y-%m-%d", errors="coerce")
+            if not pd.isna(to_ts):
+                df_f = df_f[df_f["LocaleMessageTime"] <= (to_ts + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+    except Exception:
+        LOG.exception("Date filtering failed for details; ignoring date filter")
+
+    # sort newest first
+    try:
+        df_f = df_f.sort_values("LocaleMessageTime", ascending=False)
+    except Exception:
+        pass
+
+    total_rows = len(df_f)
+
+    # If export=csv -> return full filtered CSV (no pagination)
+    if export and str(export).lower() == "csv":
+        # select and rename columns for user-friendly CSV
+        export_df = df_f.copy()
+        export_df["Date"] = export_df["LocaleMessageTime"].dt.strftime("%Y-%m-%d")
+        export_df["Time"] = export_df["LocaleMessageTime"].dt.strftime("%H:%M:%S")
+        export_cols = [
+            ("EmployeeID", "EmployeeID"),
+            ("EmployeeName", "EmployeeName"),
+            ("Date", "Date"),
+            ("Time", "Time"),
+            ("CardNumber", "CardNumber"),
+            ("DoorName", "DoorName"),
+            ("Rejection_Type", "Rejection_Type"),
+            ("PartitionName2", "Location"),
+            ("person_uid", "person_uid"),
+            ("XmlGUID", "XmlGUID"),
+        ]
+        # keep any additional column if exists e.g. Direction
+        if "Direction" in export_df.columns:
+            export_cols.insert(5, ("Direction","Direction"))
+        cols = [c[0] for c in export_cols]
+        # ensure columns exist
+        for c in cols:
+            if c not in export_df.columns:
+                export_df[c] = ""
+        try:
+            csv_bytes = export_df[cols].to_csv(index=False).encode("utf-8")
+            fname = f"emea_pin_details_{target_year}"
+            if from_date or to_date:
+                fname += f"_{from_date or ''}_{to_date or ''}"
+            fname += ".csv"
+            headers = {
+                "Content-Disposition": f'attachment; filename="{fname}"'
+            }
+            return Response(content=csv_bytes, media_type="text/csv", headers=headers)
+        except Exception:
+            LOG.exception("Failed to build CSV export")
+            raise HTTPException(status_code=500, detail="Failed to build CSV export")
+
+    # Otherwise return JSON with pagination
+    start = int(max(0, offset))
+    lim = int(max(1, limit))
+    page = df_f.iloc[start:start+lim].copy()
+
+    # map rows to desired JSON-friendly schema
+    rows = []
+    for _, r in page.iterrows():
+        locale_ts = r.get("LocaleMessageTime")
+        if pd.isna(locale_ts):
+            date_s = r.get("DateOnly", "")
+            time_s = r.get("TimeOnly", "")
+        else:
+            try:
+                date_s = pd.to_datetime(locale_ts).strftime("%Y-%m-%d")
+                time_s = pd.to_datetime(locale_ts).strftime("%H:%M:%S")
+            except Exception:
+                date_s = r.get("DateOnly","")
+                time_s = r.get("TimeOnly","")
+        rows.append({
+            "EmployeeID": _serialize_value(r.get("EmployeeID","")),
+            "EmployeeName": _serialize_value(r.get("EmployeeName","")),
+            "Date": date_s,
+            "Time": time_s,
+            "CardNumber": _serialize_value(r.get("CardNumber","")),
+            "Direction": _serialize_value(r.get("Direction","")) if "Direction" in r else "",
+            "DoorName": _serialize_value(r.get("DoorName","")),
+            "Rejection_Type": _serialize_value(r.get("Rejection_Type","")),
+            "Location": _serialize_value(r.get("PartitionName2","")),
+            "person_uid": _serialize_value(r.get("person_uid","")),
+            "XmlGUID": _serialize_value(r.get("XmlGUID","")),
+        })
+
+    resp = {
+        "total": int(total_rows),
+        "limit": lim,
+        "offset": start,
+        "rows": rows
+    }
+
+    return JSONResponse(_sanitize(resp))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #C:\Users\W0024618\Desktop\Trend Analysis\backend\api_server.py
 from pathlib import Path
 from datetime import datetime, date
