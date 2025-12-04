@@ -1,3 +1,227 @@
+            # --- combine multiple dates into single row (combine_dates == True) ---
+            try:
+                # sort group by Date (keep stable ordering)
+                g_sorted = g.copy()
+                try:
+                    g_sorted = g_sorted.sort_values(by='Date')
+                except Exception:
+                    pass
+
+                dates_list = []
+                durations_list = []
+                reasons_set = set()
+                anomaly_scores = []
+                # remove per-row summing - will compute unique flagged days below
+                flagged_any = False
+                countswipes_list = []
+
+                # --- detect any ViolationDaysLast* column (prefer highest numeric suffix) ---
+                def _detect_violation_col(cols):
+                    cand = [c for c in cols if isinstance(c, str) and c.startswith('ViolationDaysLast')]
+                    if not cand:
+                        return None
+                    # prefer column with largest numeric suffix (ViolationDaysLast180 > ViolationDaysLast90)
+                    def _suffix_num(name):
+                        m = re.search(r'ViolationDaysLast(\d+)', name)
+                        if m:
+                            try:
+                                return int(m.group(1))
+                            except Exception:
+                                return 0
+                        return 0
+                    cand_sorted = sorted(cand, key=_suffix_num, reverse=True)
+                    return cand_sorted[0]
+
+                violation_col = _detect_violation_col(g_sorted.columns)
+
+                # iterate rows and collect (but do NOT sum per-row "violation_col" here)
+                for _, rr in g_sorted.iterrows():
+                    # date string
+                    try:
+                        dval = rr.get('Date')
+                        if pd.notna(dval):
+                            if isinstance(dval, (str,)):
+                                ds = pd.to_datetime(dval, errors='coerce')
+                            else:
+                                ds = pd.to_datetime(dval, errors='coerce')
+                            if pd.notna(ds):
+                                dates_list.append(ds.date().strftime("%d/%m/%Y"))
+                            else:
+                                dates_list.append(str(dval))
+                        else:
+                            dates_list.append('')
+                    except Exception:
+                        dates_list.append(str(rr.get('Date')))
+
+                    # duration
+                    dstr = _fmt_duration_from_row(rr)
+                    if dstr:
+                        durations_list.append(dstr)
+                    else:
+                        # keep blank placeholder for alignment if needed
+                        durations_list.append("")
+
+                    # reasons: may be semicolon/comma separated; split and add unique
+                    try:
+                        rs = rr.get('Reasons') or rr.get('DetectedScenarios') or None
+                        if rs:
+                            for part in re.split(r'[;,\|]', str(rs)):
+                                p = part.strip()
+                                if p and p.lower() not in ('nan','none',''):
+                                    reasons_set.add(p)
+                    except Exception:
+                        pass
+
+                    # anomaly score
+                    try:
+                        if 'AnomalyScore' in rr and rr.get('AnomalyScore') not in (None, '', float('nan')):
+                            anomaly_scores.append(float(rr.get('AnomalyScore')))
+                    except Exception:
+                        pass
+
+                    # flagged
+                    try:
+                        if 'IsFlagged' in rr and bool(rr.get('IsFlagged')):
+                            flagged_any = True
+                    except Exception:
+                        pass
+
+                    try:
+                        if 'CountSwipes' in rr and rr.get('CountSwipes') not in (None, '', float('nan')):
+                            countswipes_list.append(int(float(rr.get('CountSwipes'))))
+                    except Exception:
+                        pass
+
+                # ---- compute ViolationDays properly: number of distinct Dates where IsFlagged == True ----
+                violation_days_total = 0
+                try:
+                    if 'IsFlagged' in g_sorted.columns and 'Date' in g_sorted.columns:
+                        # count distinct non-null dates where IsFlagged is True
+                        try:
+                            flagged_dates = g_sorted[g_sorted['IsFlagged'] == True]['Date'].dropna().unique()
+                            # normalize date objects and count unique
+                            norm_dates = { (d if isinstance(d, (str,)) else (d if getattr(d, 'isoformat', None) else d)) for d in flagged_dates }
+                            violation_days_total = int(len([d for d in norm_dates if d not in (None, '', float('nan'))]))
+                        except Exception:
+                            # fallback to robust loop
+                            s = set()
+                            for _, rr in g_sorted.iterrows():
+                                try:
+                                    if rr.get('IsFlagged'):
+                                        dd = rr.get('Date')
+                                        if pd.notna(dd):
+                                            try:
+                                                dnorm = pd.to_datetime(dd, errors='coerce').date()
+                                                if pd.notna(dnorm):
+                                                    s.add(dnorm)
+                                            except Exception:
+                                                s.add(str(dd))
+                            violation_days_total = int(len(s))
+                    elif violation_col:
+                        # fallback: older files may only carry pre-computed per-row ViolationDaysLast* columns,
+                        # sum them (best-effort) — this is legacy behaviour but kept as fallback.
+                        vt = 0
+                        for _, rr in g_sorted.iterrows():
+                            try:
+                                v = rr.get(violation_col)
+                                if v not in (None, '', float('nan')):
+                                    vt += int(float(v))
+                            except Exception:
+                                pass
+                        violation_days_total = int(vt)
+                    else:
+                        violation_days_total = 0
+                except Exception:
+                    violation_days_total = 0
+
+                # attach aggregated fields to picked row
+                # join date+duration entries as "DD/MM/YYYY: HH:MM:SS" pairs (semicolon separated)
+                pairs = []
+                for d, du in zip(dates_list, durations_list):
+                    if d and du:
+                        pairs.append(f"{d} {du}")
+                    elif d and not du:
+                        pairs.append(f"{d}")
+                    elif du and not d:
+                        pairs.append(f"{du}")
+                picked['Dates'] = "; ".join([p for p in dates_list if p])
+                picked['Duration'] = "; ".join([p for p in durations_list if p])
+                # Also keep a combined 'DurationByDate' with date+value
+                picked['DurationByDate'] = "; ".join(pairs) if pairs else None
+
+                # Reasons combined (unique)
+                if reasons_set:
+                    picked['Reasons'] = "; ".join(sorted(reasons_set))
+                else:
+                    # ensure Reasons exists
+                    if 'Reasons' not in picked or picked.get('Reasons') in (None, '', float('nan')):
+                        picked['Reasons'] = None
+
+                # Other metrics: AnomalyScore -> max, IsFlagged -> any True, CountSwipes -> max or sum (prefer max)
+                try:
+                    picked['AnomalyScore'] = max(anomaly_scores) if anomaly_scores else picked.get('AnomalyScore')
+                except Exception:
+                    pass
+                picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
+                try:
+                    # neutral/standard aggregated key
+                    picked['ViolationDays'] = int(violation_days_total)
+                    # also provide a window-specific key using DEFAULT_VIOLATION_DAYS
+                    try:
+                        picked[f'ViolationDaysLast{int(DEFAULT_VIOLATION_DAYS)}'] = int(violation_days_total)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
+                except Exception:
+                    pass
+
+
+
+
+
+
+
+
+
+
+
+    # --- ensure per-day trend CSV is written so subsequent date-runs in the same process can see history ---
+    try:
+        if trend_df is not None and not getattr(trend_df, 'empty', True):
+            try:
+                outfile = Path(outdir_path) / f"trend_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+                trend_df.to_csv(outfile, index=False)
+                logging.info("run_trend_for_date: wrote trend CSV %s", outfile)
+            except Exception:
+                logging.exception("run_trend_for_date: failed to write per-day trend CSV for %s", target_date)
+    except Exception:
+        logging.exception("run_trend_for_date: error while attempting to persist trend CSV")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Check below app.py and trend runner.py file carefully 
 i have review issue 
 
