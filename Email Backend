@@ -1,0 +1,3016 @@
+D:\Email Automation\backend-arun\.env
+
+#API key for securing endpoints (replace with your existing API key)
+API_KEYS=1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed
+#Microsoft Graph API credentials (placeholders)
+CLIENT_ID=6222d611-678e-4d57-a98b-83faa86fce76
+CLIENT_SECRET=DKV8Q~Rn4MvlucbxcMsXvAZ6ub_rBVbo-sb6.bGX 
+TENANT_ID=ce3a67f2-5a22-4fb8-a511-815f8924cda6
+# BASE_URL=http://localhost:8000
+
+BASE_URL=http://10.199.22.57:3010
+# ENV=testing
+TEST_EMAIL=gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com
+
+
+
+
+
+
+D:\Email Automation\backend-arun\alerts.py
+
+
+import pyodbc
+from datetime import datetime
+from config import Regional_Servers, Regional_Managers, GSOC_EMAIL, BASE_URL, ENV
+from db import get_sql_connection
+from log_handler import read_sqlite_alerts_set, log_sent_alert, check_exception_list, log_email,get_allowed_locations
+import logging
+from email_handler import send_email, send_email_test, get_email_template
+import uuid
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def build_sql_query():
+    """OPTIMIZED QUERY: Fetches all necessary employee data in a single call."""
+    return """
+
+    WITH CombinedQuery AS (
+        SELECT
+            DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+            t1.ObjectName1,
+            t5_card.CardNumber,
+            t1.ObjectName2,
+            CASE
+                WHEN t1.[ObjectName2] LIKE '%HQ%' THEN 'Denver'
+                WHEN t1.[ObjectName2] LIKE '%Austin%' THEN 'Austin'
+                WHEN t1.[ObjectName2] LIKE '%Miami%' THEN 'Miami'
+                WHEN t1.[ObjectName2] LIKE '%NYC%' THEN 'New York'
+                WHEN t1.ObjectName2 LIKE 'APAC_PI%' THEN 'Taguig City'
+                WHEN t1.ObjectName2 LIKE 'APAC_PH%' THEN 'Quezon City'
+                WHEN t1.ObjectName2 LIKE '%PUN%' THEN 'Pune'
+                ELSE t1.PartitionName2
+            END AS PartitionName,
+            CASE
+                WHEN t6.Name IN ('USA/Canada Default', 'US.NYC', 'US.FL.Miami', 'US.CO.OBS', 'US.CO.DTC') THEN 'NAMER'
+                WHEN t6.Name IN ('EMEA.Default', 'LT.Vilnius', 'UK.London', 'AT.Vienna', 'IT.Rome', 'IE.Dublin', 'ES.Madrid', 'DU.Abu Dhab', 'MA.Casablanca', 'RU.Moscow', 'AUT.Vienna') THEN 'EMEA'
+                WHEN t6.Name IN ('MX.Mexico City', 'AR.Cordoba', 'PE.Lima', 'PA.Panama City', 'BR.Sao Paulo', 'CR.Costa Rica Partition', 'Barbados') THEN 'LACA'
+                WHEN t6.Name IN ('APAC.Default', 'CN.Beijing', 'PH.Manila', 'JP.Tokyo', 'MY.Kuala Lumpur', 'IN.HYD') THEN 'APAC'
+                ELSE 'Unknown'
+            END AS Region,
+            t5_rej.value AS Rejection_Type,
+            t3.Name AS PersonnelType,
+            -- FIX: Added the required columns here, from the existing correct JOINs
+            t2.ManagerEmail,
+            t2.EmailAddress AS EmployeeEmailAddress,
+            t2.Text23 AS Management_Level,
+            CASE WHEN t3.Name IN ('Contractor', 'Terminated Contractor') THEN t2.Text12 ELSE CAST(t2.Int1 AS NVARCHAR) END AS "EmployeeID"
+        FROM [dbo].[ACVSUJournalLog] AS t1
+        LEFT JOIN [ACVSCore].[Access].[Personnel] AS t2 ON t1.ObjectIdentity1 = t2.GUID
+        LEFT JOIN [ACVSCore].[Access].[PersonnelType] AS t3 ON t2.[PersonnelTypeId] = t3.[ObjectID]
+        LEFT JOIN ACVSCore.dbo.Partition AS t6 ON t1.PartitionID = t6.ObjectID
+        LEFT JOIN [dbo].[ACVSUJournalLogxml] AS t_xml ON t1.XmlGUID = t_xml.GUID
+        LEFT JOIN (SELECT GUID, [value] FROM [dbo].[ACVSUJournalLogxmlShred] WHERE [Name] = 'Card') AS SCard ON t1.XmlGUID = SCard.GUID
+        OUTER APPLY (SELECT COALESCE(TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]', 'varchar(50)'), TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]', 'varchar(50)'), SCard.[value]) AS CardNumber) AS t5_card
+        LEFT JOIN [dbo].[ACVSUJournalLogxmlShred] AS t5_Rej ON t1.XmlGUID = t5_Rej.GUID AND t5_Rej.Name = 'RejectCode'
+        WHERE t1.MessageType = 'CardRejected' AND t1.MessageUTC > DATEADD(hour, -4, GETUTCDATE())
+    ),
+    Unified AS (
+        SELECT
+            CASE
+                WHEN Rejection_Type = 'Lost' THEN 'Lost'
+                WHEN Rejection_Type = 'Clearance' THEN 'Clearance'
+                WHEN Rejection_Type IN ('CardDisabled','Disabled') THEN 'Disabled'
+                WHEN Rejection_Type = 'Stolen' THEN 'Stolen'
+                WHEN Rejection_Type = 'Expired' THEN 'Expired'
+                WHEN Rejection_Type = 'PIN' THEN 'Wrong PIN'
+                WHEN Rejection_Type = 'UnknownCard' THEN 'Unknown Card'
+                WHEN Rejection_Type = 'SiteCode' THEN 'Site Code'
+                WHEN Rejection_Type = 'NotActivated' THEN 'Not Activated'
+                WHEN Rejection_Type = 'FacilityCode' THEN 'Facility Code'
+            END AS Alert_Type,
+            * -- Pass all columns from CombinedQuery through
+        FROM CombinedQuery
+    )
+    -- FIX: Removed the problematic final JOINs and selected the columns directly
+    SELECT TOP 20 
+        Alert_Type, EmployeeID, ObjectName1, PersonnelType, CardNumber, ObjectName2, PartitionName, Region,
+        CONVERT(TIME(0), LocaleMessageTime) AS Swipe_Time,
+        CONVERT(DATE, LocaleMessageTime) AS DateOnly,
+        ManagerEmail, 
+        EmployeeEmailAddress, 
+        Management_Level
+    FROM Unified
+    ORDER BY DateOnly DESC, Swipe_Time DESC;
+
+
+    """
+
+def build_alarm_query():
+    """Fetches recent alarm data."""
+    return """
+WITH Query AS (
+    SELECT
+        DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+        CAST(DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS DATE) AS MessageDate,
+        CONVERT(TIME(0), DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS Message_Time,
+        t1.[ObjectName1],
+        CASE
+            WHEN LEN(t1.ObjectName1) - LEN(REPLACE(t1.ObjectName1, ' ', '')) >= 2 THEN
+                RIGHT(
+                    t1.ObjectName1,
+                    CHARINDEX(' ', REVERSE(t1.ObjectName1), CHARINDEX(' ', REVERSE(t1.ObjectName1)) + 1) - 1
+                )
+            ELSE
+                t1.ObjectName1
+        END AS AlarmName,
+        CASE
+            WHEN LEN(t1.ObjectName1) - LEN(REPLACE(t1.ObjectName1, ' ', '')) >= 2 THEN
+                LEFT(
+                    t1.ObjectName1,
+                    LEN(t1.ObjectName1) - CHARINDEX(' ', REVERSE(t1.ObjectName1), CHARINDEX(' ', REVERSE(t1.ObjectName1)) + 1)
+                )
+            ELSE
+                t1.ObjectName1
+        END AS DoorName,
+        t1.[PartitionName1],
+        t1.[ObjectName2] AS Operator_Name,
+        t2.value AS Action_Taken,
+        CASE
+            WHEN t1.PartitionName1 IN ('USA/Canada Default', 'US.NYC', 'US.FL.Miami', 'US.CO.OBS', 'US.CO.DTC') THEN 'NAMER'
+            WHEN t1.PartitionName1 IN ('EMEA.Default', 'LT.Vilnius', 'UK.London', 'AT.Vienna', 'IT.Rome', 'IE.Dublin', 'ES.Madrid', 'DU.Abu Dhab', 'MA.Casablanca', 'RU.Moscow', 'AUT.Vienna') THEN 'EMEA'
+            WHEN t1.PartitionName1 IN ('MX.Mexico City', 'AR.Cordoba', 'PE.Lima', 'PA.Panama City', 'BR.Sao Paulo', 'CR.Costa Rica Partition', 'Barbados') THEN 'LACA'
+            WHEN t1.PartitionName1 IN ('APAC.Default', 'CN.Beijing', 'PH.Manila', 'JP.Tokyo', 'MY.Kuala Lumpur', 'IN.HYD') THEN 'APAC'
+            ELSE 'Unknown'
+        END AS Region
+    FROM
+        dbo.[ACVSUJournalLog] t1
+    INNER JOIN
+        dbo.[ACVSUJournalLogxmlShred] t2
+        ON t1.XMLGUid = t2.GUID
+    WHERE
+        t1.MessageType = 'LogMessage'
+)
+SELECT TOP 10
+    MessageDate AS DateOnly,
+    Message_Time AS Swipe_Time,
+    AlarmName AS Alert_Type,
+    DoorName AS ObjectName2,
+    Region,
+    PartitionName1 AS PartitionName,
+    Operator_Name,
+    Action_Taken
+FROM Query
+ORDER BY
+    LocaleMessageTime DESC;
+    """
+
+def is_senior_role(job_title):
+    title = str(job_title or '').lower()
+    senior_keywords = ["chief exec officer", "executive vice president", "senior vice president", "vice president", "upper mid mgmt / director"]
+    return any(keyword in title for keyword in senior_keywords)
+
+
+def check_alerts_for_server(server_config, sent_alerts=None):
+    logger.info(f"Checking alerts for {server_config['NAME']} server")
+    
+    rejection_data_list = []
+    alarm_data_list = []
+    
+    # STEP 1: Connect, fetch all data into memory, and close connection immediately.
+    # This prevents long-lived connections that cause locking issues.
+    try:
+        conn = get_sql_connection(server_config['SQL_SERVER'], server_config['SQL_DB'], server_config['SQL_USER'], server_config['SQL_PASSWORD'])
+        if not conn:
+            logger.error(f"[{server_config['NAME']}] Failed to establish database connection")
+            return
+
+        cursor = conn.cursor()
+        
+        # Fetch rejections using the single optimized query
+        logger.debug(f"[{server_config['NAME']}] Fetching rejection data...")
+        cursor.execute(build_sql_query())
+        columns = [desc[0] for desc in cursor.description]
+        rejection_data_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        logger.info(f"[{server_config['NAME']}] Fetched {len(rejection_data_list)} rejection records.")
+
+        # Fetch alarms
+        logger.debug(f"[{server_config['NAME']}] Fetching alarm data...")
+        cursor.execute(build_alarm_query())
+        columns = [desc[0] for desc in cursor.description]
+        alarm_data_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        logger.info(f"[{server_config['NAME']}] Fetched {len(alarm_data_list)} alarm records.")
+
+    except Exception as e:
+        logger.error(f"[{server_config['NAME']}] Error during database query phase: {e}", exc_info=True)
+        return
+    finally:
+        if conn:
+            conn.close()
+            logger.info(f"[{server_config['NAME']}] Database connection closed.")
+
+    # STEP 2: Process all data from the in-memory lists.
+    if sent_alerts is None:
+        sent_alerts = read_sqlite_alerts_set() 
+    
+    allowed_locations = get_allowed_locations()
+    if allowed_locations:
+        logger.info(f"Location filter is active. Only processing emails for: {allowed_locations}")    
+    
+    current_alerts = set()
+    
+    # Process rejections from the in-memory list
+    for data in rejection_data_list:
+        try:
+            composite_key = (
+                str(data.get('EmployeeID') or '').strip(), 
+                str(data.get('ObjectName1') or '').strip(),
+                str(data.get('Alert_Type') or '').strip(), 
+                str(data.get('CardNumber') or '').strip(),
+                str(data.get('ObjectName2') or '').strip(), 
+                str(data.get('Swipe_Time') or '').strip(),
+                str(data.get('DateOnly') or '').strip(), 
+                str(data.get('PartitionName') or '').strip(),
+                str(data.get('Region') or '').strip()
+            )
+            object_name_3_placeholder = ''
+
+            if composite_key in sent_alerts or composite_key in current_alerts:
+                continue
+
+            # Check for rejection types that should only be logged, not emailed
+            EXCLUDED_REJECTIONS = {"Unknown Card", "Facility Code", "Not Activated", "Site Code"}
+            rejection_type_from_db = data.get("Alert_Type")
+            if rejection_type_from_db in EXCLUDED_REJECTIONS:
+                logger.info(f"[{server_config['NAME']}] Found excluded rejection type: {rejection_type_from_db}. Logging only.")
+                log_sent_alert(*composite_key, object_name_3_placeholder)
+                current_alerts.add(composite_key)
+                continue
+
+            # If the alert is not excluded, log it and then proceed to send an email
+            log_sent_alert(*composite_key, object_name_3_placeholder)
+            current_alerts.add(composite_key)
+            region = server_config['NAME']
+            location=data.get('PartitionName')
+            
+            # --- Updated Location Filter Check ---
+            if allowed_locations:
+                if (str(region).lower(),str(location).lower()) not in allowed_locations:
+                    logger.debug(f"Skipping email for {region}/{location}; not in location filter.")
+                    continue
+                
+            # --- Start Email Logic ---
+            rejection_type = str(data.get("Alert_Type", "")).strip().lower()
+            emp_id = str(data.get("EmployeeID", "")).strip()
+            employee_name=str(data.get("ObjectName1"))
+            personnel_type = str(data.get("PersonnelType","")).strip().lower()
+            job_title = data.get("Management_Level", "").strip().lower()
+
+            if is_senior_role(job_title):
+                logger.info(f"[{server_config['NAME']}] {emp_id} is senior ({job_title}), skipping email.")
+                continue
+    
+            logger.debug(f"Debugging alert data : emp_id='{emp_id}',personnel_type:{personnel_type}, email= {data.get('EmployeeEmail')}")
+
+            to_email = None
+            if not emp_id or emp_id == "0":
+                to_email = GSOC_EMAIL
+                logger.info(f"EmployeeID is missing or invalid. Routing to GSOC.")
+            
+            elif personnel_type != 'employee':
+                # Rule for all non-employees (Contractors, etc.)
+                recipient_email = data.get('ManagerEmail')
+                if recipient_email and '@' in recipient_email:
+                    to_email = recipient_email
+                else:
+                    logger.warning(f"ManagerEmail is missing or invalid for non-employee {emp_id}. No email will be sent for this alert.")
+                    continue # Skip this alert
+            
+            elif rejection_type in ['clearance', 'expired'] and personnel_type == 'employee':
+                # Rule for specific alerts for employees
+                recipient_email = data.get('EmployeeEmailAddress')
+                if recipient_email and '@' in recipient_email:
+                    to_email = recipient_email
+                else:
+                    logger.warning(f"EmployeeEmailAddress is missing or invalid for employee {emp_id}. No email will be sent for this alert.")
+                    continue # Skip this alert
+            
+            else:
+                # This is the final fallback for all other employee alert types
+                to_email = Regional_Managers.get(region, GSOC_EMAIL)
+            
+            # if check_exception_list(to_email):
+            #     logger.info(f"[{server_config['NAME']}] Skipping email to {to_email} (exception list).")
+            #     continue
+
+            swipe_time = data.get("Swipe_Time")
+            date = data.get("DateOnly")
+            time_str = datetime.combine(date, swipe_time).strftime('%Y-%m-%d %H:%M:%S') if swipe_time and date else "Unknown Time"
+            subject_map = {
+                'clearance': f"{region}-High Security Zone Violation", 'lost': f"{region}-Access Deny Alarm - Badge Lost",
+                'wrong pin': f"{region}-Access Violation Alarm - Wrong Pin", 'expired': f"{region}-Access Deny Alarm - Badge Expired",
+                'disabled': f"{region}-Access Deny Alarm - Badge Disabled"
+            }
+            subject = subject_map.get(rejection_type, f"{region}-Unknown Rejection")
+            email_id = str(uuid.uuid4())
+            template_data = {
+                'FirstName': str(data.get('ObjectName1', '')).split(',')[1], 'ObjectName1': str(data.get('ObjectName1', '')),
+                'ObjectName2': str(data.get('ObjectName2', '')), 'DateOnly': str(data.get('DateOnly', '')),
+                'EmployeeID': emp_id, 'CardNumber': str(data.get('CardNumber', '')), 'time_str': time_str,
+                'acknowledge_url': f"{BASE_URL}/acknowledge?email_id={email_id}"
+            }
+            
+            body, template_key = get_email_template(region, rejection_type, emp_id, time_str, template_data, personnel_type)
+
+            if ENV == 'testing':
+                # send_email_test(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=emp_id,employee_name=employee_name)
+                pass
+            else:
+                send_email(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=emp_id,employee_name=employee_name)
+                # pass
+
+        except Exception as e:
+            logger.error(f"[{server_config['NAME']}] Failed to process rejection for {data.get('EmployeeID')}: {e}", exc_info=True)
+
+    # Process alarms from the in-memory list
+    for alarm_data in alarm_data_list:
+        try:
+            alarm_type = str(alarm_data.get("Alert_Type", "")).strip().lower().replace(' ','_')
+            
+            alarm_composite_key = (
+                '', str(alarm_data.get('Operator_Name', 'Unknown')).strip(), alarm_type.upper(), '',
+                str(alarm_data.get('ObjectName2', '')).strip(), str(alarm_data.get('Swipe_Time', '')).strip(),
+                str(alarm_data.get('DateOnly', '')).strip(), str(alarm_data.get('PartitionName', '')).strip(),
+                str(alarm_data.get('Region', '')).strip()
+            )
+            object_name_3_placeholder = str(alarm_data.get('Action_Taken', 'None')).strip()
+
+            if alarm_composite_key in sent_alerts or alarm_composite_key in current_alerts:
+                continue
+
+            if alarm_type not in ['held_open', 'forced_open', 'fire_event']:
+                continue
+            
+            log_sent_alert(*alarm_composite_key, object_name_3_placeholder)
+            current_alerts.add(alarm_composite_key)
+            
+            region = server_config['NAME']
+            location=alarm_data.get('PartitionName')
+            
+            if allowed_locations:
+                if (str(region).lower(),str(location).lower()) not in allowed_locations:
+                    logger.debug(f"Skipping alarm email for {region}/{location}; not in location filter.")
+                    continue
+
+            # --- Start Email Logic for Alarms ---
+            to_email = GSOC_EMAIL
+            
+            # if check_exception_list(to_email):
+            #     logger.info(f"[{server_config['NAME']}] Skipping alarm email to {to_email} (exception list).")
+            #     continue
+
+            swipe_time = alarm_data.get("Swipe_Time")
+            date = alarm_data.get("DateOnly")
+            time_str = datetime.combine(date, swipe_time).strftime('%Y-%m-%d %H:%M:%S') if swipe_time and date else "Unknown Time"
+            subject = f"{region} - Alarm Event: {alarm_type.replace('_',' ').title()}"
+            email_id = str(uuid.uuid4())
+            template_data = {
+                'ObjectName2': alarm_data.get('ObjectName2', ''), 'DateOnly': str(alarm_data.get('DateOnly', '')),
+                'time_str': time_str, 'PartitionName': alarm_data.get('PartitionName', ''),
+                'Region': region, 'Operator_Name': str(alarm_data.get('Operator_Name', 'Unknown')),
+                'Action_Taken': str(alarm_data.get('Action_Taken', 'None')),
+                'acknowledge_url': f"{BASE_URL}/acknowledge?email_id={email_id}"
+            }
+            
+            body, template_key = get_email_template(region, alarm_type, '', time_str, template_data, None)
+            
+            if ENV == 'testing':
+                # send_email_test(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=None,employee_name=None)
+                pass
+            else:
+                send_email(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=None,employee_name=None)
+                # pass
+                
+        except Exception as e:
+            logger.error(f"[{server_config['NAME']}] Error processing alarm for {alarm_data.get('ObjectName2')}: {e}", exc_info=True)
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\app.py
+
+
+from flask import Flask, Response, request, jsonify
+from flask_cors import CORS
+from alerts import check_alerts_for_server
+from config import Regional_Servers
+from log_handler import (
+    read_sqlite_alerts_by_date,
+    read_email_logs_by_date,
+    read_sqlite_alerts_set,
+    start_database_writer,
+    get_email_response_counts,
+    manage_exceptions,
+    update_acknowledgment,
+    get_image,
+    get_allowed_locations,
+    manage_location_filter
+)
+from email_handler import fetch_inbox_emails, trigger_followup_action
+import os
+import csv
+from dotenv import load_dotenv
+from functools import wraps
+import json
+import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from filelock import FileLock, Timeout
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename='log_file.log',
+    filemode='a',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logging.getLogger("filelock").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+VALID_API_KEYS = os.getenv("API_KEYS", "").split(",")
+
+start_database_writer()
+
+app = Flask(__name__)
+CORS(app)
+scheduler = BackgroundScheduler()
+log = logging.getLogger('werkzeug')
+log.disabled = True
+
+executor = ThreadPoolExecutor(max_workers=16)
+
+def check_all_regions():
+    job_lock = FileLock("check_all_regions.lock", timeout=10)
+    try:
+        with job_lock:
+            logger.info("Master lock acquired. Starting check_all_regions job.")
+            sent_alerts = read_sqlite_alerts_set()
+            for server in Regional_Servers:
+                check_alerts_for_server(server, sent_alerts)
+            logger.info("Finished check_all_regions job. Releasing master lock.")
+    except Timeout:
+        logger.warning("Could not acquire master lock. Another instance is likely running. Skipping this run.")
+    except Exception as e:
+        logger.error(f"An exception occurred during check_all_regions: {e}", exc_info=True)
+
+scheduler.add_job(check_all_regions, 'interval', seconds=60, id='check_all_regions_job', max_instances=1)
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if not api_key or api_key not in VALID_API_KEYS:
+            return jsonify({"description": "Invalid or missing API key"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route("/alert-logs-sqlite", methods=["GET"])
+@require_api_key
+def get_alert_logs_sqlite():
+    try:
+        today = datetime.now()
+        seven_days_ago = today - timedelta(days=7)
+        from_date = request.args.get('from_date', seven_days_ago.strftime('%Y-%m-%d'))
+        to_date = request.args.get('to_date', today.strftime('%Y-%m-%d'))
+
+        future = executor.submit(read_sqlite_alerts_by_date, from_date, to_date)
+        logs = future.result()
+
+        return jsonify(logs)
+    except Exception as e:
+        logger.error(f"API Error fetching alert logs: {e}", exc_info=True)
+        return jsonify({"description": "Error reading database"}), 500
+
+@app.route('/get/email-logs', methods=['GET'])
+@require_api_key
+def get_email_logs():
+    try:
+        today = datetime.now()
+        seven_days_ago = today - timedelta(days=7)
+        from_date = request.args.get('from_date', seven_days_ago.strftime('%Y-%m-%d'))
+        to_date = request.args.get('to_date', today.strftime('%Y-%m-%d'))
+
+        future = executor.submit(read_email_logs_by_date, from_date, to_date)
+        email_logs = future.result()
+
+        return jsonify(email_logs)
+    except Exception as e:
+        logger.error(f"API Error fetching email logs: {e}", exc_info=True)
+        return jsonify({"error": "Database error"}), 500
+
+@app.route("/acknowledge", methods=["GET"])
+def acknowledge_email():
+    email_id = request.args.get("email_id")
+    logger.debug(f"Acknowledge request received with email_id: {email_id}")
+    if not email_id:
+        logger.error("Missing 'email_id' in query parameters")
+        return """
+        <html>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+        <h2>Acknowledgment Failed</h2>
+        <p>Missing email ID in the request. Please check the link and try again.</p>
+        </body>
+        </html>
+        """, 400
+    try:
+        result = update_acknowledgment(email_id)
+        if not result:
+            logger.error(f"Failed to acknowledge email {email_id}: email_id not found")
+            return """
+            <html>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+            <h2>Acknowledgment Failed</h2>
+            <p>The email ID is invalid or not found. Please check the link and try again.</p>
+            </body>
+            </html>
+            """, 404
+        logger.info(f"Email acknowledged successfully: {email_id}")
+        return """
+        <html>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+        <h2>Acknowledgment Successful</h2>
+        <p>Thank you for acknowledging the email (ID: {email_id}).</p>
+        <p>You can close this page.</p>
+        </body>
+        </html>
+        """.format(email_id=email_id), 200
+    except Exception as e:
+        logger.error(f"Error acknowledging email {email_id}: {str(e)}")
+        return """
+        <html>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+        <h2>Error</h2>
+        <p>An error occurred while acknowledging the email: {error}</p>
+        <p>Please try again or contact support.</p>
+        </body>
+        </html>
+        """.format(error=str(e)), 500
+
+# (Add any other API routes you need here, following the same pattern)
+@app.route("/email/trigger-action", methods=["POST"])
+@require_api_key
+def trigger_action():
+    logger.debug("Triggering action for unacknowledged email")
+    data = request.get_json()
+    if not data or "email_id" not in data or "action" not in data:
+        logger.error("Missing 'email_id' or 'action' in request body")
+        return Response(
+            json.dumps({"description": "Missing 'email_id' or 'action' in request body"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    email_id = data["email_id"]
+    action = data["action"]
+    if action not in ["reminder", "hr", "regional_manager"]:
+        logger.error(f"Invalid action: {action}")
+        return Response(
+            json.dumps({"description": f"Invalid action: {action}"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    try:
+        trigger_followup_action(email_id, action)
+        logger.debug(f"Action triggered: {action} for email {email_id}")
+        return Response(
+            json.dumps({"status": "success", "message": f"Action {action} triggered for email {email_id}"}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error triggering action: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error triggering action: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+        
+app.route("/curl", methods=["POST"])
+@require_api_key
+def trigger_alert():
+    logger.debug("Trigger alert requested")
+    data = request.get_json()
+    if not data or "region" not in data:
+        logger.error("Missing 'region' in request body")
+        return Response(
+            json.dumps({"description": "Missing 'region' in request body"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    region = data["region"].upper()
+    server = next((s for s in Regional_Servers if s["NAME"] == region), None)
+    if not server:
+        logger.error(f"Invalid region: {region}")
+        return Response(
+            json.dumps({"description": f"Invalid region: {region}"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    try:
+        check_alerts_for_server(server)
+        logger.debug(f"Alert check triggered for {region}")
+        return Response(
+            json.dumps({"status": "success", "message": f"Alert check triggered for {region}"}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error processing alert: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error processing alert: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/responses-received", methods=["GET"])
+@require_api_key
+def get_responses_received():
+    logger.debug("Fetching count of acknowledged emails")
+    try:
+        counts = get_email_response_counts()
+        return Response(
+            json.dumps({"acknowledged_count": counts["acknowledged"]}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching acknowledged email count: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching acknowledged email count: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/responses-sent", methods=["GET"])
+@require_api_key
+def get_responses_sent():
+    logger.debug("Fetching count of sent emails")
+    try:
+        counts = get_email_response_counts()
+        return Response(
+            json.dumps({"sent_count": counts["sent"]}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching sent email count: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching sent email count: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/inbox", methods=["GET"])
+@require_api_key
+def get_inbox():
+    logger.debug("Fetching inbox emails")
+    try:
+        top = int(request.args.get("top", 10))
+        skip = int(request.args.get("skip", 0))
+        folder = request.args.get("folder", "inbox")
+        logger.debug(f"Fetching emails with top={top}, skip={skip}, folder={folder}")
+        emails = fetch_inbox_emails(top=top, skip=skip, folder=folder)
+        return Response(
+            json.dumps({
+                "emails": emails,
+                "total": len(emails),
+                "top": top,
+                "skip": skip,
+                "folder": folder,
+                "has_more": len(emails) == top
+            }, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching inbox emails: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching inbox emails: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/exceptions", methods=["GET"])
+@require_api_key
+def get_exceptions():
+    logger.debug("Fetching exception list")
+    try:
+        exceptions = manage_exceptions(action="get")
+        return Response(
+            json.dumps({"exceptions": exceptions}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching exception list: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching exception list: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/exceptions", methods=["POST"])
+@require_api_key
+def manage_exceptions_endpoint():
+    logger.debug("Managing exception list")
+    data = request.get_json()
+    if not data or "action" not in data or "email" not in data:
+        logger.error("Missing 'action' or 'email' in request body")
+        return Response(
+            json.dumps({"description": "Missing 'action' or 'email' in request body"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    action = data["action"]
+    email = data["email"]
+    logger.debug(f"Processing {action} for email: {email}")
+    try:
+        result = manage_exceptions(action=action, email=email)
+        if result is False:
+            logger.error(f"Failed to {action} email {email} in exception list")
+            return Response(
+                json.dumps({"description": f"Failed to {action} email {email} (email not found or invalid)"}, indent=2),
+                status=404 if action == "delete" else 400,
+                mimetype="application/json"
+            )
+        logger.info(f"Successfully {action} email {email} in exception list")
+        return Response(
+            json.dumps({"status": "success", "message": f"Exception list updated: {action} {email}"}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error managing exception list for action {action}, email {email}: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error managing exception list: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/templates", methods=["GET"])
+@require_api_key
+def get_templates():
+    logger.debug("Fetching email templates")
+    try:
+        with open('templates.json', 'r',encoding='utf-8') as f:
+            templates = json.load(f)
+        return Response(
+            json.dumps({"templates": templates}, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching email templates: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching email templates: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/email/templates", methods=["POST"])
+@require_api_key
+def manage_templates():
+    logger.debug("Managing email templates")
+    data = request.get_json()
+    logger.debug(f"Received JSON data: {data}")
+    if not data or "action" not in data:
+        logger.error("Missing 'action' in request body")
+        return Response(
+            json.dumps({"description": "Missing 'action' in request body"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    action = data["action"]
+    if action == "update":
+        if "region" not in data or "template_key" not in data or "template_content" not in data:
+            logger.error("Missing 'region', 'template_key', or 'template_content' for update action")
+            return Response(
+                json.dumps({"description": "Missing 'region', 'template_key', or 'template_content' for update action"}, indent=2),
+                status=400,
+                mimetype="application/json"
+            )
+        region = data["region"].upper()
+        template_key = data["template_key"]
+        template_content = data["template_content"]
+        logger.debug(f"Processing update: region={region}, template_key={template_key}, template_content={template_content}")
+        if not template_content.strip():
+            logger.error("Empty template_content provided")
+            return Response(
+                json.dumps({"description": "Template content cannot be empty"}, indent=2),
+                status=400,
+                mimetype="application/json"
+            )
+        try:
+            templates = {}
+            if os.path.exists('templates.json'):
+                with open('templates.json', 'r',encoding='utf-8') as f:
+                    templates = json.load(f)
+            if region not in templates:
+                templates[region] = {}
+            templates[region][template_key] = template_content
+            with open('templates.json', 'w',encoding='utf-8') as f:
+                json.dump(templates, f, indent=2)
+            logger.info(f"Successfully updated template for region {region}, key {template_key}")
+            return Response(
+                json.dumps({"status": "success", "message": f"Template updated for region {region}, key {template_key}"}, indent=2),
+                mimetype="application/json"
+            )
+        except Exception as e:
+            logger.error(f"Error updating template for region {region}, key {template_key}: {str(e)}")
+            return Response(
+                json.dumps({"description": f"Error updating template: {str(e)}"}, indent=2),
+                status=500,
+                mimetype="application/json"
+            )
+    elif action == "reset":
+        try:
+            if reset_templates():
+                logger.info("Successfully reset all templates to default")
+                return Response(
+                    json.dumps({"status": "success", "message": "All templates reset to default"}, indent=2),
+                    mimetype="application/json"
+                )
+            else:
+                logger.error("Failed to reset templates to default")
+                return Response(
+                    json.dumps({"description": "Failed to reset templates to default"}, indent=2),
+                    status=500,
+                    mimetype="application/json"
+                )
+        except Exception as e:
+            logger.error(f"Error resetting templates: {str(e)}")
+            return Response(
+                json.dumps({"description": f"Error resetting templates: {str(e)}"}, indent=2),
+                status=500,
+                mimetype="application/json"
+            )
+    else:
+        logger.error(f"Invalid action: {action}")
+        return Response(
+            json.dumps({"description": f"Invalid action: {action}"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+
+@app.route("/get/images", methods=["GET"])
+@require_api_key
+def get_employee_image():
+    employee_id = request.args.get("employee_id")
+    logger.debug(f"Fetching image for EmployeeID: {employee_id}")
+    if not employee_id:
+        logger.error("Missing employee_id in query parameters")
+        return Response(
+            json.dumps({"description": "Missing employee_id in query parameters"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+    try:
+        image = get_image(employee_id)
+        if image:
+            logger.debug(f"Image found for EmployeeID: {employee_id}")
+            return Response(
+                image,
+                mimetype="image/jpeg",
+                headers={"Content-Disposition": f"inline; filename={employee_id}.jpg"}
+            )
+        else:
+            logger.warning(f"No image found for EmployeeID: {employee_id}")
+            return Response(
+                json.dumps({"description": f"No image found for EmployeeID: {employee_id}"}, indent=2),
+                status=404,
+                mimetype="application/json"
+            )
+    except Exception as e:
+        logger.error(f"Error fetching image for EmployeeID {employee_id}: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error fetching image: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )
+
+@app.route("/alert-logs", methods=["GET"])
+@require_api_key
+def get_alert_logs():
+    log_file = "Book1.csv"
+    logger.debug(f"Attempting to read log file: {log_file}")
+    if not os.path.exists(log_file):
+        logger.error(f"Log file not found: {log_file}")
+        return Response(
+            json.dumps({"description": "Log file not found"}, indent=2),
+            status=404,
+            mimetype="application/json"
+        )
+    try:
+        with open(log_file, 'r') as f:
+            reader = csv.DictReader(f)
+            logs = [row for row in reader]
+        logger.debug(f"Successfully read {len(logs)} logs from {log_file}")
+        return Response(
+            json.dumps(logs, indent=2),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Error reading log file: {str(e)}")
+        return Response(
+            json.dumps({"description": f"Error reading log file: {str(e)}"}, indent=2),
+            status=500,
+            mimetype="application/json"
+        )      
+
+@app.route("/locations/filter", methods=["GET"])
+@require_api_key
+def get_location_filters():
+    success, result = manage_location_filter(action="get")
+    if success:
+        return jsonify({"filters": result})
+    else:
+        return jsonify({"description": result}), 500
+
+@app.route("/locations/filter", methods=["POST"])
+@require_api_key
+def add_or_remove_location_filter():
+    data = request.get_json()
+    if not data or "action" not in data or "region" not in data or "location" not in data:
+        return jsonify({"description": "Missing 'action', 'region', or 'location' in request body"}), 400
+    
+    action = data["action"]
+    region = data["region"]
+    location = data["location"]
+
+    success, message = manage_location_filter(action=action, region=region, location=location)
+
+    if success:
+        return jsonify({"status": "success", "message": message})
+    else:
+        return jsonify({"description": message}), 500
+
+
+if __name__ == "__main__":
+    # This stricter check ensures the scheduler is NEVER started in the parent
+    # reloader process, only in the single, true worker process.
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        logger.info("Starting scheduler in the main worker process ONLY.")
+        if not scheduler.running:
+            scheduler.start()
+    
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\bulk_add_email.py
+
+
+import pandas as pd
+import sqlite3
+import logging
+from datetime import datetime
+
+# --- Configuration ---
+# 1. The path to your SQLite database file.
+DB_FILE = "logs.db"
+# 2. The full path to your CSV file with the email addresses.
+CSV_FILE_PATH = r"C:\Users\326131\Desktop\Excluded_list.csv"  # <--- IMPORTANT: UPDATE THIS PATH
+# 3. The exact name of the column in your CSV file that contains the email addresses.
+EMAIL_COLUMN_NAME = "EmployeeEmailAddress" # <--- IMPORTANT: UPDATE THIS COLUMN NAME
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+def add_emails_to_exception_list():
+    """
+    Reads email addresses from a CSV file and adds them to the 
+    exception_list table in the SQLite database in lowercase.
+    """
+    try:
+        logger.info(f"Reading CSV file: {CSV_FILE_PATH}")
+        df = pd.read_csv(CSV_FILE_PATH)
+        
+        if EMAIL_COLUMN_NAME not in df.columns:
+            logger.error(f"Error: Column '{EMAIL_COLUMN_NAME}' not found in the CSV file.")
+            logger.error(f"Available columns are: {list(df.columns)}")
+            return
+
+        emails_to_add = df[EMAIL_COLUMN_NAME].dropna().unique().tolist()
+        
+        if not emails_to_add:
+            logger.warning("No email addresses found in the specified column.")
+            return
+
+        logger.info(f"Found {len(emails_to_add)} unique email addresses to add to the exception list.")
+
+    except FileNotFoundError:
+        logger.error(f"Error: The file was not found at '{CSV_FILE_PATH}'. Please check the path.")
+        return
+    except Exception as e:
+        logger.error(f"An error occurred while reading the CSV file: {e}")
+        return
+
+    # --- Connect to the database and insert the emails ---
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        count = 0
+        for email in emails_to_add:
+            # FIX: Added .lower() to ensure all emails are stored in lowercase
+            cursor.execute(
+                "INSERT OR REPLACE INTO exception_list (email, added_at) VALUES (?, ?)",
+                (str(email).strip().lower(), datetime.now().isoformat())
+            )
+            count += 1
+            if count % 100 == 0:
+                logger.info(f"Processed {count}/{len(emails_to_add)} emails...")
+
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"SUCCESS: Successfully added/updated {count} email addresses in the exception list.")
+
+    except Exception as e:
+        logger.error(f"An error occurred during the database operation: {e}")
+
+if __name__ == "__main__":
+    add_emails_to_exception_list()
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\check.py
+
+
+import sqlite3
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, filename='log_file.log', filemode='a', format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# SQLite database file (same as defined in log_handler.py)
+DB_FILE = "logs.db"
+
+def view_email_logs():
+    """View all records in the email_logs table from the SQLite database."""
+    try:
+        # Connect to the SQLite database
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # Query to fetch all records from email_logs
+        cursor.execute('SELECT * FROM email_logs')
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        # Check if there are any records
+        if not rows:
+            print("No records found in email_logs table.")
+            logger.info("No records found in email_logs table.")
+            conn.close()
+            return
+
+        # Print column headers
+        print("\nEmail Logs Table Contents:")
+        print("=" * 80)
+        print(" | ".join(columns))
+        print("-" * 80)
+
+        # Print each row
+        for row in rows:
+            # Convert row to list of strings, handling None values
+            formatted_row = [str(col) if col is not None else '' for col in row]
+            print(" | ".join(formatted_row))
+
+        print("=" * 80)
+        logger.info(f"Displayed {len(rows)} records from email_logs table.")
+
+        # Close the connection
+        conn.close()
+
+    except sqlite3.Error as e:
+        print(f"Error accessing email_logs table: {str(e)}")
+        logger.error(f"Error accessing email_logs table: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
+
+if __name__ == "__main__":
+    view_email_logs()
+
+
+
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\config.py
+
+
+
+import json
+import os 
+from filelock import FileLock 
+import logging
+from dotenv import load_dotenv
+
+#configure logging 
+logging.basicConfig(level=logging.DEBUG)
+logger=logging.getLogger(__name__)
+
+#Load environtment variables
+
+load_dotenv()
+BASE_URL= os.getenv("BASE_URL", "http://localhost:5000")
+ENV= os.getenv("ENV", "production")
+TEST_EMAIL = os.getenv("TEST_EMAIL","sonu.pandey@wu.com")
+
+
+Regional_Managers={
+    'APAC':'regionalmanager@westernunion.com',
+    'NAMER':'regionalmanager@westernunion.com',
+    'LACA':'regionalmanager@westernunion.com',
+    'EMEA':'regionalmanager@westernunion.com'
+}
+
+Regional_Servers=[
+    {
+        "NAME":"APAC",
+        "SQL_SERVER":"SRVWUPNQ0986V",
+        "SQL_DB":"ACVSUJournal_00010030",
+        "SQL_USER":"GSOC_Test",
+        "SQL_PASSWORD":"Westernccuredb@2026"
+    },
+    {
+        "NAME":"NAMER",
+        "SQL_SERVER":"SRVWUDEN0891V",
+        "SQL_DB":"ACVSUJournal_00010030",
+        "SQL_USER":"GSOC_Test",
+        "SQL_PASSWORD":"Westernccuredb@2026"        
+    },
+    {
+        "NAME":"EMEA",
+        "SQL_SERVER":"SRVWUFRA0986V",
+        "SQL_DB":"ACVSUJournal_00011029",
+        "SQL_USER":"GSOC_Test",
+        "SQL_PASSWORD":"Westernccuredb@2026"        
+    },
+    {
+        "NAME":"LACA",
+        "SQL_SERVER":"SRVWUSJO0986V",
+        "SQL_DB":"ACVSUJournal_00010030",
+        "SQL_USER":"GSOC_Test",
+        "SQL_PASSWORD":"Westernccuredb@2026"        
+    }
+]
+SMTP_SERVER='smtpprod.wuintranet.net'
+SMTP_PORT=25
+FROM_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+GSOC_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+bcc_email='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+PRIMARY_EMAIL=os.getenv("TEST_EMAIL")
+HR_EMAIL='hr@wu.com'
+
+# Microsoft Graph API credentials (placeholders)
+CLIENT_ID='6222d611-678e-4d57-a98b-83faa86fce76'
+CLIENT_SECRET='DKV8Q~Rn4MvlucbxcMsXvAZ6ub_rBVbo-sb6.bGX'
+TENANT_ID='ce3a67f2-5a22-4fb8-a511-815f8924cda6'
+
+LOG_FILE='Book1.csv'
+EMPLOYEE_INFO_FILE='email_latest.xlsx'
+TEMPLATES_FILE= os.path.join(os.path.dirname(__file__),'templates.json')
+
+# HTML email templates 
+DEFAULT_EMAIL_TEMPLATES={
+    'APAC':{
+        'clearance':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {FirstName},</p>
+            <p>This is in reference to your recent attempt to gain access to the restricted area at <strong>{ObjectName2}</strong> at <strong>{time_str}</strong>.</p>
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon below:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>
+            <p>Should you require assistance, please contact badge admin at your location or write to <a href="mailto:APAC-badgerequest@westernunion.com">APAC-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Kindly request you to respond to this email at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}(Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p>         
+        """,
+        'wrong_pin':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At {ObjectName2} at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently in Expired state (Got Expired on <strong>tentative date</strong>).</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'disabled':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}.Employee ID: {EmployeeID}, Card No: {CardNumber}</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Active</strong> in the system. <strong>Terminated Personnel [Global]</strong></p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'clearance_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>This is in reference to {ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber}) recent attempt to gain access to the restricted area at “{ObjectName2}” at <strong>{time_str}</strong>.</p> 
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>     
+            <p>Should you require any assistance, please contact badge admin at your location or write to <a href="mailto:APAC-badgerequest@westernunion.com">APAC-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>                                                                                                                                                                      
+        """,
+        'lost_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p> 
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p> 
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'wrong_pin_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>                                                                                                                                                                                                                                            
+            <p>As per records the Badge is currently in Expired state.</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>  
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center</p>
+        """,
+        'disabled_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge.</p>  
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Disabled</strong> in the system (Terminated Contractor).</p>
+            <p>Request you to please check and confirm.</p>    
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'held_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Held Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'forced_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Forced Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'fire_event':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Fire Event</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident immediately.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'reminder':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {Recipient},</p>
+            <p>This is a reminder regarding the previous alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2}.</p>
+            <p>Please acknowledge the original email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>In case of any query, please contact the Global Security Operations Center.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'hr_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear HR Team,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'regional_manager_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Regional Manager,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """
+    },
+    'EMEA':{
+        'clearance':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {FirstName},</p>
+            <p>This is in reference to your recent attempt to gain access to the restricted area at <strong>{ObjectName2}</strong> at <strong>{time_str}</strong>.</p>
+            <p>Should you require assistance, please contact badge admin at your location or write to <a href="mailto:EMEA-badgerequest@westernunion.com">EMEA-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Kindly request you to respond to this email at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}(Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p>         
+        """,
+        'wrong_pin':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At {ObjectName2} at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently in Expired state (Got Expired on <strong>tentative date</strong>).</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'disabled':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}.Employee ID: {EmployeeID}, Card No: {CardNumber}</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Active/Disabled</strong> in the system.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'clearance_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>                                                                                                                                                 
+            <p>This is in reference to <strong>{ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> recent attempt to gain access to the restricted area at <strong>“{ObjectName2}”</strong> at <strong>{time_str}</strong>.</p>
+            <p>Should you require any assistance, please contact badge admin at your location or write to <a href="mailto:EMEA-badgerequest@westernunion.com">EMEA-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Note: Request you to take it forward.</p> 
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p> 
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p> 
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'wrong_pin_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>                                                                                                                                                                                                                                            
+            <p>As per records the Badge is currently in Expired state.</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>  
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center</p>
+        """,
+        'disabled_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge.</p>  
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Disabled</strong> in the system (Terminated Contractor).</p>
+            <p>Request you to please check and confirm.</p>    
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'held_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Held Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'forced_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Forced Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'fire_event':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Fire Event</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident immediately.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'reminder':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {Recipient},</p>
+            <p>This is a reminder regarding the previous alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2}.</p>
+            <p>Please acknowledge the original email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>In case of any query, please contact the Global Security Operations Center.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'hr_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear HR Team,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'regional_manager_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Regional Manager,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """
+    },
+    'LACA':{
+        'clearance':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {FirstName},</p>
+            <p>This is in reference to your recent attempt to gain access to the restricted area at <strong>{ObjectName2}</strong> at <strong>{time_str}</strong>.</p>
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon below:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>                
+            <p>Should you require assistance, please contact badge admin at your location or write to <a href="mailto:LACA-badgerequest@westernunion.com">LACA-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Kindly request you to respond to this email at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}(Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p>         
+        """,
+        'wrong_pin':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At {ObjectName2} at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently in Expired state (Got Expired on <strong>tentative date</strong>).</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'disabled':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}.Employee ID: {EmployeeID}, Card No: {CardNumber}</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Active/Disabled</strong> in the system.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'clearance_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>This is in reference to {ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber}) recent attempt to gain access to the restricted area at “{ObjectName2}” at <strong>{time_str}</strong>.</p> 
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>     
+            <p>Should you require any assistance, please contact badge admin at your location or write to <a href="mailto:LACA-badgerequest@westernunion.com">LACA-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>   
+        """,
+        'lost_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p> 
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p> 
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'wrong_pin_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>                                                                                                                                                                                                                                            
+            <p>As per records the Badge is currently in Expired state.</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>  
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center</p>
+        """,
+        'disabled_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge.</p>  
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Disabled</strong> in the system (Terminated Contractor).</p>
+            <p>Request you to please check and confirm.</p>    
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'held_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Held Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'forced_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Forced Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'fire_event':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Fire Event</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident immediately.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'reminder':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {Recipient},</p>
+            <p>This is a reminder regarding the previous alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2}.</p>
+            <p>Please acknowledge the original email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>In case of any query, please contact the Global Security Operations Center.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'hr_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear HR Team,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'regional_manager_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Regional Manager,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """
+    },
+    'NAMER':{
+        'clearance':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {FirstName},</p>
+            <p>This is in reference to your recent attempt to gain access to the restricted area at <strong>{ObjectName2}</strong> at <strong>{time_str}</strong>.</p>
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon below:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>                
+            <p>Should you require assistance, please contact badge admin at your location or write to <a href="mailto:NAMER-badgerequest@westernunion.com">NAMER-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Kindly request you to respond to this email at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Team,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}(Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p>         
+        """,
+        'wrong_pin':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At {ObjectName2} at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently in Expired state (Got Expired on <strong>tentative date</strong>).</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'disabled':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Team,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}.Employee ID: {EmployeeID}, Card No: {CardNumber}</strong> had tried swiping the badge.</p>
+            <p>At {ObjectName2} at {time_str} to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Active/Disabled</strong> in the system.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'clearance_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>This is in reference to {ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber}) recent attempt to gain access to the restricted area at “{ObjectName2}” at <strong>{time_str}</strong>.</p> 
+            <p>We would like to kindly inform you that if you need access to this location, you will need to raise an iPass ticket. For instructions, please click the icon:</p>
+            <a href="https://wuprod.service-now.com/hr?id=kb_article&sys_id=a44e95761bdca1181e9e0f6cdc4bcb1c">
+                <img src="https://westernunion-my.sharepoint.com/:i:/g/personal/sonu_pandey_wu_com/EeTk5-qe-jBDo28EjzXXBM4BUfV5fchkiIuvscZ7NQM1Kw?e=e4QIpJ" alt="PASS" width="100">
+            </a>     
+            <p>Should you require any assistance, please contact badge admin at your location or write to <a href="mailto:NAMER-badgerequest@westernunion.com">NAMER-badgerequest@westernunion.com</a>. We'll be more than happy to help.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'lost_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p> 
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1} (Employee ID: {EmployeeID}, Card No: {CardNumber})</strong> had tried swiping the badge.</p> 
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>Request you to please check and confirm.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'wrong_pin_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>Reference Access violation Report generated from Access Control System on <strong>{DateOnly}</strong>, revealed <strong>{ObjectName1} (Employee ID:{EmployeeID}, Card No: {CardNumber})</strong></p>
+            <p>have <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> by punching a wrong PIN on the PIN Pad reader multiple times.</p>
+            <p>Note: Request you to take it forward.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operation Center.</p> 
+        """,
+        'expired_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p> 
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge,</p>
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>                                                                                                                                                                                                                                            
+            <p>As per records the Badge is currently in Expired state.</p>
+            <p>In order for us to re-activate the badge, respective manager of the employee has to raise iPass ticket to extend the validity of the badge.</p>
+            <p>(For any assistance, please refer attached document Appendix B section.)</p>
+            <p>Note: Request you to take it forward.</p>  
+            <p>In case of any query please feel free to contact.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center</p>
+        """,
+        'disabled_non_employee':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Sir,</p>
+            <p>As per Access Management Process, Access Deny Alarm was generated in Security System on <strong>{DateOnly}</strong>.</p>
+            <p>Employee Name: <strong>{ObjectName1}</strong> Employee ID: <strong>{EmployeeID}</strong>, Card: <strong>{CardNumber}</strong> had tried swiping the badge.</p>  
+            <p>At <strong>{ObjectName2}</strong> at <strong>{time_str}</strong> to gain access to the facility.</p>
+            <p>As per records the Badge is currently <strong>Disabled</strong> in the system.</p>
+            <p>Request you to please check and confirm.</p>    
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'held_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Held Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'forced_open':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Forced Open</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident at your earliest convenience.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'fire_event':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear GSOC Team,</p>
+            <p>An alarm of type <strong>Fire Event</strong> was triggered on <strong>{DateOnly}</strong> at <strong>{time_str}</strong>.</p>
+            <p><strong>Location Details:</strong></p>
+            <ul>
+                <li>Door: {ObjectName2}</li>
+                <li>Facility: {PartitionName}</li>
+                <li>Region: {Region}</li>
+                <li>Operator: {Operator_Name}</li>
+                <li>Action Taken: {Action_Taken}</li>
+            </ul>
+            <p>Please investigate this incident immediately.</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'reminder':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear {Recipient},</p>
+            <p>This is a reminder regarding the previous alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2}.</p>
+            <p>Please acknowledge the original email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>In case of any query, please contact the Global Security Operations Center.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'hr_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear HR Team,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """,
+        'regional_manager_notification':"""
+            <p> KINDLY IGNORE THIS EMAIL , THIS IS JUST FOR TESTING PURPOSE </p>
+            <p>Dear Regional Manager,</p>
+            <p>An alert email sent on {DateOnly} at {time_str} for {alert_type} at {ObjectName2} has not been acknowledged.</p>
+            <p>Employee ID: {EmployeeID}</p>
+            <p>Please take appropriate action.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """
+    },
+    'GLOBAL':{
+        'default':"""
+            <p>Dear team,</p>
+            <p>Security alert</p>
+            <p>Please acknowledge this email by clicking <a href="{acknowledge_url}">here</a>.</p>
+            <p>Thanks and Regards,<br>Global Security Operations Center.</p>
+        """ 
+    }    
+}
+
+
+# Path to templates.json
+TEMPLATES_FILE = os.path.join(os.path.dirname(__file__), 'templates.json')
+
+def load_templates():
+    """Load templates from templates.json if it exists, else use DEFAULT_EMAIL_TEMPLATES."""
+    global EMAIL_TEMPLATES
+    EMAIL_TEMPLATES = DEFAULT_EMAIL_TEMPLATES.copy()
+    if os.path.exists(TEMPLATES_FILE):
+        try:
+            with FileLock(f"{TEMPLATES_FILE}.lock"):
+                with open(TEMPLATES_FILE, 'r', encoding='utf-8') as f:
+                    loaded_templates = json.load(f)
+                EMAIL_TEMPLATES.update(loaded_templates)
+                logger.debug("Loaded templates from templates.json")
+        except Exception as e:
+            logger.error(f"Error loading templates.json: {str(e)}")
+            logger.info("Using default EMAIL_TEMPLATES")
+    else:
+        logger.debug("No templates.json found, using default EMAIL_TEMPLATES")
+    return EMAIL_TEMPLATES
+
+def save_templates(templates):
+    """Save templates to templates.json."""
+    try:
+        with FileLock(f"{TEMPLATES_FILE}.lock"):
+            with open(TEMPLATES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(templates, f, indent=2, ensure_ascii=False)
+        logger.debug("Saved templates to templates.json")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving templates.json: {str(e)}")
+        return False
+
+def reset_templates():
+    """Reset EMAIL_TEMPLATES to defaults and update templates.json."""
+    global EMAIL_TEMPLATES
+    EMAIL_TEMPLATES = DEFAULT_EMAIL_TEMPLATES.copy()
+    try:
+        with FileLock(f"{TEMPLATES_FILE}.lock"):
+            with open(TEMPLATES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(EMAIL_TEMPLATES, f, indent=2, ensure_ascii=False)
+        logger.debug("Reset templates to default and updated templates.json")
+        return True
+    except Exception as e:
+        logger.error(f"Error resetting templates.json: {str(e)}")
+        return False
+
+# Initialize EMAIL_TEMPLATES
+EMAIL_TEMPLATES = load_templates()
+
+
+
+
+
+
+D:\Email Automation\backend-arun\db.py
+
+
+import pyodbc
+
+def get_sql_connection(SQL_SERVER, SQL_DB, SQL_USER, SQL_PASSWORD):
+    try:
+        return pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={SQL_SERVER};DATABASE={SQL_DB};UID={SQL_USER};PWD={SQL_PASSWORD}"
+        )
+    except Exception as e:
+        print(f"Connection error for server {SQL_SERVER}: {e}")
+        return None
+
+def get_employee_details_from_db(employee_id, cursor):
+    query = """
+SELECT DISTINCT
+    AP.ObjectID AS "AccountName",
+    AP.Name AS "Emp Name",
+    AP.ManagerEmail,
+    AP.EmailAddress AS EmployeeEmailAddress,
+    AP.Text23 AS Management_Level,
+    AP.Int4 AS ManagerID,
+    CASE
+        WHEN AP.Int1 IS NOT NULL AND AP.Int1 <> 0 THEN CAST(AP.Int1 AS NVARCHAR)
+        WHEN AP.Text12 IS NOT NULL AND LTRIM(RTRIM(AP.Text12)) <> '' AND AP.Text12 <> '0' THEN AP.Text12
+        WHEN AP.Text9 IS NOT NULL AND LTRIM(RTRIM(AP.Text9)) <> '' AND AP.Text9 <> '0' THEN AP.Text9
+    END AS "EmployeeID",
+    PT.Name AS "PersonnelType",
+    AP.Text10 AS Manager_Name,
+    AP.Int4 AS Manager_WU_ID
+FROM
+    ACVSCore.Access.Personnel AP
+    FULL JOIN ACVSCore.Access.PersonnelType PT ON PT.ObjectID = AP.PersonnelTypeID
+WHERE
+    AP.Disabled = 0
+    AND (CAST(AP.Int1 AS NVARCHAR) = ? OR AP.Text12 = ? OR AP.Text9 = ?)
+ORDER BY
+    "AccountName" ASC;
+    """
+    cursor.execute(query, (employee_id, employee_id, employee_id))
+    result = cursor.fetchone()
+    
+    if result:
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, result))
+    return None
+
+def build_image_query():
+    """Query to fetch employee images and details."""
+    return """
+    SELECT distinct
+
+        t1.Name, -- Employee Name
+t2.Image,
+        CASE 
+            WHEN t3.Name IN ('Contractor', 'Terminated Contractor') THEN t1.Text12
+            ELSE CAST(t1.Int1 AS NVARCHAR)
+        END AS EmployeeID,
+        t3.Name AS PersonnelType
+    FROM
+        [ACVSCore].[Access].[Personnel] AS t1
+    inner JOIN
+        [ACVSCore].[Access].[Images] AS t2 ON t1.ObjectID = t2.ParentId
+    inner JOIN
+        [ACVSCore].[Access].[PersonnelType] AS t3 ON t1.[PersonnelTypeId] = t3.[ObjectID]
+
+		order by PersonnelType
+    """
+
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\delete_exceptions.py
+
+
+import sqlite3
+import logging
+
+# --- Configuration ---
+DB_FILE = "logs.db"
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+def clear_exception_list():
+    """Connects to the database and deletes all records from the exception_list table."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        logger.info("Attempting to delete all records from the exception_list table...")
+        
+        cursor.execute("DELETE FROM exception_list;")
+        
+        # Get the number of rows deleted for user feedback
+        rows_deleted = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"SUCCESS: Deleted {rows_deleted} email(s). The exception list is now blank.")
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    clear_exception_list()
+
+
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\email_handler.py
+
+
+import msal
+import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from config import CLIENT_ID, CLIENT_SECRET, TENANT_ID, PRIMARY_EMAIL, HR_EMAIL, Regional_Managers, EMAIL_TEMPLATES, BASE_URL, ENV, TEMPLATES_FILE
+import os
+from log_handler import log_email,check_exception_list
+import logging
+from datetime import datetime
+import uuid
+from bs4 import BeautifulSoup
+import html
+import re
+from filelock import FileLock
+import json
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+logger = logging.getLogger(__name__)
+
+class CustomHttpClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.verify = False
+
+    def post(self, url, headers=None, data=None, **kwargs):
+        return self.session.post(url, headers=headers, data=data, **kwargs)
+
+    def get(self, url, headers=None, **kwargs):
+        return self.session.get(url, headers=headers, **kwargs)
+
+def get_graph_access_token():
+    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=authority,
+        client_credential=CLIENT_SECRET,
+        http_client=CustomHttpClient()
+    )
+    scopes = ["https://graph.microsoft.com/.default"]
+    try:
+        result = app.acquire_token_for_client(scopes=scopes)
+        if "access_token" in result:
+            return result["access_token"]
+        else:
+            logger.error(f"Error obtaining access token: {result.get('error_description', 'Unknown error')}")
+            return None
+    except Exception as e:
+        logger.error(f"Error obtaining access token: {str(e)}")
+        return None
+    
+def send_email(subject, body, to_email, cc_email=None, bcc_email=None, template_key=None, email_id=None,employee_id=None,employee_name=None):
+    if not email_id: email_id = str(uuid.uuid4())
+    to_email_list = [to_email] if isinstance(to_email, str) else to_email
+    
+    original_recipients=to_email_list
+    to_email_list= [email for email in original_recipients if not check_exception_list(email)]
+    
+    if not to_email_list:
+        logger.info(f"Email '{subject}' skipped because all recipients ({original_recipients}) are on the exception list. ")
+        return
+    
+    try:
+        access_token = get_graph_access_token()
+        if not access_token:
+            raise Exception("Failed to obtain Microsoft Graph access token")
+
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        email_data = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": body},
+                "toRecipients": [{"emailAddress": {"address": email}} for email in to_email_list],
+                # FIX 1: Add the custom header "watermark" to all outgoing emails
+                "internetMessageHeaders": [
+                    {
+                        "name": "X-Alert-System-Generated",
+                        "value": "True"
+                    }
+                ]
+            },
+            "saveToSentItems": "true"
+        }
+        
+        response = requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{PRIMARY_EMAIL}/sendMail",
+            headers=headers, json=email_data, verify=False
+        )
+        response.raise_for_status()
+
+        logger.info(f"Email sent: {subject} to {', '.join(to_email_list)}")
+        log_email(
+            email_id, subject, body, ", ".join(to_email_list), None, None,
+            datetime.now().isoformat(), None, None, template_key, employee_id,
+            False, None, "Sent",employee_name
+        )
+    except Exception as e:
+        logger.error(f"Error sending email: {e}", exc_info=True)
+        log_email(
+            email_id, subject, body, ", ".join(to_email_list), None, None,
+            datetime.now().isoformat(), None, None, template_key, employee_id,
+            False, None, "Failed",employee_name
+        )
+        raise
+
+def send_email_test(subject, body, to_email, cc_email=None, bcc_email=None, template_key=None, email_id=None,employee_id=None,employee_name=None):
+    test_email_recipient = "sonu.pandey@wu.com"
+    
+    if check_exception_list(test_email_recipient):
+        logger.info(f"Test Mode: Email '{subject}' skipped because test recipient '{test_email_recipient}' is on the exception list.")
+        return
+    
+    logger.info(f"TEST MODE: Sending email '{subject}' to {test_email_recipient} instead of {to_email}")
+    send_email(f"[TEST] {subject}", body, test_email_recipient, template_key=template_key, email_id=email_id,employee_id=employee_id,employee_name=employee_name)
+
+def html_to_plain_body(raw_body, remove_replies=True):
+    if not raw_body:
+        return ""
+    soup = BeautifulSoup(raw_body, "html.parser")
+    plain_body = soup.get_text(separator="\n\n", strip=True)
+    plain_body = html.unescape(plain_body)
+    plain_body = re.sub(r'\n+', '\n', plain_body)
+    plain_body = re.sub(r'(:)\n', r': ', plain_body)
+    if remove_replies:
+        parts = re.split(r'\nFrom:', plain_body, maxsplit=1, flags=re.IGNORECASE)
+        plain_body = parts[0]
+    return plain_body
+
+
+
+def fetch_inbox_emails(top=10, skip=0, folder="inbox"):
+    access_token = get_graph_access_token()
+    if not access_token:
+        logger.error("Failed to obtain access token for fetching emails")
+        return []
+    
+    headers = {"Authorization": f"Bearer {access_token}"}
+    emails = []
+    try:
+        # FIX 2: Add internetMessageHeaders to the $select parameter to fetch our "watermark"
+        select_params = "subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,body,internetMessageHeaders"
+        url = f"https://graph.microsoft.com/v1.0/users/{PRIMARY_EMAIL}/mailFolders/{folder}/messages?$select={select_params}&$top={top}&$skip={skip}&$orderby=receivedDateTime desc"
+        
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        messages = response.json().get("value", [])
+        
+        for msg in messages:
+            # FIX 3: Check for the custom header "watermark"
+            headers = msg.get('internetMessageHeaders', [])
+            is_system_generated = any(
+                h.get('name') == 'X-Alert-System-Generated' and h.get('value') == 'True' 
+                for h in headers
+            )
+
+            # If the header exists, it's a self-sent alert, so we skip it.
+            if is_system_generated:
+                logger.debug(f"Skipping inbox logging for self-sent email: {msg.get('subject')}")
+                continue
+
+            email_id = str(uuid.uuid4())
+            plain_body = html_to_plain_body(msg.get("body", {}).get("content", ""))
+            to_recipients = ", ".join([recp.get("emailAddress", {}).get("address", "") for recp in msg.get("toRecipients", [])])
+            cc_recipients = [recp.get("emailAddress", {}).get("address", "") for recp in msg.get("ccRecipients", [])]
+            bcc_recipients = [recp.get("emailAddress", {}).get("address", "") for recp in msg.get("bccRecipients", [])]
+
+            log_email(
+                email_id, msg.get("subject", ""), plain_body, to_recipients,
+                ", ".join(cc_recipients), ", ".join(bcc_recipients),
+                None, datetime.now().isoformat(),
+                "Inbox", "inbox_fetch", None, 
+                False, None, "Received",
+                None
+            )
+            
+            emails.append({
+                "subject": msg.get("subject", ""),
+                "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
+                "received_date": msg.get("receivedDateTime", ""),
+                "email_id": email_id,
+                "body": plain_body,
+                "cc": cc_recipients,
+                "bcc": bcc_recipients
+            })
+    except Exception as e:
+        logger.error(f"Error fetching inbox emails: {e}", exc_info=True)
+        return []
+        
+    return emails
+def get_email_template(region, alert_type, emp_id, time_str, template_data, personnel_type=None):
+    try:
+        with open(TEMPLATES_FILE, 'r', encoding='utf-8') as f:
+            templates = json.load(f)
+        
+        region_upper = region.upper()
+        template_key = alert_type.lower().replace(' ', '_')
+        if personnel_type and personnel_type not in ['employee', 'unknown']:
+            template_key = f"{template_key}_non_employee"
+        
+        template = templates.get(region_upper, {}).get(template_key)
+        
+        if not template:
+            template = templates.get('GLOBAL', {}).get('default', 'Alert: {ObjectName1} at {ObjectName2}')
+            logger.warning(f"No template found for {region_upper}.{template_key}, using GLOBAL.default")
+        
+        class SafeDict(dict):
+            def __missing__(self, key):
+                return f'{{{key}}}'
+        
+        formatted_body = template.format_map(SafeDict(template_data))
+        return formatted_body, template_key
+    except Exception as e:
+        logger.error(f"Error fetching template for {region}.{template_key}: {e}", exc_info=True)
+        return "Error rendering email template.", "default"
+
+def trigger_followup_action(email_id, action):
+    from log_handler import get_email_by_id
+    email_record = get_email_by_id(email_id)
+    if not email_record:
+        logger.error(f"No email found with ID: {email_id}")
+        return
+    region = email_record.get("region", "GLOBAL")
+    alert_type = email_record.get("alert_type", "default")
+    employee_id = email_record.get("employee_id", "")
+    date_only = email_record.get("date_only", "")
+    time_str = email_record.get("time_str", "")
+    object_name2 = email_record.get("object_name2", "")
+    template_data = {
+        "Recipient": email_record.get("to_email", "").split(",")[0] if email_record.get("to_email") else "Team",
+        "DateOnly": date_only,
+        "time_str": time_str,
+        "alert_type": alert_type,
+        "ObjectName2": object_name2,
+        "EmployeeID": employee_id,
+        "acknowledge_url": f"{BASE_URL}/acknowledge?email_id={email_id}"
+    }
+    if action == "reminder":
+        subject = f"Reminder: {region} - {alert_type.capitalize()} Alert"
+        to_email = email_record.get("to_email", "").split(",")[0]
+    elif action == "hr":
+        subject = f"{region} - Unacknowledged {alert_type.capitalize()} Alert"
+        to_email = HR_EMAIL
+    elif action == "regional_manager":
+        subject = f"{region} - Unacknowledged {alert_type.capitalize()} Alert"
+        to_email = Regional_Managers.get(region, HR_EMAIL)
+    else:
+        logger.error(f"Invalid action: {action}")
+        return
+    try:
+        body, template_key = get_email_template(region, action, employee_id, time_str, template_data)
+        new_email_id = str(uuid.uuid4())
+        if ENV == 'testing':
+            # send_email(subject, body, to_email, template_key=template_key, email_id=new_email_id)  # Commented out
+            send_email_test(subject, body, to_email, None, None, template_key=template_key, email_id=new_email_id)
+        else:
+            send_email(subject, body, to_email, template_key=template_key, email_id=new_email_id)
+        from log_handler import update_email_action
+        update_email_action(email_id, action)
+        logger.debug(f"Follow-up action {action} triggered for email {email_id}")
+    except Exception as e:
+        logger.error(f"Error triggering follow-up action {action} for email {email_id}: {str(e)}")
+
+
+
+
+
+
+
+
+
+D:\Email Automation\backend-arun\log_handler.py
+
+
+import sqlite3
+import os
+import queue
+import threading
+from config import LOG_FILE
+from filelock import FileLock
+import logging
+from datetime import datetime, timedelta
+import uuid
+import functools
+from concurrent.futures import ThreadPoolExecutor
+# Configure logging
+logging.basicConfig(level=logging.INFO, filename='log_file.log', filemode='a', format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+DB_FILE = "logs.db"
+
+# This is the central "mailbox" for all database write requests
+db_write_queue = queue.Queue()
+thread_pool = ThreadPoolExecutor(max_workers=8)
+
+def _database_writer_worker():
+    """This is the dedicated writer. It's the ONLY part of the app that writes to the DB."""
+    logger.info("Database writer thread started.")
+    while True:
+        try:
+            log_type, data = db_write_queue.get()
+            if log_type == 'log_alert':
+                _write_alert_to_db_internal(data)
+            elif log_type == 'log_email':
+                _write_email_to_db_internal(data)
+            elif log_type == 'update_ack':
+                _update_acknowledgment_internal(data)
+    
+            db_write_queue.task_done()
+        except Exception as e:
+            logger.error(f"Error in database writer thread: {e}", exc_info=True)
+
+def start_database_writer():
+    """Starts the writer thread in the background. Called once from app.py."""
+    writer_thread = threading.Thread(target=_database_writer_worker, daemon=True)
+    writer_thread.start()
+
+# --- Public Functions ---
+# These functions are called by the rest of the app. They are now INSTANTANEOUS.
+
+def log_sent_alert(*args):
+    """INSTANT: Puts an alert log request on the queue."""
+    db_write_queue.put(('log_alert', args))
+    logger.debug(f"Queued alert for logging: {args[2]}")
+
+def log_email(*args):
+    """INSTANT: Puts an email log request on the queue."""
+    db_write_queue.put(('log_email', args))
+    logger.debug(f"Queued email for logging: {args[1]}")
+
+def update_acknowledgment(email_id):
+    """INSTANT: Puts an acknowledgment update request on the queue."""
+    db_write_queue.put(('update_ack', email_id))
+    logger.debug(f"Queued acknowledgment for email: {email_id}")
+    return True # Assume success, as it's now an async operation
+
+
+# --- Internal Write Functions (ONLY called by the single writer thread) ---
+
+def _write_alert_to_db_internal(log_tuple):
+    """Performs the actual write to the alert_logs table."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR IGNORE INTO alert_logs (EmployeeID, ObjectName1, Alert_Type, CardNumber, ObjectName2, Swipe_Time, DateOnly, PartitionName, Region, ObjectName3)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', log_tuple)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"INTERNAL WRITER FAILED to log alert: {e}", exc_info=True)
+
+
+def _write_email_to_db_internal(email_tuple):
+    """Performs the actual write to the email_logs table."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR IGNORE INTO email_logs (
+                email_id, subject, body, to_email, cc_email, bcc_email, sent_time, received_time,
+                region, alert_type, employee_id, acknowledged, acknowledgment_time, action_taken,employee_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', email_tuple)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"INTERNAL WRITER FAILED to log email: {e}", exc_info=True)
+
+
+def _update_acknowledgment_internal(email_id):
+    """Performs the actual database update for an acknowledgment."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE email_logs SET acknowledged = ?, acknowledgment_time = ? WHERE email_id = ?
+        ''', (True, datetime.now().isoformat(), email_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"Acknowledgment processed for email: {email_id}")
+    except Exception as e:
+        logger.error(f"INTERNAL WRITER FAILED to update acknowledgment for {email_id}: {e}", exc_info=True)
+
+
+# --- Read functions are safe, as WAL mode allows reads during writes ---
+def update_email_action(email_id, action):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE email_logs
+                SET action_taken = ?
+                WHERE email_id = ?
+            ''', (action, email_id))
+            conn.commit()
+            conn.close()
+            logger.debug(f"Updated action {action} for email: {email_id}")
+            return
+        except Exception as e:
+            logger.error(f"Error updating action for email {email_id} (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            raise
+
+def get_email_response_counts():
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM email_logs WHERE sent_time IS NOT NULL')
+            sent_count = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM email_logs WHERE acknowledged = 1')
+            acknowledged_count = cursor.fetchone()[0]
+            conn.close()
+            return {"sent": sent_count, "acknowledged": acknowledged_count}
+        except Exception as e:
+            logger.error(f"Error getting email response counts (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return {"sent": 0, "acknowledged": 0}
+
+def get_email_by_id(email_id):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM email_logs WHERE email_id = ?', (email_id,))
+            columns = [desc[0] for desc in cursor.description]
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                return dict(zip(columns, row))
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving email by ID {email_id} (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return None
+
+def manage_exceptions(action, email=None):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            if action == "get":
+                cursor.execute('SELECT email, added_at FROM exception_list')
+                rows = cursor.fetchall()
+                conn.close()
+                return [{"email": row[0], "added_at": row[1]} for row in rows]
+            elif action == "add":
+                cursor.execute('INSERT OR REPLACE INTO exception_list (email, added_at) VALUES (?, ?)',
+                    (email.lower(), datetime.now().isoformat()))
+                conn.commit()
+                logger.debug(f"Added email to exception list: {email}")
+            elif action == "delete":
+                cursor.execute('DELETE FROM exception_list WHERE email = ?', (email.lower(),))
+                conn.commit()
+                logger.debug(f"Deleted email from exception_list: {email}")
+            else:
+                logger.error(f"Invalid action for exception list: {action}")
+                return None
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error managing exception list (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return None
+
+def check_exception_list(email):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute('SELECT email FROM exception_list WHERE email = ?', (email.lower(),))
+            result = cursor.fetchone()
+            conn.close()
+            return result is not None
+        except Exception as e:
+            logger.error(f"Error checking exception list for {email} (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return False
+
+def check_unacknowledged_emails():
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            ten_hours_ago = (datetime.now() - timedelta(hours=10)).isoformat()
+            cursor.execute('''
+                SELECT email_id FROM email_logs
+                WHERE sent_time IS NOT NULL
+                AND acknowledged = 0
+                AND sent_time <= ?
+                AND action_taken IS NULL
+            ''', (ten_hours_ago,))
+            rows = cursor.fetchall()
+            conn.close()
+            for row in rows:
+                logger.debug(f"Unacknowledged email found: {row[0]}")
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.error(f"Error checking unacknowledged emails (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return []
+
+def get_image(employee_id):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('SELECT Image FROM employee_images WHERE EmployeeID = ?', (employee_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row['Image']:
+                return row['Image']
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving image for EmployeeID {employee_id} (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return None
+# @functools.lru_cache(maxsize=256)            
+def read_sqlite_alerts_by_date(from_date, to_date):
+    """Fetches alert logs within a specific date range."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        cursor = conn.cursor()
+        query = "SELECT * FROM alert_logs WHERE DateOnly BETWEEN ? AND ? ORDER BY DateOnly DESC, Swipe_Time DESC"
+        cursor.execute(query, (from_date, to_date))
+        columns = [desc[0] for desc in cursor.description]
+        logs = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return logs
+    except Exception as e:
+        logger.error(f"Error reading alert logs by date: {e}")
+        return []
+# @functools.lru_cache(maxsize=256)
+def read_email_logs_by_date(from_date, to_date):
+    """Fetches email logs using SUBSTR on the date part of sent_time."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        cursor = conn.cursor()
+        query = "SELECT * FROM email_logs WHERE SUBSTR(sent_time, 1, 10) BETWEEN ? AND ? ORDER BY sent_time DESC"
+        cursor.execute(query, (from_date, to_date))
+        columns = [desc[0] for desc in cursor.description]
+        logs = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return logs
+    except Exception as e:
+        logger.error(f"Error reading email logs by date: {e}")
+        return []
+
+def read_sqlite_alerts_set():
+    """Used by the scheduler to check for duplicates before processing."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        cursor = conn.cursor()
+        # Fetching recent alerts is faster than loading the whole table
+        four_hours_ago = (datetime.now() - timedelta(hours=4)).strftime('%Y-%m-%d')
+        cursor.execute('SELECT EmployeeID, ObjectName1, Alert_Type, CardNumber, ObjectName2, Swipe_Time, DateOnly, PartitionName, Region FROM alert_logs WHERE DateOnly >= ?', (four_hours_ago,))
+        rows = cursor.fetchall()
+        conn.close()
+        return {
+            (
+                str(row[0] or '').strip(), str(row[1] or '').strip(), str(row[2] or '').strip(),
+                str(row[3] or '').strip(), str(row[4] or '').strip(), str(row[5] or '').strip(),
+                str(row[6] or '').strip(), str(row[7] or '').strip(), str(row[8] or '').strip()
+            )
+            for row in rows
+        }
+    except Exception as e:
+        logger.error(f"Error reading SQLite for redundancy check: {e}")
+        return set()
+
+# (init_db and other read-only functions can stay, simplified without retry loops)
+def read_sqlite_alerts(from_date=None, to_date=None):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            query = 'SELECT * FROM alert_logs'
+            params = []
+            if from_date and to_date:
+                query += ' WHERE DateOnly BETWEEN ? AND ?'
+                params = [from_date, to_date]
+            cursor.execute(query, params)
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            logger.error(f"Error reading from SQLite database (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return []
+
+def read_email_logs(from_date=None, to_date=None):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=30)
+            cursor = conn.cursor()
+            query = 'SELECT * FROM email_logs'
+            params = []
+            if from_date and to_date:
+                query += ' WHERE SUBSTR(sent_time, 1, 10) BETWEEN ? AND ?'
+                params = [from_date, to_date]
+            cursor.execute(query, params)
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            logger.error(f"Error reading from SQLite database for email logs (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                continue
+            return []
+
+
+def init_sqlite_db():
+    """Initialize SQLite database with alert_logs, email_logs, exception_list, location_filter, employee_images tables."""
+    if not os.path.exists(DB_FILE):
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+
+        cursor.execute("PRAGMA journal_mode=WAL")  # Enable WAL mode for concurrency
+
+        # Create alert_logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alert_logs (
+                EmployeeID TEXT,
+                ObjectName1 TEXT,
+                Alert_Type TEXT,
+                CardNumber TEXT,
+                ObjectName2 TEXT,
+                Swipe_Time TEXT,
+                DateOnly TEXT,
+                PartitionName TEXT,
+                Region TEXT,
+                ObjectName3 TEXT
+            )
+        ''')
+
+        # Add index on DateOnly for alert_logs
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_alert_logs_dateonly ON alert_logs(DateOnly)')
+
+        # Create email_logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS email_logs (
+                email_id TEXT PRIMARY KEY,
+                subject TEXT,
+                body TEXT,
+                to_email TEXT,
+                cc_email TEXT,
+                bcc_email TEXT,
+                sent_time TEXT,
+                received_time TEXT,
+                region TEXT,
+                alert_type TEXT,
+                employee_id TEXT,
+                acknowledged BOOLEAN,
+                acknowledgment_time TEXT,
+                action_taken TEXT
+            )
+        ''')
+
+        # Add index on sent_time for email_logs
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_email_logs_sent_time ON email_logs(sent_time)')
+
+        # Add employee_name column to email_logs if not exists
+        try:
+            cursor.execute("ALTER TABLE email_logs ADD COLUMN employee_name TEXT")
+            logger.info("Added 'employee_name' column to email_logs table.")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                logger.error(f"Error altering email_logs table: {e}")
+
+        # Create exception_list table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS exception_list (
+                email TEXT PRIMARY KEY,
+                added_at TEXT
+            )
+        ''')
+
+        # Create location_filter table for allowed locations
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS location_filter (
+                region TEXT NOT NULL,
+                location TEXT NOT NULL,
+                added_at TEXT,
+                PRIMARY KEY (region, location)
+            )
+        ''')
+
+        # Create employee_images table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS employee_images (
+                Name TEXT,
+                Image BLOB,
+                EmployeeID TEXT PRIMARY KEY,
+                PersonnelType TEXT
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+        logger.info(f"{DB_FILE} created with alert_logs, email_logs, exception_list, location_filter, and employee_images tables.")
+    else:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")  # Enable WAL mode for concurrency
+
+        # Add indexes if they do not exist (for existing DBs)
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_alert_logs_dateonly ON alert_logs(DateOnly)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_email_logs_sent_time ON email_logs(sent_time)')
+
+        # Ensure ObjectName3 column exists in alert_logs
+        try:
+            cursor.execute("ALTER TABLE alert_logs ADD COLUMN ObjectName3 TEXT")
+            conn.commit()
+            logger.info("Added ObjectName3 column to alert_logs.")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                logger.error(f"Error adding ObjectName3 column: {str(e)}")
+
+        # Ensure email_logs table exists and has employee_name column
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS email_logs (
+                    email_id TEXT PRIMARY KEY,
+                    subject TEXT,
+                    body TEXT,
+                    to_email TEXT,
+                    cc_email TEXT,
+                    bcc_email TEXT,
+                    sent_time TEXT,
+                    received_time TEXT,
+                    region TEXT,
+                    alert_type TEXT,
+                    employee_id TEXT,
+                    acknowledged BOOLEAN,
+                    acknowledgment_time TEXT,
+                    action_taken TEXT,
+                    employee_name TEXT
+                )
+            ''')
+            conn.commit()
+            logger.info("Ensured email_logs table exists.")
+        except Exception as e:
+            logger.error(f"Error creating email_logs table: {str(e)}")
+
+        # Ensure employee_images table exists
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS employee_images (
+                    Name TEXT,
+                    Image BLOB,
+                    EmployeeID TEXT PRIMARY KEY,
+                    PersonnelType TEXT
+                )
+            ''')
+            conn.commit()
+            logger.info("Ensured employee_images table exists.")
+        except Exception as e:
+            logger.error(f"Error creating employee_images table: {str(e)}")
+
+        conn.close()
+init_sqlite_db()
+
+def read_sent_alerts():
+    try:
+        with open(LOG_FILE, 'r') as f:
+            reader = csv.DictReader(f)
+            return {
+                (row['EmployeeID'], row['ObjectName1'], row['Alert_Type'], row['CardNumber'], row['ObjectName2'], row['Swipe_Time'], row['DateOnly'], row['PartitionName'], row['Region'])
+                for row in reader
+                if row
+            }
+    except Exception as e:
+        logger.error(f"Error reading the log file: {str(e)}")
+        return set()
+
+
+def get_allowed_locations():
+    """Fetches all allowed (region, location) pairs from the filter for checking."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        cursor = conn.cursor()
+        cursor.execute("SELECT region, location FROM location_filter")
+        # Return a set of lowercase tuples for fast, case-insensitive checking
+        allowed_locations = { (str(row[0]).lower(), str(row[1]).lower()) for row in cursor.fetchall() }
+        conn.close()
+        return allowed_locations
+    except Exception as e:
+        logger.error(f"Error fetching allowed locations: {e}")
+        return set()
+
+def manage_location_filter(action, region=None, location=None):
+    """Adds, deletes, or gets location pairs from the filter (case-insensitive)."""
+    if action in ["add", "delete"] and not (region and location):
+        return False, "Region and location are required for this action."
+
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        cursor = conn.cursor()
+        
+        if action == "get":
+            cursor.execute('SELECT region, location, added_at FROM location_filter ORDER BY region, location')
+            rows = cursor.fetchall()
+            conn.close()
+            return True, [{"region": row[0], "location": row[1], "added_at": row[2]} for row in rows]
+            
+        elif action == "add":
+            # Store the region in uppercase for consistency, location as is.
+            cursor.execute('INSERT OR REPLACE INTO location_filter (region, location, added_at) VALUES (?, ?, ?)',
+            (region.upper(), location, datetime.now().isoformat()))
+            logger.info(f"Added location filter: ({region.upper()}, {location})")
+            
+        elif action == "delete":
+            # Match case-insensitively for deletion
+            cursor.execute('DELETE FROM location_filter WHERE LOWER(region) = ? AND LOWER(location) = ?',
+            (region.lower(), location.lower()))
+            logger.info(f"Removed location filter: ({region.lower()}, {location.lower()})")
+        
+        conn.commit()
+        conn.close()
+        return True, f"Location filter list updated: {action} ({region}, {location})"
+    except Exception as e:
+        logger.error(f"Error managing location filter: {e}", exc_info=True)
+        return False, str(e)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
