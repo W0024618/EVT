@@ -1,3 +1,418 @@
+    # grouping keys: if combine_dates -> group by key only; else group by key+Date
+    group_cols = ['_trend_key'] if combine_dates else ['_trend_key', 'Date']
+
+    out_rows = []
+    try:
+        grouped = df2.groupby(group_cols, sort=False, dropna=False)
+    except Exception:
+        grouped = [(None, df2)]
+
+    for gkeys, group in grouped:
+        g = group.copy()  # unified group dataframe
+
+        # If there is only one row in this group -> keep it (still normalize Date type)
+        if len(g) == 1:
+            out_rows.append(g.iloc[0])
+            continue
+
+        # pick a representative row using priority rules
+        picked = None
+        try:
+            if 'IsFlagged' in g.columns:
+                flagged = g[g['IsFlagged'] == True]
+                if not flagged.empty:
+                    if 'AnomalyScore' in flagged.columns:
+                        try:
+                            idx = pd.to_numeric(flagged['AnomalyScore'], errors='coerce').fillna(-1).astype(float).idxmax()
+                            picked = flagged.loc[idx].copy()
+                        except Exception:
+                            picked = flagged.iloc[0].copy()
+                    else:
+                        picked = flagged.iloc[0].copy()
+        except Exception:
+            picked = None
+
+        if picked is None:
+            if 'CountSwipes' in g.columns:
+                try:
+                    idx = pd.to_numeric(g['CountSwipes'], errors='coerce').fillna(-1).astype(float).idxmax()
+                    picked = g.loc[idx].copy()
+                except Exception:
+                    picked = None
+
+        if picked is None:
+            if 'DurationSeconds' in g.columns:
+                try:
+                    idx = pd.to_numeric(g['DurationSeconds'], errors='coerce').fillna(-1).astype(float).idxmax()
+                    picked = g.loc[idx].copy()
+                except Exception:
+                    picked = None
+
+        if picked is None:
+            if 'LastSwipe' in g.columns:
+                try:
+                    g['__ls__'] = pd.to_datetime(g['LastSwipe'], errors='coerce')
+                    idx = g['__ls__'].idxmax()
+                    picked = g.loc[idx].copy()
+                except Exception:
+                    picked = None
+                finally:
+                    try:
+                        if '__ls__' in g.columns:
+                            g = g.drop(columns=['__ls__'])
+                    except Exception:
+                        pass
+
+        if picked is None:
+            picked = g.iloc[0].copy()
+
+        # If not combining across dates: keep representative row
+        if not combine_dates:
+            out_rows.append(picked)
+            continue
+
+        # --- combine multiple dates into single row (combine_dates == True) ---
+        try:
+            # sort group (best-effort)
+            g_sorted = g.copy()
+            try:
+                g_sorted = g_sorted.sort_values(by='Date')
+            except Exception:
+                pass
+
+            dates_list = []
+            durations_list = []
+            reasons_set = set()
+            anomaly_scores = []
+            flagged_any = False
+            countswipes_list = []
+
+            # detect ViolationDaysLast* column (prefer highest numeric suffix)
+            def _detect_violation_col(cols):
+                cand = [c for c in cols if isinstance(c, str) and c.startswith('ViolationDaysLast')]
+                if not cand:
+                    return None
+                def _suffix_num(name):
+                    m = re.search(r'ViolationDaysLast(\d+)', name)
+                    if m:
+                        try:
+                            return int(m.group(1))
+                        except Exception:
+                            return 0
+                    return 0
+                cand_sorted = sorted(cand, key=_suffix_num, reverse=True)
+                return cand_sorted[0]
+
+            violation_col = _detect_violation_col(g_sorted.columns)
+
+            # collect per-row values (NO per-row summing of violation_col here)
+            for _, rr in g_sorted.iterrows():
+                # date string
+                try:
+                    dval = rr.get('Date')
+                    if pd.notna(dval):
+                        ds = pd.to_datetime(dval, errors='coerce')
+                        if pd.notna(ds):
+                            dates_list.append(ds.date().strftime("%d/%m/%Y"))
+                        else:
+                            dates_list.append(str(dval))
+                    else:
+                        dates_list.append('')
+                except Exception:
+                    dates_list.append(str(rr.get('Date')))
+
+                # duration
+                dstr = _fmt_duration_from_row(rr)
+                durations_list.append(dstr if dstr else "")
+
+                # reasons
+                try:
+                    rs = rr.get('Reasons') or rr.get('DetectedScenarios') or None
+                    if rs:
+                        for part in re.split(r'[;,\|]', str(rs)):
+                            p = part.strip()
+                            if p and p.lower() not in ('nan','none',''):
+                                reasons_set.add(p)
+                except Exception:
+                    pass
+
+                # anomaly score
+                try:
+                    if 'AnomalyScore' in rr and rr.get('AnomalyScore') not in (None, '', float('nan')):
+                        anomaly_scores.append(float(rr.get('AnomalyScore')))
+                except Exception:
+                    pass
+
+                # flagged
+                try:
+                    if 'IsFlagged' in rr and bool(rr.get('IsFlagged')):
+                        flagged_any = True
+                except Exception:
+                    pass
+
+                # CountSwipes
+                try:
+                    if 'CountSwipes' in rr and rr.get('CountSwipes') not in (None, '', float('nan')):
+                        countswipes_list.append(int(float(rr.get('CountSwipes'))))
+                except Exception:
+                    pass
+
+            # ---- compute ViolationDays properly: number of distinct Dates where IsFlagged == True ----
+            violation_days_total = 0
+            try:
+                if 'IsFlagged' in g_sorted.columns and 'Date' in g_sorted.columns:
+                    flagged_rows = g_sorted[g_sorted['IsFlagged'] == True]
+                    if not flagged_rows.empty:
+                        norm_set = set()
+                        for _, fr in flagged_rows.iterrows():
+                            dd = fr.get('Date')
+                            if pd.isna(dd) or dd in (None, '', float('nan')):
+                                continue
+                            try:
+                                dnorm = pd.to_datetime(dd, errors='coerce').date()
+                                if pd.notna(dnorm):
+                                    norm_set.add(dnorm)
+                                else:
+                                    norm_set.add(str(dd))
+                            except Exception:
+                                norm_set.add(str(dd))
+                        violation_days_total = int(len(norm_set))
+                elif violation_col:
+                    vt = 0
+                    for _, rr in g_sorted.iterrows():
+                        try:
+                            v = rr.get(violation_col)
+                            if v not in (None, '', float('nan')):
+                                vt += int(float(v))
+                        except Exception:
+                            pass
+                    violation_days_total = int(vt)
+                else:
+                    violation_days_total = 0
+            except Exception:
+                violation_days_total = 0
+
+            # attach aggregated fields to picked row
+            pairs = []
+            for d, du in zip(dates_list, durations_list):
+                if d and du:
+                    pairs.append(f"{d} {du}")
+                elif d and not du:
+                    pairs.append(f"{d}")
+                elif du and not d:
+                    pairs.append(f"{du}")
+
+            picked['Dates'] = "; ".join([p for p in dates_list if p])
+            picked['Duration'] = "; ".join([p for p in durations_list if p])
+            picked['DurationByDate'] = "; ".join(pairs) if pairs else None
+
+            if reasons_set:
+                picked['Reasons'] = "; ".join(sorted(reasons_set))
+            else:
+                if 'Reasons' not in picked or picked.get('Reasons') in (None, '', float('nan')):
+                    picked['Reasons'] = None
+
+            try:
+                picked['AnomalyScore'] = max(anomaly_scores) if anomaly_scores else picked.get('AnomalyScore')
+            except Exception:
+                pass
+            picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
+
+            try:
+                picked['ViolationDays'] = int(violation_days_total)
+                try:
+                    picked[f'ViolationDaysLast{int(DEFAULT_VIOLATION_DAYS)}'] = int(violation_days_total)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            try:
+                picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
+            except Exception:
+                pass
+
+        except Exception:
+            logging.exception("Failed to aggregate multi-date group for key=%s", str(gkeys))
+            # fallback: use representative row as-is (picked already assigned)
+        out_rows.append(picked)
+
+    try:
+        out_df = pd.DataFrame(out_rows).reset_index(drop=True)
+    except Exception:
+        return df
+
+    if '_trend_key' in out_df.columns:
+        try:
+            out_df = out_df.drop(columns=['_trend_key'])
+        except Exception:
+            pass
+
+    return out_df
+
+
+
+
+
+
+
+
+
+
+def run_trend_for_date(target_date: date,
+                       regions: Optional[List[str]] = None,
+                       outdir: str = None,
+                       city: str = "pune",
+                       window_days: Optional[int] = None,
+                       as_dict: bool = False) -> pd.DataFrame:
+    city_slug = _slug_city(city)
+    if regions is None:
+        regions = []
+        try:
+            rcfg = REGION_CONFIG if isinstance(REGION_CONFIG, dict) else {}
+            city_norm = None
+            if city:
+                city_norm = re.sub(r'[^a-z0-9]', '', str(city).strip().lower())
+            all_region_keys = list(rcfg.keys()) if rcfg else []
+            matched = []
+            if city_norm and rcfg:
+                for rkey, rc in rcfg.items():
+                    parts = rc.get("partitions", []) or []
+                    likes = rc.get("logical_like", []) or []
+                    tokens = set()
+                    for p in parts:
+                        if not p:
+                            continue
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(p).strip().lower()))
+                        for piece in re.split(r'[.\-/\s]', str(p)):
+                            if piece:
+                                tokens.add(re.sub(r'[^a-z0-9]', '', piece.strip().lower()))
+                    for lk in likes:
+                        tokens.add(re.sub(r'[^a-z0-9]', '', str(lk).strip().lower()))
+                    serv = rc.get("server") or ""
+                    tokens.add(re.sub(r'[^a-z0-9]', '', str(serv).strip().lower()))
+                    if city_norm in tokens:
+                        matched.append(rkey)
+                if matched:
+                    regions = matched
+                else:
+                    regions = all_region_keys
+            else:
+                regions = all_region_keys
+        except Exception:
+            regions = list(REGION_CONFIG.keys()) if isinstance(REGION_CONFIG, dict) and REGION_CONFIG else []
+    regions = [r.lower() for r in regions if r]
+
+    outdir_path = Path(outdir) if outdir else OUTDIR
+    if run_for_date is None:
+        raise RuntimeError("duration_report.run_for_date is not available in this environment.")
+    try:
+        results = run_for_date(target_date, regions, str(outdir_path), city)
+    except TypeError:
+        try:
+            results = run_for_date(target_date, regions, str(outdir_path))
+        except Exception:
+            try:
+                results = run_for_date(target_date)
+            except Exception:
+                logging.exception("run_for_date failed entirely.")
+                raise
+
+    # collect durations & swipes
+    dur_list = []
+    swipe_list = []
+    try:
+        for rkey, rr in (results or {}).items():
+            try:
+                dfdur = rr.get('durations')
+                if dfdur is not None and not dfdur.empty:
+                    dfdur = dfdur.copy()
+                    dfdur['region'] = rkey
+                    dur_list.append(dfdur)
+            except Exception:
+                pass
+            try:
+                dfsw = rr.get('swipes')
+                if dfsw is not None and not dfsw.empty:
+                    dfcopy = dfsw.copy()
+                    dfcopy['region'] = rkey
+                    swipe_list.append(dfcopy)
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("Failed to iterate results returned by run_for_date.")
+
+    combined = pd.concat(dur_list, ignore_index=True) if dur_list else pd.DataFrame()
+    sw_combined = pd.concat(swipe_list, ignore_index=True) if swipe_list else pd.DataFrame()
+
+    # (rest of your existing preparation/scoring code remains unchanged up to:)
+    # Merge features with durations (prefer features)
+    try:
+        merged = pd.merge(features, combined, how='left', on=['person_uid', 'Date'], suffixes=('_feat', '_dur'))
+    except Exception:
+        merged = features
+
+    trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date, window_days=window_days)
+
+    # --- ensure per-day trend CSV is written so subsequent date-runs in the same process can see history ---
+    try:
+        if trend_df is not None and not getattr(trend_df, 'empty', True):
+            try:
+                outfile = Path(outdir_path) / f"trend_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+                trend_df.to_csv(outfile, index=False)
+                logging.info("run_trend_for_date: wrote trend CSV %s", outfile)
+            except Exception:
+                logging.exception("run_trend_for_date: failed to write per-day trend CSV for %s", target_date)
+    except Exception:
+        logging.exception("run_trend_for_date: error while attempting to persist trend CSV")
+
+    # write csv (use city_slug, not hard-coded 'pune')
+    try:
+        write_df = trend_df.copy()
+        for dtcol in ('FirstSwipe', 'LastSwipe'):
+            if dtcol in write_df.columns:
+                write_df[dtcol] = pd.to_datetime(write_df[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+        if 'Date' in write_df.columns:
+            try:
+                write_df['Date'] = pd.to_datetime(write_df['Date'], errors='coerce').dt.date
+                write_df['Date'] = write_df['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+            except Exception:
+                pass
+        write_df = write_df.where(pd.notnull(write_df), None)
+        out_csv = Path(outdir_path) / f"trend_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+        write_df.to_csv(out_csv, index=False)
+        logging.info("run_trend_for_date: wrote %s (rows=%d)", out_csv, len(write_df))
+    except Exception:
+        logging.exception("Failed to write trend CSV")
+
+    # (rest of function continues unchanged: formatting DisplayDate, handling as_dict, enrichment, return)
+    # Format DisplayDate
+    try:
+        if 'DisplayDate' in trend_df.columns:
+            trend_df['DisplayDate'] = pd.to_datetime(trend_df['DisplayDate'], errors='coerce').dt.date
+            trend_df['DisplayDate'] = trend_df['DisplayDate'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+    except Exception:
+        pass
+
+    if as_dict:
+        # (omitted here for brevity - keep your existing as_dict construction)
+        ...
+    return trend_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS C:\Users\W0024618\Desktop\Trend Analysis\backend> python app.py
   File "C:\Users\W0024618\Desktop\Trend Analysis\backend\app.py", line 1191
     except Exception:
