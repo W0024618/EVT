@@ -22,9 +22,6 @@ from flask import jsonify, request
 import logging
 logging.basicConfig(level=logging.INFO)
 
-force = str(params.get('force', '')).lower() in ('1', 'true', 'yes')
-city_slug_safe = city_slug or 'pune'
-
 
 
 # new import to reuse canonicalization helpers from duration_report
@@ -71,9 +68,6 @@ except Exception:
         return None
     def get_personnel_info(pid):
         return {}
-
-
-
 
 
 from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
@@ -185,12 +179,18 @@ def _safe_read_csv(fp):
         except Exception:
             return pd.DataFrame()
 
-#path 
+# path 
 BASE_DIR = Path(__file__).parent.resolve()
 DEFAULT_OUTDIR = BASE_DIR / "outputs"
 DEFAULT_OUTDIR.mkdir(parents=True, exist_ok=True)
 
 OUTDIR = DEFAULT_OUTDIR
+
+# -------------------------------------------------------------------
+
+# Can be overridden by env var VIOLATION_DAYS (int)
+DEFAULT_VIOLATION_DAYS = int(os.getenv("VIOLATION_DAYS", "90"))
+# -------------------------------------------------------------------
 
 OVERRIDES_FILE = DEFAULT_OUTDIR / "overrides.csv"
 
@@ -242,12 +242,8 @@ def _slug_city(s):
     slug = re.sub(r'[\s_]+', '-', slug)
     return slug
 
-
-
 _acvscore_backoff = {"ts": None, "failed": False}
 _ACVSCORE_BACKOFF_SECONDS = 20
-
-
 # ODBC driver (keep existing env-based driver)
 ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
 
@@ -263,10 +259,6 @@ def load_model(name):
     data = joblib.load(p)
     _loaded_models[name] = data
     return data
-
-
-
-
 
 
 
@@ -791,9 +783,6 @@ def _row_matches_tokens(row, tokens: List[str]) -> bool:
     return False
 
 
-
-
-
 def _find_swipe_files(outdir: Path, date_obj: Optional[date] = None, city_slug: Optional[str] = None, include_shifted: bool = True):
     """
     Robust swipe-file discovery.
@@ -859,8 +848,6 @@ def _find_swipe_files(outdir: Path, date_obj: Optional[date] = None, city_slug: 
         files = [f for f in files if 'shift' not in f.name.lower()]
 
     return files
-
-
 
 
 def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd.DataFrame:
@@ -1008,6 +995,7 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
             out_rows.append(picked)
             continue
 
+
         # --- combine multiple dates into single row (combine_dates == True) ---
         # Build Dates list and Durations list (maintain original order by Date)
         try:
@@ -1025,6 +1013,26 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
             violation_days_total = 0
             flagged_any = False
             countswipes_list = []
+
+            # --- detect any ViolationDaysLast* column (prefer highest numeric suffix) ---
+            def _detect_violation_col(cols):
+                cand = [c for c in cols if isinstance(c, str) and c.startswith('ViolationDaysLast')]
+                if not cand:
+                    return None
+                # prefer column with largest numeric suffix (ViolationDaysLast180 > ViolationDaysLast90)
+                def _suffix_num(name):
+                    m = re.search(r'ViolationDaysLast(\d+)', name)
+                    if m:
+                        try:
+                            return int(m.group(1))
+                        except Exception:
+                            return 0
+                    return 0
+                cand_sorted = sorted(cand, key=_suffix_num, reverse=True)
+                return cand_sorted[0]
+
+            violation_col = _detect_violation_col(g_sorted.columns)
+
             # iterate rows and collect
             for _, rr in g_sorted.iterrows():
                 # date string
@@ -1070,11 +1078,12 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                 except Exception:
                     pass
 
-                # violation days
+                # violation days (dynamic column detection)
                 try:
-                    v = rr.get('ViolationDaysLast90')
-                    if v not in (None, '', float('nan')):
-                        violation_days_total += int(float(v))
+                    if violation_col:
+                        v = rr.get(violation_col)
+                        if v not in (None, '', float('nan')):
+                            violation_days_total += int(float(v))
                 except Exception:
                     pass
 
@@ -1121,13 +1130,31 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                 pass
             picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
             try:
-                picked['ViolationDaysLast90'] = int(violation_days_total)
+                # neutral/standard aggregated key
+                picked['ViolationDaysLast'] = int(violation_days_total)
+                # also provide a window-specific key using DEFAULT_VIOLATION_DAYS
+                try:
+                    picked[f'ViolationDaysLast{int(DEFAULT_VIOLATION_DAYS)}'] = int(violation_days_total)
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
                 picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
             except Exception:
                 pass
+
+
+
+
+
+
+
+
+
+
+
+
 
         except Exception:
             # if aggregation fails, fall back to the representative row
@@ -1153,8 +1180,6 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
 # -----------------------
 # Routes
 # -----------------------
-
-
 
 
 @app.route('/')
@@ -1296,60 +1321,99 @@ def run_trend():
         valid_regions = [k.lower() for k in REGION_CONFIG.keys()] if REGION_CONFIG else ['apac']
     params['_regions_to_run'] = valid_regions
 
+
+
     city_param = params.get('city') or params.get('site') or params.get('site_name') or None
     city_slug = _slug_city(city_param) if city_param else None
     params['_city'] = city_slug
+    force = str(params.get('force', '')).lower() in ('1', 'true', 'yes')
+    city_slug_safe = city_slug or 'pune'
+
 
     combined_rows = []
     files = []
 
     
-    
-    
     # ---------------------------
-    # Run trend for each requested date
+    # Run trend for each requested date (updated: skip if CSV exists unless force=True)
     # ---------------------------
     for d in dates:
         try:
-            if run_trend_for_date is None:
-                raise RuntimeError("run_trend_for_date helper not available in trend_runner")
-            try:
-                df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug)
-            except TypeError:
+            csv_path = DEFAULT_OUTDIR / f"trend_{city_slug_safe}_{d.strftime('%Y%m%d')}.csv"
+
+            # If CSV already exists and caller did not request force -> reuse it (cache)
+            if csv_path.exists() and not force:
+                logging.info("Skipping generation for %s (city=%s) because %s exists (use force to override)", d.isoformat(), city_slug_safe, csv_path.name)
                 try:
-                    df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
-                except Exception:
-                    # Last-resort: try duration_report fallback if available
+                    # attempt to read CSV produced earlier
                     try:
-                        from duration_report import run_for_date as _dr_run_for_date
-                        region_results = _dr_run_for_date(d, valid_regions, str(DEFAULT_OUTDIR), city_param)
-                        combined_list = []
-                        for rkey, res in (region_results or {}).items():
-                            try:
-                                df_dur = res.get('durations')
-                                if df_dur is not None and not df_dur.empty:
-                                    combined_list.append(df_dur)
-                            except Exception:
-                                continue
-                        df = pd.concat(combined_list, ignore_index=True) if combined_list else pd.DataFrame()
+                        df = pd.read_csv(csv_path, parse_dates=['Date', 'FirstSwipe', 'LastSwipe'])
                     except Exception:
-                        raise
+                        # fallback if parse_dates causes trouble
+                        df = pd.read_csv(csv_path, dtype=str)
+                except Exception:
+                    logging.exception("Failed to read existing CSV %s; will attempt regeneration", csv_path)
+                    df = None
+                files.append(csv_path.name)
+            else:
+                # Need to generate (either file missing or force=True)
+                if run_trend_for_date is None:
+                    raise RuntimeError("run_trend_for_date helper not available in trend_runner")
+
+                # try calling with the richer signature first (regions, outdir, city)
+                df = None
+                try:
+                    # attempt most-common signature
+                    df = run_trend_for_date(d, regions=valid_regions, outdir=str(DEFAULT_OUTDIR), city=city_slug_safe)
+                except TypeError:
+                    # fallback attempts for older signatures
+                    try:
+                        df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR), city=city_slug_safe)
+                    except TypeError:
+                        try:
+                            df = run_trend_for_date(d, outdir=str(DEFAULT_OUTDIR))
+                        except TypeError:
+                            try:
+                                df = run_trend_for_date(d)
+                            except Exception as e_inner:
+                                logging.exception("All call attempts to run_trend_for_date failed for %s: %s", d, e_inner)
+                                raise
+
+                # If run_trend_for_date returned a DataFrame, ensure we record csv name if file created
+                try:
+                    # if generator wrote csv to DEFAULT_OUTDIR, append it
+                    if csv_path.exists():
+                        files.append(csv_path.name)
+                except Exception:
+                    pass
+
         except Exception as e:
             logging.exception("run_trend_for_date failed for %s", d)
             return jsonify({"error": f"runner failed for {d}: {e}"}), 500
 
+        # If we got here and df is None or empty -> continue without adding rows
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            continue
 
-        # after df returned from run_trend_for_date for date d and before we append file names
-        csv_path = DEFAULT_OUTDIR / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
-        # if caller requested hybrid mode also write per-city copy
+        # Replace placeholder strings etc (same as before)
+        try:
+            df = _replace_placeholder_strings(df)
+        except Exception:
+            pass
+
+        if 'IsFlagged' not in df.columns:
+            df['IsFlagged'] = False
+        if 'Reasons' not in df.columns:
+            df['Reasons'] = None
+
+        # still support hybrid store (existing behavior)
         try:
             if str(params.get('hybrid', '')).lower() in ('1','true','yes'):
                 try:
-                    # create city-specific outdir under DEFAULT_OUTDIR (e.g. ./outputs/pune/)
-                    per_city_dir = DEFAULT_OUTDIR / (city_slug or 'unknown_city')
+                    per_city_dir = DEFAULT_OUTDIR / (city_slug_safe or 'unknown_city')
                     per_city_dir.mkdir(parents=True, exist_ok=True)
-                    per_city_path = per_city_dir / f"trend_{city_slug}_{d.strftime('%Y%m%d')}.csv"
-                    # write copy if df exists and not empty
+                    per_city_path = per_city_dir / f"trend_{city_slug_safe}_{d.strftime('%Y%m%d')}.csv"
+                    # write CSV copy if df exists and not empty
                     if df is not None and not (hasattr(df, 'empty') and df.empty):
                         try:
                             df.to_csv(per_city_path, index=False)
@@ -1361,27 +1425,9 @@ def run_trend():
         except Exception:
             pass
 
-        if csv_path.exists():
-            files.append(csv_path.name)
-
-
-
-        if df is None or (hasattr(df, 'empty') and df.empty):
-            continue
-
-        try:
-            df = _replace_placeholder_strings(df)
-        except Exception:
-            pass
-
-        if 'IsFlagged' not in df.columns:
-            df['IsFlagged'] = False
-        if 'Reasons' not in df.columns:
-            df['Reasons'] = None
-
         combined_rows.append(df)
-
     
+
     # *** Important: combine after loop to avoid UnboundLocalError and extra repeated concat inside loop ***
     try:
         combined_df = pd.concat(combined_rows, ignore_index=True) if combined_rows else pd.DataFrame()
@@ -1497,8 +1543,6 @@ def run_trend():
     except Exception:
         samples = []
 
-
-
     resp = {
         "start_date": dates[0].isoformat() if dates else None,
         "end_date": dates[-1].isoformat() if dates else None,
@@ -1509,10 +1553,10 @@ def run_trend():
         "flagged_rate_percent": float(flagged_rate_pct),
         "files": files,
          "sample": (samples if isinstance(samples, list) else samples),
-       # "sample": (samples[:10] if isinstance(samples, list) else samples),
+   
         "reasons_count": {},
         "risk_counts": {},
-        #"flagged_persons": (samples if samples else []),
+      
          "flagged_persons": (samples if samples else []),
         "_raw_unique_person_uids": int(raw_unique_person_uids),
         "regions_run": params.get('_regions_to_run', []),
@@ -1520,10 +1564,6 @@ def run_trend():
     }
 
     return jsonify(resp)
-
-
-
-
 
 
 
@@ -2801,7 +2841,20 @@ def _load_latest_trend_df(outdir: Path, city: str = "pune"):
     df = _replace_placeholder_strings(df)
     return df, latest.name
 
-def _find_person_rows(identifier: str, days: int = 90, outdir: Path = DEFAULT_OUTDIR):
+
+
+
+def _find_person_rows(identifier: str, days: int | None = None, outdir: Path = DEFAULT_OUTDIR):
+    """
+    Find person rows in past trend CSVs. `days` is optional; if None the
+    DEFAULT_VIOLATION_DAYS is used from configuration/env.
+    """
+    # resolve days to use
+    try:
+        days = int(days) if days is not None else int(DEFAULT_VIOLATION_DAYS)
+    except Exception:
+        days = int(DEFAULT_VIOLATION_DAYS)
+
     if _normalize_id_val:
         norm = _normalize_id_val(identifier)
     else:
@@ -2841,9 +2894,6 @@ def _find_person_rows(identifier: str, days: int = 90, outdir: Path = DEFAULT_OU
             past = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-
-
-
     except Exception:
         past = pd.DataFrame()
 
@@ -2879,6 +2929,8 @@ def _find_person_rows(identifier: str, days: int = 90, outdir: Path = DEFAULT_OU
             match_mask = match_mask | past['EmployeeName'].astype(str).isin(close)
 
     return past[match_mask].copy()
+
+
 
 def _explain_scenario_code(code):
     if not code:
@@ -3022,7 +3074,10 @@ def chatbot_query():
         else:
             return jsonify({"answer":"PresentToday field not available in latest trends.","evidence":[]})
 
-    hint = "I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last 90 days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+    
+    #hint = "I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last 90 days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+    hint = f"I can answer: 'Who is high risk today', 'Who is low risk today', 'Show me <EmployeeID|Name> last {DEFAULT_VIOLATION_DAYS} days', 'Explain <scenario_code>', 'Trend details for today — top reasons'."
+
     return jsonify({"answer": f"I can help with trend & risk questions. I recognized: {q}. Try: {hint}", "evidence":[]})
 
 
