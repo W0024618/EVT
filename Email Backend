@@ -1,3 +1,219 @@
+# ---------- updated scenario_long_gap (use strict OUT->IN gap) ----------
+def scenario_long_gap(row):
+    try:
+        # Prefer explicit MaxOutInGapSeconds (computed by agg_swipe_group). Fall back to MaxSwipeGapSeconds.
+        gap = int(row.get('MaxOutInGapSeconds') or row.get('MaxSwipeGapSeconds') or 0)
+        return gap >= int(4.5 * 3600)
+    except Exception:
+        return False
+
+
+# ---------- inside agg_swipe_group: compute OUT->IN gaps and stronger pattern detection ----------
+def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
+    # ... (keep existing preamble until computing 'times' and 'gaps') ...
+
+    # existing: compute all gaps
+    gaps = []
+    short_gap_count = 0
+    times = []
+    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
+        try:
+            times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
+        except Exception:
+            try:
+                times = sorted([pd.to_datetime(x) for x in list(g['LocaleMessageTime'].dropna())])
+            except Exception:
+                times = []
+    for i in range(1, len(times)):
+        s = (times[i] - times[i-1]).total_seconds()
+        gaps.append(s)
+        if s <= 5 * 60:
+            short_gap_count += 1
+    max_gap = int(max(gaps)) if gaps else 0
+
+    # --- NEW: compute strict OUT->IN gaps (only when previous direction looks like OUT and next looks like IN)
+    outin_gaps = []
+    try:
+        # extract ordered timeline rows (timestamp, direction)
+        timeline_dir = []
+        if 'LocaleMessageTime' in g.columns:
+            try:
+                rows_sorted = g.sort_values('LocaleMessageTime')
+            except Exception:
+                rows_sorted = g
+            for _, rr in rows_sorted.iterrows():
+                try:
+                    t = pd.to_datetime(rr.get('LocaleMessageTime'))
+                except Exception:
+                    t = None
+                d = rr.get('Direction') if 'Direction' in rr else None
+                if t is not None:
+                    timeline_dir.append((t, str(d or '').strip().lower()))
+        # scan consecutive pairs for out -> in pattern
+        for i in range(1, len(timeline_dir)):
+            prev_t, prev_d = timeline_dir[i-1]
+            cur_t, cur_d = timeline_dir[i]
+            # coarse match: 'out' or 'exit' in previous, 'in' in current
+            prev_is_out = bool(prev_d and ('out' in prev_d or 'exit' in prev_d))
+            cur_is_in  = bool(cur_d and ('in' in cur_d))
+            if prev_is_out and cur_is_in:
+                s = (cur_t - prev_t).total_seconds()
+                if s >= 0:
+                    outin_gaps.append(s)
+    except Exception:
+        outin_gaps = []
+    max_outin_gap = int(max(outin_gaps)) if outin_gaps else 0
+
+    # --- build timeline with zone + direction for segment logic (improved)
+    timeline = []
+    if 'LocaleMessageTime' in g.columns:
+        try:
+            rows_to_iter = g.sort_values('LocaleMessageTime')
+        except Exception:
+            rows_to_iter = g
+    else:
+        rows_to_iter = g
+
+    for _, row in rows_to_iter.iterrows():
+        t = row.get('LocaleMessageTime')
+        dname = row.get('Door') if 'Door' in row else None
+        direction = row.get('Direction') if 'Direction' in row else None
+        zone = map_door_to_zone(dname, direction)
+        timeline.append((t, dname, direction, zone))
+
+    # build segments but also capture first/last direction per segment (so pattern checks can be strict)
+    segments = []
+    if timeline:
+        cur_zone = None
+        seg_start = timeline[0][0]
+        seg_label = None
+        seg_dirs = []
+        for (t, dname, direction, zone) in timeline:
+            lbl = 'work'
+            if zone is not None and zone in _BREAK_ZONES:
+                lbl = 'break'
+            elif zone == _OUT_OF_OFFICE_ZONE:
+                lbl = 'out_of_office'
+            else:
+                lbl = 'work'
+            if cur_zone is None:
+                cur_zone = zone
+                seg_label = lbl
+                seg_start = t
+                seg_dirs = [str(direction).strip().lower() if direction is not None else '']
+            else:
+                if lbl != seg_label:
+                    # finalize current segment with directions list
+                    segments.append({
+                        'label': seg_label,
+                        'start': seg_start,
+                        'end': t,
+                        'start_zone': cur_zone,
+                        'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
+                    })
+                    seg_start = t
+                    seg_label = lbl
+                    seg_dirs = [str(direction).strip().lower() if direction is not None else '']
+                    cur_zone = zone
+                else:
+                    seg_dirs.append(str(direction).strip().lower() if direction is not None else '')
+                    cur_zone = cur_zone or zone
+        # push final seg
+        if seg_label is not None:
+            segments.append({
+                'label': seg_label,
+                'start': seg_start,
+                'end': timeline[-1][0],
+                'start_zone': cur_zone,
+                'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
+            })
+
+    # compute durations & stats per segment and detect pattern short->long->short with strict direction checks
+    pattern_flag = False
+    pattern_sequence_readable = None
+    try:
+        seq = []
+        for s in segments:
+            dur_mins = 0
+            try:
+                dur_mins = int(round(((s['end'] - s['start']).total_seconds() / 60.0))) if (s.get('start') and s.get('end')) else 0
+            except Exception:
+                dur_mins = 0
+            first_dir = s['dirs'][0] if s.get('dirs') and len(s['dirs'])>0 else ''
+            last_dir = s['dirs'][-1] if s.get('dirs') and len(s['dirs'])>0 else ''
+            seq.append({
+                'label': s.get('label'),
+                'mins': dur_mins,
+                'first_dir': first_dir,
+                'last_dir': last_dir
+            })
+        # thresholds: short < 60 min; long >= 4.5 hours (4.5*60 = 270)
+        SHORT_MAX = 60
+        LONG_MIN = int(4.5 * 60)
+        for i in range(len(seq)-2):
+            a = seq[i]; b = seq[i+1]; c = seq[i+2]
+            # first and third must be short 'work' segments, middle must be long break/out_of_office
+            if (a['label'] == 'work' and a['mins'] < SHORT_MAX) and \
+               (b['label'] in ('break','out_of_office') and b['mins'] >= LONG_MIN) and \
+               (c['label'] == 'work' and c['mins'] < SHORT_MAX):
+                # strict direction check: last direction of a should include 'out', first direction of c should include 'in'
+                a_last_out = (a.get('last_dir') and ('out' in a.get('last_dir')))
+                c_first_in = (c.get('first_dir') and ('in' in c.get('first_dir')))
+                if a_last_out and c_first_in:
+                    pattern_flag = True
+                    pattern_sequence_readable = f"work_short ({a['mins']}m) -> out_long ({b['mins']}m) -> work_short ({c['mins']}m)"
+                    break
+    except Exception:
+        pattern_flag = False
+        pattern_sequence_readable = None
+
+    # ... (existing computations: unique_doors, work/break totals etc) ...
+
+    # After computing max_gap and max_outin_gap, set MaxOutInGapSeconds and prefer it for MaxSwipeGapSeconds
+    final_max_gap = int(max_outin_gap) if int(max_outin_gap) > 0 else int(max_gap)
+
+    # return series (include new MaxOutInGapSeconds and Pattern fields)
+    return pd.Series({
+        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
+        'MaxSwipeGapSeconds': final_max_gap,
+        'MaxOutInGapSeconds': int(max_outin_gap),
+        'ShortGapCount': int(short_gap_count),
+        # ... other fields unchanged ...
+        'PatternShortLongRepeat': bool(pattern_flag),
+        'PatternSequenceReadable': pattern_sequence_readable,
+        # 'PatternSequence' etc if needed
+    })
+
+
+
+
+
+
+
+# ---------- update weights: make long-gap more prioritized ----------
+WEIGHTS = {
+    "long_gap_>=4.5h": 2.5,            # increased from 1.3 -> 2.5
+    "short_duration_<4h": 1.0,
+    "coffee_badging": 1.0,
+    "low_swipe_count_<=5": 0.5,
+    "single_door": 0.25,
+    # ... rest unchanged ...
+    "shortstay_longout_repeat": 2.0
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 D:\Email Automation\backend-arun\.env
 
 #API key for securing endpoints (replace with your existing API key)
