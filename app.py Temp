@@ -922,6 +922,12 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
             pass
         return None
 
+
+
+
+
+
+
     # grouping keys: if combine_dates -> group by key only; else group by key+Date
     group_cols = ['_trend_key'] if combine_dates else ['_trend_key', 'Date']
 
@@ -932,16 +938,14 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
         grouped = [(None, df2)]
 
     for gkeys, group in grouped:
-        # For single-key grouping groupby returns key as tuple when group_cols has multiple items;
-        # unify into a single group dataframe variable `g`
-        g = group.copy()
+        g = group.copy()  # unified group dataframe
 
-        # If there is only one row in this group -> keep it (but still normalize Date type)
+        # If there is only one row in this group -> keep it (still normalize Date type)
         if len(g) == 1:
             out_rows.append(g.iloc[0])
             continue
 
-        # pick a representative row using your existing priority rules
+        # pick a representative row using priority rules
         picked = None
         try:
             if 'IsFlagged' in g.columns:
@@ -956,7 +960,7 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                     else:
                         picked = flagged.iloc[0].copy()
         except Exception:
-            pass
+            picked = None
 
         if picked is None:
             if 'CountSwipes' in g.columns:
@@ -980,26 +984,26 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                     g['__ls__'] = pd.to_datetime(g['LastSwipe'], errors='coerce')
                     idx = g['__ls__'].idxmax()
                     picked = g.loc[idx].copy()
-                    try:
-                        g = g.drop(columns=['__ls__'])
-                    except Exception:
-                        pass
                 except Exception:
                     picked = None
+                finally:
+                    try:
+                        if '__ls__' in g.columns:
+                            g = g.drop(columns=['__ls__'])
+                    except Exception:
+                        pass
 
         if picked is None:
             picked = g.iloc[0].copy()
 
-        # If not combining across dates: we are done — keep representative row
+        # If not combining across dates: keep representative row
         if not combine_dates:
             out_rows.append(picked)
             continue
 
-
         # --- combine multiple dates into single row (combine_dates == True) ---
-        # Build Dates list and Durations list (maintain original order by Date)
         try:
-            # sort group by Date (keep stable ordering)
+            # sort group (best-effort)
             g_sorted = g.copy()
             try:
                 g_sorted = g_sorted.sort_values(by='Date')
@@ -1010,16 +1014,14 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
             durations_list = []
             reasons_set = set()
             anomaly_scores = []
-            violation_days_total = 0
             flagged_any = False
             countswipes_list = []
 
-            # --- detect any ViolationDaysLast* column (prefer highest numeric suffix) ---
+            # detect ViolationDaysLast* column (prefer highest numeric suffix)
             def _detect_violation_col(cols):
                 cand = [c for c in cols if isinstance(c, str) and c.startswith('ViolationDaysLast')]
                 if not cand:
                     return None
-                # prefer column with largest numeric suffix (ViolationDaysLast180 > ViolationDaysLast90)
                 def _suffix_num(name):
                     m = re.search(r'ViolationDaysLast(\d+)', name)
                     if m:
@@ -1033,16 +1035,13 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
 
             violation_col = _detect_violation_col(g_sorted.columns)
 
-            # iterate rows and collect
+            # collect per-row values (NO per-row summing of violation_col here)
             for _, rr in g_sorted.iterrows():
                 # date string
                 try:
                     dval = rr.get('Date')
                     if pd.notna(dval):
-                        if isinstance(dval, (str,)):
-                            ds = pd.to_datetime(dval, errors='coerce')
-                        else:
-                            ds = pd.to_datetime(dval, errors='coerce')
+                        ds = pd.to_datetime(dval, errors='coerce')
                         if pd.notna(ds):
                             dates_list.append(ds.date().strftime("%d/%m/%Y"))
                         else:
@@ -1054,13 +1053,9 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
 
                 # duration
                 dstr = _fmt_duration_from_row(rr)
-                if dstr:
-                    durations_list.append(dstr)
-                else:
-                    # keep blank placeholder for alignment if needed
-                    durations_list.append("")
+                durations_list.append(dstr if dstr else "")
 
-                # reasons: may be semicolon/comma separated; split and add unique
+                # reasons
                 try:
                     rs = rr.get('Reasons') or rr.get('DetectedScenarios') or None
                     if rs:
@@ -1078,15 +1073,6 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                 except Exception:
                     pass
 
-                # violation days (dynamic column detection)
-                try:
-                    if violation_col:
-                        v = rr.get(violation_col)
-                        if v not in (None, '', float('nan')):
-                            violation_days_total += int(float(v))
-                except Exception:
-                    pass
-
                 # flagged
                 try:
                     if 'IsFlagged' in rr and bool(rr.get('IsFlagged')):
@@ -1094,14 +1080,49 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                 except Exception:
                     pass
 
+                # CountSwipes
                 try:
                     if 'CountSwipes' in rr and rr.get('CountSwipes') not in (None, '', float('nan')):
                         countswipes_list.append(int(float(rr.get('CountSwipes'))))
                 except Exception:
                     pass
 
+            # ---- compute ViolationDays properly: number of distinct Dates where IsFlagged == True ----
+            violation_days_total = 0
+            try:
+                if 'IsFlagged' in g_sorted.columns and 'Date' in g_sorted.columns:
+                    flagged_rows = g_sorted[g_sorted['IsFlagged'] == True]
+                    if not flagged_rows.empty:
+                        norm_set = set()
+                        for _, fr in flagged_rows.iterrows():
+                            dd = fr.get('Date')
+                            if pd.isna(dd) or dd in (None, '', float('nan')):
+                                continue
+                            try:
+                                dnorm = pd.to_datetime(dd, errors='coerce').date()
+                                if pd.notna(dnorm):
+                                    norm_set.add(dnorm)
+                                else:
+                                    norm_set.add(str(dd))
+                            except Exception:
+                                norm_set.add(str(dd))
+                        violation_days_total = int(len(norm_set))
+                elif violation_col:
+                    vt = 0
+                    for _, rr in g_sorted.iterrows():
+                        try:
+                            v = rr.get(violation_col)
+                            if v not in (None, '', float('nan')):
+                                vt += int(float(v))
+                        except Exception:
+                            pass
+                    violation_days_total = int(vt)
+                else:
+                    violation_days_total = 0
+            except Exception:
+                violation_days_total = 0
+
             # attach aggregated fields to picked row
-            # join date+duration entries as "DD/MM/YYYY: HH:MM:SS" pairs (semicolon separated)
             pairs = []
             for d, du in zip(dates_list, durations_list):
                 if d and du:
@@ -1110,56 +1131,40 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
                     pairs.append(f"{d}")
                 elif du and not d:
                     pairs.append(f"{du}")
+
             picked['Dates'] = "; ".join([p for p in dates_list if p])
             picked['Duration'] = "; ".join([p for p in durations_list if p])
-            # Also keep a combined 'DurationByDate' with date+value
             picked['DurationByDate'] = "; ".join(pairs) if pairs else None
 
-            # Reasons combined (unique)
             if reasons_set:
                 picked['Reasons'] = "; ".join(sorted(reasons_set))
             else:
-                # ensure Reasons exists
                 if 'Reasons' not in picked or picked.get('Reasons') in (None, '', float('nan')):
                     picked['Reasons'] = None
 
-            # Other metrics: AnomalyScore -> max, IsFlagged -> any True, CountSwipes -> max or sum (prefer max)
             try:
                 picked['AnomalyScore'] = max(anomaly_scores) if anomaly_scores else picked.get('AnomalyScore')
             except Exception:
                 pass
             picked['IsFlagged'] = bool(flagged_any) or bool(picked.get('IsFlagged'))
+
             try:
-                # neutral/standard aggregated key
-                picked['ViolationDaysLast'] = int(violation_days_total)
-                # also provide a window-specific key using DEFAULT_VIOLATION_DAYS
+                picked['ViolationDays'] = int(violation_days_total)
                 try:
                     picked[f'ViolationDaysLast{int(DEFAULT_VIOLATION_DAYS)}'] = int(violation_days_total)
                 except Exception:
                     pass
             except Exception:
                 pass
+
             try:
                 picked['CountSwipes'] = int(max(countswipes_list)) if countswipes_list else picked.get('CountSwipes', 0)
             except Exception:
                 pass
 
-
-
-
-
-
-
-
-
-
-
-
-
         except Exception:
-            # if aggregation fails, fall back to the representative row
             logging.exception("Failed to aggregate multi-date group for key=%s", str(gkeys))
-
+            # fallback: use representative row as-is (picked already assigned)
         out_rows.append(picked)
 
     try:
@@ -1174,6 +1179,9 @@ def _consolidate_trend_rows(df: pd.DataFrame, combine_dates: bool = False) -> pd
             pass
 
     return out_df
+
+
+
 
 
 
