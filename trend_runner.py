@@ -15,7 +15,7 @@ from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from typing import Optional, List
 
-# ------------------ personnel enrichment (lazy) ------------------
+# ------------------ personnel enrichment ------------------
 def _get_personnel_funcs_lazy():
     """
     Try to import personnel helpers from (preferably) the app module at call time (avoids circular imports).
@@ -114,9 +114,7 @@ def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"
     return out
 
 
-# ---------------------------------------------------------------------------
-
-# ------------------ duration_report imports (robust) ------------------
+# ------------------ duration_report imports------------------
 try:
     from duration_report import run_for_date, compute_daily_durations, REGION_CONFIG
 except Exception:
@@ -133,7 +131,7 @@ except Exception:
             compute_daily_durations = None
             REGION_CONFIG = {}
 
-# ------------------ optional config door_zone mapping ------------------
+# ------------------config door_zone mapping ------------------
 try:
     from config.door_zone import map_door_to_zone as config_map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
 except Exception:
@@ -141,7 +139,7 @@ except Exception:
     BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area"])
     OUT_OF_OFFICE_ZONE = "Out of office"
 
-# History profile (optional)
+# History profile
 CANDIDATE_HISTORY = [
     Path(__file__).parent / "config" / "current_analysis.csv",
     Path(__file__).parent.parent / "config" / "current_analysis.csv",
@@ -293,7 +291,7 @@ def _extract_card_from_xml(txt):
         pass
     return None
 
-# door -> zone mapping fallback
+# door -> zone mapping 
 try:
     _BREAK_ZONES = BREAK_ZONES
     _OUT_OF_OFFICE_ZONE = OUT_OF_OFFICE_ZONE
@@ -354,13 +352,24 @@ def map_score_to_label(score: float) -> (int, str):
 
 
 
-# scenario functions (kept from your improved version)
+# scenario functions 
+
+# def scenario_long_gap(row):
+#     try:
+#         gap = int(row.get('MaxSwipeGapSeconds') or 0)
+#         return gap >= int(4.5 * 3600)
+#     except Exception:
+#         return False
+
+# ---------- updated scenario_long_gap (use strict OUT->IN gap) ----------
 def scenario_long_gap(row):
     try:
-        gap = int(row.get('MaxSwipeGapSeconds') or 0)
+        # Prefer explicit MaxOutInGapSeconds (computed by agg_swipe_group). Fall back to MaxSwipeGapSeconds.
+        gap = int(row.get('MaxOutInGapSeconds') or row.get('MaxSwipeGapSeconds') or 0)
         return gap >= int(4.5 * 3600)
     except Exception:
         return False
+
 
 def scenario_short_duration(row):
     return (row.get('DurationMinutes') or 0) < 240
@@ -415,48 +424,49 @@ def scenario_very_long_duration(row):
         return False
 
 
-# def scenario_unusually_high_swipes(row):
-#     cur = int(row.get('CountSwipes') or 0)
-#     dur = float(row.get('DurationMinutes') or 0.0)
-#     empid = row.get('EmployeeID')
-#     try:
-#         if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
-#             rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-#             median = rec.get('TotalSwipes_median', np.nan)
-#             if pd.notna(median) and median > 0:
-#                 return (cur > 3 * float(median)) and (dur < 60)
-#     except Exception:
-#         pass
-#     try:
-#         if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
-#             global_med = HIST_DF['TotalSwipes_median'].median()
-#             if pd.notna(global_med) and global_med > 0:
-#                 return (cur > 3 * float(global_med)) and (dur < 60)
-#     except Exception:
-#         pass
-#     return (cur > 50) and (dur < 60)
+def scenario_unusually_high_swipes(row):
+    cur = int(row.get('CountSwipes') or 0)
+    dur = float(row.get('DurationMinutes') or 0.0)
+    empid = row.get('EmployeeID')
+    try:
+        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+            median = rec.get('TotalSwipes_median', np.nan)
+            if pd.notna(median) and median > 0:
+                return (cur > 3 * float(median)) and (dur < 60)
+    except Exception:
+        pass
+    try:
+        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+            global_med = HIST_DF['TotalSwipes_median'].median()
+            if pd.notna(global_med) and global_med > 0:
+                return (cur > 3 * float(global_med)) and (dur < 60)
+    except Exception:
+        pass
+    return (cur > 50) and (dur < 60)
 
 
-# def scenario_high_swipes_benign(row):
-#     cur = int(row.get('CountSwipes') or 0)
-#     dur = float(row.get('DurationMinutes') or 0.0)
-#     empid = row.get('EmployeeID')
-#     try:
-#         if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
-#             rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
-#             median = rec.get('TotalSwipes_median', np.nan)
-#             if pd.notna(median) and median > 0:
-#                 return (cur > 3 * float(median)) and (dur >= 60)
-#     except Exception:
-#         pass
-#     try:
-#         if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
-#             global_med = HIST_DF['TotalSwipes_median'].median()
-#             if pd.notna(global_med) and global_med > 0:
-#                 return (cur > 3 * float(global_med)) and (dur >= 60)
-#     except Exception:
-#         pass
-#     return (cur > 50) and (dur >= 60)
+def scenario_high_swipes_benign(row):
+    cur = int(row.get('CountSwipes') or 0)
+    dur = float(row.get('DurationMinutes') or 0.0)
+    empid = row.get('EmployeeID')
+    try:
+        if not HIST_DF.empty and empid is not None and empid in HIST_DF['EmployeeID'].values:
+            rec = HIST_DF[HIST_DF['EmployeeID'] == empid].iloc[0]
+            median = rec.get('TotalSwipes_median', np.nan)
+            if pd.notna(median) and median > 0:
+                return (cur > 3 * float(median)) and (dur >= 60)
+    except Exception:
+        pass
+    try:
+        if not HIST_DF.empty and 'TotalSwipes_median' in HIST_DF.columns:
+            global_med = HIST_DF['TotalSwipes_median'].median()
+            if pd.notna(global_med) and global_med > 0:
+                return (cur > 3 * float(global_med)) and (dur >= 60)
+    except Exception:
+        pass
+    return (cur > 50) and (dur >= 60)
+
 
 def scenario_behaviour_shift(row, hist_df=None, minutes_threshold=180):
     try:
@@ -530,6 +540,7 @@ def scenario_weekend_activity(row):
 def scenario_repeated_rejection_count(row):
     return (row.get('RejectionCount') or 0) >= 2
 
+
 def scenario_badge_sharing_suspected(row, badge_map=None):
     card = row.get('CardNumber')
     d = row.get('Date')
@@ -587,6 +598,7 @@ def scenario_shift_inconsistency(row):
             return (dur < med - 2.5 * std) or (dur > med + 2.5 * std)
     return False
 
+
 def scenario_trending_decline(row):
     empid = row.get('EmployeeID')
     if HIST_DF is None or HIST_DF.empty:
@@ -597,6 +609,7 @@ def scenario_trending_decline(row):
             val = rec.iloc[0].get('TrendingDecline')
             return str(val).strip().lower() == 'yes' if pd.notna(val) else False
     return False
+
 
 def scenario_consecutive_absent_days(row):
     if row.get('CountSwipes') == 0:
@@ -609,6 +622,7 @@ def scenario_consecutive_absent_days(row):
         return False
     return False
 
+
 def scenario_high_variance_duration(row):
     empid = row.get('EmployeeID')
     if HIST_DF is not None and not HIST_DF.empty and empid in HIST_DF['EmployeeID'].values:
@@ -619,10 +633,13 @@ def scenario_high_variance_duration(row):
             return (std / med) > 1.0
     return False
 
+
+
 def scenario_short_duration_on_high_presence_days(row):
     days_present = row.get('DaysPresentInWeek') or 0
     dur = row.get('DurationMinutes') or 0
     return (days_present >= 4) and (dur < 240)
+
 
 def scenario_swipe_overlap(row, swipe_overlap_map=None):
     d = row.get('Date')
@@ -953,19 +970,38 @@ def compute_features(swipes: pd.DataFrame, durations: pd.DataFrame) -> pd.DataFr
 
 
 
-# ---------- robust agg_swipe_group (replace existing definition) ----------
+
+
+
+
+
+
+
+
+
+# ---------- REPLACE EXISTING agg_swipe_group WITH THIS SINGLE SNIPPET ----------
 def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
-    # times sorted
+    """
+    Aggregator for a group of swipes (one person, one date).
+    Computes:
+      - sorted times, gaps, MaxOutInGapSeconds (strict OUT->IN pairs) and MaxSwipeGapSeconds (preferred)
+      - direction counts (tolerant substring matching)
+      - card/employee/name extraction (robust)
+      - zone-aware segments with direction lists to allow strict pattern detection
+      - totals for work/break durations and pattern detection (short->long->short with strict direction checks)
+    """
+    # --- times sorted safely ---
     times = []
     if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
         try:
             times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
         except Exception:
-            # fallback: attempt to coerce individually
             try:
                 times = sorted([pd.to_datetime(x) for x in list(g['LocaleMessageTime'].dropna())])
             except Exception:
                 times = []
+
+    # --- basic gaps and short gap count ---
     gaps = []
     short_gap_count = 0
     for i in range(1, len(times)):
@@ -975,15 +1011,45 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
             short_gap_count += 1
     max_gap = int(max(gaps)) if gaps else 0
 
-    # Direction detection: be tolerant (substring match, case-insensitive)
+    # --- strict OUT->IN gaps (only count pairs where previous direction looks like OUT and next like IN) ---
+    outin_gaps = []
+    try:
+        timeline_dir = []
+        if 'LocaleMessageTime' in g.columns:
+            try:
+                rows_sorted = g.sort_values('LocaleMessageTime')
+            except Exception:
+                rows_sorted = g
+            for _, rr in rows_sorted.iterrows():
+                try:
+                    t = pd.to_datetime(rr.get('LocaleMessageTime'))
+                except Exception:
+                    t = None
+                d = rr.get('Direction') if 'Direction' in rr else None
+                if t is not None:
+                    timeline_dir.append((t, str(d or '').strip().lower()))
+        for i in range(1, len(timeline_dir)):
+            prev_t, prev_d = timeline_dir[i-1]
+            cur_t, cur_d = timeline_dir[i]
+            prev_is_out = bool(prev_d and ('out' in prev_d or 'exit' in prev_d))
+            cur_is_in  = bool(cur_d and ('in' in cur_d))
+            if prev_is_out and cur_is_in:
+                s = (cur_t - prev_t).total_seconds()
+                if s >= 0:
+                    outin_gaps.append(s)
+    except Exception:
+        outin_gaps = []
+    max_outin_gap = int(max(outin_gaps)) if outin_gaps else 0
+
+    # --- direction tolerant counts ---
     in_count = 0
     out_count = 0
     if 'Direction' in g.columns:
         try:
             sers = g['Direction'].astype(str).fillna('').str.lower()
-            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b|in\$|in$|in\W', regex=True).sum())
-            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|out\$|out$|out\W|exit', regex=True).sum())
-            # fallback: simple containment
+            # attempt reasonably strict regex first, fall back to containment
+            in_count = int(sers.str.contains(r'\bin\b|\bin-direction\b', regex=True).sum() or 0)
+            out_count = int(sers.str.contains(r'\bout\b|\bout-direction\b|exit', regex=True).sum() or 0)
             if in_count == 0:
                 in_count = int(sers.str.contains('in', na=False).sum())
             if out_count == 0:
@@ -996,11 +1062,12 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
                 in_count = 0
                 out_count = 0
 
+    # --- unique counts and rejection ---
     unique_doors = int(g['Door'].nunique()) if 'Door' in g.columns else 0
     unique_locations = int(g['PartitionName2'].nunique()) if 'PartitionName2' in g.columns else 0
     rejection_count = int(g['Rejection_Type'].notna().sum()) if 'Rejection_Type' in g.columns else 0
 
-    # card extraction: tolerant
+    # --- card extraction tolerant ---
     card_numbers = []
     try:
         if 'CardNumber' in g.columns:
@@ -1008,14 +1075,13 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
         if not card_numbers:
             for c in g.columns:
                 lc = c.lower()
-                if 'card' in lc or 'chuid' in lc or 'value' == lc or 'xml' in lc or 'msg' in lc:
+                if 'card' in lc or 'chuid' in lc or lc == 'value' or 'xml' in lc or 'msg' in lc:
                     try:
                         vals = list(pd.unique(g[c].dropna().astype(str)))
                         if vals:
                             card_numbers.extend(vals)
                     except Exception:
                         continue
-        # xml extraction fallback
         if not card_numbers:
             for c in g.columns:
                 if 'xml' in c.lower():
@@ -1028,7 +1094,7 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
     card_numbers = list(dict.fromkeys([_normalize_id_val(x) for x in card_numbers if _normalize_id_val(x)]))
     card_number = card_numbers[0] if card_numbers else None
 
-    # stable id/name extraction (kept as before but robust)
+    # --- employee id / identity / name extraction (robust) ---
     employee_id = None
     if 'EmployeeID' in g.columns:
         try:
@@ -1084,14 +1150,12 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
     first_swipe = times[0] if times else None
     last_swipe = times[-1] if times else None
 
-    # build timeline -> segments (zone aware)
+    # --- build timeline with zone + direction for segment logic (improved) ---
     timeline = []
-    # SAFE sort/iterate: only sort when column exists, otherwise iterate rows as-is
     if 'LocaleMessageTime' in g.columns:
         try:
             rows_to_iter = g.sort_values('LocaleMessageTime')
         except Exception:
-            # older pandas or unexpected errors -> fall back to unsorted frame
             rows_to_iter = g
     else:
         rows_to_iter = g
@@ -1103,11 +1167,13 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
         zone = map_door_to_zone(dname, direction)
         timeline.append((t, dname, direction, zone))
 
+    # build segments and collect directions per segment
     segments = []
     if timeline:
         cur_zone = None
         seg_start = timeline[0][0]
         seg_label = None
+        seg_dirs = []
         for (t, dname, direction, zone) in timeline:
             lbl = 'work'
             if zone is not None and zone in _BREAK_ZONES:
@@ -1120,18 +1186,72 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
                 cur_zone = zone
                 seg_label = lbl
                 seg_start = t
+                seg_dirs = [str(direction).strip().lower() if direction is not None else '']
             else:
                 if lbl != seg_label:
-                    segments.append({'label': seg_label, 'start': seg_start, 'end': t, 'start_zone': cur_zone})
+                    segments.append({
+                        'label': seg_label,
+                        'start': seg_start,
+                        'end': t,
+                        'start_zone': cur_zone,
+                        'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
+                    })
                     seg_start = t
                     seg_label = lbl
+                    seg_dirs = [str(direction).strip().lower() if direction is not None else '']
                     cur_zone = zone
                 else:
+                    seg_dirs.append(str(direction).strip().lower() if direction is not None else '')
                     cur_zone = cur_zone or zone
+        # push final seg
         if seg_label is not None:
-            segments.append({'label': seg_label, 'start': seg_start, 'end': timeline[-1][0], 'start_zone': cur_zone})
+            segments.append({
+                'label': seg_label,
+                'start': seg_start,
+                'end': timeline[-1][0],
+                'start_zone': cur_zone,
+                'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
+            })
 
-    # compute durations
+    # --- compute durations & stats per segment and detect pattern short->long->short with strict direction checks ---
+    pattern_flag = False
+    pattern_sequence_readable = None
+    try:
+        seq = []
+        for s in segments:
+            dur_mins = 0
+            try:
+                dur_mins = int(round(((s['end'] - s['start']).total_seconds() / 60.0))) if (s.get('start') and s.get('end')) else 0
+            except Exception:
+                dur_mins = 0
+            first_dir = s['dirs'][0] if s.get('dirs') and len(s['dirs'])>0 else ''
+            last_dir = s['dirs'][-1] if s.get('dirs') and len(s['dirs'])>0 else ''
+            seq.append({
+                'label': s.get('label'),
+                'mins': dur_mins,
+                'first_dir': first_dir,
+                'last_dir': last_dir
+            })
+        # thresholds: short < 60 min; long >= 4.5 hours (270 min)
+        SHORT_MAX = 60
+        LONG_MIN = int(4.5 * 60)
+        for i in range(len(seq)-2):
+            a = seq[i]; b = seq[i+1]; c = seq[i+2]
+            if (a['label'] == 'work' and a['mins'] < SHORT_MAX) and \
+               (b['label'] in ('break','out_of_office') and b['mins'] >= LONG_MIN) and \
+               (c['label'] == 'work' and c['mins'] < SHORT_MAX):
+                # strict direction check: last direction of a should include 'out', first direction of c should include 'in'
+                a_last_out = (a.get('last_dir') and ('out' in a.get('last_dir')))
+                c_first_in = (c.get('first_dir') and ('in' in c.get('first_dir')))
+                if a_last_out and c_first_in:
+                    pattern_flag = True
+                    pattern_sequence_readable = f"work_short ({a['mins']}m) -> out_long ({b['mins']}m) -> work_short ({c['mins']}m)"
+                    break
+    except Exception:
+        pattern_flag = False
+        pattern_sequence_readable = None
+
+    # compute total work/break minutes and other segment-level stats
     total_work_minutes = 0.0
     total_break_minutes = 0.0
     longest_break_minutes = 0.0
@@ -1154,34 +1274,18 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
 
     break_dominant = bool(total_break_minutes > total_work_minutes and total_break_minutes > 0)
     break_more_than_4h = bool(total_break_minutes >= 240)
-
     break_count = int(break_segments_count)
     long_break_count = int(sum(1 for s in segments
                                if s.get('label') in ('break','out_of_office') and
                                   (s.get('start') is not None and s.get('end') is not None and ((s['end'] - s['start']).total_seconds()/60.0) >= 120)))
 
-    # pattern detection (unchanged)
-    pattern_flag = False
-    pattern_sequence_readable = None
-    try:
-        seq = []
-        for s in segments:
-            dur_mins = (s['end'] - s['start']).total_seconds() / 60.0 if (s['end'] and s['start']) else 0
-            seq.append((s['label'], int(round(dur_mins))))
-        for i in range(len(seq)-2):
-            a = seq[i]; b = seq[i+1]; c = seq[i+2]
-            if (a[0] == 'work' and a[1] < 60) and (b[0] in ('out_of_office','break') and b[1] >= 120) and (c[0] == 'work' and c[1] < 60):
-                pattern_flag = True
-                seq_fragment = [a,b,c]
-                pattern_sequence_readable = " -> ".join([f"{lbl} ({mins}m)" for lbl, mins in seq_fragment])
-                break
-    except Exception:
-        pattern_flag = False
-        pattern_sequence_readable = None
+    # prefer MaxOutInGapSeconds when available
+    final_max_gap = int(max_outin_gap) if int(max_outin_gap) > 0 else int(max_gap)
 
     return pd.Series({
         'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
-        'MaxSwipeGapSeconds': int(max_gap),
+        'MaxSwipeGapSeconds': final_max_gap,
+        'MaxOutInGapSeconds': int(max_outin_gap),
         'ShortGapCount': int(short_gap_count),
         'InCount': int(in_count),
         'OutCount': int(out_count),
@@ -1212,7 +1316,7 @@ def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
 
 # ---------------- SCENARIO WEIGHTS ----------------
 WEIGHTS = {
-    "long_gap_>=4.5h": 1.3,
+    "long_gap_>=4.5h": 2.5,
     "short_duration_<4h": 1.0,
     "coffee_badging": 1.0,
     "low_swipe_count_<=5": 0.5,
@@ -1241,8 +1345,6 @@ WEIGHTS = {
     "shortstay_longout_repeat": 2.0
 }
 ANOMALY_THRESHOLD = 1.5
-
-
 
 
 # ---------- small improvement in _read_past_trend_csvs: normalize 'date' column name ----------
@@ -2111,6 +2213,17 @@ def _slug_city(city: str) -> str:
     return str(city).strip().lower().replace(" ", "_")
 
 
+
+
+
+
+
+
+
+
+
+
+
 def run_trend_for_date(target_date: date,
                        regions: Optional[List[str]] = None,
                        outdir: str = None,
@@ -2467,8 +2580,35 @@ def run_trend_for_date(target_date: date,
 
     #trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date)
 
+
     trend_df = score_trends_from_durations(merged, swipes_df=sw_combined, outdir=str(outdir_path), target_date=target_date, window_days=window_days)
 
+    # --- ensure per-day trend CSV is written so subsequent date-runs in the same process can see history ---
+    try:
+        if trend_df is not None and not getattr(trend_df, 'empty', True):
+            try:
+                outfile = Path(outdir_path) / f"trend_{city_slug}_{target_date.strftime('%Y%m%d')}.csv"
+                # normalize datetime columns for CSV
+                tmp_write = trend_df.copy()
+                for dtcol in ('FirstSwipe', 'LastSwipe'):
+                    if dtcol in tmp_write.columns:
+                        try:
+                            tmp_write[dtcol] = pd.to_datetime(tmp_write[dtcol], errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
+                        except Exception:
+                            pass
+                if 'Date' in tmp_write.columns:
+                    try:
+                        tmp_write['Date'] = pd.to_datetime(tmp_write['Date'], errors='coerce').dt.date
+                        tmp_write['Date'] = tmp_write['Date'].apply(lambda d: d.isoformat() if pd.notna(d) else None)
+                    except Exception:
+                        pass
+                tmp_write = tmp_write.where(pd.notnull(tmp_write), None)
+                tmp_write.to_csv(outfile, index=False)
+                logging.info("run_trend_for_date: wrote trend CSV %s", outfile)
+            except Exception:
+                logging.exception("run_trend_for_date: failed to write per-day trend CSV for %s", target_date)
+    except Exception:
+        logging.exception("run_trend_for_date: error while attempting to persist trend CSV")
     # write csv (use city_slug, not hard-coded 'pune')
     try:
         write_df = trend_df.copy()
