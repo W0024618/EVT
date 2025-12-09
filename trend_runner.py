@@ -69,7 +69,7 @@ def _enrich_with_personnel_info(df, image_endpoint_template="/employee/{}/image"
                 break
         cand_uid = row.get('EmployeeIdentity') or row.get('person_uid') or None
 
-        # 1) try the personnel helper if available
+        # 1) try the personnel helper if availabl
         if get_personnel_info:
             try:
                 lookup = cand_empid or cand_uid
