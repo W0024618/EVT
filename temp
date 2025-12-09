@@ -1,3 +1,389 @@
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust, defensive implementation that:
+     - accepts a swipes dataframe (may be empty)
+     - ensures expected columns exist
+     - deduplicates near-duplicate swipes (rounded to seconds)
+     - assigns Date from LocaleMessageTime (strict local wall-time date)
+     - groups by person_uid + Date and computes first/last, counts and durations
+     - SPECIAL: for shift locations (LT.Vilnius, Quezon City) splits a person's stream
+       into shifts where inactivity gap > SHIFT_GAP_HOURS (default 4.5h) and applies
+       post-processing merge rules for gaps in 6-8 hours where the next segment is small/short.
+    """
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "DurationMinutes", "DurationDisplay", "DurationHMS",
+        "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+
+    # quick return for empty input
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # work on a copy
+    df = swipes_df.copy()
+
+    # ensure expected columns exist so later code can always reference them
+    expected = [
+        "EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+        "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"
+    ]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    # parse datetimes robustly
+    try:
+        if df["LocaleMessageTime"].dtype == object:
+            df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    # drop near-duplicate swipes (round to seconds)
+    try:
+        df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+        dedupe_subset = ["person_uid", "_lts_rounded", "CardNumber"]
+        if df["person_uid"].isnull().all():
+            dedupe_subset = ["EmployeeIdentity", "_lts_rounded", "CardNumber"]
+        df = df.drop_duplicates(subset=dedupe_subset, keep="first").copy()
+    except Exception:
+        try:
+            df = df.drop_duplicates(subset=["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber"], keep="first")
+        except Exception:
+            pass
+
+    # Date assignment (strict local date)
+    try:
+        df["Date"] = df["LocaleMessageTime"].dt.date
+    except Exception:
+        try:
+            df["Date"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce").dt.date
+        except Exception:
+            df["Date"] = None
+
+    # ensure person_uid column exists; fallback to a stable join key if missing
+    if "person_uid" not in df.columns or df["person_uid"].isnull().all():
+        def make_person_uid(row):
+            try:
+                for cand in ("EmployeeID", "Int1", "Text12"):
+                    if cand in row and row.get(cand) not in (None, '', float('nan')):
+                        s = str(row.get(cand)).strip()
+                        if s:
+                            return s
+                if row.get("EmployeeIdentity") not in (None, '', float('nan')):
+                    return str(row.get("EmployeeIdentity")).strip()
+                if row.get("EmployeeName") not in (None, '', float('nan')):
+                    return str(row.get("EmployeeName")).strip()
+            except Exception:
+                pass
+            return None
+        df["person_uid"] = df.apply(make_person_uid, axis=1)
+
+    # drop rows with no person_uid or no Date (they are not groupable)
+    df = df[df["person_uid"].notna() & df["Date"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # --------- NEW: split shift-locations vs normal locations ----------
+    # canonical partition names that require shift-segmentation
+    SHIFT_LOCATIONS = set(["LT.Vilnius", "Quezon City"])
+    # gap threshold (hours) - configurable via env var SHIFT_GAP_HOURS
+    try:
+        gap_hours = float(os.getenv("SHIFT_GAP_HOURS", "4.5"))
+    except Exception:
+        gap_hours = 4.5
+    SHIFT_GAP_SECONDS = int(round(gap_hours * 3600.0))
+
+    # Merge-rule constants (as per your request)
+    MERGE_GAP_MIN_HOURS = 6.0
+    MERGE_GAP_MAX_HOURS = 8.0
+    MERGE_GAP_MIN_SECONDS = int(MERGE_GAP_MIN_HOURS * 3600)
+    MERGE_GAP_MAX_SECONDS = int(MERGE_GAP_MAX_HOURS * 3600)
+    MERGE_MAX_SWIPES = 5        # merge when next segment CountSwipes < 5
+    MERGE_MAX_DURATION_SECONDS = 2 * 3600  # merge when next segment duration < 2 hours
+    # If next segment is >= 4h or swipes >=5 we keep as new shift (default behaviour)
+
+    # mark which rows are shift-loc rows
+    try:
+        df["_is_shift_loc"] = df["PartitionName2"].apply(lambda x: (str(x) in SHIFT_LOCATIONS))
+    except Exception:
+        df["_is_shift_loc"] = False
+
+    normal_df = df[~df["_is_shift_loc"]].copy()
+    shift_df = df[df["_is_shift_loc"]].copy()
+
+    grouped_parts = []
+
+    # ---------- EXISTING logic for normal locations (unchanged) ----------
+    if not normal_df.empty:
+        try:
+            normal_df = normal_df.sort_values(["person_uid", "Date", "LocaleMessageTime"])
+            grp = normal_df.groupby(["person_uid", "Date"], sort=False).agg(
+                FirstSwipe=("LocaleMessageTime", "first"),
+                LastSwipe=("LocaleMessageTime", "last"),
+                FirstDoor=("Door", "first"),
+                LastDoor=("Door", "last"),
+                CountSwipes=("LocaleMessageTime", "count"),
+                EmployeeIdentity=("EmployeeIdentity", "first"),
+                EmployeeID=("EmployeeID", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                EmployeeName=("EmployeeName", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                CardNumber=("CardNumber", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                PersonnelTypeName=("PersonnelTypeName", "first"),
+                PartitionName2=("PartitionName2", "first"),
+                CompanyName=("CompanyName", "first"),
+                PrimaryLocation=("PrimaryLocation", "first"),
+                FirstDirection=("Direction", "first"),
+                LastDirection=("Direction", "last")
+            ).reset_index()
+        except Exception:
+            def agg_for_group(g):
+                g_sorted = g.sort_values("LocaleMessageTime")
+                first = g_sorted.iloc[0]
+                last = g_sorted.iloc[-1]
+                empid = _pick_first_non_guid_value(g_sorted["EmployeeID"]) if "EmployeeID" in g_sorted else first.get("EmployeeID")
+                ename = _pick_first_non_guid_value(g_sorted["EmployeeName"]) if "EmployeeName" in g_sorted else first.get("EmployeeName")
+                cnum = _pick_first_non_guid_value(g_sorted["CardNumber"]) if "CardNumber" in g_sorted else first.get("CardNumber")
+                return pd.Series({
+                    "person_uid": first["person_uid"],
+                    "EmployeeIdentity": first.get("EmployeeIdentity"),
+                    "EmployeeID": empid,
+                    "EmployeeName": ename,
+                    "CardNumber": cnum,
+                    "Date": first["Date"],
+                    "FirstSwipe": first["LocaleMessageTime"],
+                    "LastSwipe": last["LocaleMessageTime"],
+                    "FirstDoor": first.get("Door"),
+                    "LastDoor": last.get("Door"),
+                    "CountSwipes": int(len(g_sorted)),
+                    "PersonnelTypeName": first.get("PersonnelTypeName"),
+                    "PartitionName2": first.get("PartitionName2"),
+                    "CompanyName": first.get("CompanyName"),
+                    "PrimaryLocation": first.get("PrimaryLocation"),
+                    "FirstDirection": first.get("Direction"),
+                    "LastDirection": last.get("Direction")
+                })
+            grp = normal_df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+        grouped_parts.append(grp)
+
+    # ---------- NEW block: SHIFT logic for LT.Vilnius and Quezon City ----------
+    if not shift_df.empty:
+        # sort and compute previous timestamp per person
+        shift_df = shift_df.sort_values(["person_uid", "LocaleMessageTime"]).copy()
+        shift_df["_prev_ts"] = shift_df.groupby("person_uid")["LocaleMessageTime"].shift(1)
+        shift_df["_gap_seconds"] = (shift_df["LocaleMessageTime"] - shift_df["_prev_ts"]).dt.total_seconds().fillna(0).astype(float)
+
+        # mark new segment when gap > threshold (first row will have gap=0 -> new segment start)
+        shift_df["_new_segment"] = (shift_df["_gap_seconds"] > float(SHIFT_GAP_SECONDS)).astype(int)
+        # cumulative segment id per person (first segment will be 0 or 1 depending on cumsum)
+        shift_df["_segment_id"] = shift_df.groupby("person_uid")["_new_segment"].cumsum()
+
+        # aggregate per person_uid + segment_id
+        try:
+            shift_grp = shift_df.groupby(["person_uid", "_segment_id"], sort=False).agg(
+                FirstSwipe=("LocaleMessageTime", "first"),
+                LastSwipe=("LocaleMessageTime", "last"),
+                FirstDoor=("Door", "first"),
+                LastDoor=("Door", "last"),
+                CountSwipes=("LocaleMessageTime", "count"),
+                EmployeeIdentity=("EmployeeIdentity", "first"),
+                EmployeeID=("EmployeeID", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                EmployeeName=("EmployeeName", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                CardNumber=("CardNumber", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+                PersonnelTypeName=("PersonnelTypeName", "first"),
+                PartitionName2=("PartitionName2", "first"),
+                CompanyName=("CompanyName", "first"),
+                PrimaryLocation=("PrimaryLocation", "first"),
+                FirstDirection=("Direction", "first"),
+                LastDirection=("Direction", "last")
+            ).reset_index()
+        except Exception:
+            def agg_seg(g):
+                g_sorted = g.sort_values("LocaleMessageTime")
+                first = g_sorted.iloc[0]
+                last = g_sorted.iloc[-1]
+                empid = _pick_first_non_guid_value(g_sorted["EmployeeID"]) if "EmployeeID" in g_sorted else first.get("EmployeeID")
+                ename = _pick_first_non_guid_value(g_sorted["EmployeeName"]) if "EmployeeName" in g_sorted else first.get("EmployeeName")
+                cnum = _pick_first_non_guid_value(g_sorted["CardNumber"]) if "CardNumber" in g_sorted else first.get("CardNumber")
+                return pd.Series({
+                    "person_uid": first["person_uid"],
+                    "EmployeeIdentity": first.get("EmployeeIdentity"),
+                    "EmployeeID": empid,
+                    "EmployeeName": ename,
+                    "CardNumber": cnum,
+                    "FirstSwipe": first["LocaleMessageTime"],
+                    "LastSwipe": last["LocaleMessageTime"],
+                    "FirstDoor": first.get("Door"),
+                    "LastDoor": last.get("Door"),
+                    "CountSwipes": int(len(g_sorted)),
+                    "PersonnelTypeName": first.get("PersonnelTypeName"),
+                    "PartitionName2": first.get("PartitionName2"),
+                    "CompanyName": first.get("CompanyName"),
+                    "PrimaryLocation": first.get("PrimaryLocation"),
+                    "FirstDirection": first.get("Direction"),
+                    "LastDirection": last.get("Direction")
+                })
+            shift_grp = shift_df.groupby(["person_uid", "_segment_id"], sort=False).apply(agg_seg).reset_index(drop=True)
+
+        # compute segment durations now (we need them for merge logic)
+        shift_grp["FirstSwipe"] = pd.to_datetime(shift_grp["FirstSwipe"], errors="coerce")
+        shift_grp["LastSwipe"] = pd.to_datetime(shift_grp["LastSwipe"], errors="coerce")
+        shift_grp["SegmentDurationSeconds"] = (shift_grp["LastSwipe"] - shift_grp["FirstSwipe"]).dt.total_seconds().clip(lower=0).fillna(0).astype(float)
+
+        # Now perform per-person segment merging according to the new rules:
+        merged_rows = []
+        for person, person_df in shift_grp.groupby("person_uid", sort=False):
+            # sort person's segments by FirstSwipe
+            pseg = person_df.sort_values("FirstSwipe").reset_index(drop=True)
+            if pseg.shape[0] == 0:
+                continue
+            # start with the first segment as current_merged
+            cur = pseg.loc[0].to_dict()
+            # add a helper to ensure numeric types
+            cur["CountSwipes"] = int(cur.get("CountSwipes", 0) or 0)
+            for i in range(1, len(pseg)):
+                nxt = pseg.loc[i].to_dict()
+                # compute gap between segments (nxt.FirstSwipe - cur.LastSwipe)
+                try:
+                    gap_sec = (pd.to_datetime(nxt["FirstSwipe"]) - pd.to_datetime(cur["LastSwipe"])).total_seconds()
+                    if np.isnan(gap_sec):
+                        gap_sec = float("inf")
+                except Exception:
+                    gap_sec = float("inf")
+
+                # default: do not merge
+                do_merge = False
+
+                # Merge-case: gap in [6h,8h] AND next segment small in swipes (<5) AND next segment short (<2h)
+                if MERGE_GAP_MIN_SECONDS <= gap_sec <= MERGE_GAP_MAX_SECONDS:
+                    nxt_swipes = int(nxt.get("CountSwipes", 0) or 0)
+                    nxt_dur = float(nxt.get("SegmentDurationSeconds", 0) or 0)
+                    if (nxt_swipes < MERGE_MAX_SWIPES) and (nxt_dur < MERGE_MAX_DURATION_SECONDS):
+                        do_merge = True
+
+                # If we decide to merge, extend cur to include nxt
+                if do_merge:
+                    # update LastSwipe, LastDoor, LastDirection, CountSwipes, SegmentDurationSeconds, LastSwipe values
+                    try:
+                        cur["LastSwipe"] = max(pd.to_datetime(cur["LastSwipe"]), pd.to_datetime(nxt["LastSwipe"]))
+                    except Exception:
+                        cur["LastSwipe"] = nxt.get("LastSwipe") or cur.get("LastSwipe")
+                    cur["LastDoor"] = nxt.get("LastDoor") or cur.get("LastDoor")
+                    cur["LastDirection"] = nxt.get("LastDirection") or cur.get("LastDirection")
+                    cur["CountSwipes"] = int(cur.get("CountSwipes", 0) or 0) + int(nxt.get("CountSwipes", 0) or 0)
+                    # recompute segment duration seconds
+                    try:
+                        cur_fd = pd.to_datetime(cur["FirstSwipe"])
+                        cur_ld = pd.to_datetime(cur["LastSwipe"])
+                        cur["SegmentDurationSeconds"] = max(0.0, (cur_ld - cur_fd).total_seconds())
+                    except Exception:
+                        pass
+                    # keep other first-* fields as-is (first swipe, first door, etc)
+                else:
+                    # finalize current and start new current
+                    merged_rows.append(cur)
+                    cur = nxt
+                    cur["CountSwipes"] = int(cur.get("CountSwipes", 0) or 0)
+
+            # append last current
+            merged_rows.append(cur)
+
+        # build DataFrame from merged_rows and map to columns expected by grouped_parts
+        if merged_rows:
+            merged_df = pd.DataFrame(merged_rows)
+            # normalize columns that may be missing
+            for c in ["FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes", "EmployeeIdentity",
+                      "EmployeeID", "EmployeeName", "CardNumber", "PersonnelTypeName", "PartitionName2",
+                      "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection", "SegmentDurationSeconds", "person_uid"]:
+                if c not in merged_df.columns:
+                    merged_df[c] = None
+
+            # rename SegmentDurationSeconds -> DurationSeconds for later common processing
+            merged_df = merged_df.rename(columns={"SegmentDurationSeconds": "DurationSeconds"})
+
+            # ensure Date = date of FirstSwipe (shift start)
+            merged_df["FirstSwipe"] = pd.to_datetime(merged_df["FirstSwipe"], errors="coerce")
+            merged_df["LastSwipe"] = pd.to_datetime(merged_df["LastSwipe"], errors="coerce")
+            merged_df["Date"] = merged_df["FirstSwipe"].dt.date
+
+            # keep only needed columns (some may be None) - we'll compute DurationSeconds later globally if needed
+            grouped_parts.append(merged_df)
+        else:
+            # no merged rows (edge-case) – skip
+            pass
+
+    # concat results
+    if grouped_parts:
+        grouped = pd.concat(grouped_parts, ignore_index=True, sort=False)
+    else:
+        return pd.DataFrame(columns=out_cols)
+
+    # If DurationSeconds not present (normal_df path created it later) compute it now (for merged shift segments we already have DurationSeconds column)
+    if "DurationSeconds" not in grouped.columns or grouped["DurationSeconds"].isnull().all():
+        grouped["DurationSeconds"] = (pd.to_datetime(grouped["LastSwipe"]) - pd.to_datetime(grouped["FirstSwipe"])).dt.total_seconds().clip(lower=0)
+
+    # format Duration as H:MM string (hours can exceed 24)
+    def _seconds_to_hhmm(seconds_val):
+        try:
+            if seconds_val is None or (isinstance(seconds_val, float) and np.isnan(seconds_val)):
+                return None
+            total = int(round(float(seconds_val)))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            return f"{hours}:{minutes:02d}"
+        except Exception:
+            return None
+
+    grouped["Duration"] = grouped["DurationSeconds"].apply(_seconds_to_hhmm)
+
+    # human readable minutes and hms representations
+    def _format_minutes_to_hhmm(seconds_val):
+        try:
+            if seconds_val is None or (isinstance(seconds_val, float) and np.isnan(seconds_val)):
+                return None
+            total_minutes = int(round(float(seconds_val) / 60.0))
+            h = total_minutes // 60
+            m = total_minutes % 60
+            return f"{h}h {m}m"
+        except Exception:
+            return None
+
+    grouped["DurationMinutes"] = grouped["DurationSeconds"].apply(lambda s: int(round(float(s) / 60.0)) if pd.notna(s) else None)
+    grouped["DurationDisplay"] = grouped["DurationSeconds"].apply(_format_minutes_to_hhmm)
+    grouped["DurationHMS"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    # ensure all requested out_cols exist (stable ordering)
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    # drop helper columns if present
+    for helper in ("_lts_rounded", "_prev_ts", "_gap_seconds", "_new_segment", "_segment_id", "_is_shift_loc"):
+        if helper in grouped.columns:
+            try:
+                grouped = grouped.drop(columns=[helper])
+            except Exception:
+                pass
+
+    # final column ordering and return
+    return grouped[out_cols]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # backend/duration_report.py
 from __future__ import annotations
 
