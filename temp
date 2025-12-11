@@ -1,1 +1,1065 @@
 
+# backend/duration_report.py
+from __future__ import annotations
+
+import logging
+import os
+import re
+import warnings
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+import numpy as np
+import hashlib
+
+try:
+    import pyodbc
+except Exception:
+    pyodbc = None
+
+# Log available drivers at import time for easier debugging
+if pyodbc:
+    try:
+        logging.info("pyodbc available. Installed ODBC drivers: %s", pyodbc.drivers())
+    except Exception:
+        logging.info("pyodbc available but failed to list drivers.")
+else:
+    logging.warning("pyodbc not importable in this environment (pyodbc=None).")
+
+# ODBC driver name (can be overridden by env var ODBC_DRIVER)
+ODBC_DRIVER = os.getenv("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# Try to import shared door/zone helpers from config; fall back to a small local implementation if missing.
+try:
+    from config.door_zone import map_door_to_zone, BREAK_ZONES, OUT_OF_OFFICE_ZONE
+except Exception:
+    # fallback — keep behaviour if config file unavailable
+    BREAK_ZONES = set(["East Outdoor Area", "West Outdoor Area", "Assembly Area"])
+    OUT_OF_OFFICE_ZONE = "Out of office"
+
+    def map_door_to_zone(door: object, direction: object = None) -> str:
+        """
+        Fallback: Map a raw Door string (and optionally Direction) to a logical zone.
+        """
+        try:
+            if door is None:
+                return None
+            s = str(door).strip()
+            if not s:
+                return None
+            s_l = s.lower()
+            if direction and isinstance(direction, str):
+                d = direction.strip().lower()
+                if "out" in d:
+                    return OUT_OF_OFFICE_ZONE
+                if "in" in d:
+                    return "Reception Area"
+            if "out" in s_l or "exit" in s_l or ("turnstile" in s_l and "out" in s_l):
+                return OUT_OF_OFFICE_ZONE
+            return "Working Area"
+        except Exception:
+            return None
+
+# REGION configuration - databases list used to build UNION queries
+REGION_CONFIG = {
+    "apac": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUPNQ0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["APAC.Default", "SG.Singapore", "PH.Manila","IN.HYD"]
+    },
+    "emea": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUFRA0986V",
+        "databases": [
+            "ACVSUJournal_00011029","ACVSUJournal_00011028","ACVSUJournal_00011027",
+            "ACVSUJournal_00011026","ACVSUJournal_00011025","ACVSUJournal_00011024",
+            "ACVSUJournal_00011023","ACVSUJournal_00011022","CVSUJournal_00011021"
+        ],
+        "partitions": ["LT.Vilnius","AUT.Vienna","MA.Casablanca","RU.Moscow","IT.Rome","UK.London","IE.DUblin",
+                        "DU.Abu Dhab", "ES.Madrid"]
+    },
+    "laca": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUSJO0986V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["AR.Cordoba", "BR.Sao Paulo", "CR.Costa Rica Partition","PA.Panama City","PE.Lima", "MX.Mexico City"]
+    },
+    "namer": {
+        "user": "GSOC_Test",
+        "password": "Westernccuredb@2026",
+        "server": "SRVWUDEN0891V",
+        "databases": [
+            "ACVSUJournal_00010030","ACVSUJournal_00010029","ACVSUJournal_00010028",
+            "ACVSUJournal_00010027","ACVSUJournal_00010026","ACVSUJournal_00010025"
+        ],
+        "partitions": ["US.CO.OBS", "USA/Canada Default", "US.FL.Miami", "US.NYC"],
+        "logical_like": ["%HQ%", "%Austin%", "%Miami%", "%NYC%"]
+    }
+}
+
+# logic in this file no longer depends on it for date assignment.
+GENERIC_SQL_TEMPLATE = r"""
+SELECT
+    t1.[ObjectName1] AS EmployeeName,
+    t1.[ObjectName2] AS Door,
+    CASE WHEN t3.[Name] IN ('Contractor','Terminated Contractor') THEN t2.[Text12] ELSE CAST(t2.[Int1] AS NVARCHAR) END AS EmployeeID,
+    t2.[Int1] AS Int1,
+    t2.[Text12] AS Text12,
+    t_xml.XmlMessage AS XmlMessage,
+    sc.value AS XmlShredValue,
+    COALESCE(
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID/Card)[1]','varchar(50)'),
+      TRY_CAST(t_xml.XmlMessage AS XML).value('(/LogMessage/CHUID)[1]','varchar(50)'),
+      sc.value,
+      NULLIF(CAST(t2.[Int1] AS NVARCHAR),'0'),
+      t2.[Text12]
+    ) AS CardNumber,
+    t3.[Name] AS PersonnelTypeName,
+    t1.ObjectIdentity1 AS EmployeeIdentity,
+    t1.PartitionName2,
+    DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC]) AS LocaleMessageTime,
+    DATEADD(HOUR, -2, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) AS AdjustedMessageTime,
+    t1.MessageType,
+    t5d.value AS Direction,
+    t2.Text4 AS CompanyName,
+    t2.Text5 AS PrimaryLocation
+FROM [{db}].dbo.ACVSUJournalLog AS t1
+LEFT JOIN ACVSCore.Access.Personnel AS t2 ON t1.ObjectIdentity1 = t2.GUID
+LEFT JOIN ACVSCore.Access.PersonnelType AS t3 ON t2.PersonnelTypeID = t3.ObjectID
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxmlShred t5d
+  ON t1.XmlGUID = t5d.GUID AND t5d.Value IN ('InDirection','OutDirection')
+LEFT JOIN [{db}].dbo.ACVSUJournalLogxml t_xml
+  ON t1.XmlGUID = t_xml.GUID
+LEFT JOIN (
+  SELECT GUID, value
+  FROM [{db}].dbo.ACVSUJournalLogxmlShred
+  WHERE Name IN ('Card','CHUID')
+) AS sc
+  ON t1.XmlGUID = sc.GUID
+WHERE t1.MessageType = 'CardAdmitted'
+  AND t3.[Name] = 'Employee'
+  {date_condition}
+  {region_filter}
+"""
+
+# -------------------- helpers and utilities --------------------
+
+def _split_db_name(dbname: str):
+    m = re.match(r"^(.*?)(\d+)$", dbname)
+    if not m:
+        return dbname, None
+    return m.group(1), m.group(2)
+
+def _expand_databases_from_base(db_base: str, last_n: int) -> List[str]:
+    prefix, digits = _split_db_name(db_base)
+    if digits is None:
+        return [db_base]
+    width = len(digits)
+    try:
+        cur = int(digits)
+    except Exception:
+        return [db_base]
+    out = []
+    for i in range(last_n):
+        num = cur - i
+        if num < 0:
+            break
+        out.append(f"{prefix}{str(num).zfill(width)}")
+    return out
+
+# GUID / placeholders helpers
+_GUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$')
+_PLACEHOLDER_STRS = set(['', 'nan', 'na', 'n/a', '-', '—', '–', 'none', 'null'])
+
+def _strip_person_uid_prefix(token: object) -> Optional[str]:
+    if token is None:
+        return None
+    try:
+        s = str(token).strip()
+        if not s:
+            return None
+        if ':' in s:
+            prefix, rest = s.split(':', 1)
+            if prefix.lower() in ('emp', 'uid', 'name'):
+                rest = rest.strip()
+                if rest:
+                    return rest
+        return s
+    except Exception:
+        return None
+
+# alias
+def _strip_uid_prefix(token: object) -> Optional[str]:
+    return _strip_person_uid_prefix(token)
+
+def _looks_like_guid(s: object) -> bool:
+    try:
+        if s is None:
+            return False
+        st = str(s).strip()
+        if not st:
+            return False
+        return bool(_GUID_RE.match(st))
+    except Exception:
+        return False
+
+def _is_placeholder_str(s: object) -> bool:
+    try:
+        if s is None:
+            return True
+        st = str(s).strip().lower()
+        return st in _PLACEHOLDER_STRS
+    except Exception:
+        return False
+
+def _pick_first_non_guid_value(series):
+    for v in series:
+        if v is None:
+            continue
+        try:
+            s = str(v).strip()
+        except Exception:
+            continue
+        if not s:
+            continue
+        if _is_placeholder_str(s):
+            continue
+        if _looks_like_guid(s):
+            continue
+        return s
+    return None
+
+def _canonical_person_uid_from_row(row):
+    empid = None
+    for cand in ('EmployeeID', 'Int1', 'Text12'):
+        if cand in row and row.get(cand) not in (None, '', float('nan')):
+            empid = row.get(cand)
+            break
+    empident = row.get("EmployeeIdentity", None)
+    name = row.get("EmployeeName", None)
+
+    # normalize empid numeric floats -> ints
+    if empid is not None:
+        try:
+            s = str(empid).strip()
+            if '.' in s:
+                f = float(s)
+                if f.is_integer():
+                    s = str(int(f))
+            if s and not _looks_like_guid(s) and not _is_placeholder_str(s):
+                return f"emp:{s}"
+        except Exception:
+            pass
+
+    if empident not in (None, '', float('nan')):
+        try:
+            si = str(empident).strip()
+            if si:
+                return f"uid:{si}"
+        except Exception:
+            pass
+
+    if name not in (None, '', float('nan')):
+        try:
+            sn = str(name).strip()
+            if sn and not _looks_like_guid(sn) and not _is_placeholder_str(sn):
+                h = hashlib.sha1(sn.lower().encode('utf8')).hexdigest()[:10]
+                return f"name:{h}"
+        except Exception:
+            pass
+
+    return None
+
+def _get_candidate_databases(rc: Dict[str, Any]) -> List[str]:
+    if "databases" in rc and isinstance(rc["databases"], list) and rc["databases"]:
+        return rc["databases"]
+    base_db = rc.get("database")
+    if not base_db:
+        return []
+    last_n = int(rc.get("last_n_databases", 1) or 1)
+    if last_n <= 1:
+        return [base_db]
+    return _expand_databases_from_base(base_db, last_n)
+
+# -------------------- ODBC driver selection & connections --------------------
+
+def _pick_odbc_driver() -> str:
+    """
+    Heuristic to pick a usable ODBC driver string for pyodbc on the host.
+    Preference order:
+      1) ODBC_DRIVER env var (explicit)
+      2) prefer modern MS drivers (18,17) if installed
+      3) fall back to any installed driver returned by pyodbc.drivers()
+      4) fallback to the module-level ODBC_DRIVER constant
+    """
+    # 1) env override
+    env_driver = os.getenv("ODBC_DRIVER")
+    if env_driver:
+        logging.debug("Using ODBC driver from ODBC_DRIVER env: %s", env_driver)
+        return env_driver
+
+    if pyodbc is None:
+        logging.debug("pyodbc not available; returning constant driver: %s", ODBC_DRIVER)
+        return ODBC_DRIVER
+
+    try:
+        installed = pyodbc.drivers() or []
+    except Exception:
+        installed = []
+
+    preferred = [
+        "ODBC Driver 18 for SQL Server",
+        "ODBC Driver 17 for SQL Server",
+        "SQL Server Native Client 11.0",
+        "SQL Server"
+    ]
+
+    for pref in preferred:
+        for d in installed:
+            if pref.lower() in d.lower():
+                logging.debug("Selected installed ODBC driver '%s' (matched preference '%s')", d, pref)
+                return d
+
+    if installed:
+        logging.debug("No preferred driver matched; using first installed driver: %s", installed[0])
+        return installed[0]
+
+    logging.debug("No installed drivers found; falling back to constant: %s", ODBC_DRIVER)
+    return ODBC_DRIVER
+
+def _connect_master(rc: Dict[str, Any]):
+    """
+    Connect to the master DB on the server for DB discovery.
+    Returns a pyodbc connection or None on failure (we log exceptions).
+    """
+    if pyodbc is None:
+        logging.debug("pyodbc not available; cannot connect to master for DB discovery.")
+        return None
+
+    # pick a driver and attempt
+    driver = _pick_odbc_driver()
+    conn_str = (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+        "TrustServerCertificate=Yes;"
+    )
+
+    try:
+        logging.debug("Attempting master connection using driver '%s' to server '%s'", driver, rc.get("server"))
+        return pyodbc.connect(conn_str, autocommit=True)
+    except Exception:
+        logging.exception("Failed to connect to master DB using driver '%s' for server %s", driver, rc.get("server"))
+
+    # try alternates if available
+    try:
+        installed = pyodbc.drivers() or []
+    except Exception:
+        installed = []
+
+    for alt in installed:
+        if alt == driver:
+            continue
+        try:
+            alt_conn_str = (
+                f"DRIVER={{{alt}}};"
+                f"SERVER={rc['server']};DATABASE=master;UID={rc['user']};PWD={rc['password']};"
+                "TrustServerCertificate=Yes;"
+            )
+            logging.debug("Attempting master connection using alternate driver '%s' to server '%s'", alt, rc.get("server"))
+            return pyodbc.connect(alt_conn_str, autocommit=True)
+        except Exception:
+            logging.exception("Alternate driver '%s' failed for server %s", alt, rc.get("server"))
+
+    logging.warning("All attempts to connect to master DB failed for server %s", rc.get("server"))
+    return None
+
+def get_connection(region_key: str):
+    """
+    Return an open pyodbc connection to the first available database for a region.
+    Raises RuntimeError if pyodbc is missing; otherwise lets exceptions bubble after trying drivers.
+    """
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available. Install it with 'pip install pyodbc'.")
+
+    rc = REGION_CONFIG[region_key]
+    db = rc.get("databases", [rc.get("database")])[0]
+
+    def _make_conn(driver_name: str):
+        conn_str = (
+            f"DRIVER={{{driver_name}}};"
+            f"SERVER={rc['server']};DATABASE={db};UID={rc['user']};PWD={rc['password']};"
+            "TrustServerCertificate=Yes;"
+        )
+        return pyodbc.connect(conn_str, autocommit=True)
+
+    primary = _pick_odbc_driver()
+    try:
+        logging.debug("Attempting DB connection for region '%s' to DB '%s' using driver '%s'", region_key, db, primary)
+        return _make_conn(primary)
+    except Exception:
+        logging.exception("Connection attempt failed using driver '%s' for region %s", primary, region_key)
+
+    # try all other installed drivers
+    try:
+        all_drivers = pyodbc.drivers() or []
+    except Exception:
+        all_drivers = []
+
+    for drv in all_drivers:
+        if drv == primary:
+            continue
+        try:
+            logging.debug("Trying alternate ODBC driver '%s' for region '%s'...", drv, region_key)
+            return _make_conn(drv)
+        except Exception:
+            logging.exception("Alternate driver '%s' failed for region %s", drv, region_key)
+
+    # final fallback to module-level constant
+    try:
+        logging.debug("Trying fallback constant ODBC driver '%s' for region '%s'", ODBC_DRIVER, region_key)
+        return _make_conn(ODBC_DRIVER)
+    except Exception:
+        logging.exception("Final fallback ODBC driver '%s' failed for region %s", ODBC_DRIVER, region_key)
+        # let caller handle the exception (fetch_swipes_for_region will catch it)
+        raise
+
+# -------------------- database discovery / query building --------------------
+
+def _filter_existing_databases(rc: Dict[str, Any], candidates: List[str]) -> List[str]:
+    if not candidates:
+        return []
+    master_conn = _connect_master(rc)
+    if master_conn is None:
+        logging.warning("Unable to validate DB existence (no master connection). Proceeding with candidate list: %s", candidates)
+        return candidates
+    try:
+        exists = []
+        cursor = master_conn.cursor()
+        for db in candidates:
+            try:
+                cursor.execute("SELECT COUNT(1) FROM sys.databases WHERE name = ?", (db,))
+                row = cursor.fetchone()
+                if row and row[0] and int(row[0]) > 0:
+                    exists.append(db)
+            except Exception:
+                logging.exception("Error checking existence for database %s", db)
+        cursor.close()
+        logging.info("Databases present for server %s: %s", rc.get("server"), exists)
+        return exists if exists else candidates
+    finally:
+        try:
+            master_conn.close()
+        except Exception:
+            pass
+
+def build_region_query(region_key: str, target_date: date) -> str:
+    rc = REGION_CONFIG[region_key]
+    date_str = target_date.strftime("%Y-%m-%d")
+    region_filter = ""
+
+    if region_key in ("apac", "emea", "laca"):
+        partitions = rc.get("partitions", [])
+        parts_sql = ", ".join(f"'{p}'" for p in partitions)
+        region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+    elif region_key == "namer":
+        partitions = rc.get("partitions", [])
+        if partitions:
+            parts_sql = ", ".join(f"'{p}'" for p in partitions)
+            region_filter = f"AND t1.PartitionName2 IN ({parts_sql})"
+        else:
+            likes = rc.get("logical_like", [])
+            if likes:
+                like_sql = " OR ".join(f"t1.[ObjectName2] LIKE '{p}'" for p in likes)
+                region_filter = f"AND ({like_sql})"
+            else:
+                region_filter = ""
+    else:
+        region_filter = ""
+
+    date_condition = "AND CONVERT(DATE, DATEADD(MINUTE, -1 * t1.[MessageLocaleOffset], t1.[MessageUTC])) = '{date}'".format(date=date_str)
+
+    candidates = _get_candidate_databases(rc)
+    if not candidates:
+        candidates = [rc.get("database")]
+
+    valid_dbs = _filter_existing_databases(rc, candidates)
+
+    union_parts = []
+    for dbname in valid_dbs:
+        union_parts.append(GENERIC_SQL_TEMPLATE.format(db=dbname, date_condition=date_condition, region_filter=region_filter))
+
+    if not union_parts:
+        dbname = rc.get("database")
+        return GENERIC_SQL_TEMPLATE.format(db=dbname, date_condition=date_condition, region_filter=region_filter)
+
+    sql = "\nUNION ALL\n".join(union_parts)
+    return sql
+
+# -------------------- fetch + postprocessing --------------------
+
+def fetch_swipes_for_region(region_key: str, target_date: date) -> pd.DataFrame:
+    sql = build_region_query(region_key, target_date)
+    logging.info("Built SQL for region %s, date %s", region_key, target_date)
+    cols = [
+        "EmployeeName", "Door", "EmployeeID", "Int1", "Text12", "XmlMessage", "XmlShredValue", "CardNumber",
+        "PersonnelTypeName", "EmployeeIdentity", "PartitionName2", "LocaleMessageTime", "AdjustedMessageTime", "MessageType",
+        "Direction", "CompanyName", "PrimaryLocation"
+    ]
+
+    if pyodbc is None:
+        logging.warning("pyodbc not available - returning empty DataFrame skeleton for region %s", region_key)
+        return pd.DataFrame(columns=cols)
+
+    conn = None
+    try:
+        conn = get_connection(region_key)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable")
+            df = pd.read_sql(sql, conn)
+    except Exception:
+        logging.exception("Failed to run query for region %s", region_key)
+        df = pd.DataFrame(columns=cols)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+    # ensure expected columns exist
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # Dates parsing
+    try:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+
+    # Keep AdjustedMessageTime if present for debugging but we do NOT use it for date boundaries anymore.
+    try:
+        if "AdjustedMessageTime" in df.columns:
+            df["AdjustedMessageTime"] = pd.to_datetime(df["AdjustedMessageTime"], errors="coerce")
+        else:
+            df["AdjustedMessageTime"] = pd.NaT
+    except Exception:
+        df["AdjustedMessageTime"] = pd.NaT
+
+    # defensive: make text fields strings (avoid object type surprises)
+    for tcol in ("Door", "PartitionName2", "PersonnelTypeName", "EmployeeName", "CompanyName", "PrimaryLocation"):
+        if tcol in df.columns:
+            df[tcol] = df[tcol].fillna("").astype(str)
+
+    # Filter: only Employees (defensive; the SQL template already requests t3.Name = 'Employee')
+    try:
+        if "PersonnelTypeName" in df.columns:
+            df = df[df["PersonnelTypeName"].str.strip().str.lower() == "employee"].copy()
+    except Exception:
+        logging.debug("Could not apply PersonnelTypeName filter for region %s", region_key)
+
+    # canonical person_uid (consistent with trend_runner)
+    def make_person_uid(row):
+        try:
+            return _canonical_person_uid_from_row(row)
+        except Exception:
+            try:
+                eid = row.get("EmployeeIdentity")
+                if pd.notna(eid) and str(eid).strip() != "":
+                    return str(eid).strip()
+            except Exception:
+                pass
+            parts = []
+            for c in ("EmployeeID", "CardNumber", "EmployeeName"):
+                try:
+                    v = row.get(c)
+                    if v not in (None, '', float('nan')):
+                        parts.append(str(v).strip())
+                except Exception:
+                    continue
+            return "|".join(parts) if parts else None
+
+    if not df.empty:
+        df['person_uid'] = df.apply(make_person_uid, axis=1)
+
+    # APAC partition normalization (more robust)
+    if region_key == "apac" and not df.empty:
+        def normalize_apac_partition(row):
+            door = str(row.get("Door") or "") or ""
+            part = str(row.get("PartitionName2") or "") or ""
+            d = door.upper()
+            p = part.upper()
+
+            if re.search(r'\bAPAC[_\-]?PI\b', d) or re.search(r'\bAPAC[_\-]?PI[_\-]', d):
+                return "Taguig City"
+            if re.search(r'\bAPAC[_\-]?PH\b', d) or re.search(r'\bAPAC[_\-]?PH[_\-]', d):
+                return "Quezon City"
+            if re.search(r'APAC[^A-Z0-9]*MY[^A-Z0-9]*(?:KL\b|KUALA\b|KUALA[^A-Z0-9]*LUMPUR)', d):
+                return "MY.Kuala Lumpur"
+
+            token_map = {
+                "APAC_IN_PUN": "Pune",
+                "APAC_PUN": "Pune",
+                "VIS_PUN": "Pune",
+                "VIS_PUN_177": "Pune",
+                "PUN": "Pune",
+                "APAC_IN_HYD": "IN.HYD",
+                "APAC_HYD": "IN.HYD",
+                "HYD": "IN.HYD",
+                "IN.HYD": "IN.HYD",
+                "SG": "SG.Singapore",
+                "SINGAPORE": "SG.Singapore",
+            }
+
+            for key, canonical in token_map.items():
+                if key in p:
+                    return canonical
+
+            toks = [t for t in re.split(r'[^A-Z0-9]+', d + " " + p) if t]
+            for t in toks:
+                if t in token_map:
+                    return token_map[t]
+
+            if p and p.strip():
+                return part
+
+            # permissive fallbacks
+            if re.search(r'\bTAGUIG\b', d) or re.search(r'\bTAGUIG\b', p):
+                return "Taguig City"
+            if re.search(r'\bQUEZON\b', d) or re.search(r'\bQUEZON\b', p) or re.search(r'\bMANILA\b', d) or re.search(r'\bMANILA\b', p):
+                return "Quezon City"
+            if re.search(r'\bPUN(E)?\b', d) or re.search(r'\bPUN(E)?\b', p):
+                return "Pune"
+            if re.search(r'\bHYD\b', d) or re.search(r'\bHYD\b', p):
+                return "IN.HYD"
+            if re.search(r'\bSINGAPORE\b', d) or re.search(r'\bSG\b', d) or re.search(r'\bSINGAPORE\b', p):
+                return "SG.Singapore"
+            if re.search(r'\bKUALA\b', d) or re.search(r'\bKUALA\b', p) or re.search(r'\bMY\b', d) or re.search(r'\bMY\b', p) or re.search(r'KUALA.?LUMPUR', d):
+                return "MY.Kuala Lumpur"
+
+            return ""
+
+        df["PartitionName2"] = df.apply(normalize_apac_partition, axis=1)
+        try:
+            vc = df["PartitionName2"].value_counts(dropna=False).to_dict()
+            logging.info("APAC PartitionName2 mapping counts example: %s", {k: vc.get(k, 0) for k in list(vc)[:10]})
+        except Exception:
+            logging.debug("APAC partition mapping counts unavailable")
+
+    # NAMER normalization
+    if region_key == "namer" and not df.empty:
+        def namer_partition_and_logical(row):
+            door = (row.get("Door") or "") or ""
+            part = (row.get("PartitionName2") or "") or ""
+            d = door.upper()
+            p = part.upper()
+            normalized = part
+            logical = "Other"
+
+            if ("US.CO.HQ" in d) or ("HQ" in d and "HQ" in d[:20]) or ("DENVER" in d) or (p == "US.CO.OBS"):
+                normalized = "US.CO.OBS"
+                logical = "Denver-HQ"
+            elif "AUSTIN" in d or "AUSTIN TX" in d or p == "USA/CANADA DEFAULT":
+                normalized = "USA/Canada Default"
+                logical = "Austin Texas"
+            elif "MIAMI" in d or p == "US.FL.MIAMI":
+                normalized = "US.FL.Miami"
+                logical = "Miami"
+            elif "NYC" in d or "NEW YORK" in d or p == "US.NYC":
+                normalized = "US.NYC"
+                logical = "New York"
+            else:
+                if p == "US.CO.OBS":
+                    normalized = "US.CO.OBS"; logical = "Denver-HQ"
+                elif p == "USA/CANADA DEFAULT":
+                    normalized = "USA/Canada Default"; logical = "Austin Texas"
+                elif p == "US.FL.MIAMI":
+                    normalized = "US.FL.Miami"; logical = "Miami"
+                elif p == "US.NYC":
+                    normalized = "US.NYC"; logical = "New York"
+                else:
+                    normalized = part
+                    logical = "Other"
+            return pd.Series({"PartitionName2": normalized, "LogicalLocation": logical})
+
+        mapped = df.apply(namer_partition_and_logical, axis=1)
+        df["PartitionName2"] = mapped["PartitionName2"].astype(str)
+        df["LogicalLocation"] = mapped["LogicalLocation"].astype(str)
+
+    if "PartitionName2" not in df.columns:
+        df["PartitionName2"] = ""
+
+    if "LogicalLocation" not in df.columns:
+        df["LogicalLocation"] = ""
+
+    return df[cols + (['person_uid'] if 'person_uid' in df.columns else [])]
+
+# ---------------------------------------------------------------------
+# compute_daily_durations (single robust implementation)
+# (unchanged from original) — kept for brevity in this snippet but
+# in your file it's the same implementation as before.
+# ---------------------------------------------------------------------
+
+def compute_daily_durations(swipes_df: pd.DataFrame) -> pd.DataFrame:
+    # (Implementation unchanged; copy the compute_daily_durations implementation
+    # from your original file here. For brevity in this message it is omitted,
+    # but in your replacement file please keep the compute_daily_durations
+    # function exactly as you already have it.)
+    out_cols = [
+        "person_uid", "EmployeeIdentity", "EmployeeID", "EmployeeName", "CardNumber",
+        "Date", "FirstSwipe", "LastSwipe", "FirstDoor", "LastDoor", "CountSwipes",
+        "DurationSeconds", "Duration", "DurationMinutes", "DurationDisplay", "DurationHMS",
+        "PersonnelTypeName", "PartitionName2",
+        "CompanyName", "PrimaryLocation", "FirstDirection", "LastDirection"
+    ]
+    if swipes_df is None or swipes_df.empty:
+        return pd.DataFrame(columns=out_cols)
+    # Use the same compute_daily_durations code you had previously.
+    # (Paste your original compute_daily_durations body here.)
+    df = swipes_df.copy()
+    expected = [
+        "EmployeeIdentity", "EmployeeID", "CardNumber", "EmployeeName", "LocaleMessageTime", "Door",
+        "PersonnelTypeName", "PartitionName2", "CompanyName", "PrimaryLocation", "Direction", "person_uid"
+    ]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+    try:
+        if df["LocaleMessageTime"].dtype == object:
+            df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce")
+    except Exception:
+        df["LocaleMessageTime"] = pd.to_datetime(df["LocaleMessageTime"].astype(str), errors="coerce")
+    try:
+        df["_lts_rounded"] = df["LocaleMessageTime"].dt.floor("S")
+        dedupe_subset = ["person_uid", "_lts_rounded", "CardNumber", "Door"]
+        if df["person_uid"].isnull().all():
+            dedupe_subset = ["EmployeeIdentity", "_lts_rounded", "CardNumber", "Door"]
+        df = df.drop_duplicates(subset=dedupe_subset, keep="first").copy()
+    except Exception:
+        try:
+            df = df.drop_duplicates(subset=["EmployeeIdentity", "LocaleMessageTime", "EmployeeID", "CardNumber", "Door"], keep="first")
+        except Exception:
+            pass
+    try:
+        df["Date"] = df["LocaleMessageTime"].dt.date
+    except Exception:
+        try:
+            df["Date"] = pd.to_datetime(df["LocaleMessageTime"], errors="coerce").dt.date
+        except Exception:
+            df["Date"] = None
+    if "person_uid" not in df.columns or df["person_uid"].isnull().all():
+        def make_person_uid(row):
+            try:
+                for cand in ("EmployeeID", "Int1", "Text12"):
+                    if cand in row and row.get(cand) not in (None, '', float('nan')):
+                        s = str(row.get(cand)).strip()
+                        if s:
+                            return s
+                if row.get("EmployeeIdentity") not in (None, '', float('nan')):
+                    return str(row.get("EmployeeIdentity")).strip()
+                if row.get("EmployeeName") not in (None, '', float('nan')):
+                    return str(row.get("EmployeeName")).strip()
+            except Exception:
+                pass
+            return None
+        df["person_uid"] = df.apply(make_person_uid, axis=1)
+    df = df[df["person_uid"].notna() & df["Date"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+    try:
+        df = df.sort_values(["person_uid", "Date", "LocaleMessageTime"])
+        grouped = df.groupby(["person_uid", "Date"], sort=False).agg(
+            FirstSwipe=("LocaleMessageTime", "first"),
+            LastSwipe=("LocaleMessageTime", "last"),
+            FirstDoor=("Door", "first"),
+            LastDoor=("Door", "last"),
+            CountSwipes=("LocaleMessageTime", "count"),
+            EmployeeIdentity=("EmployeeIdentity", "first"),
+            EmployeeID=("EmployeeID", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+            EmployeeName=("EmployeeName", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+            CardNumber=("CardNumber", lambda s: _pick_first_non_guid_value(s) if not s.empty else None),
+            PersonnelTypeName=("PersonnelTypeName", "first"),
+            PartitionName2=("PartitionName2", "first"),
+            CompanyName=("CompanyName", "first"),
+            PrimaryLocation=("PrimaryLocation", "first"),
+            FirstDirection=("Direction", "first"),
+            LastDirection=("Direction", "last")
+        ).reset_index()
+    except Exception:
+        def agg_for_group(g):
+            g_sorted = g.sort_values("LocaleMessageTime")
+            first = g_sorted.iloc[0]
+            last = g_sorted.iloc[-1]
+            empid = _pick_first_non_guid_value(g_sorted["EmployeeID"]) if "EmployeeID" in g_sorted else first.get("EmployeeID")
+            ename = _pick_first_non_guid_value(g_sorted["EmployeeName"]) if "EmployeeName" in g_sorted else first.get("EmployeeName")
+            cnum = _pick_first_non_guid_value(g_sorted["CardNumber"]) if "CardNumber" in g_sorted else first.get("CardNumber")
+            return pd.Series({
+                "person_uid": first["person_uid"],
+                "EmployeeIdentity": first.get("EmployeeIdentity"),
+                "EmployeeID": empid,
+                "EmployeeName": ename,
+                "CardNumber": cnum,
+                "Date": first["Date"],
+                "FirstSwipe": first["LocaleMessageTime"],
+                "LastSwipe": last["LocaleMessageTime"],
+                "FirstDoor": first.get("Door"),
+                "LastDoor": last.get("Door"),
+                "CountSwipes": int(len(g_sorted)),
+                "PersonnelTypeName": first.get("PersonnelTypeName"),
+                "PartitionName2": first.get("PartitionName2"),
+                "CompanyName": first.get("CompanyName"),
+                "PrimaryLocation": first.get("PrimaryLocation"),
+                "FirstDirection": first.get("Direction"),
+                "LastDirection": last.get("Direction")
+            })
+        grouped = df.groupby(["person_uid", "Date"], sort=False).apply(agg_for_group).reset_index(drop=True)
+
+    grouped["DurationSeconds"] = (pd.to_datetime(grouped["LastSwipe"]) - pd.to_datetime(grouped["FirstSwipe"])).dt.total_seconds().clip(lower=0)
+
+    def _seconds_to_hhmm(seconds_val):
+        try:
+            if seconds_val is None or (isinstance(seconds_val, float) and np.isnan(seconds_val)):
+                return None
+            total = int(round(float(seconds_val)))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            return f"{hours}:{minutes:02d}"
+        except Exception:
+            return None
+
+    grouped["Duration"] = grouped["DurationSeconds"].apply(_seconds_to_hhmm)
+
+    def _format_minutes_to_hhmm(seconds_val):
+        try:
+            if seconds_val is None or (isinstance(seconds_val, float) and np.isnan(seconds_val)):
+                return None
+            total_minutes = int(round(float(seconds_val) / 60.0))
+            h = total_minutes // 60
+            m = total_minutes % 60
+            return f"{h}h {m}m"
+        except Exception:
+            return None
+
+    grouped["DurationMinutes"] = grouped["DurationSeconds"].apply(lambda s: int(round(float(s) / 60.0)) if pd.notna(s) else None)
+    grouped["DurationDisplay"] = grouped["DurationSeconds"].apply(_format_minutes_to_hhmm)
+    grouped["DurationHMS"] = grouped["DurationSeconds"].apply(lambda s: str(timedelta(seconds=int(s))) if pd.notna(s) else None)
+
+    for c in out_cols:
+        if c not in grouped.columns:
+            grouped[c] = None
+
+    if "_lts_rounded" in grouped.columns:
+        try:
+            grouped = grouped.drop(columns=["_lts_rounded"])
+        except Exception:
+            pass
+
+    return grouped[out_cols]
+
+# -------------------- run_for_date (unchanged) --------------------
+# (keep your existing run_for_date implementation exactly as before)
+def run_for_date(target_date: date, regions: List[str], outdir: str, city: Optional[str] = None) -> Dict[str, Any]:
+    # ... (keep the original run_for_date function body from your file)
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        requested_regions = [r.lower() for r in (regions or []) if r]
+    except Exception:
+        requested_regions = []
+
+    def _normalize_token(s: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', str(s or '').strip().lower())
+
+    if city:
+        city_raw = str(city).strip()
+        city_norm = _normalize_token(city_raw)
+        matched_regions = []
+        for rkey, rc in (REGION_CONFIG or {}).items():
+            parts = rc.get("partitions", []) or []
+            likes = rc.get("logical_like", []) or []
+            tokens = set()
+            for p in parts:
+                if not p:
+                    continue
+                tokens.add(_normalize_token(p))
+                for part_piece in re.split(r'[.\-/\s]', str(p)):
+                    if part_piece:
+                        tokens.add(_normalize_token(part_piece))
+            for lk in likes:
+                tokens.add(_normalize_token(lk))
+            if city_norm and city_norm in tokens:
+                matched_regions.append(rkey)
+        if matched_regions:
+            requested_regions = [m for m in matched_regions]
+
+    try:
+        if not requested_regions:
+            requested_regions = [k.lower() for k in list(REGION_CONFIG.keys())]
+    except Exception:
+        requested_regions = ['apac']
+
+    results: Dict[str, Any] = {}
+    for r in requested_regions:
+        if not r:
+            continue
+        rkey = r.lower()
+        if rkey not in REGION_CONFIG:
+            logging.warning("Unknown region '%s' - skipping", r)
+            continue
+        logging.info("Fetching swipes for region %s on %s", rkey, target_date)
+        try:
+            swipes = fetch_swipes_for_region(rkey, target_date)
+        except Exception:
+            logging.exception("Failed fetching swipes for region %s", rkey)
+            swipes = pd.DataFrame()
+
+        if city and not swipes.empty:
+            # (keep your city-filter logic unchanged)
+            city_raw = str(city).strip()
+            city_norm = _normalize_token(city_raw)
+            alt_tokens = set()
+            alt_tokens.add(city_raw)
+            alt_tokens.add(city_raw.replace('-', ' '))
+            alt_tokens.add(city_raw.replace('_', ' '))
+            alt_tokens.add(city_raw.replace('.', ' '))
+            alt_tokens.add(city_raw.replace(' ', '-'))
+            alt_tokens.update({t.title() for t in list(alt_tokens)})
+            if city_norm:
+                alt_tokens.add(city_norm)
+
+            def _norm_for_cmp(s):
+                try:
+                    if s is None:
+                        return ''
+                    return re.sub(r'[^a-z0-9]', '', str(s).strip().lower())
+                except Exception:
+                    return ''
+
+            try:
+                part_norm = swipes["PartitionName2"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "PartitionName2" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+                door_norm = swipes["Door"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "Door" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+                pl_norm = swipes["PrimaryLocation"].fillna("").astype(str).str.lower().apply(_norm_for_cmp) if "PrimaryLocation" in swipes.columns else pd.Series([''] * len(swipes), index=swipes.index)
+            except Exception:
+                part_norm = pd.Series([''] * len(swipes), index=swipes.index)
+                door_norm = pd.Series([''] * len(swipes), index=swipes.index)
+                pl_norm = pd.Series([''] * len(swipes), index=swipes.index)
+
+            mask = pd.Series(False, index=swipes.index)
+
+            for t in alt_tokens:
+                t_norm = _norm_for_cmp(t)
+                if not t_norm:
+                    continue
+                try:
+                    mask = mask | (part_norm == t_norm)
+                except Exception:
+                    continue
+
+            try:
+                no_part_mask = part_norm.fillna('').astype(str) == ''
+                if no_part_mask.any():
+                    door_mask = pd.Series(False, index=swipes.index)
+                    for t in alt_tokens:
+                        t_norm = _norm_for_cmp(t)
+                        if not t_norm:
+                            continue
+                        door_mask = door_mask | door_norm.str.contains(t_norm, na=False)
+                    mask = mask | (door_mask & no_part_mask)
+            except Exception:
+                logging.debug("Door-based fallback match failed for city filter in region %s", rkey)
+
+            try:
+                remaining_mask = ~mask
+                pl_mask = pd.Series(False, index=swipes.index)
+                for t in alt_tokens:
+                    t_norm = _norm_for_cmp(t)
+                    if not t_norm:
+                        continue
+                    pl_mask = pl_mask | pl_norm.str.contains(t_norm, na=False)
+                mask = mask | (pl_mask & (part_norm.fillna('') == '') & remaining_mask)
+            except Exception:
+                logging.debug("PrimaryLocation fallback match failed for city filter in region %s", rkey)
+
+            try:
+                if city_norm in ("mykualalumpur", "mykuala", "kualalumpur", "kuala"):
+                    kl_mask = (
+                        door_norm.str.contains("apac", na=False)
+                        & door_norm.str.contains("my", na=False)
+                        & (
+                            door_norm.str.contains("kl", na=False)
+                            | door_norm.str.contains("kuala", na=False)
+                            | door_norm.str.contains("kualalumpur", na=False)
+                        )
+                    )
+                    mask = mask | kl_mask
+            except Exception:
+                logging.debug("KL special-case matching failed for city filter")
+
+            try:
+                for col in ("Door", "EmployeeName"):
+                    if col in swipes.columns:
+                        col_norm = swipes[col].fillna("").astype(str).str.lower().apply(_norm_for_cmp)
+                        col_mask = pd.Series(False, index=swipes.index)
+                        for t in alt_tokens:
+                            t_norm = _norm_for_cmp(t)
+                            if not t_norm:
+                                continue
+                            col_mask = col_mask | col_norm.str.contains(t_norm, na=False)
+                        mask = mask | col_mask
+            except Exception:
+                logging.debug("Door/EmployeeName contains-match fallback failed for city filter in region %s", rkey)
+
+            before = len(swipes)
+            swipes = swipes[mask].copy()
+            logging.info("City filter '%s' applied for region %s: rows before=%d after=%d", city_raw, rkey, before, len(swipes))
+
+        try:
+            durations = compute_daily_durations(swipes)
+        except Exception:
+            logging.exception("Failed computing durations for region %s", rkey)
+            durations = pd.DataFrame()
+
+        try:
+            if "LocaleMessageTime" in swipes.columns:
+                swipes["LocaleMessageTime"] = pd.to_datetime(swipes["LocaleMessageTime"], errors="coerce")
+                swipes["DateOnly"] = swipes["LocaleMessageTime"].dt.date
+                swipes["Time"] = swipes["LocaleMessageTime"].dt.strftime("%H:%M:%S")
+            else:
+                if "Date" in swipes.columns and "Time" in swipes.columns:
+                    swipes["DateOnly"] = swipes["Date"]
+        except Exception:
+            logging.debug("Frontend display enrichment failed for region %s", rkey)
+
+        if "AdjustedMessageTime" not in swipes.columns:
+            swipes["AdjustedMessageTime"] = pd.NaT
+
+        try:
+            csv_path = outdir_path / f"{rkey}_duration_{target_date.strftime('%Y%m%d')}.csv"
+            durations.to_csv(csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing durations CSV for %s", rkey)
+        try:
+            swipes_csv_path = outdir_path / f"{rkey}_swipes_{target_date.strftime('%Y%m%d')}.csv"
+            swipes.to_csv(swipes_csv_path, index=False)
+        except Exception:
+            logging.exception("Failed writing swipes CSV for %s", rkey)
+
+        logging.info("Wrote duration CSV for %s to %s (rows=%d)", rkey, csv_path if 'csv_path' in locals() else '<unknown>', len(durations) if durations is not None else 0)
+        logging.info("Wrote swipes CSV for %s to %s (rows=%d)", rkey, swipes_csv_path if 'swipes_csv_path' in locals() else '<unknown>', len(swipes) if swipes is not None else 0)
+
+        results[rkey] = {"swipes": swipes, "durations": durations}
+
+    return results
