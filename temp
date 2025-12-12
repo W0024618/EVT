@@ -2,3 +2,318 @@ i dont understand where i need to update below snippet
 so Update snippet carefully and share me updated file carefully 
 so i can easily swap file each other...
 
+
+
+
+Where to change
+
+Edit: C:\Users\W0024618\Desktop\email-Dashboard\backend\alerts.py
+Function to update: check_alerts_for_server(server_config, sent_alerts=None)
+
+You will add:
+	•	a short today filter right after the DB fetch (so we only process rows whose DateOnly is today), and
+	•	inside the rejection and alarm processing loops, an additional guard so send_email(...) is executed only for region == 'APAC' and PartitionName == 'Pune' (case-insensitive).
+
+We keep logging and log_sent_alert(...) (so the system still records alerts), but sending is restricted.
+
+
+
+
+Patch — replace the existing check_alerts_for_server body with this (or edit accordingly)
+
+Find the function and replace its body with the version below (I kept your existing logging and structure, I only added the filtering and Pune checks):
+
+
+
+
+
+def check_alerts_for_server(server_config, sent_alerts=None):
+    logger.info(f"Checking alerts for {server_config['NAME']} server")
+    
+    rejection_data_list = []
+    alarm_data_list = []
+    
+    # STEP 1: Connect, fetch all data into memory, and close connection immediately.
+    # This prevents long-lived connections that cause locking issues.
+    try:
+        conn = get_sql_connection(server_config['SQL_SERVER'], server_config['SQL_DB'], server_config['SQL_USER'], server_config['SQL_PASSWORD'])
+        if not conn:
+            logger.error(f"[{server_config['NAME']}] Failed to establish database connection")
+            return
+
+        cursor = conn.cursor()
+        
+        # Fetch rejections using the single optimized query
+        logger.debug(f"[{server_config['NAME']}] Fetching rejection data...")
+        cursor.execute(build_sql_query())
+        columns = [desc[0] for desc in cursor.description]
+        rejection_data_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        logger.info(f"[{server_config['NAME']}] Fetched {len(rejection_data_list)} rejection records.")
+
+        # Fetch alarms
+        logger.debug(f"[{server_config['NAME']}] Fetching alarm data...")
+        cursor.execute(build_alarm_query())
+        columns = [desc[0] for desc in cursor.description]
+        alarm_data_list = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        logger.info(f"[{server_config['NAME']}] Fetched {len(alarm_data_list)} alarm records.")
+
+    except Exception as e:
+        logger.error(f"[{server_config['NAME']}] Error during database query phase: {e}", exc_info=True)
+        return
+    finally:
+        if conn:
+            conn.close()
+            logger.info(f"[{server_config['NAME']}] Database connection closed.")
+
+    # -------------------
+    # NEW: Only process today's alerts (filter by DateOnly)
+    # -------------------
+    try:
+        today_date = datetime.now().date()
+        def _is_today(val):
+            if val is None:
+                return False
+            # If value is already a date
+            try:
+                # Some DB drivers return date/datetime types, some return strings
+                if hasattr(val, 'date'):
+                    # datetime -> date
+                    return val.date() == today_date
+            except Exception:
+                pass
+            # If it's a date object
+            if isinstance(val, (datetime, )):
+                return val.date() == today_date
+            try:
+                # string comparison fallback: 'YYYY-MM-DD'
+                return str(val).strip().startswith(today_date.strftime('%Y-%m-%d'))
+            except Exception:
+                return False
+
+        rejection_data_list = [r for r in rejection_data_list if _is_today(r.get('DateOnly'))]
+        alarm_data_list = [a for a in alarm_data_list if _is_today(a.get('DateOnly'))]
+        logger.info(f"[{server_config['NAME']}] After today-filter: {len(rejection_data_list)} rejections, {len(alarm_data_list)} alarms to process.")
+    except Exception as e:
+        logger.error(f"[{server_config['NAME']}] Error filtering for today's alerts: {e}", exc_info=True)
+        # if filter fails, proceed cautiously with full lists (or choose to return) - here we continue
+
+    # STEP 2: Process all data from the in-memory lists.
+    if sent_alerts is None:
+        sent_alerts = read_sqlite_alerts_set() 
+    
+    allowed_locations = get_allowed_locations()
+    if allowed_locations:
+        logger.info(f"Location filter is active. Only processing emails for: {allowed_locations}")    
+    
+    current_alerts = set()
+    
+    # Process rejections from the in-memory list
+    for data in rejection_data_list:
+        try:
+            composite_key = (
+                str(data.get('EmployeeID') or '').strip(), 
+                str(data.get('ObjectName1') or '').strip(),
+                str(data.get('Alert_Type') or '').strip(), 
+                str(data.get('CardNumber') or '').strip(),
+                str(data.get('ObjectName2') or '').strip(), 
+                str(data.get('Swipe_Time') or '').strip(),
+                str(data.get('DateOnly') or '').strip(), 
+                str(data.get('PartitionName') or '').strip(),
+                str(data.get('Region') or '').strip()
+            )
+            object_name_3_placeholder = ''
+
+            if composite_key in sent_alerts or composite_key in current_alerts:
+                continue
+
+            # Check for rejection types that should only be logged, not emailed
+            EXCLUDED_REJECTIONS = {"Unknown Card", "Facility Code", "Not Activated", "Site Code"}
+            rejection_type_from_db = data.get("Alert_Type")
+            if rejection_type_from_db in EXCLUDED_REJECTIONS:
+                logger.info(f"[{server_config['NAME']}] Found excluded rejection type: {rejection_type_from_db}. Logging only.")
+                log_sent_alert(*composite_key, object_name_3_placeholder)
+                current_alerts.add(composite_key)
+                continue
+
+            # If the alert is not excluded, log it (always) and then decide about sending an email
+            log_sent_alert(*composite_key, object_name_3_placeholder)
+            current_alerts.add(composite_key)
+            region = server_config['NAME']
+            location = data.get('PartitionName') or ''
+
+            # --- Updated Location Filter Check (existing) ---
+            if allowed_locations:
+                if (str(region).lower(), str(location).lower()) not in allowed_locations:
+                    logger.debug(f"Skipping email for {region}/{location}; not in location filter.")
+                    continue
+
+            # --- NEW: Only send emails for APAC region and Pune location ---
+            send_email_flag = False
+            try:
+                if str(region).upper() == 'APAC' and str(location).strip().lower() == 'pune':
+                    send_email_flag = True
+                else:
+                    logger.debug(f"[{server_config['NAME']}] Email suppressed (only APAC/Pune are allowed). Region={region}, Location={location}")
+            except Exception:
+                logger.debug("Error checking region/location for send_email_flag; defaulting to suppress send.", exc_info=True)
+
+            # --- Start Email Logic but send only if send_email_flag True ---
+            rejection_type = str(data.get("Alert_Type", "")).strip().lower()
+            emp_id = str(data.get("EmployeeID", "")).strip()
+            employee_name = str(data.get("ObjectName1"))
+            personnel_type = str(data.get("PersonnelType","")).strip().lower()
+            job_title = data.get("Management_Level", "").strip().lower()
+
+            if is_senior_role(job_title):
+                logger.info(f"[{server_config['NAME']}] {emp_id} is senior ({job_title}), skipping email.")
+                continue
+
+            to_email = None
+            if not emp_id or emp_id == "0":
+                to_email = GSOC_EMAIL
+                logger.info(f"EmployeeID is missing or invalid. Routing to GSOC.")
+            
+            elif personnel_type != 'employee':
+                # Rule for all non-employees (Contractors, etc.)
+                recipient_email = data.get('ManagerEmail')
+                if recipient_email and '@' in recipient_email:
+                    to_email = recipient_email
+                else:
+                    logger.warning(f"ManagerEmail is missing or invalid for non-employee {emp_id}. No email will be sent for this alert.")
+                    # we logged already - continue (no send)
+                    continue
+            
+            elif rejection_type in ['clearance', 'expired'] and personnel_type == 'employee':
+                # Rule for specific alerts for employees
+                recipient_email = data.get('EmployeeEmailAddress')
+                if recipient_email and '@' in recipient_email:
+                    to_email = recipient_email
+                else:
+                    logger.warning(f"EmployeeEmailAddress is missing or invalid for employee {emp_id}. No email will be sent for this alert.")
+                    continue # Skip this alert
+            
+            else:
+                # This is the final fallback for all other employee alert types
+                to_email = Regional_Managers.get(region, GSOC_EMAIL)
+
+            swipe_time = data.get("Swipe_Time")
+            date = data.get("DateOnly")
+            time_str = datetime.combine(date, swipe_time).strftime('%Y-%m-%d %H:%M:%S') if swipe_time and date else "Unknown Time"
+            subject_map = {
+                'clearance': f"{region}-High Security Zone Violation", 'lost': f"{region}-Access Deny Alarm - Badge Lost",
+                'wrong pin': f"{region}-Access Violation Alarm - Wrong Pin", 'expired': f"{region}-Access Deny Alarm - Badge Expired",
+                'disabled': f"{region}-Access Deny Alarm - Badge Disabled"
+            }
+            subject = subject_map.get(rejection_type, f"{region}-Unknown Rejection")
+            email_id = str(uuid.uuid4())
+            template_data = {
+                'FirstName': str(data.get('ObjectName1', '')).split(',')[1] if ',' in str(data.get('ObjectName1','')) else '',
+                'ObjectName1': str(data.get('ObjectName1', '')),
+                'ObjectName2': str(data.get('ObjectName2', '')), 'DateOnly': str(data.get('DateOnly', '')),
+                'EmployeeID': emp_id, 'CardNumber': str(data.get('CardNumber', '')), 'time_str': time_str,
+                'acknowledge_url': f"{BASE_URL}/acknowledge?email_id={email_id}"
+            }
+            
+            body, template_key = get_email_template(region, rejection_type, emp_id, time_str, template_data, personnel_type)
+
+            if not send_email_flag:
+                # We log that the email was intentionally suppressed for non-Pune/other regions.
+                logger.info(f"[{server_config['NAME']}] Email suppressed for alert {emp_id} at {location} (not APAC/Pune). Logged only.")
+                continue
+
+            if ENV == 'testing':
+                # send_email_test(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=emp_id,employee_name=employee_name)
+                pass
+            else:
+                send_email(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=emp_id,employee_name=employee_name)
+
+        except Exception as e:
+            logger.error(f"[{server_config['NAME']}] Failed to process rejection for {data.get('EmployeeID')}: {e}", exc_info=True)
+
+    # Process alarms from the in-memory list
+    for alarm_data in alarm_data_list:
+        try:
+            alarm_type = str(alarm_data.get("Alert_Type", "")).strip().lower().replace(' ','_')
+            
+            alarm_composite_key = (
+                '', str(alarm_data.get('Operator_Name', 'Unknown')).strip(), alarm_type.upper(), '',
+                str(alarm_data.get('ObjectName2', '')).strip(), str(alarm_data.get('Swipe_Time', '')).strip(),
+                str(alarm_data.get('DateOnly', '')).strip(), str(alarm_data.get('PartitionName', '')).strip(),
+                str(alarm_data.get('Region', '')).strip()
+            )
+            object_name_3_placeholder = str(alarm_data.get('Action_Taken', 'None')).strip()
+
+            if alarm_composite_key in sent_alerts or alarm_composite_key in current_alerts:
+                continue
+
+            if alarm_type not in ['held_open', 'forced_open', 'fire_event']:
+                continue
+            
+            log_sent_alert(*alarm_composite_key, object_name_3_placeholder)
+            current_alerts.add(alarm_composite_key)
+            
+            region = server_config['NAME']
+            location = alarm_data.get('PartitionName') or ''
+
+            if allowed_locations:
+                if (str(region).lower(),str(location).lower()) not in allowed_locations:
+                    logger.debug(f"Skipping alarm email for {region}/{location}; not in location filter.")
+                    continue
+
+            # --- NEW: Only send alarm emails for APAC region and Pune location ---
+            if not (str(region).upper() == 'APAC' and str(location).strip().lower() == 'pune'):
+                logger.debug(f"[{server_config['NAME']}] Alarm email suppressed (only APAC/Pune allowed). Region={region}, Location={location}")
+                continue
+
+            # --- Start Email Logic for Alarms ---
+            to_email = GSOC_EMAIL
+
+            swipe_time = alarm_data.get("Swipe_Time")
+            date = alarm_data.get("DateOnly")
+            time_str = datetime.combine(date, swipe_time).strftime('%Y-%m-%d %H:%M:%S') if swipe_time and date else "Unknown Time"
+            subject = f"{region} - Alarm Event: {alarm_type.replace('_',' ').title()}"
+            email_id = str(uuid.uuid4())
+            template_data = {
+                'ObjectName2': alarm_data.get('ObjectName2', ''), 'DateOnly': str(alarm_data.get('DateOnly', '')),
+                'time_str': time_str, 'PartitionName': alarm_data.get('PartitionName', ''),
+                'Region': region, 'Operator_Name': str(alarm_data.get('Operator_Name', 'Unknown')),
+                'Action_Taken': str(alarm_data.get('Action_Taken', 'None')),
+                'acknowledge_url': f"{BASE_URL}/acknowledge?email_id={email_id}"
+            }
+            
+            body, template_key = get_email_template(region, alarm_type, '', time_str, template_data, None)
+            
+            if ENV == 'testing':
+                # send_email_test(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=None,employee_name=None)
+                pass
+            else:
+                send_email(subject, body, to_email, template_key=template_key, email_id=email_id,employee_id=None,employee_name=None)
+                
+        except Exception as e:
+            logger.error(f"[{server_config['NAME']}] Error processing alarm for {alarm_data.get('ObjectName2')}: {e}", exc_info=True)
+
+
+
+
+
+
+
+
+
+
+Notes & caveats
+	•	We still call log_sent_alert(...) for every alert (so your logs/dedupe remain intact), but actual send_email(...) calls are suppressed unless region == 'APAC' and PartitionName equals 'Pune'.
+	•	Date checking uses DateOnly field — your SQL returns CONVERT(DATE, LocaleMessageTime) so in most cases DateOnly will be a date object. The helper _is_today is robust for datetime, date, or 'YYYY-MM-DD' strings.
+	•	The filter above guarantees that when you start the backend, only today’s events will be considered for sending (older events are ignored).
+	•	If you want the system to not even log past alerts (instead of only suppressing sends) you can move the today filter earlier — currently we filter before processing so nothing old is logged for sending; but your DB logging will still record only those filtered lists.
+	•	Timezone nuance: DateOnly is produced in SQL using MessageLocaleOffset (your query does local conversion), and we compare to datetime.now().date() on the backend host. If your server timezone differs from the SQL-result local date for Pune, consider using the local date from the DB (which we already do by comparing DB DateOnly values). This implementation is tolerant, but confirm the host/timezone if you observe mismatches.
+	•	After editing, restart the backend (so scheduler and new logic apply).
+
+
+
+
+
+
+
+
+
