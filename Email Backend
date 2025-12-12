@@ -1,240 +1,23 @@
-# ---------- updated scenario_long_gap (use strict OUT->IN gap) ----------
-def scenario_long_gap(row):
-    try:
-        # Prefer explicit MaxOutInGapSeconds (computed by agg_swipe_group). Fall back to MaxSwipeGapSeconds.
-        gap = int(row.get('MaxOutInGapSeconds') or row.get('MaxSwipeGapSeconds') or 0)
-        return gap >= int(4.5 * 3600)
-    except Exception:
-        return False
-
-
-# ---------- inside agg_swipe_group: compute OUT->IN gaps and stronger pattern detection ----------
-def agg_swipe_group(g: pd.DataFrame) -> pd.Series:
-    # ... (keep existing preamble until computing 'times' and 'gaps') ...
-
-    # existing: compute all gaps
-    gaps = []
-    short_gap_count = 0
-    times = []
-    if isinstance(g, pd.DataFrame) and 'LocaleMessageTime' in g.columns:
-        try:
-            times = sorted(pd.to_datetime(g['LocaleMessageTime'].dropna().tolist()))
-        except Exception:
-            try:
-                times = sorted([pd.to_datetime(x) for x in list(g['LocaleMessageTime'].dropna())])
-            except Exception:
-                times = []
-    for i in range(1, len(times)):
-        s = (times[i] - times[i-1]).total_seconds()
-        gaps.append(s)
-        if s <= 5 * 60:
-            short_gap_count += 1
-    max_gap = int(max(gaps)) if gaps else 0
-
-    # --- NEW: compute strict OUT->IN gaps (only when previous direction looks like OUT and next looks like IN)
-    outin_gaps = []
-    try:
-        # extract ordered timeline rows (timestamp, direction)
-        timeline_dir = []
-        if 'LocaleMessageTime' in g.columns:
-            try:
-                rows_sorted = g.sort_values('LocaleMessageTime')
-            except Exception:
-                rows_sorted = g
-            for _, rr in rows_sorted.iterrows():
-                try:
-                    t = pd.to_datetime(rr.get('LocaleMessageTime'))
-                except Exception:
-                    t = None
-                d = rr.get('Direction') if 'Direction' in rr else None
-                if t is not None:
-                    timeline_dir.append((t, str(d or '').strip().lower()))
-        # scan consecutive pairs for out -> in pattern
-        for i in range(1, len(timeline_dir)):
-            prev_t, prev_d = timeline_dir[i-1]
-            cur_t, cur_d = timeline_dir[i]
-            # coarse match: 'out' or 'exit' in previous, 'in' in current
-            prev_is_out = bool(prev_d and ('out' in prev_d or 'exit' in prev_d))
-            cur_is_in  = bool(cur_d and ('in' in cur_d))
-            if prev_is_out and cur_is_in:
-                s = (cur_t - prev_t).total_seconds()
-                if s >= 0:
-                    outin_gaps.append(s)
-    except Exception:
-        outin_gaps = []
-    max_outin_gap = int(max(outin_gaps)) if outin_gaps else 0
-
-    # --- build timeline with zone + direction for segment logic (improved)
-    timeline = []
-    if 'LocaleMessageTime' in g.columns:
-        try:
-            rows_to_iter = g.sort_values('LocaleMessageTime')
-        except Exception:
-            rows_to_iter = g
-    else:
-        rows_to_iter = g
-
-    for _, row in rows_to_iter.iterrows():
-        t = row.get('LocaleMessageTime')
-        dname = row.get('Door') if 'Door' in row else None
-        direction = row.get('Direction') if 'Direction' in row else None
-        zone = map_door_to_zone(dname, direction)
-        timeline.append((t, dname, direction, zone))
-
-    # build segments but also capture first/last direction per segment (so pattern checks can be strict)
-    segments = []
-    if timeline:
-        cur_zone = None
-        seg_start = timeline[0][0]
-        seg_label = None
-        seg_dirs = []
-        for (t, dname, direction, zone) in timeline:
-            lbl = 'work'
-            if zone is not None and zone in _BREAK_ZONES:
-                lbl = 'break'
-            elif zone == _OUT_OF_OFFICE_ZONE:
-                lbl = 'out_of_office'
-            else:
-                lbl = 'work'
-            if cur_zone is None:
-                cur_zone = zone
-                seg_label = lbl
-                seg_start = t
-                seg_dirs = [str(direction).strip().lower() if direction is not None else '']
-            else:
-                if lbl != seg_label:
-                    # finalize current segment with directions list
-                    segments.append({
-                        'label': seg_label,
-                        'start': seg_start,
-                        'end': t,
-                        'start_zone': cur_zone,
-                        'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
-                    })
-                    seg_start = t
-                    seg_label = lbl
-                    seg_dirs = [str(direction).strip().lower() if direction is not None else '']
-                    cur_zone = zone
-                else:
-                    seg_dirs.append(str(direction).strip().lower() if direction is not None else '')
-                    cur_zone = cur_zone or zone
-        # push final seg
-        if seg_label is not None:
-            segments.append({
-                'label': seg_label,
-                'start': seg_start,
-                'end': timeline[-1][0],
-                'start_zone': cur_zone,
-                'dirs': [d for d in seg_dirs if d is not None and d != 'nan' and d != '']
-            })
-
-    # compute durations & stats per segment and detect pattern short->long->short with strict direction checks
-    pattern_flag = False
-    pattern_sequence_readable = None
-    try:
-        seq = []
-        for s in segments:
-            dur_mins = 0
-            try:
-                dur_mins = int(round(((s['end'] - s['start']).total_seconds() / 60.0))) if (s.get('start') and s.get('end')) else 0
-            except Exception:
-                dur_mins = 0
-            first_dir = s['dirs'][0] if s.get('dirs') and len(s['dirs'])>0 else ''
-            last_dir = s['dirs'][-1] if s.get('dirs') and len(s['dirs'])>0 else ''
-            seq.append({
-                'label': s.get('label'),
-                'mins': dur_mins,
-                'first_dir': first_dir,
-                'last_dir': last_dir
-            })
-        # thresholds: short < 60 min; long >= 4.5 hours (4.5*60 = 270)
-        SHORT_MAX = 60
-        LONG_MIN = int(4.5 * 60)
-        for i in range(len(seq)-2):
-            a = seq[i]; b = seq[i+1]; c = seq[i+2]
-            # first and third must be short 'work' segments, middle must be long break/out_of_office
-            if (a['label'] == 'work' and a['mins'] < SHORT_MAX) and \
-               (b['label'] in ('break','out_of_office') and b['mins'] >= LONG_MIN) and \
-               (c['label'] == 'work' and c['mins'] < SHORT_MAX):
-                # strict direction check: last direction of a should include 'out', first direction of c should include 'in'
-                a_last_out = (a.get('last_dir') and ('out' in a.get('last_dir')))
-                c_first_in = (c.get('first_dir') and ('in' in c.get('first_dir')))
-                if a_last_out and c_first_in:
-                    pattern_flag = True
-                    pattern_sequence_readable = f"work_short ({a['mins']}m) -> out_long ({b['mins']}m) -> work_short ({c['mins']}m)"
-                    break
-    except Exception:
-        pattern_flag = False
-        pattern_sequence_readable = None
-
-    # ... (existing computations: unique_doors, work/break totals etc) ...
-
-    # After computing max_gap and max_outin_gap, set MaxOutInGapSeconds and prefer it for MaxSwipeGapSeconds
-    final_max_gap = int(max_outin_gap) if int(max_outin_gap) > 0 else int(max_gap)
-
-    # return series (include new MaxOutInGapSeconds and Pattern fields)
-    return pd.Series({
-        'CountSwipes': int(len(g)) if hasattr(g, '__len__') else 0,
-        'MaxSwipeGapSeconds': final_max_gap,
-        'MaxOutInGapSeconds': int(max_outin_gap),
-        'ShortGapCount': int(short_gap_count),
-        # ... other fields unchanged ...
-        'PatternShortLongRepeat': bool(pattern_flag),
-        'PatternSequenceReadable': pattern_sequence_readable,
-        # 'PatternSequence' etc if needed
-    })
-
-
-
-
-
-
-
-# ---------- update weights: make long-gap more prioritized ----------
-WEIGHTS = {
-    "long_gap_>=4.5h": 2.5,            # increased from 1.3 -> 2.5
-    "short_duration_<4h": 1.0,
-    "coffee_badging": 1.0,
-    "low_swipe_count_<=5": 0.5,
-    "single_door": 0.25,
-    # ... rest unchanged ...
-    "shortstay_longout_repeat": 2.0
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-D:\Email Automation\backend-arun\.env
+C:\Users\W0024618\Desktop\email-Dashboard\backend\.env
 
 #API key for securing endpoints (replace with your existing API key)
 API_KEYS=1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed
 #Microsoft Graph API credentials (placeholders)
 CLIENT_ID=6222d611-678e-4d57-a98b-83faa86fce76
-CLIENT_SECRET=DKV8Q~Rn4MvlucbxcMsXvAZ6ub_rBVbo-sb6.bGX 
+CLIENT_SECRET=DKV8Q~Rn4MvlucbxcMsXvAZ6ub_rBVbo-sb6.bGX
 TENANT_ID=ce3a67f2-5a22-4fb8-a511-815f8924cda6
-# BASE_URL=http://localhost:8000
-
-BASE_URL=http://10.199.22.57:3010
+BASE_URL=http://localhost:8000
 # ENV=testing
-TEST_EMAIL=gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com
+# TEST_EMAIL=gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com
+TEST_EMAIL=Swapnil.Diwate@westernunion.com
 
 
 
 
 
+file 2)
 
-D:\Email Automation\backend-arun\alerts.py
-
+C:\Users\W0024618\Desktop\email-Dashboard\backend\alerts.py
 
 import pyodbc
 from datetime import datetime
@@ -617,9 +400,7 @@ def check_alerts_for_server(server_config, sent_alerts=None):
 
 
 
-
-D:\Email Automation\backend-arun\app.py
-
+C:\Users\W0024618\Desktop\email-Dashboard\backend\app.py
 
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
@@ -648,7 +429,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from filelock import FileLock, Timeout
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-
+ 
 logging.basicConfig(
     level=logging.DEBUG,
     filename='log_file.log',
@@ -657,20 +438,20 @@ logging.basicConfig(
 )
 logging.getLogger("filelock").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
+ 
 load_dotenv()
 VALID_API_KEYS = os.getenv("API_KEYS", "").split(",")
-
+ 
 start_database_writer()
-
+ 
 app = Flask(__name__)
 CORS(app)
 scheduler = BackgroundScheduler()
 log = logging.getLogger('werkzeug')
 log.disabled = True
-
+ 
 executor = ThreadPoolExecutor(max_workers=16)
-
+ 
 def check_all_regions():
     job_lock = FileLock("check_all_regions.lock", timeout=10)
     try:
@@ -684,9 +465,9 @@ def check_all_regions():
         logger.warning("Could not acquire master lock. Another instance is likely running. Skipping this run.")
     except Exception as e:
         logger.error(f"An exception occurred during check_all_regions: {e}", exc_info=True)
-
+ 
 scheduler.add_job(check_all_regions, 'interval', seconds=60, id='check_all_regions_job', max_instances=1)
-
+ 
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -695,7 +476,7 @@ def require_api_key(f):
             return jsonify({"description": "Invalid or missing API key"}), 401
         return f(*args, **kwargs)
     return decorated_function
-
+ 
 @app.route("/alert-logs-sqlite", methods=["GET"])
 @require_api_key
 def get_alert_logs_sqlite():
@@ -704,15 +485,15 @@ def get_alert_logs_sqlite():
         seven_days_ago = today - timedelta(days=7)
         from_date = request.args.get('from_date', seven_days_ago.strftime('%Y-%m-%d'))
         to_date = request.args.get('to_date', today.strftime('%Y-%m-%d'))
-
+ 
         future = executor.submit(read_sqlite_alerts_by_date, from_date, to_date)
         logs = future.result()
-
+ 
         return jsonify(logs)
     except Exception as e:
         logger.error(f"API Error fetching alert logs: {e}", exc_info=True)
         return jsonify({"description": "Error reading database"}), 500
-
+ 
 @app.route('/get/email-logs', methods=['GET'])
 @require_api_key
 def get_email_logs():
@@ -721,15 +502,15 @@ def get_email_logs():
         seven_days_ago = today - timedelta(days=7)
         from_date = request.args.get('from_date', seven_days_ago.strftime('%Y-%m-%d'))
         to_date = request.args.get('to_date', today.strftime('%Y-%m-%d'))
-
+ 
         future = executor.submit(read_email_logs_by_date, from_date, to_date)
         email_logs = future.result()
-
+ 
         return jsonify(email_logs)
     except Exception as e:
         logger.error(f"API Error fetching email logs: {e}", exc_info=True)
         return jsonify({"error": "Database error"}), 500
-
+ 
 @app.route("/acknowledge", methods=["GET"])
 def acknowledge_email():
     email_id = request.args.get("email_id")
@@ -777,8 +558,7 @@ def acknowledge_email():
         </body>
         </html>
         """.format(error=str(e)), 500
-
-# (Add any other API routes you need here, following the same pattern)
+ 
 @app.route("/email/trigger-action", methods=["POST"])
 @require_api_key
 def trigger_action():
@@ -814,8 +594,8 @@ def trigger_action():
             status=500,
             mimetype="application/json"
         )
-        
-app.route("/curl", methods=["POST"])
+       
+@app.route("/curl", methods=["POST"])
 @require_api_key
 def trigger_alert():
     logger.debug("Trigger alert requested")
@@ -850,7 +630,7 @@ def trigger_alert():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/email/responses-received", methods=["GET"])
 @require_api_key
 def get_responses_received():
@@ -868,7 +648,7 @@ def get_responses_received():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/email/responses-sent", methods=["GET"])
 @require_api_key
 def get_responses_sent():
@@ -886,7 +666,7 @@ def get_responses_sent():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/email/inbox", methods=["GET"])
 @require_api_key
 def get_inbox():
@@ -915,7 +695,9 @@ def get_inbox():
             status=500,
             mimetype="application/json"
         )
-
+ 
+# ==================== UPDATED EXCEPTION LIST ENDPOINTS ====================
+ 
 @app.route("/email/exceptions", methods=["GET"])
 @require_api_key
 def get_exceptions():
@@ -933,12 +715,13 @@ def get_exceptions():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/email/exceptions", methods=["POST"])
 @require_api_key
 def manage_exceptions_endpoint():
     logger.debug("Managing exception list")
     data = request.get_json()
+   
     if not data or "action" not in data or "email" not in data:
         logger.error("Missing 'action' or 'email' in request body")
         return Response(
@@ -946,19 +729,34 @@ def manage_exceptions_endpoint():
             status=400,
             mimetype="application/json"
         )
+   
     action = data["action"]
     email = data["email"]
-    logger.debug(f"Processing {action} for email: {email}")
+    region = data.get("region")
+    violation_type = data.get("violation_type")
+   
+    if not region or not violation_type:
+        logger.error("Missing 'region' or 'violation_type' in request body")
+        return Response(
+            json.dumps({"description": "Missing 'region' or 'violation_type' in request body"}, indent=2),
+            status=400,
+            mimetype="application/json"
+        )
+   
+    logger.debug(f"Processing {action} for email: {email}, region: {region}, violation: {violation_type}")
+   
     try:
-        result = manage_exceptions(action=action, email=email)
+        result = manage_exceptions(action=action, email=email, region=region, violation_type=violation_type)
+       
         if result is False:
             logger.error(f"Failed to {action} email {email} in exception list")
             return Response(
                 json.dumps({"description": f"Failed to {action} email {email} (email not found or invalid)"}, indent=2),
-                status=404 if action == "delete" else 400,
+                status=404 if action in ["delete", "remove"] else 400,
                 mimetype="application/json"
             )
-        logger.info(f"Successfully {action} email {email} in exception list")
+       
+        logger.info(f"Successfully {action} email {email} for {region}/{violation_type}")
         return Response(
             json.dumps({"status": "success", "message": f"Exception list updated: {action} {email}"}, indent=2),
             mimetype="application/json"
@@ -970,7 +768,9 @@ def manage_exceptions_endpoint():
             status=500,
             mimetype="application/json"
         )
-
+ 
+# ==================== REST OF YOUR EXISTING ENDPOINTS ====================
+ 
 @app.route("/email/templates", methods=["GET"])
 @require_api_key
 def get_templates():
@@ -989,7 +789,7 @@ def get_templates():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/email/templates", methods=["POST"])
 @require_api_key
 def manage_templates():
@@ -1074,7 +874,7 @@ def manage_templates():
             status=400,
             mimetype="application/json"
         )
-
+ 
 @app.route("/get/images", methods=["GET"])
 @require_api_key
 def get_employee_image():
@@ -1110,7 +910,7 @@ def get_employee_image():
             status=500,
             mimetype="application/json"
         )
-
+ 
 @app.route("/alert-logs", methods=["GET"])
 @require_api_key
 def get_alert_logs():
@@ -1139,7 +939,7 @@ def get_alert_logs():
             status=500,
             mimetype="application/json"
         )      
-
+ 
 @app.route("/locations/filter", methods=["GET"])
 @require_api_key
 def get_location_filters():
@@ -1148,26 +948,26 @@ def get_location_filters():
         return jsonify({"filters": result})
     else:
         return jsonify({"description": result}), 500
-
+ 
 @app.route("/locations/filter", methods=["POST"])
 @require_api_key
 def add_or_remove_location_filter():
     data = request.get_json()
     if not data or "action" not in data or "region" not in data or "location" not in data:
         return jsonify({"description": "Missing 'action', 'region', or 'location' in request body"}), 400
-    
+   
     action = data["action"]
     region = data["region"]
     location = data["location"]
-
+ 
     success, message = manage_location_filter(action=action, region=region, location=location)
-
+ 
     if success:
         return jsonify({"status": "success", "message": message})
     else:
         return jsonify({"description": message}), 500
-
-
+ 
+ 
 if __name__ == "__main__":
     # This stricter check ensures the scheduler is NEVER started in the parent
     # reloader process, only in the single, true worker process.
@@ -1175,7 +975,7 @@ if __name__ == "__main__":
         logger.info("Starting scheduler in the main worker process ONLY.")
         if not scheduler.running:
             scheduler.start()
-    
+   
     app.run(host="0.0.0.0", port=5000, debug=True)
 
 
@@ -1186,8 +986,7 @@ if __name__ == "__main__":
 
 
 
-
-D:\Email Automation\backend-arun\bulk_add_email.py
+C:\Users\W0024618\Desktop\email-Dashboard\backend\bulk_add_email.py
 
 
 import pandas as pd
@@ -1270,7 +1069,7 @@ if __name__ == "__main__":
 
 
 
-D:\Email Automation\backend-arun\check.py
+C:\Users\W0024618\Desktop\email-Dashboard\backend\check.py
 
 
 import sqlite3
@@ -1339,9 +1138,7 @@ if __name__ == "__main__":
 
 
 
-
-D:\Email Automation\backend-arun\config.py
-
+C:\Users\W0024618\Desktop\email-Dashboard\backend\config.py
 
 
 import json
@@ -1401,9 +1198,15 @@ Regional_Servers=[
 ]
 SMTP_SERVER='smtpprod.wuintranet.net'
 SMTP_PORT=25
-FROM_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
-GSOC_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
-bcc_email='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+# FROM_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+# GSOC_EMAIL='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+# bcc_email='gsoc-globalsecurityoperationcenter.sharedmailbox@westernunion.com'
+
+FROM_EMAIL='Swapnil.Diwate@westernunion.com'
+GSOC_EMAIL='Swapnil.Diwate@westernunion.com'
+bcc_email='Swapnil.Diwate@westernunion.com'
+
+
 PRIMARY_EMAIL=os.getenv("TEST_EMAIL")
 HR_EMAIL='hr@wu.com'
 
@@ -2228,7 +2031,9 @@ EMAIL_TEMPLATES = load_templates()
 
 
 
-D:\Email Automation\backend-arun\db.py
+
+C:\Users\W0024618\Desktop\email-Dashboard\backend\db.py
+
 
 
 import pyodbc
@@ -2307,7 +2112,9 @@ t2.Image,
 
 
 
-D:\Email Automation\backend-arun\delete_exceptions.py
+
+C:\Users\W0024618\Desktop\email-Dashboard\backend\delete_exceptions.py
+
 
 
 import sqlite3
@@ -2348,12 +2155,7 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
-D:\Email Automation\backend-arun\email_handler.py
+C:\Users\W0024618\Desktop\email-Dashboard\backend\email_handler.py
 
 
 import msal
@@ -2630,7 +2432,10 @@ def trigger_followup_action(email_id, action):
 
 
 
-D:\Email Automation\backend-arun\log_handler.py
+
+
+C:\Users\W0024618\Desktop\email-Dashboard\backend\log_handler.py
+
 
 
 import sqlite3
@@ -2992,7 +2797,137 @@ def read_email_logs(from_date=None, to_date=None):
                 continue
             return []
 
-
+# def init_sqlite_db():
+#     """Initialize SQLite database with alert_logs, email_logs, exception_list, and employee_images tables."""
+#     if not os.path.exists(DB_FILE):
+#         conn = sqlite3.connect(DB_FILE, timeout=30)
+#         cursor = conn.cursor()
+#         cursor.execute("PRAGMA journal_mode=WAL")  # Set WAL mode for concurrent access
+#         # Create alert_logs table
+#         cursor.execute('''
+#             CREATE TABLE IF NOT EXISTS alert_logs (
+#                 EmployeeID TEXT,
+#                 ObjectName1 TEXT,
+#                 Alert_Type TEXT,
+#                 CardNumber TEXT,
+#                 ObjectName2 TEXT,
+#                 Swipe_Time TEXT,
+#                 DateOnly TEXT,
+#                 PartitionName TEXT,
+#                 Region TEXT,
+#                 ObjectName3 TEXT
+#             )
+#         ''')
+#         # Create email_logs table
+#         cursor.execute('''
+#             CREATE TABLE IF NOT EXISTS email_logs (
+#                 email_id TEXT PRIMARY KEY,
+#                 subject TEXT,
+#                 body TEXT,
+#                 to_email TEXT,
+#                 cc_email TEXT,
+#                 bcc_email TEXT,
+#                 sent_time TEXT,
+#                 received_time TEXT,
+#                 region TEXT,
+#                 alert_type TEXT,
+#                 employee_id TEXT,
+#                 acknowledged BOOLEAN,
+#                 acknowledgment_time TEXT,
+#                 action_taken TEXT
+#             )
+#         ''')
+#         #add the employee_name in email_logs
+#         try:
+#             cursor.execute("ALTER TABLE email_logs ADD COLUMN employee_name TEXT")
+#             logger.info("Added 'employee_name' column to email_logs table.")
+#         except sqlite3.OperationalError as e:
+#         # This error is expected if the column already exists, so we can ignore it.
+#             if "duplicate column name" not in str(e).lower():
+#                 logger.error(f"Error altering email_logs table: {e}")
+        
+#         # Create exception_list table
+#         cursor.execute('''
+#             CREATE TABLE IF NOT EXISTS  exception_list (
+#                 email TEXT PRIMARY KEY,
+#                 added_at TEXT
+#             )
+#         ''')
+        
+#         #crate table for location_filter to store allowed locations
+#         cursor.execute('''
+#             CREATE TABLE IF NOT EXISTS location_filter (
+#                 region TEXT NOT NULL,
+#                 location TEXT NOT NULL,
+#                 added_at TEXT,
+#                 PRIMARY KEY (region,location)
+#             )         
+#         ''')
+        
+#         # Create employee_images table
+#         cursor.execute('''
+#             CREATE TABLE IF NOT EXISTS employee_images (
+#                 Name TEXT,
+#                 Image BLOB,
+#                 EmployeeID TEXT PRIMARY KEY,
+#                 PersonnelType TEXT
+#             )
+#         ''')
+#         conn.commit()
+#         conn.close()
+#         logger.info(f"{DB_FILE} created with alert_logs, email_logs, exception_list, and employee_images tables.")
+#     else:
+#         conn = sqlite3.connect(DB_FILE, timeout=30)
+#         cursor = conn.cursor()
+#         cursor.execute("PRAGMA journal_mode=WAL")  # Set WAL mode for concurrent access
+#         # Ensure ObjectName3 column exists in alert_logs
+#         try:
+#             cursor.execute("ALTER TABLE alert_logs ADD COLUMN ObjectName3 TEXT")
+#             conn.commit()
+#             logger.info("Added ObjectName3 column to alert_logs.")
+#         except sqlite3.OperationalError as e:
+#             if "duplicate column name" not in str(e).lower():
+#                 logger.error(f"Error adding ObjectName3 column: {str(e)}")
+#         # Ensure email_logs table exists
+#         try:
+#             cursor.execute('''
+#                 CREATE TABLE IF NOT EXISTS email_logs (
+#                     email_id TEXT PRIMARY KEY,
+#                     subject TEXT,
+#                     body TEXT,
+#                     to_email TEXT,
+#                     cc_email TEXT,
+#                     bcc_email TEXT,
+#                     sent_time TEXT,
+#                     received_time TEXT,
+#                     region TEXT,
+#                     alert_type TEXT,
+#                     employee_id TEXT,
+#                     acknowledged BOOLEAN,
+#                     acknowledgment_time TEXT,
+#                     action_taken TEXT
+#                     employee_name TEXT
+#                 )
+#             ''')
+#             conn.commit()
+#             logger.info("Ensured email_logs table exists.")
+#         except Exception as e:
+#             logger.error(f"Error creating email_logs table: {str(e)}")
+#         # Ensure employee_images table exists
+#         try:
+#             cursor.execute('''
+#                 CREATE TABLE IF NOT EXISTS employee_images (
+#                     Name TEXT,
+#                     Image BLOB,
+#                     EmployeeID TEXT PRIMARY KEY,
+#                     PersonnelType TEXT
+#                 )
+#             ''')
+#             conn.commit()
+#             logger.info("Ensured employee_images table exists.")
+#         except Exception as e:
+#             logger.error(f"Error creating employee_images table: {str(e)}")
+#         conn.close()
 def init_sqlite_db():
     """Initialize SQLite database with alert_logs, email_logs, exception_list, location_filter, employee_images tables."""
     if not os.path.exists(DB_FILE):
@@ -3205,7 +3140,6 @@ def manage_location_filter(action, region=None, location=None):
     except Exception as e:
         logger.error(f"Error managing location filter: {e}", exc_info=True)
         return False, str(e)
-
 
 
 
