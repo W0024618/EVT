@@ -1,3 +1,463 @@
+# incident_report.py
+import os
+import json
+from typing import Optional, List, Dict, Any
+from datetime import datetime, date, time
+
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, EmailStr, validator
+from sqlalchemy import Column, Integer, String, DateTime, Text, func
+from sqlalchemy.dialects.sqlite import JSON as SQLITE_JSON
+
+from database import Base, engine, SessionLocal
+
+router = APIRouter(prefix="/incident", tags=["incident"])
+
+# Ensure uploads directory exists
+BASE_DIR = os.path.dirname(__file__)
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# -------------------------
+# SQLAlchemy model (unchanged structure)
+# -------------------------
+class IncidentReport(Base):
+    __tablename__ = "incident_reports"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+
+    # basic fields (strings)
+    type_of_incident = Column(String, nullable=False)   # e.g. Medical / Theft / Other
+    other_type_text = Column(String, nullable=True)     # filled when type_of_incident == "Other"
+
+    date_of_report = Column(String, nullable=False)     # ISO date string e.g. "2025-12-03"
+    time_of_report = Column(String, nullable=False)     # HH:MM:SS
+
+    impacted_name = Column(String, nullable=False)
+    impacted_employee_id = Column(String, nullable=False)
+
+    was_reported_verbally = Column(Integer, default=0)    # 1 = True, 0 = False
+    incident_reported_to = Column(String, nullable=True) # JSON-string list when present
+    reported_to_details = Column(String, nullable=True)
+
+    location = Column(String, nullable=False)
+
+    reported_by_name = Column(String, nullable=False)
+    reported_by_employee_id = Column(String, nullable=False)
+    reported_by_email = Column(String, nullable=False)
+    reported_by_contact = Column(String, nullable=False)
+
+    date_of_incident = Column(String, nullable=False)
+    time_of_incident = Column(String, nullable=False)
+
+    detailed_description = Column(Text, nullable=False)
+    immediate_actions_taken = Column(Text, nullable=False)
+
+    accompanying_person = Column(SQLITE_JSON, nullable=True)   # list of {name, contact}
+    witnesses = Column(SQLITE_JSON, nullable=True)            # list of strings
+    witness_contacts = Column(SQLITE_JSON, nullable=True)     # list of strings
+
+    root_cause_analysis = Column(Text, nullable=True)         # optional
+    preventive_actions = Column(Text, nullable=True)          # optional
+
+    proofs = Column(SQLITE_JSON, nullable=True)               # list of uploaded filenames (relative)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# create tables if not exist
+Base.metadata.create_all(bind=engine)
+
+
+# -------------------------
+# Pydantic Schemas (strict types)
+# -------------------------
+class AccompanyPerson(BaseModel):
+    name: str = Field(..., min_length=1)
+    contact: str = Field(..., min_length=3)
+
+class IncidentCreate(BaseModel):
+    # required
+    type_of_incident: str = Field(..., min_length=1)
+    other_type_text: Optional[str] = None
+
+    date_of_report: date
+    time_of_report: time
+
+    impacted_name: str = Field(..., min_length=1)
+    impacted_employee_id: str = Field(..., min_length=1)
+
+    was_reported_verbally: bool
+
+    # If was_reported_verbally true
+    incident_reported_to: Optional[List[str]] = None
+    reported_to_details: Optional[str] = None
+
+    location: str = Field(..., min_length=1)
+
+    reported_by_name: str = Field(..., min_length=1)
+    reported_by_employee_id: str = Field(..., min_length=1)
+    reported_by_email: EmailStr
+    reported_by_contact: str = Field(..., min_length=3)
+
+    date_of_incident: date
+    time_of_incident: time
+
+    detailed_description: str = Field(..., min_length=5)
+    immediate_actions_taken: str = Field(..., min_length=1)
+
+    accompanying_person: List[AccompanyPerson] = Field(..., min_items=0)
+    witnesses: List[str] = Field(..., min_items=0)
+    witness_contacts: List[str] = Field(..., min_items=0)
+
+    root_cause_analysis: Optional[str] = None
+    preventive_actions: Optional[str] = None
+
+    @validator("other_type_text", always=True)
+    def require_other_text_if_other(cls, v, values):
+        if values.get("type_of_incident") and values.get("type_of_incident").strip().lower() == "other":
+            if not v or not v.strip():
+                raise ValueError("When type_of_incident is 'Other', provide other_type_text.")
+            return v
+        return v
+
+    @validator("incident_reported_to", always=True)
+    def validate_reported_to_if_needed(cls, v, values):
+        if values.get("was_reported_verbally"):
+            if not v or len(v) == 0:
+                raise ValueError("When was_reported_verbally is True, provide incident_reported_to (list).")
+        return v
+
+    @validator("reported_to_details", always=True)
+    def validate_reported_to_details_if_needed(cls, v, values):
+        if values.get("was_reported_verbally"):
+            if v is None or not str(v).strip():
+                # require details when verbally reported (per your spec)
+                raise ValueError("When was_reported_verbally is True, provide reported_to_details (Name and Department).")
+        return v
+
+    @validator("witness_contacts", always=True)
+    def validate_witness_lengths(cls, v, values):
+        w = values.get("witnesses") or []
+        if len(w) != len(v):
+            raise ValueError("witnesses and witness_contacts must have the same length (parallel arrays).")
+        return v
+
+class IncidentOut(BaseModel):
+    id: int
+    type_of_incident: str
+    other_type_text: Optional[str] = None
+    date_of_report: str
+    time_of_report: str
+    impacted_name: str
+    impacted_employee_id: str
+    was_reported_verbally: bool
+    incident_reported_to: Optional[List[str]] = None
+    reported_to_details: Optional[str] = None
+    location: str
+    reported_by_name: str
+    reported_by_employee_id: str
+    reported_by_email: str
+    reported_by_contact: str
+    date_of_incident: str
+    time_of_incident: str
+    detailed_description: str
+    immediate_actions_taken: str
+    accompanying_person: Optional[List[dict]] = None
+    witnesses: Optional[List[str]] = None
+    witness_contacts: Optional[List[str]] = None
+    root_cause_analysis: Optional[str] = None
+    preventive_actions: Optional[str] = None
+    proofs: Optional[List[str]] = None
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# -------------------------
+# Helpers for file saving
+# -------------------------
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB per file
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".gif", ".bmp"}
+
+def secure_filename(filename: str) -> str:
+    name = "".join(c for c in filename if c.isalnum() or c in (" ", ".", "_", "-")).strip()
+    return name or "upload"
+
+def save_uploads_sync(upload_files: Optional[List[UploadFile]]) -> List[str]:
+    """
+    Save uploaded files under uploads/YYYY/MM/ and return relative paths (YYYY/MM/<ts>_name.ext)
+    """
+    if not upload_files:
+        return []
+    saved = []
+    for f in upload_files:
+        raw_name = getattr(f, "filename", "upload")
+        name = secure_filename(raw_name)
+        ext = os.path.splitext(name)[1].lower()
+        if ext and ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
+        f.file.seek(0)
+        data = f.file.read()
+        if not isinstance(data, (bytes, bytearray)):
+            # fallback
+            data = bytes(data)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=400, detail=f"File too large: {name}")
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        y = datetime.utcnow().strftime("%Y")
+        m = datetime.utcnow().strftime("%m")
+        folder = os.path.join(UPLOAD_DIR, y, m)
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{ts}_{name}"
+        path = os.path.join(folder, filename)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        rel = os.path.join(y, m, filename)
+        saved.append(rel)
+    return saved
+
+
+# -------------------------
+# Endpoints
+# -------------------------
+@router.post("/create", response_model=IncidentOut)
+async def create_incident(
+    payload: str = Form(...),
+    proofs: Optional[List[UploadFile]] = File(None)
+):
+    """
+    Accepts multipart/form-data:
+      - payload: JSON string matching IncidentCreate schema
+      - proofs: optional list of files (images, pdf)
+    """
+    # parse JSON payload
+    try:
+        data = json.loads(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+
+    # validate payload with Pydantic
+    try:
+        incident = IncidentCreate.parse_obj(data)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    db = SessionLocal()
+    try:
+        saved_files = []
+        if proofs:
+            # use sync saver (UploadFile.file.read() is OK here)
+            saved_files = save_uploads_sync(proofs)
+
+        inst = IncidentReport(
+            type_of_incident = incident.type_of_incident.strip(),
+            other_type_text = incident.other_type_text.strip() if incident.other_type_text else None,
+            date_of_report = incident.date_of_report.isoformat(),
+            time_of_report = incident.time_of_report.strftime("%H:%M:%S"),
+            impacted_name = incident.impacted_name.strip(),
+            impacted_employee_id = incident.impacted_employee_id.strip(),
+            was_reported_verbally = 1 if incident.was_reported_verbally else 0,
+            incident_reported_to = json.dumps(incident.incident_reported_to) if incident.incident_reported_to else None,
+            reported_to_details = incident.reported_to_details.strip() if incident.reported_to_details else None,
+            location = incident.location.strip(),
+            reported_by_name = incident.reported_by_name.strip(),
+            reported_by_employee_id = incident.reported_by_employee_id.strip(),
+            reported_by_email = str(incident.reported_by_email),
+            reported_by_contact = incident.reported_by_contact.strip(),
+            date_of_incident = incident.date_of_incident.isoformat(),
+            time_of_incident = incident.time_of_incident.strftime("%H:%M:%S"),
+            detailed_description = incident.detailed_description.strip(),
+            immediate_actions_taken = incident.immediate_actions_taken.strip(),
+            accompanying_person = [p.dict() for p in incident.accompanying_person] if incident.accompanying_person else None,
+            witnesses = incident.witnesses if incident.witnesses else None,
+            witness_contacts = incident.witness_contacts if incident.witness_contacts else None,
+            root_cause_analysis = incident.root_cause_analysis.strip() if incident.root_cause_analysis else None,
+            preventive_actions = incident.preventive_actions.strip() if incident.preventive_actions else None,
+            proofs = saved_files if saved_files else None,
+            created_at = datetime.utcnow()
+        )
+
+        db.add(inst)
+        db.commit()
+        db.refresh(inst)
+
+        # convert incident_reported_to JSON-string back to list for response
+        if inst.incident_reported_to:
+            try:
+                inst.incident_reported_to = json.loads(inst.incident_reported_to)
+            except:
+                inst.incident_reported_to = None
+
+        return inst
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@router.get("/list", response_model=List[IncidentOut])
+def list_incidents(
+    limit: int = 200,
+    page: int = 1,
+    page_size: int = 50,
+    type_of_incident: Optional[str] = None,
+    location: Optional[str] = None,
+    start_date: Optional[str] = None,   # ISO date string: YYYY-MM-DD
+    end_date: Optional[str] = None      # ISO date string
+):
+    """
+    Returns paginated & filterable incidents.
+    Supports: type_of_incident, location substring, start_date, end_date, page, page_size.
+    """
+    db = SessionLocal()
+    try:
+        q = db.query(IncidentReport)
+        if type_of_incident:
+            q = q.filter(IncidentReport.type_of_incident == type_of_incident)
+        if location:
+            # sqlite uses case-insensitive LIKE by default for ASCII; use lower compare if needed
+            q = q.filter(IncidentReport.location.ilike(f"%{location}%"))
+        if start_date:
+            q = q.filter(IncidentReport.date_of_incident >= start_date)
+        if end_date:
+            q = q.filter(IncidentReport.date_of_incident <= end_date)
+
+        page = max(page, 1)
+        page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * page_size
+
+        rows = q.order_by(IncidentReport.created_at.desc()).offset(offset).limit(page_size).all()
+
+        # parse JSON strings before returning
+        for r in rows:
+            if isinstance(r.incident_reported_to, str):
+                try:
+                    r.incident_reported_to = json.loads(r.incident_reported_to)
+                except:
+                    r.incident_reported_to = None
+        return rows
+    finally:
+        db.close()
+
+
+@router.get("/{incident_id}", response_model=IncidentOut)
+def get_incident(incident_id: int):
+    db = SessionLocal()
+    try:
+        row = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        if isinstance(row.incident_reported_to, str):
+            try:
+                row.incident_reported_to = json.loads(row.incident_reported_to)
+            except:
+                row.incident_reported_to = None
+        return row
+    finally:
+        db.close()
+
+
+# Attachment download (allow slashes in filename via :path)
+@router.get("/{incident_id}/attachment/{filename:path}")
+def download_attachment(incident_id: int, filename: str):
+    """
+    filename should be the relative path stored in 'proofs' (like '2025/12/20251231010101_file.pdf').
+    Use the exact relative path when calling (or provide an endpoint that lists attachments).
+    """
+    safe_path = os.path.normpath(os.path.join(UPLOAD_DIR, filename))
+    # Prevent path traversal: ensure safe_path starts with UPLOAD_DIR absolute path
+    if not os.path.abspath(safe_path).startswith(os.path.abspath(UPLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not os.path.exists(safe_path):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return FileResponse(safe_path, filename=os.path.basename(safe_path))
+
+
+# -------------------------
+# Monthly aggregation endpoint
+# -------------------------
+@router.get("/stats/monthly")
+def monthly_stats(year: Optional[int] = None):
+    """
+    Returns counts grouped by month and incident type.
+    Example response:
+    {
+      "2025-11": {"Medical": 3, "Theft": 1},
+      "2025-12": {"Medical": 2, "Other": 5}
+    }
+    """
+    db = SessionLocal()
+    try:
+        month_label = func.strftime('%Y-%m', IncidentReport.date_of_incident).label('month')
+        q = db.query(month_label, IncidentReport.type_of_incident, func.count().label('cnt'))
+        if year:
+            start = f"{year:04d}-01-01"
+            end = f"{year:04d}-12-31"
+            q = q.filter(IncidentReport.date_of_incident >= start, IncidentReport.date_of_incident <= end)
+        q = q.group_by(month_label, IncidentReport.type_of_incident).order_by(month_label.desc())
+        rows = q.all()
+
+        out: Dict[str, Dict[str, int]] = {}
+        for month, typ, cnt in rows:
+            if month is None:
+                month = "unknown"
+            out.setdefault(month, {})[typ] = cnt
+        return out
+    finally:
+        db.close()
+
+
+# -------------------------
+# Summary stats endpoint (type-wise & severity estimation)
+# -------------------------
+@router.get("/stats/summary")
+def summary_stats():
+    """
+    Return overall totals, and totals by type and by month (last 12 months).
+    """
+    db = SessionLocal()
+    try:
+        total = db.query(func.count(IncidentReport.id)).scalar()
+        by_type = db.query(IncidentReport.type_of_incident, func.count().label('cnt')).group_by(IncidentReport.type_of_incident).all()
+        month_label = func.strftime('%Y-%m', IncidentReport.date_of_incident).label('month')
+        last_12 = db.query(month_label, func.count().label('cnt')) \
+                    .group_by(month_label) \
+                    .order_by(month_label.desc()) \
+                    .limit(12) \
+                    .all()
+
+        return {
+            "total": int(total or 0),
+            "by_type": {typ: cnt for typ, cnt in by_type},
+            "last_12_months": {m: cnt for m, cnt in last_12}
+        }
+    finally:
+        db.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (venv) PS C:\Users\W0024618\Desktop\incidenceDashboard\backend> uvicorn main:app --reload --port 8000
 INFO:     Will watch for changes in these directories: ['C:\\Users\\W0024618\\Desktop\\incidenceDashboard\\backend']
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
