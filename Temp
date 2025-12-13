@@ -1,3 +1,248 @@
+# manage_incidents.py (updated)
+import os
+import shutil
+import sqlite3
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Path config - update if your paths differ
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "database.db"
+BACKUP_DIR = BASE_DIR
+UPLOADS_DIR = BASE_DIR / "uploads"
+
+def backup_db():
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    bak = BACKUP_DIR / f"database.db.bak.{ts}"
+    shutil.copy2(DB_PATH, bak)
+    print(f"Backed up DB to: {bak}")
+    return bak
+
+def list_incidents(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT id, type_of_incident, impacted_name, impacted_employee_id, date_of_incident, created_at FROM incident_reports ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    if not rows:
+        print("No incidents found.")
+        return []
+    print(f"Found {len(rows)} incident(s):")
+    for r in rows:
+        print(f"ID={r[0]:>4} | Type={r[1]!s:20.20} | Impacted={r[2]!s:20.20} | EmpID={r[3]!s:12.12} | Date={r[4]} | Created={r[5]}")
+    return rows
+
+def delete_incident(conn, incident_id):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM incident_reports WHERE id = ?", (incident_id,))
+    if cur.fetchone() is None:
+        print("No such id:", incident_id)
+        return False
+    cur.execute("DELETE FROM incident_reports WHERE id = ?", (incident_id,))
+    conn.commit()
+    print(f"Deleted incident id={incident_id}")
+    return True
+
+def delete_all_incidents(conn):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM incident_reports")
+    conn.commit()
+    print("Deleted ALL incidents (careful!).")
+
+def sanitize_name(name: str) -> str:
+    return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_", "-")).strip() or "upload"
+
+def save_file_to_uploads(source: Path) -> str:
+    """
+    copy a single file into uploads/YYYY/MM/<ts>_name.ext
+    returns relative path stored in DB (e.g. '2025/12/20251231_....pdf')
+    """
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    y = now.strftime("%Y")
+    m = now.strftime("%m")
+    folder = UPLOADS_DIR / y / m
+    folder.mkdir(parents=True, exist_ok=True)
+    name = sanitize_name(source.name)
+    ts = now.strftime("%Y%m%d%H%M%S%f")
+    dest_name = f"{ts}_{name}"
+    dest = folder / dest_name
+    shutil.copy2(source, dest)
+    rel = os.path.join(y, m, dest_name)
+    print(f"Saved file to: {dest}  (relative path saved in DB: {rel})")
+    return rel
+
+def prompt_with_default(prompt_text, default=None):
+    try:
+        if default:
+            v = input(f"{prompt_text} [{default}]: ").strip()
+            return v if v else default
+        else:
+            return input(f"{prompt_text}: ").strip()
+    except KeyboardInterrupt:
+        print("\nAborted by user.")
+        raise SystemExit(1)
+
+def main():
+    if not DB_PATH.exists():
+        print("Database not found at", DB_PATH)
+        return
+    # backup
+    backup_db()
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    # list existing incidents
+    rows = list_incidents(conn)
+
+    # ask user if they want to delete existing entries
+    if rows:
+        print("\nIf you want to remove previous incident(s), you can:")
+        print(" - enter a single id to delete that incident (e.g. 17)")
+        print(" - enter 'all' to delete ALL incidents")
+        print(" - press Enter to skip deletion")
+        choice = input("Delete choice (id / all / Enter to skip): ").strip().lower()
+        if choice == "all":
+            confirm = input("CONFIRM: type YES to actually delete all incidents: ").strip()
+            if confirm.upper() == "YES" or confirm.lower() in ("y", "yes"):
+                delete_all_incidents(conn)
+            else:
+                print("Skipping deletion.")
+        elif choice.isdigit():
+            delete_incident(conn, int(choice))
+        else:
+            print("No deletion performed.")
+
+    # prompt for PDF path (or allow skipping)
+    print("\nProvide path to the PDF you want to attach (absolute or relative).")
+    print("If you already placed the PDF in this backend folder, just enter its filename (e.g. 'DocScanner 13-Dec-2025 10-46 AM.pdf').")
+    print("Press Enter to skip attaching a proof file.")
+    user_path = input("Path to PDF (or Enter to skip): ").strip()
+
+    rel_proof_path = None
+    if user_path:
+        source = Path(user_path).expanduser()
+        # if user gave a relative path and file doesn't exist, also check BASE_DIR
+        if not source.exists():
+            alt = BASE_DIR / user_path
+            if alt.exists():
+                source = alt
+        if not source.exists():
+            print(f"File not found at '{user_path}' (and not in backend folder).")
+            print("Please move your PDF into the backend folder or enter a correct path when you re-run.")
+            print("Skipping attachment.")
+            rel_proof_path = None
+        else:
+            rel_proof_path = save_file_to_uploads(source)
+
+    # prefill some defaults (use current UTC now)
+    now = datetime.now(timezone.utc)
+    pre_date = now.date().isoformat()
+    pre_time = now.time().strftime("%H:%M:%S")
+
+    print("\nNow enter details for the new incident (press Enter to accept the default shown in brackets).")
+    # required fields
+    type_of_incident = prompt_with_default("Type of incident (e.g. Medical, Theft, Fire, Other)", "Other")
+    other_type_text = None
+    if type_of_incident.strip().lower() == "other":
+        other_type_text = prompt_with_default("If 'Other', please provide the specific type", "Documented Report (scanned)")
+    date_of_report = prompt_with_default("Date of report (YYYY-MM-DD)", pre_date)
+    time_of_report = prompt_with_default("Time of report (HH:MM or HH:MM:SS)", pre_time[:8])
+    impacted_name = prompt_with_default("Impacted person name", "Unknown")
+    impacted_employee_id = prompt_with_default("Impacted employee ID", "N/A")
+    was_reported_verbally = prompt_with_default("Was reported verbally before? (yes/no)", "no").lower().startswith("y")
+    incident_reported_to = []
+    reported_to_details = None
+    if was_reported_verbally:
+        reporter = prompt_with_default("Incident reported to (comma-separated names/roles)", "Supervisor")
+        incident_reported_to = [s.strip() for s in reporter.split(",") if s.strip()]
+        reported_to_details = prompt_with_default("Reported to details (Name & Department)", "Supervisor - Operations")
+    location = prompt_with_default("Location (Office/Branch)", "Head Office")
+    reported_by_name = prompt_with_default("Reported by - Name", "Registrar")
+    reported_by_employee_id = prompt_with_default("Reported by - Employee ID", "REG-001")
+    reported_by_email = prompt_with_default("Reported by - Email", "registrar@example.com")
+    reported_by_contact = prompt_with_default("Reported by - Contact", "+0000000000")
+    date_of_incident = prompt_with_default("Date of incident occurred (YYYY-MM-DD)", pre_date)
+    time_of_incident = prompt_with_default("Time of incident occurred (HH:MM or HH:MM:SS)", pre_time[:8])
+    detailed_description = prompt_with_default("Detailed description (short)", "See attached scanned document." if rel_proof_path else "Manual entry.")
+    immediate_actions_taken = prompt_with_default("Immediate actions taken", "Recorded in register; further action pending.")
+    accompanying_person = []  # left empty; add if needed
+    witnesses = []  # empty
+    witness_contacts = []  # empty
+    root_cause_analysis = prompt_with_default("Root cause analysis (optional)", "")
+    preventive_actions = prompt_with_default("Preventive actions (optional)", "")
+
+    # Build payload values matching DB columns order used by your table
+    insert_values = (
+        type_of_incident,
+        other_type_text,
+        date_of_report,
+        time_of_report if len(time_of_report) == 8 else (time_of_report + ":00" if len(time_of_report) == 5 else time_of_report),
+        impacted_name,
+        impacted_employee_id,
+        1 if was_reported_verbally else 0,
+        json.dumps(incident_reported_to) if incident_reported_to else None,
+        reported_to_details,
+        location,
+        reported_by_name,
+        reported_by_employee_id,
+        reported_by_email,
+        reported_by_contact,
+        date_of_incident,
+        time_of_incident if len(time_of_incident) == 8 else (time_of_incident + ":00" if len(time_of_incident) == 5 else time_of_incident),
+        detailed_description,
+        immediate_actions_taken,
+        json.dumps(accompanying_person) if accompanying_person else None,
+        json.dumps(witnesses) if witnesses else None,
+        json.dumps(witness_contacts) if witness_contacts else None,
+        root_cause_analysis or None,
+        preventive_actions or None,
+        json.dumps([rel_proof_path]) if rel_proof_path else None,
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO incident_reports (
+            type_of_incident, other_type_text, date_of_report, time_of_report,
+            impacted_name, impacted_employee_id, was_reported_verbally, incident_reported_to, reported_to_details,
+            location, reported_by_name, reported_by_employee_id, reported_by_email, reported_by_contact,
+            date_of_incident, time_of_incident, detailed_description, immediate_actions_taken,
+            accompanying_person, witnesses, witness_contacts, root_cause_analysis, preventive_actions,
+            proofs, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, insert_values)
+    conn.commit()
+    new_id = cur.lastrowid
+    print(f"\nNew incident inserted with id = {new_id}")
+    if rel_proof_path:
+        print("Proofs saved (relative path stored in DB):", [rel_proof_path])
+    else:
+        print("No proof attached.")
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (venv) PS C:\Users\W0024618\Desktop\incidenceDashboard\backend> python manage_incidents.py
 >>
 C:\Users\W0024618\Desktop\incidenceDashboard\backend\manage_incidents.py:18: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
